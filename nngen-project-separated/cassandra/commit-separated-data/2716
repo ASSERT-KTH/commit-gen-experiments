@@ -1,0 +1,370 @@
+BLEU SCORE: 0.03635358866852297
+
+TEST MSG: Improve repair tasks ( snapshot , differencing ) concurrency
+GENERATED MSG: actually remove auto _ bootstrap from example config ( see # 2447 )
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index fd1062e . . a5da346 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 16 , 6 + 16 , 7 @ @ <nl> * Avoid overlaps in LCS ( CASSANDRA - 6688 ) <nl> * Improve support for paginating over composites ( CASSANDRA - 4851 ) <nl> * Fix count ( * ) queries in a mixed cluster ( CASSANDRA - 6707 ) <nl> + * Improve repair tasks ( snapshot , differencing ) concurrency ( CASSANDRA - 6566 ) <nl> Merged from 1 . 2 : <nl> * Fix broken streams when replacing with same IP ( CASSANDRA - 6622 ) <nl> * Fix upgradesstables NPE for non - CF - based indexes ( CASSANDRA - 6645 ) <nl> diff - - git a / src / java / org / apache / cassandra / repair / RepairJob . java b / src / java / org / apache / cassandra / repair / RepairJob . java <nl> index 6705c95 . . 475d7f7 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / RepairJob . java <nl> + + + b / src / java / org / apache / cassandra / repair / RepairJob . java <nl> @ @ - 18 , 24 + 18 , 18 @ @ <nl> package org . apache . cassandra . repair ; <nl> <nl> import java . net . InetAddress ; <nl> - import java . util . ArrayList ; <nl> - import java . util . Collection ; <nl> - import java . util . List ; <nl> - import java . util . UUID ; <nl> - import java . util . concurrent . CountDownLatch ; <nl> + import java . util . * ; <nl> + import java . util . concurrent . Executors ; <nl> import java . util . concurrent . locks . Condition ; <nl> <nl> + import com . google . common . util . concurrent . * ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> - import org . apache . cassandra . concurrent . Stage ; <nl> - import org . apache . cassandra . concurrent . StageManager ; <nl> - import org . apache . cassandra . db . SnapshotCommand ; <nl> + import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> import org . apache . cassandra . db . Keyspace ; <nl> import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . dht . Token ; <nl> - import org . apache . cassandra . net . IAsyncCallback ; <nl> - import org . apache . cassandra . net . MessageIn ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> import org . apache . cassandra . repair . messages . ValidationRequest ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> @ @ - 57 , 9 + 51 , 9 @ @ public class RepairJob <nl> private final List < TreeResponse > trees = new ArrayList < > ( ) ; <nl> / / once all responses are received , each tree is compared with each other , and differencer tasks <nl> / / are submitted . the job is done when all differencers are complete . <nl> - private final RequestCoordinator < Differencer > differencers ; <nl> + private final Set < Differencer > differencers = new HashSet < > ( ) ; <nl> + private final ListeningExecutorService taskExecutor ; <nl> private final Condition requestsSent = new SimpleCondition ( ) ; <nl> - private CountDownLatch snapshotLatch = null ; <nl> private int gcBefore = - 1 ; <nl> <nl> private volatile boolean failed = false ; <nl> @ @ - 67 , 10 + 61 , 11 @ @ public class RepairJob <nl> / * * <nl> * Create repair job to run on specific columnfamily <nl> * / <nl> - public RepairJob ( UUID sessionId , String keyspace , String columnFamily , Range < Token > range , boolean isSequential ) <nl> + public RepairJob ( UUID sessionId , String keyspace , String columnFamily , Range < Token > range , boolean isSequential , ListeningExecutorService taskExecutor ) <nl> { <nl> this . desc = new RepairJobDesc ( sessionId , keyspace , columnFamily , range ) ; <nl> this . isSequential = isSequential ; <nl> + this . taskExecutor = taskExecutor ; <nl> this . treeRequests = new RequestCoordinator < InetAddress > ( isSequential ) <nl> { <nl> public void send ( InetAddress endpoint ) <nl> @ @ - 79 , 13 + 74 , 6 @ @ public class RepairJob <nl> MessagingService . instance ( ) . sendOneWay ( request . createMessage ( ) , endpoint ) ; <nl> } <nl> } ; <nl> - this . differencers = new RequestCoordinator < Differencer > ( isSequential ) <nl> - { <nl> - public void send ( Differencer d ) <nl> - { <nl> - StageManager . getStage ( Stage . ANTI _ ENTROPY ) . execute ( d ) ; <nl> - } <nl> - } ; <nl> } <nl> <nl> / * * <nl> @ @ - 106 , 46 + 94 , 48 @ @ public class RepairJob <nl> allEndpoints . add ( FBUtilities . getBroadcastAddress ( ) ) ; <nl> <nl> if ( isSequential ) <nl> - makeSnapshots ( allEndpoints ) ; <nl> - <nl> - this . gcBefore = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) . gcBefore ( System . currentTimeMillis ( ) ) ; <nl> - <nl> - for ( InetAddress endpoint : allEndpoints ) <nl> - treeRequests . add ( endpoint ) ; <nl> - <nl> - logger . info ( String . format ( " [ repair # % s ] requesting merkle trees for % s ( to % s ) " , desc . sessionId , desc . columnFamily , allEndpoints ) ) ; <nl> - treeRequests . start ( ) ; <nl> - requestsSent . signalAll ( ) ; <nl> - } <nl> - <nl> - public void makeSnapshots ( Collection < InetAddress > endpoints ) <nl> - { <nl> - try <nl> { <nl> - snapshotLatch = new CountDownLatch ( endpoints . size ( ) ) ; <nl> - IAsyncCallback callback = new IAsyncCallback ( ) <nl> + List < ListenableFuture < InetAddress > > snapshotTasks = new ArrayList < > ( allEndpoints . size ( ) ) ; <nl> + for ( InetAddress endpoint : allEndpoints ) <nl> + { <nl> + SnapshotTask snapshotTask = new SnapshotTask ( desc , endpoint ) ; <nl> + snapshotTasks . add ( snapshotTask ) ; <nl> + taskExecutor . execute ( snapshotTask ) ; <nl> + } <nl> + ListenableFuture < List < InetAddress > > allSnapshotTasks = Futures . allAsList ( snapshotTasks ) ; <nl> + / / Execute send tree request after all snapshot complete <nl> + Futures . addCallback ( allSnapshotTasks , new FutureCallback < List < InetAddress > > ( ) <nl> { <nl> - public boolean isLatencyForSnitch ( ) <nl> + public void onSuccess ( List < InetAddress > endpoints ) <nl> { <nl> - return false ; <nl> + sendTreeRequestsInternal ( endpoints ) ; <nl> } <nl> <nl> - public void response ( MessageIn msg ) <nl> + public void onFailure ( Throwable throwable ) <nl> { <nl> - RepairJob . this . snapshotLatch . countDown ( ) ; <nl> + / / TODO need to propagate error to RepairSession <nl> + logger . error ( " Error while snapshot " , throwable ) ; <nl> + failed = true ; <nl> } <nl> - } ; <nl> - for ( InetAddress endpoint : endpoints ) <nl> - MessagingService . instance ( ) . sendRR ( new SnapshotCommand ( desc . keyspace , desc . columnFamily , desc . sessionId . toString ( ) , false ) . createMessage ( ) , endpoint , callback ) ; <nl> - snapshotLatch . await ( ) ; <nl> - snapshotLatch = null ; <nl> + } , taskExecutor ) ; <nl> } <nl> - catch ( InterruptedException e ) <nl> + else <nl> { <nl> - throw new RuntimeException ( e ) ; <nl> + sendTreeRequestsInternal ( allEndpoints ) ; <nl> } <nl> } <nl> <nl> + private void sendTreeRequestsInternal ( Collection < InetAddress > endpoints ) <nl> + { <nl> + this . gcBefore = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) . gcBefore ( System . currentTimeMillis ( ) ) ; <nl> + for ( InetAddress endpoint : endpoints ) <nl> + treeRequests . add ( endpoint ) ; <nl> + <nl> + logger . info ( String . format ( " [ repair # % s ] requesting merkle trees for % s ( to % s ) " , desc . sessionId , desc . columnFamily , endpoints ) ) ; <nl> + treeRequests . start ( ) ; <nl> + requestsSent . signalAll ( ) ; <nl> + } <nl> + <nl> / * * <nl> * Add a new received tree and return the number of remaining tree to <nl> * be received for the job to be complete . <nl> @ @ - 191 , 11 + 181 , 11 @ @ public class RepairJob <nl> { <nl> TreeResponse r2 = trees . get ( j ) ; <nl> Differencer differencer = new Differencer ( desc , r1 , r2 ) ; <nl> - logger . debug ( " Queueing comparison { } " , differencer ) ; <nl> differencers . add ( differencer ) ; <nl> + logger . debug ( " Queueing comparison { } " , differencer ) ; <nl> + taskExecutor . submit ( differencer ) ; <nl> } <nl> } <nl> - differencers . start ( ) ; <nl> trees . clear ( ) ; / / allows gc to do its thing <nl> } <nl> <nl> @ @ - 207 , 18 + 197 , 7 @ @ public class RepairJob <nl> if ( ! success ) <nl> failed = true ; <nl> Differencer completed = new Differencer ( desc , new TreeResponse ( nodes . endpoint1 , null ) , new TreeResponse ( nodes . endpoint2 , null ) ) ; <nl> - return differencers . completed ( completed ) = = 0 ; <nl> - } <nl> - <nl> - / * * <nl> - * terminate this job . <nl> - * / <nl> - public void terminate ( ) <nl> - { <nl> - if ( snapshotLatch ! = null ) <nl> - { <nl> - while ( snapshotLatch . getCount ( ) > 0 ) <nl> - snapshotLatch . countDown ( ) ; <nl> - } <nl> + differencers . remove ( completed ) ; <nl> + return differencers . size ( ) = = 0 ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / repair / RepairSession . java b / src / java / org / apache / cassandra / repair / RepairSession . java <nl> index 36b7226 . . 7ffe87f 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / RepairSession . java <nl> + + + b / src / java / org / apache / cassandra / repair / RepairSession . java <nl> @ @ - 22 , 12 + 22 , 16 @ @ import java . net . InetAddress ; <nl> import java . util . * ; <nl> import java . util . concurrent . ConcurrentHashMap ; <nl> import java . util . concurrent . ConcurrentLinkedQueue ; <nl> + import java . util . concurrent . Executors ; <nl> import java . util . concurrent . atomic . AtomicBoolean ; <nl> import java . util . concurrent . locks . Condition ; <nl> <nl> + import com . google . common . util . concurrent . ListeningExecutorService ; <nl> + import com . google . common . util . concurrent . MoreExecutors ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> + import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . dht . Token ; <nl> @ @ - 91 , 6 + 95 , 9 @ @ public class RepairSession extends WrappedRunnable implements IEndpointStateChan <nl> / / this map , keyed by CF name . <nl> final Map < String , RepairJob > syncingJobs = new ConcurrentHashMap < > ( ) ; <nl> <nl> + / / Tasks ( snapshot , validate request , differencing , . . . ) are run on taskExecutor <nl> + private final ListeningExecutorService taskExecutor = MoreExecutors . listeningDecorator ( Executors . newCachedThreadPool ( new NamedThreadFactory ( " RepairJobTask " ) ) ) ; <nl> + <nl> private final SimpleCondition completed = new SimpleCondition ( ) ; <nl> public final Condition differencingDone = new SimpleCondition ( ) ; <nl> <nl> @ @ - 215 , 6 + 222 , 7 @ @ public class RepairSession extends WrappedRunnable implements IEndpointStateChan <nl> <nl> if ( jobs . isEmpty ( ) & & syncingJobs . isEmpty ( ) ) <nl> { <nl> + taskExecutor . shutdown ( ) ; <nl> / / this repair session is completed <nl> completed . signalAll ( ) ; <nl> } <nl> @ @ - 260 , 7 + 268 , 7 @ @ public class RepairSession extends WrappedRunnable implements IEndpointStateChan <nl> / / Create and queue a RepairJob for each column family <nl> for ( String cfname : cfnames ) <nl> { <nl> - RepairJob job = new RepairJob ( id , keyspace , cfname , range , isSequential ) ; <nl> + RepairJob job = new RepairJob ( id , keyspace , cfname , range , isSequential , taskExecutor ) ; <nl> jobs . offer ( job ) ; <nl> } <nl> <nl> @ @ - 294 , 8 + 302 , 6 @ @ public class RepairSession extends WrappedRunnable implements IEndpointStateChan <nl> public void terminate ( ) <nl> { <nl> terminated = true ; <nl> - for ( RepairJob job : jobs ) <nl> - job . terminate ( ) ; <nl> jobs . clear ( ) ; <nl> syncingJobs . clear ( ) ; <nl> } <nl> @ @ - 305 , 6 + 311 , 7 @ @ public class RepairSession extends WrappedRunnable implements IEndpointStateChan <nl> * / <nl> public void forceShutdown ( ) <nl> { <nl> + taskExecutor . shutdownNow ( ) ; <nl> differencingDone . signalAll ( ) ; <nl> completed . signalAll ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / repair / SnapshotTask . java b / src / java / org / apache / cassandra / repair / SnapshotTask . java <nl> new file mode 100644 <nl> index 0000000 . . 1a9d324 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / repair / SnapshotTask . java <nl> @ @ - 0 , 0 + 1 , 79 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . repair ; <nl> + <nl> + import java . net . InetAddress ; <nl> + import java . util . List ; <nl> + import java . util . concurrent . RunnableFuture ; <nl> + <nl> + import com . google . common . util . concurrent . AbstractFuture ; <nl> + <nl> + import org . apache . cassandra . db . SnapshotCommand ; <nl> + import org . apache . cassandra . net . IAsyncCallback ; <nl> + import org . apache . cassandra . net . MessageIn ; <nl> + import org . apache . cassandra . net . MessagingService ; <nl> + <nl> + / * * <nl> + * SnapshotTask is a task that sends snapshot request . <nl> + * / <nl> + public class SnapshotTask extends AbstractFuture < InetAddress > implements RunnableFuture < InetAddress > <nl> + { <nl> + private final RepairJobDesc desc ; <nl> + private final InetAddress endpoint ; <nl> + <nl> + public SnapshotTask ( RepairJobDesc desc , InetAddress endpoint ) <nl> + { <nl> + this . desc = desc ; <nl> + this . endpoint = endpoint ; <nl> + } <nl> + <nl> + public void run ( ) <nl> + { <nl> + MessagingService . instance ( ) . sendRR ( new SnapshotCommand ( desc . keyspace , <nl> + desc . columnFamily , <nl> + desc . sessionId . toString ( ) , <nl> + false ) . createMessage ( ) , <nl> + endpoint , <nl> + new SnapshotCallback ( this ) ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Callback for snapshot request . Run on INTERNAL _ RESPONSE stage . <nl> + * / <nl> + static class SnapshotCallback implements IAsyncCallback <nl> + { <nl> + final SnapshotTask task ; <nl> + <nl> + SnapshotCallback ( SnapshotTask task ) <nl> + { <nl> + this . task = task ; <nl> + } <nl> + <nl> + / * * <nl> + * When we received response from the node , <nl> + * <nl> + * @ param msg response received . <nl> + * / <nl> + public void response ( MessageIn msg ) <nl> + { <nl> + task . set ( task . endpoint ) ; <nl> + } <nl> + <nl> + public boolean isLatencyForSnitch ( ) { return false ; } <nl> + } <nl> + }
+NEAREST DIFF (one line): diff - - git a / test / conf / cassandra . yaml b / test / conf / cassandra . yaml <nl> index 1df2501 . . 315a75a 100644 <nl> - - - a / test / conf / cassandra . yaml <nl> + + + b / test / conf / cassandra . yaml <nl> @ @ - 20 , 7 + 20 , 7 @ @ disk _ access _ mode : mmap <nl> seed _ provider : <nl> - class _ name : org . apache . cassandra . locator . SimpleSeedProvider <nl> parameters : <nl> - - seeds : " 127 . 0 . 0 . 2 " <nl> + - seeds : " 127 . 0 . 0 . 1 " <nl> endpoint _ snitch : org . apache . cassandra . locator . SimpleSnitch <nl> dynamic _ snitch : true <nl> request _ scheduler : org . apache . cassandra . scheduler . RoundRobinScheduler
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index fd1062e . . a5da346 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 16 , 6 + 16 , 7 @ @ 
+ * Avoid overlaps in LCS ( CASSANDRA - 6688 ) 
+ * Improve support for paginating over composites ( CASSANDRA - 4851 ) 
+ * Fix count ( * ) queries in a mixed cluster ( CASSANDRA - 6707 ) 
+ + * Improve repair tasks ( snapshot , differencing ) concurrency ( CASSANDRA - 6566 ) 
+ Merged from 1 . 2 : 
+ * Fix broken streams when replacing with same IP ( CASSANDRA - 6622 ) 
+ * Fix upgradesstables NPE for non - CF - based indexes ( CASSANDRA - 6645 ) 
+ diff - - git a / src / java / org / apache / cassandra / repair / RepairJob . java b / src / java / org / apache / cassandra / repair / RepairJob . java 
+ index 6705c95 . . 475d7f7 100644 
+ - - - a / src / java / org / apache / cassandra / repair / RepairJob . java 
+ + + + b / src / java / org / apache / cassandra / repair / RepairJob . java 
+ @ @ - 18 , 24 + 18 , 18 @ @ 
+ package org . apache . cassandra . repair ; 
+ 
+ import java . net . InetAddress ; 
+ - import java . util . ArrayList ; 
+ - import java . util . Collection ; 
+ - import java . util . List ; 
+ - import java . util . UUID ; 
+ - import java . util . concurrent . CountDownLatch ; 
+ + import java . util . * ; 
+ + import java . util . concurrent . Executors ; 
+ import java . util . concurrent . locks . Condition ; 
+ 
+ + import com . google . common . util . concurrent . * ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ - import org . apache . cassandra . concurrent . Stage ; 
+ - import org . apache . cassandra . concurrent . StageManager ; 
+ - import org . apache . cassandra . db . SnapshotCommand ; 
+ + import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ import org . apache . cassandra . db . Keyspace ; 
+ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . dht . Token ; 
+ - import org . apache . cassandra . net . IAsyncCallback ; 
+ - import org . apache . cassandra . net . MessageIn ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ import org . apache . cassandra . repair . messages . ValidationRequest ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ @ @ - 57 , 9 + 51 , 9 @ @ public class RepairJob 
+ private final List < TreeResponse > trees = new ArrayList < > ( ) ; 
+ / / once all responses are received , each tree is compared with each other , and differencer tasks 
+ / / are submitted . the job is done when all differencers are complete . 
+ - private final RequestCoordinator < Differencer > differencers ; 
+ + private final Set < Differencer > differencers = new HashSet < > ( ) ; 
+ + private final ListeningExecutorService taskExecutor ; 
+ private final Condition requestsSent = new SimpleCondition ( ) ; 
+ - private CountDownLatch snapshotLatch = null ; 
+ private int gcBefore = - 1 ; 
+ 
+ private volatile boolean failed = false ; 
+ @ @ - 67 , 10 + 61 , 11 @ @ public class RepairJob 
+ / * * 
+ * Create repair job to run on specific columnfamily 
+ * / 
+ - public RepairJob ( UUID sessionId , String keyspace , String columnFamily , Range < Token > range , boolean isSequential ) 
+ + public RepairJob ( UUID sessionId , String keyspace , String columnFamily , Range < Token > range , boolean isSequential , ListeningExecutorService taskExecutor ) 
+ { 
+ this . desc = new RepairJobDesc ( sessionId , keyspace , columnFamily , range ) ; 
+ this . isSequential = isSequential ; 
+ + this . taskExecutor = taskExecutor ; 
+ this . treeRequests = new RequestCoordinator < InetAddress > ( isSequential ) 
+ { 
+ public void send ( InetAddress endpoint ) 
+ @ @ - 79 , 13 + 74 , 6 @ @ public class RepairJob 
+ MessagingService . instance ( ) . sendOneWay ( request . createMessage ( ) , endpoint ) ; 
+ } 
+ } ; 
+ - this . differencers = new RequestCoordinator < Differencer > ( isSequential ) 
+ - { 
+ - public void send ( Differencer d ) 
+ - { 
+ - StageManager . getStage ( Stage . ANTI _ ENTROPY ) . execute ( d ) ; 
+ - } 
+ - } ; 
+ } 
+ 
+ / * * 
+ @ @ - 106 , 46 + 94 , 48 @ @ public class RepairJob 
+ allEndpoints . add ( FBUtilities . getBroadcastAddress ( ) ) ; 
+ 
+ if ( isSequential ) 
+ - makeSnapshots ( allEndpoints ) ; 
+ - 
+ - this . gcBefore = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) . gcBefore ( System . currentTimeMillis ( ) ) ; 
+ - 
+ - for ( InetAddress endpoint : allEndpoints ) 
+ - treeRequests . add ( endpoint ) ; 
+ - 
+ - logger . info ( String . format ( " [ repair # % s ] requesting merkle trees for % s ( to % s ) " , desc . sessionId , desc . columnFamily , allEndpoints ) ) ; 
+ - treeRequests . start ( ) ; 
+ - requestsSent . signalAll ( ) ; 
+ - } 
+ - 
+ - public void makeSnapshots ( Collection < InetAddress > endpoints ) 
+ - { 
+ - try 
+ { 
+ - snapshotLatch = new CountDownLatch ( endpoints . size ( ) ) ; 
+ - IAsyncCallback callback = new IAsyncCallback ( ) 
+ + List < ListenableFuture < InetAddress > > snapshotTasks = new ArrayList < > ( allEndpoints . size ( ) ) ; 
+ + for ( InetAddress endpoint : allEndpoints ) 
+ + { 
+ + SnapshotTask snapshotTask = new SnapshotTask ( desc , endpoint ) ; 
+ + snapshotTasks . add ( snapshotTask ) ; 
+ + taskExecutor . execute ( snapshotTask ) ; 
+ + } 
+ + ListenableFuture < List < InetAddress > > allSnapshotTasks = Futures . allAsList ( snapshotTasks ) ; 
+ + / / Execute send tree request after all snapshot complete 
+ + Futures . addCallback ( allSnapshotTasks , new FutureCallback < List < InetAddress > > ( ) 
+ { 
+ - public boolean isLatencyForSnitch ( ) 
+ + public void onSuccess ( List < InetAddress > endpoints ) 
+ { 
+ - return false ; 
+ + sendTreeRequestsInternal ( endpoints ) ; 
+ } 
+ 
+ - public void response ( MessageIn msg ) 
+ + public void onFailure ( Throwable throwable ) 
+ { 
+ - RepairJob . this . snapshotLatch . countDown ( ) ; 
+ + / / TODO need to propagate error to RepairSession 
+ + logger . error ( " Error while snapshot " , throwable ) ; 
+ + failed = true ; 
+ } 
+ - } ; 
+ - for ( InetAddress endpoint : endpoints ) 
+ - MessagingService . instance ( ) . sendRR ( new SnapshotCommand ( desc . keyspace , desc . columnFamily , desc . sessionId . toString ( ) , false ) . createMessage ( ) , endpoint , callback ) ; 
+ - snapshotLatch . await ( ) ; 
+ - snapshotLatch = null ; 
+ + } , taskExecutor ) ; 
+ } 
+ - catch ( InterruptedException e ) 
+ + else 
+ { 
+ - throw new RuntimeException ( e ) ; 
+ + sendTreeRequestsInternal ( allEndpoints ) ; 
+ } 
+ } 
+ 
+ + private void sendTreeRequestsInternal ( Collection < InetAddress > endpoints ) 
+ + { 
+ + this . gcBefore = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) . gcBefore ( System . currentTimeMillis ( ) ) ; 
+ + for ( InetAddress endpoint : endpoints ) 
+ + treeRequests . add ( endpoint ) ; 
+ + 
+ + logger . info ( String . format ( " [ repair # % s ] requesting merkle trees for % s ( to % s ) " , desc . sessionId , desc . columnFamily , endpoints ) ) ; 
+ + treeRequests . start ( ) ; 
+ + requestsSent . signalAll ( ) ; 
+ + } 
+ + 
+ / * * 
+ * Add a new received tree and return the number of remaining tree to 
+ * be received for the job to be complete . 
+ @ @ - 191 , 11 + 181 , 11 @ @ public class RepairJob 
+ { 
+ TreeResponse r2 = trees . get ( j ) ; 
+ Differencer differencer = new Differencer ( desc , r1 , r2 ) ; 
+ - logger . debug ( " Queueing comparison { } " , differencer ) ; 
+ differencers . add ( differencer ) ; 
+ + logger . debug ( " Queueing comparison { } " , differencer ) ; 
+ + taskExecutor . submit ( differencer ) ; 
+ } 
+ } 
+ - differencers . start ( ) ; 
+ trees . clear ( ) ; / / allows gc to do its thing 
+ } 
+ 
+ @ @ - 207 , 18 + 197 , 7 @ @ public class RepairJob 
+ if ( ! success ) 
+ failed = true ; 
+ Differencer completed = new Differencer ( desc , new TreeResponse ( nodes . endpoint1 , null ) , new TreeResponse ( nodes . endpoint2 , null ) ) ; 
+ - return differencers . completed ( completed ) = = 0 ; 
+ - } 
+ - 
+ - / * * 
+ - * terminate this job . 
+ - * / 
+ - public void terminate ( ) 
+ - { 
+ - if ( snapshotLatch ! = null ) 
+ - { 
+ - while ( snapshotLatch . getCount ( ) > 0 ) 
+ - snapshotLatch . countDown ( ) ; 
+ - } 
+ + differencers . remove ( completed ) ; 
+ + return differencers . size ( ) = = 0 ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / repair / RepairSession . java b / src / java / org / apache / cassandra / repair / RepairSession . java 
+ index 36b7226 . . 7ffe87f 100644 
+ - - - a / src / java / org / apache / cassandra / repair / RepairSession . java 
+ + + + b / src / java / org / apache / cassandra / repair / RepairSession . java 
+ @ @ - 22 , 12 + 22 , 16 @ @ import java . net . InetAddress ; 
+ import java . util . * ; 
+ import java . util . concurrent . ConcurrentHashMap ; 
+ import java . util . concurrent . ConcurrentLinkedQueue ; 
+ + import java . util . concurrent . Executors ; 
+ import java . util . concurrent . atomic . AtomicBoolean ; 
+ import java . util . concurrent . locks . Condition ; 
+ 
+ + import com . google . common . util . concurrent . ListeningExecutorService ; 
+ + import com . google . common . util . concurrent . MoreExecutors ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ + import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . dht . Token ; 
+ @ @ - 91 , 6 + 95 , 9 @ @ public class RepairSession extends WrappedRunnable implements IEndpointStateChan 
+ / / this map , keyed by CF name . 
+ final Map < String , RepairJob > syncingJobs = new ConcurrentHashMap < > ( ) ; 
+ 
+ + / / Tasks ( snapshot , validate request , differencing , . . . ) are run on taskExecutor 
+ + private final ListeningExecutorService taskExecutor = MoreExecutors . listeningDecorator ( Executors . newCachedThreadPool ( new NamedThreadFactory ( " RepairJobTask " ) ) ) ; 
+ + 
+ private final SimpleCondition completed = new SimpleCondition ( ) ; 
+ public final Condition differencingDone = new SimpleCondition ( ) ; 
+ 
+ @ @ - 215 , 6 + 222 , 7 @ @ public class RepairSession extends WrappedRunnable implements IEndpointStateChan 
+ 
+ if ( jobs . isEmpty ( ) & & syncingJobs . isEmpty ( ) ) 
+ { 
+ + taskExecutor . shutdown ( ) ; 
+ / / this repair session is completed 
+ completed . signalAll ( ) ; 
+ } 
+ @ @ - 260 , 7 + 268 , 7 @ @ public class RepairSession extends WrappedRunnable implements IEndpointStateChan 
+ / / Create and queue a RepairJob for each column family 
+ for ( String cfname : cfnames ) 
+ { 
+ - RepairJob job = new RepairJob ( id , keyspace , cfname , range , isSequential ) ; 
+ + RepairJob job = new RepairJob ( id , keyspace , cfname , range , isSequential , taskExecutor ) ; 
+ jobs . offer ( job ) ; 
+ } 
+ 
+ @ @ - 294 , 8 + 302 , 6 @ @ public class RepairSession extends WrappedRunnable implements IEndpointStateChan 
+ public void terminate ( ) 
+ { 
+ terminated = true ; 
+ - for ( RepairJob job : jobs ) 
+ - job . terminate ( ) ; 
+ jobs . clear ( ) ; 
+ syncingJobs . clear ( ) ; 
+ } 
+ @ @ - 305 , 6 + 311 , 7 @ @ public class RepairSession extends WrappedRunnable implements IEndpointStateChan 
+ * / 
+ public void forceShutdown ( ) 
+ { 
+ + taskExecutor . shutdownNow ( ) ; 
+ differencingDone . signalAll ( ) ; 
+ completed . signalAll ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / repair / SnapshotTask . java b / src / java / org / apache / cassandra / repair / SnapshotTask . java 
+ new file mode 100644 
+ index 0000000 . . 1a9d324 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / repair / SnapshotTask . java 
+ @ @ - 0 , 0 + 1 , 79 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . repair ; 
+ + 
+ + import java . net . InetAddress ; 
+ + import java . util . List ; 
+ + import java . util . concurrent . RunnableFuture ; 
+ + 
+ + import com . google . common . util . concurrent . AbstractFuture ; 
+ + 
+ + import org . apache . cassandra . db . SnapshotCommand ; 
+ + import org . apache . cassandra . net . IAsyncCallback ; 
+ + import org . apache . cassandra . net . MessageIn ; 
+ + import org . apache . cassandra . net . MessagingService ; 
+ + 
+ + / * * 
+ + * SnapshotTask is a task that sends snapshot request . 
+ + * / 
+ + public class SnapshotTask extends AbstractFuture < InetAddress > implements RunnableFuture < InetAddress > 
+ + { 
+ + private final RepairJobDesc desc ; 
+ + private final InetAddress endpoint ; 
+ + 
+ + public SnapshotTask ( RepairJobDesc desc , InetAddress endpoint ) 
+ + { 
+ + this . desc = desc ; 
+ + this . endpoint = endpoint ; 
+ + } 
+ + 
+ + public void run ( ) 
+ + { 
+ + MessagingService . instance ( ) . sendRR ( new SnapshotCommand ( desc . keyspace , 
+ + desc . columnFamily , 
+ + desc . sessionId . toString ( ) , 
+ + false ) . createMessage ( ) , 
+ + endpoint , 
+ + new SnapshotCallback ( this ) ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Callback for snapshot request . Run on INTERNAL _ RESPONSE stage . 
+ + * / 
+ + static class SnapshotCallback implements IAsyncCallback 
+ + { 
+ + final SnapshotTask task ; 
+ + 
+ + SnapshotCallback ( SnapshotTask task ) 
+ + { 
+ + this . task = task ; 
+ + } 
+ + 
+ + / * * 
+ + * When we received response from the node , 
+ + * 
+ + * @ param msg response received . 
+ + * / 
+ + public void response ( MessageIn msg ) 
+ + { 
+ + task . set ( task . endpoint ) ; 
+ + } 
+ + 
+ + public boolean isLatencyForSnitch ( ) { return false ; } 
+ + } 
+ + }
+
+NEAREST DIFF:
+diff - - git a / test / conf / cassandra . yaml b / test / conf / cassandra . yaml 
+ index 1df2501 . . 315a75a 100644 
+ - - - a / test / conf / cassandra . yaml 
+ + + + b / test / conf / cassandra . yaml 
+ @ @ - 20 , 7 + 20 , 7 @ @ disk _ access _ mode : mmap 
+ seed _ provider : 
+ - class _ name : org . apache . cassandra . locator . SimpleSeedProvider 
+ parameters : 
+ - - seeds : " 127 . 0 . 0 . 2 " 
+ + - seeds : " 127 . 0 . 0 . 1 " 
+ endpoint _ snitch : org . apache . cassandra . locator . SimpleSnitch 
+ dynamic _ snitch : true 
+ request _ scheduler : org . apache . cassandra . scheduler . RoundRobinScheduler

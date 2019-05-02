@@ -1,0 +1,369 @@
+BLEU SCORE: 0.02161788649631246
+
+TEST MSG: Make index building pluggable
+GENERATED MSG: Push the validation of secondary index values to the secondary index manager
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index a6646f9 . . 13b2d05 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 2 <nl> + * Make index building pluggable ( CASSANDRA - 10681 ) <nl> * Add sstable flush observer ( CASSANDRA - 10678 ) <nl> * Improve NTS endpoints calculation ( CASSANDRA - 10200 ) <nl> * Improve performance of the folderSize function ( CASSANDRA - 10677 ) <nl> diff - - git a / src / java / org / apache / cassandra / index / Index . java b / src / java / org / apache / cassandra / index / Index . java <nl> index 7bca924 . . 64d621f 100644 <nl> - - - a / src / java / org / apache / cassandra / index / Index . java <nl> + + + b / src / java / org / apache / cassandra / index / Index . java <nl> @ @ - 1 , 6 + 1 , 8 @ @ <nl> package org . apache . cassandra . index ; <nl> <nl> + import java . util . Collection ; <nl> import java . util . Optional ; <nl> + import java . util . Set ; <nl> import java . util . concurrent . Callable ; <nl> import java . util . function . BiFunction ; <nl> <nl> @ @ - 15 , 9 + 17 , 12 @ @ import org . apache . cassandra . db . partitions . PartitionUpdate ; <nl> import org . apache . cassandra . db . partitions . UnfilteredPartitionIterator ; <nl> import org . apache . cassandra . db . rows . Row ; <nl> import org . apache . cassandra . exceptions . InvalidRequestException ; <nl> + import org . apache . cassandra . index . internal . CollatedViewIndexBuilder ; <nl> import org . apache . cassandra . index . transactions . IndexTransaction ; <nl> import org . apache . cassandra . io . sstable . Descriptor ; <nl> + import org . apache . cassandra . io . sstable . ReducingKeyIterator ; <nl> import org . apache . cassandra . io . sstable . format . SSTableFlushObserver ; <nl> + import org . apache . cassandra . io . sstable . format . SSTableReader ; <nl> import org . apache . cassandra . schema . IndexMetadata ; <nl> import org . apache . cassandra . utils . concurrent . OpOrder ; <nl> <nl> @ @ - 108 , 10 + 113 , 56 @ @ public interface Index <nl> { <nl> <nl> / * <nl> + * Helpers for building indexes from SSTable data <nl> + * / <nl> + <nl> + / * * <nl> + * Provider of { @ code SecondaryIndexBuilder } instances . See { @ code getBuildTaskSupport } and <nl> + * { @ code SecondaryIndexManager . buildIndexesBlocking } for more detail . <nl> + * / <nl> + interface IndexBuildingSupport <nl> + { <nl> + SecondaryIndexBuilder getIndexBuildTask ( ColumnFamilyStore cfs , Set < Index > indexes , Collection < SSTableReader > sstables ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Default implementation of { @ code IndexBuildingSupport } which uses a { @ code ReducingKeyIterator } to obtain a <nl> + * collated view of the data in the SSTables . <nl> + * / <nl> + public static class CollatedViewIndexBuildingSupport implements IndexBuildingSupport <nl> + { <nl> + public SecondaryIndexBuilder getIndexBuildTask ( ColumnFamilyStore cfs , Set < Index > indexes , Collection < SSTableReader > sstables ) <nl> + { <nl> + return new CollatedViewIndexBuilder ( cfs , indexes , new ReducingKeyIterator ( sstables ) ) ; <nl> + } <nl> + } <nl> + <nl> + / * * <nl> + * Singleton instance of { @ code CollatedViewIndexBuildingSupport } , which may be used by any { @ code Index } <nl> + * implementation . <nl> + * / <nl> + public static final CollatedViewIndexBuildingSupport INDEX _ BUILDER _ SUPPORT = new CollatedViewIndexBuildingSupport ( ) ; <nl> + <nl> + / * <nl> * Management functions <nl> * / <nl> <nl> / * * <nl> + * Get an instance of a helper to provide tasks for building the index from a set of SSTable data . <nl> + * When processing a number of indexes to be rebuilt , { @ code SecondaryIndexManager . buildIndexesBlocking } groups <nl> + * those with the same { @ code IndexBuildingSupport } instance , allowing multiple indexes to be built with a <nl> + * single pass through the data . The singleton instance returned from the default method implementation builds <nl> + * indexes using a { @ code ReducingKeyIterator } to provide a collated view of the SSTable data . <nl> + * <nl> + * @ return an instance of the index build taski helper . Index implementations which return < b > the same instance < / b > <nl> + * will be built using a single task . <nl> + * / <nl> + default IndexBuildingSupport getBuildTaskSupport ( ) <nl> + { <nl> + return INDEX _ BUILDER _ SUPPORT ; <nl> + } <nl> + <nl> + / * * <nl> * Return a task to perform any initialization work when a new index instance is created . <nl> * This may involve costly operations such as ( re ) building the index , and is performed asynchronously <nl> * by SecondaryIndexManager <nl> diff - - git a / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java b / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java <nl> index e66f0a3 . . 9ec8a4e 100644 <nl> - - - a / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java <nl> + + + b / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java <nl> @ @ - 17 , 61 + 17 , 12 @ @ <nl> * / <nl> package org . apache . cassandra . index ; <nl> <nl> - import java . io . IOException ; <nl> - import java . util . Set ; <nl> - import java . util . UUID ; <nl> - <nl> - import org . apache . cassandra . db . ColumnFamilyStore ; <nl> - import org . apache . cassandra . db . DecoratedKey ; <nl> - import org . apache . cassandra . db . Keyspace ; <nl> import org . apache . cassandra . db . compaction . CompactionInfo ; <nl> - import org . apache . cassandra . db . compaction . CompactionInterruptedException ; <nl> - import org . apache . cassandra . db . compaction . OperationType ; <nl> - import org . apache . cassandra . io . sstable . ReducingKeyIterator ; <nl> - import org . apache . cassandra . utils . UUIDGen ; <nl> <nl> / * * <nl> * Manages building an entire index from column family data . Runs on to compaction manager . <nl> * / <nl> - public class SecondaryIndexBuilder extends CompactionInfo . Holder <nl> + public abstract class SecondaryIndexBuilder extends CompactionInfo . Holder <nl> { <nl> - private final ColumnFamilyStore cfs ; <nl> - private final Set < Index > indexers ; <nl> - private final ReducingKeyIterator iter ; <nl> - private final UUID compactionId ; <nl> - <nl> - public SecondaryIndexBuilder ( ColumnFamilyStore cfs , Set < Index > indexers , ReducingKeyIterator iter ) <nl> - { <nl> - this . cfs = cfs ; <nl> - this . indexers = indexers ; <nl> - this . iter = iter ; <nl> - this . compactionId = UUIDGen . getTimeUUID ( ) ; <nl> - } <nl> - <nl> - public CompactionInfo getCompactionInfo ( ) <nl> - { <nl> - return new CompactionInfo ( cfs . metadata , <nl> - OperationType . INDEX _ BUILD , <nl> - iter . getBytesRead ( ) , <nl> - iter . getTotalBytes ( ) , <nl> - compactionId ) ; <nl> - } <nl> - <nl> - public void build ( ) <nl> - { <nl> - try <nl> - { <nl> - while ( iter . hasNext ( ) ) <nl> - { <nl> - if ( isStopRequested ( ) ) <nl> - throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; <nl> - DecoratedKey key = iter . next ( ) ; <nl> - Keyspace . indexPartition ( key , cfs , indexers ) ; <nl> - } <nl> - } <nl> - finally <nl> - { <nl> - iter . close ( ) ; <nl> - } <nl> - } <nl> + public abstract void build ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java <nl> index df8e38d . . 3eb72d3 100644 <nl> - - - a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java <nl> + + + b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java <nl> @ @ - 51 , 7 + 51 , 6 @ @ import org . apache . cassandra . db . rows . * ; <nl> import org . apache . cassandra . exceptions . InvalidRequestException ; <nl> import org . apache . cassandra . index . internal . CassandraIndex ; <nl> import org . apache . cassandra . index . transactions . * ; <nl> - import org . apache . cassandra . io . sstable . ReducingKeyIterator ; <nl> import org . apache . cassandra . io . sstable . format . SSTableReader ; <nl> import org . apache . cassandra . schema . IndexMetadata ; <nl> import org . apache . cassandra . schema . Indexes ; <nl> @ @ - 338 , 11 + 337 , 20 @ @ public class SecondaryIndexManager implements IndexRegistry <nl> indexes . stream ( ) . map ( i - > i . getIndexMetadata ( ) . name ) . collect ( Collectors . joining ( " , " ) ) , <nl> sstables . stream ( ) . map ( SSTableReader : : toString ) . collect ( Collectors . joining ( " , " ) ) ) ; <nl> <nl> - SecondaryIndexBuilder builder = new SecondaryIndexBuilder ( baseCfs , <nl> - indexes , <nl> - new ReducingKeyIterator ( sstables ) ) ; <nl> - Future < ? > future = CompactionManager . instance . submitIndexBuild ( builder ) ; <nl> - FBUtilities . waitOnFuture ( future ) ; <nl> + Map < Index . IndexBuildingSupport , Set < Index > > byType = new HashMap < > ( ) ; <nl> + for ( Index index : indexes ) <nl> + { <nl> + Set < Index > stored = byType . computeIfAbsent ( index . getBuildTaskSupport ( ) , i - > new HashSet < > ( ) ) ; <nl> + stored . add ( index ) ; <nl> + } <nl> + <nl> + List < Future < ? > > futures = byType . entrySet ( ) <nl> + . stream ( ) <nl> + . map ( ( e ) - > e . getKey ( ) . getIndexBuildTask ( baseCfs , e . getValue ( ) , sstables ) ) <nl> + . map ( CompactionManager . instance : : submitIndexBuild ) <nl> + . collect ( Collectors . toList ( ) ) ; <nl> + <nl> + FBUtilities . waitOnFutures ( futures ) ; <nl> <nl> flushIndexesBlocking ( indexes ) ; <nl> logger . info ( " Index build of { } complete " , <nl> diff - - git a / src / java / org / apache / cassandra / index / internal / CassandraIndex . java b / src / java / org / apache / cassandra / index / internal / CassandraIndex . java <nl> index 674cd20 . . 3128152 100644 <nl> - - - a / src / java / org / apache / cassandra / index / internal / CassandraIndex . java <nl> + + + b / src / java / org / apache / cassandra / index / internal / CassandraIndex . java <nl> @ @ - 664 , 9 + 664 , 9 @ @ public abstract class CassandraIndex implements Index <nl> metadata . name , <nl> getSSTableNames ( sstables ) ) ; <nl> <nl> - SecondaryIndexBuilder builder = new SecondaryIndexBuilder ( baseCfs , <nl> - Collections . singleton ( this ) , <nl> - new ReducingKeyIterator ( sstables ) ) ; <nl> + SecondaryIndexBuilder builder = new CollatedViewIndexBuilder ( baseCfs , <nl> + Collections . singleton ( this ) , <nl> + new ReducingKeyIterator ( sstables ) ) ; <nl> Future < ? > future = CompactionManager . instance . submitIndexBuild ( builder ) ; <nl> FBUtilities . waitOnFuture ( future ) ; <nl> indexCfs . forceBlockingFlush ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / index / internal / CollatedViewIndexBuilder . java b / src / java / org / apache / cassandra / index / internal / CollatedViewIndexBuilder . java <nl> new file mode 100644 <nl> index 0000000 . . 8ea7a68 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / index / internal / CollatedViewIndexBuilder . java <nl> @ @ - 0 , 0 + 1 , 78 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . index . internal ; <nl> + <nl> + import java . util . Set ; <nl> + import java . util . UUID ; <nl> + <nl> + import org . apache . cassandra . db . ColumnFamilyStore ; <nl> + import org . apache . cassandra . db . DecoratedKey ; <nl> + import org . apache . cassandra . db . Keyspace ; <nl> + import org . apache . cassandra . db . compaction . CompactionInfo ; <nl> + import org . apache . cassandra . db . compaction . CompactionInterruptedException ; <nl> + import org . apache . cassandra . db . compaction . OperationType ; <nl> + import org . apache . cassandra . index . Index ; <nl> + import org . apache . cassandra . index . SecondaryIndexBuilder ; <nl> + import org . apache . cassandra . io . sstable . ReducingKeyIterator ; <nl> + import org . apache . cassandra . utils . UUIDGen ; <nl> + <nl> + / * * <nl> + * Manages building an entire index from column family data . Runs on to compaction manager . <nl> + * / <nl> + public class CollatedViewIndexBuilder extends SecondaryIndexBuilder <nl> + { <nl> + private final ColumnFamilyStore cfs ; <nl> + private final Set < Index > indexers ; <nl> + private final ReducingKeyIterator iter ; <nl> + private final UUID compactionId ; <nl> + <nl> + public CollatedViewIndexBuilder ( ColumnFamilyStore cfs , Set < Index > indexers , ReducingKeyIterator iter ) <nl> + { <nl> + this . cfs = cfs ; <nl> + this . indexers = indexers ; <nl> + this . iter = iter ; <nl> + this . compactionId = UUIDGen . getTimeUUID ( ) ; <nl> + } <nl> + <nl> + public CompactionInfo getCompactionInfo ( ) <nl> + { <nl> + return new CompactionInfo ( cfs . metadata , <nl> + OperationType . INDEX _ BUILD , <nl> + iter . getBytesRead ( ) , <nl> + iter . getTotalBytes ( ) , <nl> + compactionId ) ; <nl> + } <nl> + <nl> + public void build ( ) <nl> + { <nl> + try <nl> + { <nl> + while ( iter . hasNext ( ) ) <nl> + { <nl> + if ( isStopRequested ( ) ) <nl> + throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; <nl> + DecoratedKey key = iter . next ( ) ; <nl> + Keyspace . indexPartition ( key , cfs , indexers ) ; <nl> + } <nl> + } <nl> + finally <nl> + { <nl> + iter . close ( ) ; <nl> + } <nl> + } <nl> + } <nl> diff - - git a / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java b / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java <nl> index 0957f74 . . 2b17849 100644 <nl> - - - a / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java <nl> + + + b / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java <nl> @ @ - 622 , 9 + 622 , 9 @ @ public class CustomCassandraIndex implements Index <nl> metadata . name , <nl> getSSTableNames ( sstables ) ) ; <nl> <nl> - SecondaryIndexBuilder builder = new SecondaryIndexBuilder ( baseCfs , <nl> - Collections . singleton ( this ) , <nl> - new ReducingKeyIterator ( sstables ) ) ; <nl> + SecondaryIndexBuilder builder = new CollatedViewIndexBuilder ( baseCfs , <nl> + Collections . singleton ( this ) , <nl> + new ReducingKeyIterator ( sstables ) ) ; <nl> Future < ? > future = CompactionManager . instance . submitIndexBuild ( builder ) ; <nl> FBUtilities . waitOnFuture ( future ) ; <nl> indexCfs . forceBlockingFlush ( ) ;
+NEAREST DIFF (one line): diff - - git a / bin / cqlsh b / bin / cqlsh <nl> index c67a818 . . c4b35fc 100755 <nl> - - - a / bin / cqlsh <nl> + + + b / bin / cqlsh <nl> @ @ - 329 , 6 + 329 , 9 @ @ class NoKeyspaceError ( Exception ) : <nl> class KeyspaceNotFound ( Exception ) : <nl> pass <nl> <nl> + class ColumnFamilyNotFound ( Exception ) : <nl> + pass <nl> + <nl> class VersionNotSupported ( Exception ) : <nl> pass <nl> <nl> @ @ - 678 , 6 + 681 , 8 @ @ class Shell ( cmd . Cmd ) : <nl> <nl> def fetchdict ( self ) : <nl> row = self . cursor . fetchone ( ) <nl> + if row is None : <nl> + return None <nl> desc = self . cursor . description <nl> return dict ( zip ( [ d [ 0 ] for d in desc ] , row ) ) <nl> <nl> @ @ - 705 , 7 + 710 , 7 @ @ class Shell ( cmd . Cmd ) : <nl> for c in cf _ defs : <nl> if c . name = = cfname : <nl> return c <nl> - raise KeyError ( " Unconfigured column family % r " % ( cfname , ) ) <nl> + raise ColumnFamilyNotFound ( " Unconfigured column family % r " % ( cfname , ) ) <nl> <nl> def get _ columnfamily _ names ( self , ksname = None ) : <nl> return [ c . name for c in self . get _ columnfamilies ( ksname ) ] <nl> @ @ - 800 , 6 + 805 , 8 @ @ class Shell ( cmd . Cmd ) : <nl> where " keyspace " = : ks and " columnfamily " = : cf " " " , <nl> { ' ks ' : ksname , ' cf ' : cfname } ) <nl> layout = self . fetchdict ( ) <nl> + if layout is None : <nl> + raise ColumnFamilyNotFound ( " Column family % r not found " % cfname ) <nl> self . cursor . execute ( " " " select * from system . schema _ columns <nl> where " keyspace " = : ks and " columnfamily " = : cf " " " , <nl> { ' ks ' : ksname , ' cf ' : cfname } )
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index a6646f9 . . 13b2d05 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 2 
+ + * Make index building pluggable ( CASSANDRA - 10681 ) 
+ * Add sstable flush observer ( CASSANDRA - 10678 ) 
+ * Improve NTS endpoints calculation ( CASSANDRA - 10200 ) 
+ * Improve performance of the folderSize function ( CASSANDRA - 10677 ) 
+ diff - - git a / src / java / org / apache / cassandra / index / Index . java b / src / java / org / apache / cassandra / index / Index . java 
+ index 7bca924 . . 64d621f 100644 
+ - - - a / src / java / org / apache / cassandra / index / Index . java 
+ + + + b / src / java / org / apache / cassandra / index / Index . java 
+ @ @ - 1 , 6 + 1 , 8 @ @ 
+ package org . apache . cassandra . index ; 
+ 
+ + import java . util . Collection ; 
+ import java . util . Optional ; 
+ + import java . util . Set ; 
+ import java . util . concurrent . Callable ; 
+ import java . util . function . BiFunction ; 
+ 
+ @ @ - 15 , 9 + 17 , 12 @ @ import org . apache . cassandra . db . partitions . PartitionUpdate ; 
+ import org . apache . cassandra . db . partitions . UnfilteredPartitionIterator ; 
+ import org . apache . cassandra . db . rows . Row ; 
+ import org . apache . cassandra . exceptions . InvalidRequestException ; 
+ + import org . apache . cassandra . index . internal . CollatedViewIndexBuilder ; 
+ import org . apache . cassandra . index . transactions . IndexTransaction ; 
+ import org . apache . cassandra . io . sstable . Descriptor ; 
+ + import org . apache . cassandra . io . sstable . ReducingKeyIterator ; 
+ import org . apache . cassandra . io . sstable . format . SSTableFlushObserver ; 
+ + import org . apache . cassandra . io . sstable . format . SSTableReader ; 
+ import org . apache . cassandra . schema . IndexMetadata ; 
+ import org . apache . cassandra . utils . concurrent . OpOrder ; 
+ 
+ @ @ - 108 , 10 + 113 , 56 @ @ public interface Index 
+ { 
+ 
+ / * 
+ + * Helpers for building indexes from SSTable data 
+ + * / 
+ + 
+ + / * * 
+ + * Provider of { @ code SecondaryIndexBuilder } instances . See { @ code getBuildTaskSupport } and 
+ + * { @ code SecondaryIndexManager . buildIndexesBlocking } for more detail . 
+ + * / 
+ + interface IndexBuildingSupport 
+ + { 
+ + SecondaryIndexBuilder getIndexBuildTask ( ColumnFamilyStore cfs , Set < Index > indexes , Collection < SSTableReader > sstables ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Default implementation of { @ code IndexBuildingSupport } which uses a { @ code ReducingKeyIterator } to obtain a 
+ + * collated view of the data in the SSTables . 
+ + * / 
+ + public static class CollatedViewIndexBuildingSupport implements IndexBuildingSupport 
+ + { 
+ + public SecondaryIndexBuilder getIndexBuildTask ( ColumnFamilyStore cfs , Set < Index > indexes , Collection < SSTableReader > sstables ) 
+ + { 
+ + return new CollatedViewIndexBuilder ( cfs , indexes , new ReducingKeyIterator ( sstables ) ) ; 
+ + } 
+ + } 
+ + 
+ + / * * 
+ + * Singleton instance of { @ code CollatedViewIndexBuildingSupport } , which may be used by any { @ code Index } 
+ + * implementation . 
+ + * / 
+ + public static final CollatedViewIndexBuildingSupport INDEX _ BUILDER _ SUPPORT = new CollatedViewIndexBuildingSupport ( ) ; 
+ + 
+ + / * 
+ * Management functions 
+ * / 
+ 
+ / * * 
+ + * Get an instance of a helper to provide tasks for building the index from a set of SSTable data . 
+ + * When processing a number of indexes to be rebuilt , { @ code SecondaryIndexManager . buildIndexesBlocking } groups 
+ + * those with the same { @ code IndexBuildingSupport } instance , allowing multiple indexes to be built with a 
+ + * single pass through the data . The singleton instance returned from the default method implementation builds 
+ + * indexes using a { @ code ReducingKeyIterator } to provide a collated view of the SSTable data . 
+ + * 
+ + * @ return an instance of the index build taski helper . Index implementations which return < b > the same instance < / b > 
+ + * will be built using a single task . 
+ + * / 
+ + default IndexBuildingSupport getBuildTaskSupport ( ) 
+ + { 
+ + return INDEX _ BUILDER _ SUPPORT ; 
+ + } 
+ + 
+ + / * * 
+ * Return a task to perform any initialization work when a new index instance is created . 
+ * This may involve costly operations such as ( re ) building the index , and is performed asynchronously 
+ * by SecondaryIndexManager 
+ diff - - git a / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java b / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java 
+ index e66f0a3 . . 9ec8a4e 100644 
+ - - - a / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java 
+ + + + b / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java 
+ @ @ - 17 , 61 + 17 , 12 @ @ 
+ * / 
+ package org . apache . cassandra . index ; 
+ 
+ - import java . io . IOException ; 
+ - import java . util . Set ; 
+ - import java . util . UUID ; 
+ - 
+ - import org . apache . cassandra . db . ColumnFamilyStore ; 
+ - import org . apache . cassandra . db . DecoratedKey ; 
+ - import org . apache . cassandra . db . Keyspace ; 
+ import org . apache . cassandra . db . compaction . CompactionInfo ; 
+ - import org . apache . cassandra . db . compaction . CompactionInterruptedException ; 
+ - import org . apache . cassandra . db . compaction . OperationType ; 
+ - import org . apache . cassandra . io . sstable . ReducingKeyIterator ; 
+ - import org . apache . cassandra . utils . UUIDGen ; 
+ 
+ / * * 
+ * Manages building an entire index from column family data . Runs on to compaction manager . 
+ * / 
+ - public class SecondaryIndexBuilder extends CompactionInfo . Holder 
+ + public abstract class SecondaryIndexBuilder extends CompactionInfo . Holder 
+ { 
+ - private final ColumnFamilyStore cfs ; 
+ - private final Set < Index > indexers ; 
+ - private final ReducingKeyIterator iter ; 
+ - private final UUID compactionId ; 
+ - 
+ - public SecondaryIndexBuilder ( ColumnFamilyStore cfs , Set < Index > indexers , ReducingKeyIterator iter ) 
+ - { 
+ - this . cfs = cfs ; 
+ - this . indexers = indexers ; 
+ - this . iter = iter ; 
+ - this . compactionId = UUIDGen . getTimeUUID ( ) ; 
+ - } 
+ - 
+ - public CompactionInfo getCompactionInfo ( ) 
+ - { 
+ - return new CompactionInfo ( cfs . metadata , 
+ - OperationType . INDEX _ BUILD , 
+ - iter . getBytesRead ( ) , 
+ - iter . getTotalBytes ( ) , 
+ - compactionId ) ; 
+ - } 
+ - 
+ - public void build ( ) 
+ - { 
+ - try 
+ - { 
+ - while ( iter . hasNext ( ) ) 
+ - { 
+ - if ( isStopRequested ( ) ) 
+ - throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; 
+ - DecoratedKey key = iter . next ( ) ; 
+ - Keyspace . indexPartition ( key , cfs , indexers ) ; 
+ - } 
+ - } 
+ - finally 
+ - { 
+ - iter . close ( ) ; 
+ - } 
+ - } 
+ + public abstract void build ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java 
+ index df8e38d . . 3eb72d3 100644 
+ - - - a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java 
+ + + + b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java 
+ @ @ - 51 , 7 + 51 , 6 @ @ import org . apache . cassandra . db . rows . * ; 
+ import org . apache . cassandra . exceptions . InvalidRequestException ; 
+ import org . apache . cassandra . index . internal . CassandraIndex ; 
+ import org . apache . cassandra . index . transactions . * ; 
+ - import org . apache . cassandra . io . sstable . ReducingKeyIterator ; 
+ import org . apache . cassandra . io . sstable . format . SSTableReader ; 
+ import org . apache . cassandra . schema . IndexMetadata ; 
+ import org . apache . cassandra . schema . Indexes ; 
+ @ @ - 338 , 11 + 337 , 20 @ @ public class SecondaryIndexManager implements IndexRegistry 
+ indexes . stream ( ) . map ( i - > i . getIndexMetadata ( ) . name ) . collect ( Collectors . joining ( " , " ) ) , 
+ sstables . stream ( ) . map ( SSTableReader : : toString ) . collect ( Collectors . joining ( " , " ) ) ) ; 
+ 
+ - SecondaryIndexBuilder builder = new SecondaryIndexBuilder ( baseCfs , 
+ - indexes , 
+ - new ReducingKeyIterator ( sstables ) ) ; 
+ - Future < ? > future = CompactionManager . instance . submitIndexBuild ( builder ) ; 
+ - FBUtilities . waitOnFuture ( future ) ; 
+ + Map < Index . IndexBuildingSupport , Set < Index > > byType = new HashMap < > ( ) ; 
+ + for ( Index index : indexes ) 
+ + { 
+ + Set < Index > stored = byType . computeIfAbsent ( index . getBuildTaskSupport ( ) , i - > new HashSet < > ( ) ) ; 
+ + stored . add ( index ) ; 
+ + } 
+ + 
+ + List < Future < ? > > futures = byType . entrySet ( ) 
+ + . stream ( ) 
+ + . map ( ( e ) - > e . getKey ( ) . getIndexBuildTask ( baseCfs , e . getValue ( ) , sstables ) ) 
+ + . map ( CompactionManager . instance : : submitIndexBuild ) 
+ + . collect ( Collectors . toList ( ) ) ; 
+ + 
+ + FBUtilities . waitOnFutures ( futures ) ; 
+ 
+ flushIndexesBlocking ( indexes ) ; 
+ logger . info ( " Index build of { } complete " , 
+ diff - - git a / src / java / org / apache / cassandra / index / internal / CassandraIndex . java b / src / java / org / apache / cassandra / index / internal / CassandraIndex . java 
+ index 674cd20 . . 3128152 100644 
+ - - - a / src / java / org / apache / cassandra / index / internal / CassandraIndex . java 
+ + + + b / src / java / org / apache / cassandra / index / internal / CassandraIndex . java 
+ @ @ - 664 , 9 + 664 , 9 @ @ public abstract class CassandraIndex implements Index 
+ metadata . name , 
+ getSSTableNames ( sstables ) ) ; 
+ 
+ - SecondaryIndexBuilder builder = new SecondaryIndexBuilder ( baseCfs , 
+ - Collections . singleton ( this ) , 
+ - new ReducingKeyIterator ( sstables ) ) ; 
+ + SecondaryIndexBuilder builder = new CollatedViewIndexBuilder ( baseCfs , 
+ + Collections . singleton ( this ) , 
+ + new ReducingKeyIterator ( sstables ) ) ; 
+ Future < ? > future = CompactionManager . instance . submitIndexBuild ( builder ) ; 
+ FBUtilities . waitOnFuture ( future ) ; 
+ indexCfs . forceBlockingFlush ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / index / internal / CollatedViewIndexBuilder . java b / src / java / org / apache / cassandra / index / internal / CollatedViewIndexBuilder . java 
+ new file mode 100644 
+ index 0000000 . . 8ea7a68 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / index / internal / CollatedViewIndexBuilder . java 
+ @ @ - 0 , 0 + 1 , 78 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . index . internal ; 
+ + 
+ + import java . util . Set ; 
+ + import java . util . UUID ; 
+ + 
+ + import org . apache . cassandra . db . ColumnFamilyStore ; 
+ + import org . apache . cassandra . db . DecoratedKey ; 
+ + import org . apache . cassandra . db . Keyspace ; 
+ + import org . apache . cassandra . db . compaction . CompactionInfo ; 
+ + import org . apache . cassandra . db . compaction . CompactionInterruptedException ; 
+ + import org . apache . cassandra . db . compaction . OperationType ; 
+ + import org . apache . cassandra . index . Index ; 
+ + import org . apache . cassandra . index . SecondaryIndexBuilder ; 
+ + import org . apache . cassandra . io . sstable . ReducingKeyIterator ; 
+ + import org . apache . cassandra . utils . UUIDGen ; 
+ + 
+ + / * * 
+ + * Manages building an entire index from column family data . Runs on to compaction manager . 
+ + * / 
+ + public class CollatedViewIndexBuilder extends SecondaryIndexBuilder 
+ + { 
+ + private final ColumnFamilyStore cfs ; 
+ + private final Set < Index > indexers ; 
+ + private final ReducingKeyIterator iter ; 
+ + private final UUID compactionId ; 
+ + 
+ + public CollatedViewIndexBuilder ( ColumnFamilyStore cfs , Set < Index > indexers , ReducingKeyIterator iter ) 
+ + { 
+ + this . cfs = cfs ; 
+ + this . indexers = indexers ; 
+ + this . iter = iter ; 
+ + this . compactionId = UUIDGen . getTimeUUID ( ) ; 
+ + } 
+ + 
+ + public CompactionInfo getCompactionInfo ( ) 
+ + { 
+ + return new CompactionInfo ( cfs . metadata , 
+ + OperationType . INDEX _ BUILD , 
+ + iter . getBytesRead ( ) , 
+ + iter . getTotalBytes ( ) , 
+ + compactionId ) ; 
+ + } 
+ + 
+ + public void build ( ) 
+ + { 
+ + try 
+ + { 
+ + while ( iter . hasNext ( ) ) 
+ + { 
+ + if ( isStopRequested ( ) ) 
+ + throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; 
+ + DecoratedKey key = iter . next ( ) ; 
+ + Keyspace . indexPartition ( key , cfs , indexers ) ; 
+ + } 
+ + } 
+ + finally 
+ + { 
+ + iter . close ( ) ; 
+ + } 
+ + } 
+ + } 
+ diff - - git a / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java b / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java 
+ index 0957f74 . . 2b17849 100644 
+ - - - a / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java 
+ + + + b / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java 
+ @ @ - 622 , 9 + 622 , 9 @ @ public class CustomCassandraIndex implements Index 
+ metadata . name , 
+ getSSTableNames ( sstables ) ) ; 
+ 
+ - SecondaryIndexBuilder builder = new SecondaryIndexBuilder ( baseCfs , 
+ - Collections . singleton ( this ) , 
+ - new ReducingKeyIterator ( sstables ) ) ; 
+ + SecondaryIndexBuilder builder = new CollatedViewIndexBuilder ( baseCfs , 
+ + Collections . singleton ( this ) , 
+ + new ReducingKeyIterator ( sstables ) ) ; 
+ Future < ? > future = CompactionManager . instance . submitIndexBuild ( builder ) ; 
+ FBUtilities . waitOnFuture ( future ) ; 
+ indexCfs . forceBlockingFlush ( ) ;
+
+NEAREST DIFF:
+diff - - git a / bin / cqlsh b / bin / cqlsh 
+ index c67a818 . . c4b35fc 100755 
+ - - - a / bin / cqlsh 
+ + + + b / bin / cqlsh 
+ @ @ - 329 , 6 + 329 , 9 @ @ class NoKeyspaceError ( Exception ) : 
+ class KeyspaceNotFound ( Exception ) : 
+ pass 
+ 
+ + class ColumnFamilyNotFound ( Exception ) : 
+ + pass 
+ + 
+ class VersionNotSupported ( Exception ) : 
+ pass 
+ 
+ @ @ - 678 , 6 + 681 , 8 @ @ class Shell ( cmd . Cmd ) : 
+ 
+ def fetchdict ( self ) : 
+ row = self . cursor . fetchone ( ) 
+ + if row is None : 
+ + return None 
+ desc = self . cursor . description 
+ return dict ( zip ( [ d [ 0 ] for d in desc ] , row ) ) 
+ 
+ @ @ - 705 , 7 + 710 , 7 @ @ class Shell ( cmd . Cmd ) : 
+ for c in cf _ defs : 
+ if c . name = = cfname : 
+ return c 
+ - raise KeyError ( " Unconfigured column family % r " % ( cfname , ) ) 
+ + raise ColumnFamilyNotFound ( " Unconfigured column family % r " % ( cfname , ) ) 
+ 
+ def get _ columnfamily _ names ( self , ksname = None ) : 
+ return [ c . name for c in self . get _ columnfamilies ( ksname ) ] 
+ @ @ - 800 , 6 + 805 , 8 @ @ class Shell ( cmd . Cmd ) : 
+ where " keyspace " = : ks and " columnfamily " = : cf " " " , 
+ { ' ks ' : ksname , ' cf ' : cfname } ) 
+ layout = self . fetchdict ( ) 
+ + if layout is None : 
+ + raise ColumnFamilyNotFound ( " Column family % r not found " % cfname ) 
+ self . cursor . execute ( " " " select * from system . schema _ columns 
+ where " keyspace " = : ks and " columnfamily " = : cf " " " , 
+ { ' ks ' : ksname , ' cf ' : cfname } )

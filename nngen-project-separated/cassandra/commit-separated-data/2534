@@ -1,0 +1,191 @@
+BLEU SCORE: 0.02383853510228548
+
+TEST MSG: Plug holes in resource release when wiring up StreamSession
+GENERATED MSG: merge from 1 . 1
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index cd6443e . . 376ad87 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 7 , 6 + 7 , 7 @ @ <nl> * Fix performance regression from CASSANDRA - 5614 ( CASSANDRA - 6949 ) <nl> * Merge groupable mutations in TriggerExecutor # execute ( ) ( CASSANDRA - 7047 ) <nl> * Fix CFMetaData # getColumnDefinitionFromColumnName ( ) ( CASSANDRA - 7074 ) <nl> + * Plug holes in resource release when wiring up StreamSession ( CASSANDRA - 7073 ) <nl> Merged from 1 . 2 : <nl> * Fix nodetool display with vnodes ( CASSANDRA - 7082 ) <nl> * Fix schema concurrency exceptions ( CASSANDRA - 6841 ) <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java b / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java <nl> index 1ea4c55 . . 4a1604d 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java <nl> @ @ - 167 , 13 + 167 , 26 @ @ public class SSTableLoader implements StreamEventHandler <nl> if ( toIgnore . contains ( remote ) ) <nl> continue ; <nl> <nl> - Collection < StreamSession . SSTableStreamingSections > endpointDetails = streamingDetails . get ( remote ) ; <nl> + List < StreamSession . SSTableStreamingSections > endpointDetails = new LinkedList < > ( ) ; <nl> <nl> - / / transferSSTables assumes references have been acquired <nl> - for ( StreamSession . SSTableStreamingSections details : endpointDetails ) <nl> - details . sstable . acquireReference ( ) ; <nl> + try <nl> + { <nl> + / / transferSSTables assumes references have been acquired <nl> + for ( StreamSession . SSTableStreamingSections details : streamingDetails . get ( remote ) ) <nl> + { <nl> + if ( ! details . sstable . acquireReference ( ) ) <nl> + throw new IllegalStateException ( ) ; <nl> + <nl> + endpointDetails . add ( details ) ; <nl> + } <nl> <nl> - plan . transferFiles ( remote , streamingDetails . get ( remote ) ) ; <nl> + plan . transferFiles ( remote , endpointDetails ) ; <nl> + } <nl> + finally <nl> + { <nl> + for ( StreamSession . SSTableStreamingSections details : endpointDetails ) <nl> + details . sstable . releaseReference ( ) ; <nl> + } <nl> } <nl> plan . listeners ( this , listeners ) ; <nl> return plan . execute ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamPlan . java b / src / java / org / apache / cassandra / streaming / StreamPlan . java <nl> index 740ad66 . . b57e097 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamPlan . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamPlan . java <nl> @ @ - 112 , 7 + 112 , 8 @ @ public class StreamPlan <nl> * Add transfer task to send given SSTable files . <nl> * <nl> * @ param to endpoint address of receiver <nl> - * @ param sstableDetails sstables with file positions and estimated key count <nl> + * @ param sstableDetails sstables with file positions and estimated key count . <nl> + * this collection will be modified to remove those files that are successfully handed off <nl> * @ return this object for chaining <nl> * / <nl> public StreamPlan transferFiles ( InetAddress to , Collection < StreamSession . SSTableStreamingSections > sstableDetails ) <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamSession . java b / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> index 7976a40 . . 0ba41fb 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> @ @ - 25 , 7 + 25 , 6 @ @ import java . util . concurrent . TimeUnit ; <nl> <nl> import com . google . common . collect . Iterables ; <nl> import com . google . common . collect . Lists ; <nl> - import org . apache . cassandra . io . sstable . SSTableWriter ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 248 , 42 + 247 , 61 @ @ public class StreamSession implements IEndpointStateChangeSubscriber , IFailureDe <nl> flushSSTables ( stores ) ; <nl> <nl> List < Range < Token > > normalizedRanges = Range . normalize ( ranges ) ; <nl> - List < SSTableReader > sstables = Lists . newLinkedList ( ) ; <nl> - for ( ColumnFamilyStore cfStore : stores ) <nl> + List < SSTableStreamingSections > sections = getSSTableSectionsForRanges ( normalizedRanges , stores ) ; <nl> + try <nl> { <nl> - List < AbstractBounds < RowPosition > > rowBoundsList = Lists . newLinkedList ( ) ; <nl> - for ( Range < Token > range : normalizedRanges ) <nl> - rowBoundsList . add ( range . toRowBounds ( ) ) ; <nl> - ColumnFamilyStore . ViewFragment view = cfStore . markReferenced ( rowBoundsList ) ; <nl> - sstables . addAll ( view . sstables ) ; <nl> + addTransferFiles ( sections ) ; <nl> + } <nl> + finally <nl> + { <nl> + for ( SSTableStreamingSections release : sections ) <nl> + release . sstable . releaseReference ( ) ; <nl> } <nl> - addTransferFiles ( normalizedRanges , sstables ) ; <nl> } <nl> <nl> - / * * <nl> - * Set up transfer of the specific SSTables . <nl> - * { @ code sstables } must be marked as referenced so that not get deleted until transfer completes . <nl> - * <nl> - * @ param ranges Transfer ranges <nl> - * @ param sstables Transfer files <nl> - * / <nl> - public void addTransferFiles ( Collection < Range < Token > > ranges , Collection < SSTableReader > sstables ) <nl> + private List < SSTableStreamingSections > getSSTableSectionsForRanges ( Collection < Range < Token > > ranges , Collection < ColumnFamilyStore > stores ) <nl> { <nl> - List < SSTableStreamingSections > sstableDetails = new ArrayList < > ( sstables . size ( ) ) ; <nl> - for ( SSTableReader sstable : sstables ) <nl> - sstableDetails . add ( new SSTableStreamingSections ( sstable , sstable . getPositionsForRanges ( ranges ) , sstable . estimatedKeysForRanges ( ranges ) ) ) ; <nl> + List < SSTableReader > sstables = new ArrayList < > ( ) ; <nl> + try <nl> + { <nl> + for ( ColumnFamilyStore cfStore : stores ) <nl> + { <nl> + List < AbstractBounds < RowPosition > > rowBoundsList = new ArrayList < > ( ranges . size ( ) ) ; <nl> + for ( Range < Token > range : ranges ) <nl> + rowBoundsList . add ( range . toRowBounds ( ) ) ; <nl> + ColumnFamilyStore . ViewFragment view = cfStore . markReferenced ( rowBoundsList ) ; <nl> + sstables . addAll ( view . sstables ) ; <nl> + } <nl> <nl> - addTransferFiles ( sstableDetails ) ; <nl> + List < SSTableStreamingSections > sections = new ArrayList < > ( sstables . size ( ) ) ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + { <nl> + sections . add ( new SSTableStreamingSections ( sstable , <nl> + sstable . getPositionsForRanges ( ranges ) , <nl> + sstable . estimatedKeysForRanges ( ranges ) ) ) ; <nl> + } <nl> + return sections ; <nl> + } <nl> + catch ( Throwable t ) <nl> + { <nl> + SSTableReader . releaseReferences ( sstables ) ; <nl> + throw t ; <nl> + } <nl> } <nl> <nl> + <nl> + <nl> public void addTransferFiles ( Collection < SSTableStreamingSections > sstableDetails ) <nl> { <nl> - for ( SSTableStreamingSections details : sstableDetails ) <nl> + Iterator < SSTableStreamingSections > iter = sstableDetails . iterator ( ) ; <nl> + while ( iter . hasNext ( ) ) <nl> { <nl> + SSTableStreamingSections details = iter . next ( ) ; <nl> if ( details . sections . isEmpty ( ) ) <nl> { <nl> / / A reference was acquired on the sstable and we won ' t stream it <nl> details . sstable . releaseReference ( ) ; <nl> + iter . remove ( ) ; <nl> continue ; <nl> } <nl> <nl> @ @ - 295 , 6 + 313 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber , IFailureDe <nl> transfers . put ( cfId , task ) ; <nl> } <nl> task . addTransferFile ( details . sstable , details . estimatedKeys , details . sections ) ; <nl> + iter . remove ( ) ; <nl> } <nl> } <nl>
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / HintedHandOffManager . java b / src / java / org / apache / cassandra / db / HintedHandOffManager . java <nl> index a83fbab . . e2dc046 100644 <nl> - - - a / src / java / org / apache / cassandra / db / HintedHandOffManager . java <nl> + + + b / src / java / org / apache / cassandra / db / HintedHandOffManager . java <nl> @ @ - 391 , 7 + 391 , 9 @ @ public class HintedHandOffManager implements HintedHandOffManagerMBean <nl> { <nl> Token < ? > token = StorageService . getPartitioner ( ) . getTokenFactory ( ) . fromByteArray ( row . key . key ) ; <nl> InetAddress target = StorageService . instance . getTokenMetadata ( ) . getEndpoint ( token ) ; <nl> - scheduleHintDelivery ( target ) ; <nl> + / / token may have since been removed ( in which case we have just read back a tombstone ) <nl> + if ( target ! = null ) <nl> + scheduleHintDelivery ( target ) ; <nl> } <nl> <nl> if ( logger _ . isDebugEnabled ( ) )
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index cd6443e . . 376ad87 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 7 , 6 + 7 , 7 @ @ 
+ * Fix performance regression from CASSANDRA - 5614 ( CASSANDRA - 6949 ) 
+ * Merge groupable mutations in TriggerExecutor # execute ( ) ( CASSANDRA - 7047 ) 
+ * Fix CFMetaData # getColumnDefinitionFromColumnName ( ) ( CASSANDRA - 7074 ) 
+ + * Plug holes in resource release when wiring up StreamSession ( CASSANDRA - 7073 ) 
+ Merged from 1 . 2 : 
+ * Fix nodetool display with vnodes ( CASSANDRA - 7082 ) 
+ * Fix schema concurrency exceptions ( CASSANDRA - 6841 ) 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java b / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java 
+ index 1ea4c55 . . 4a1604d 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java 
+ @ @ - 167 , 13 + 167 , 26 @ @ public class SSTableLoader implements StreamEventHandler 
+ if ( toIgnore . contains ( remote ) ) 
+ continue ; 
+ 
+ - Collection < StreamSession . SSTableStreamingSections > endpointDetails = streamingDetails . get ( remote ) ; 
+ + List < StreamSession . SSTableStreamingSections > endpointDetails = new LinkedList < > ( ) ; 
+ 
+ - / / transferSSTables assumes references have been acquired 
+ - for ( StreamSession . SSTableStreamingSections details : endpointDetails ) 
+ - details . sstable . acquireReference ( ) ; 
+ + try 
+ + { 
+ + / / transferSSTables assumes references have been acquired 
+ + for ( StreamSession . SSTableStreamingSections details : streamingDetails . get ( remote ) ) 
+ + { 
+ + if ( ! details . sstable . acquireReference ( ) ) 
+ + throw new IllegalStateException ( ) ; 
+ + 
+ + endpointDetails . add ( details ) ; 
+ + } 
+ 
+ - plan . transferFiles ( remote , streamingDetails . get ( remote ) ) ; 
+ + plan . transferFiles ( remote , endpointDetails ) ; 
+ + } 
+ + finally 
+ + { 
+ + for ( StreamSession . SSTableStreamingSections details : endpointDetails ) 
+ + details . sstable . releaseReference ( ) ; 
+ + } 
+ } 
+ plan . listeners ( this , listeners ) ; 
+ return plan . execute ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamPlan . java b / src / java / org / apache / cassandra / streaming / StreamPlan . java 
+ index 740ad66 . . b57e097 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamPlan . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamPlan . java 
+ @ @ - 112 , 7 + 112 , 8 @ @ public class StreamPlan 
+ * Add transfer task to send given SSTable files . 
+ * 
+ * @ param to endpoint address of receiver 
+ - * @ param sstableDetails sstables with file positions and estimated key count 
+ + * @ param sstableDetails sstables with file positions and estimated key count . 
+ + * this collection will be modified to remove those files that are successfully handed off 
+ * @ return this object for chaining 
+ * / 
+ public StreamPlan transferFiles ( InetAddress to , Collection < StreamSession . SSTableStreamingSections > sstableDetails ) 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamSession . java b / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ index 7976a40 . . 0ba41fb 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ @ @ - 25 , 7 + 25 , 6 @ @ import java . util . concurrent . TimeUnit ; 
+ 
+ import com . google . common . collect . Iterables ; 
+ import com . google . common . collect . Lists ; 
+ - import org . apache . cassandra . io . sstable . SSTableWriter ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 248 , 42 + 247 , 61 @ @ public class StreamSession implements IEndpointStateChangeSubscriber , IFailureDe 
+ flushSSTables ( stores ) ; 
+ 
+ List < Range < Token > > normalizedRanges = Range . normalize ( ranges ) ; 
+ - List < SSTableReader > sstables = Lists . newLinkedList ( ) ; 
+ - for ( ColumnFamilyStore cfStore : stores ) 
+ + List < SSTableStreamingSections > sections = getSSTableSectionsForRanges ( normalizedRanges , stores ) ; 
+ + try 
+ { 
+ - List < AbstractBounds < RowPosition > > rowBoundsList = Lists . newLinkedList ( ) ; 
+ - for ( Range < Token > range : normalizedRanges ) 
+ - rowBoundsList . add ( range . toRowBounds ( ) ) ; 
+ - ColumnFamilyStore . ViewFragment view = cfStore . markReferenced ( rowBoundsList ) ; 
+ - sstables . addAll ( view . sstables ) ; 
+ + addTransferFiles ( sections ) ; 
+ + } 
+ + finally 
+ + { 
+ + for ( SSTableStreamingSections release : sections ) 
+ + release . sstable . releaseReference ( ) ; 
+ } 
+ - addTransferFiles ( normalizedRanges , sstables ) ; 
+ } 
+ 
+ - / * * 
+ - * Set up transfer of the specific SSTables . 
+ - * { @ code sstables } must be marked as referenced so that not get deleted until transfer completes . 
+ - * 
+ - * @ param ranges Transfer ranges 
+ - * @ param sstables Transfer files 
+ - * / 
+ - public void addTransferFiles ( Collection < Range < Token > > ranges , Collection < SSTableReader > sstables ) 
+ + private List < SSTableStreamingSections > getSSTableSectionsForRanges ( Collection < Range < Token > > ranges , Collection < ColumnFamilyStore > stores ) 
+ { 
+ - List < SSTableStreamingSections > sstableDetails = new ArrayList < > ( sstables . size ( ) ) ; 
+ - for ( SSTableReader sstable : sstables ) 
+ - sstableDetails . add ( new SSTableStreamingSections ( sstable , sstable . getPositionsForRanges ( ranges ) , sstable . estimatedKeysForRanges ( ranges ) ) ) ; 
+ + List < SSTableReader > sstables = new ArrayList < > ( ) ; 
+ + try 
+ + { 
+ + for ( ColumnFamilyStore cfStore : stores ) 
+ + { 
+ + List < AbstractBounds < RowPosition > > rowBoundsList = new ArrayList < > ( ranges . size ( ) ) ; 
+ + for ( Range < Token > range : ranges ) 
+ + rowBoundsList . add ( range . toRowBounds ( ) ) ; 
+ + ColumnFamilyStore . ViewFragment view = cfStore . markReferenced ( rowBoundsList ) ; 
+ + sstables . addAll ( view . sstables ) ; 
+ + } 
+ 
+ - addTransferFiles ( sstableDetails ) ; 
+ + List < SSTableStreamingSections > sections = new ArrayList < > ( sstables . size ( ) ) ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + { 
+ + sections . add ( new SSTableStreamingSections ( sstable , 
+ + sstable . getPositionsForRanges ( ranges ) , 
+ + sstable . estimatedKeysForRanges ( ranges ) ) ) ; 
+ + } 
+ + return sections ; 
+ + } 
+ + catch ( Throwable t ) 
+ + { 
+ + SSTableReader . releaseReferences ( sstables ) ; 
+ + throw t ; 
+ + } 
+ } 
+ 
+ + 
+ + 
+ public void addTransferFiles ( Collection < SSTableStreamingSections > sstableDetails ) 
+ { 
+ - for ( SSTableStreamingSections details : sstableDetails ) 
+ + Iterator < SSTableStreamingSections > iter = sstableDetails . iterator ( ) ; 
+ + while ( iter . hasNext ( ) ) 
+ { 
+ + SSTableStreamingSections details = iter . next ( ) ; 
+ if ( details . sections . isEmpty ( ) ) 
+ { 
+ / / A reference was acquired on the sstable and we won ' t stream it 
+ details . sstable . releaseReference ( ) ; 
+ + iter . remove ( ) ; 
+ continue ; 
+ } 
+ 
+ @ @ - 295 , 6 + 313 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber , IFailureDe 
+ transfers . put ( cfId , task ) ; 
+ } 
+ task . addTransferFile ( details . sstable , details . estimatedKeys , details . sections ) ; 
+ + iter . remove ( ) ; 
+ } 
+ } 
+
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / HintedHandOffManager . java b / src / java / org / apache / cassandra / db / HintedHandOffManager . java 
+ index a83fbab . . e2dc046 100644 
+ - - - a / src / java / org / apache / cassandra / db / HintedHandOffManager . java 
+ + + + b / src / java / org / apache / cassandra / db / HintedHandOffManager . java 
+ @ @ - 391 , 7 + 391 , 9 @ @ public class HintedHandOffManager implements HintedHandOffManagerMBean 
+ { 
+ Token < ? > token = StorageService . getPartitioner ( ) . getTokenFactory ( ) . fromByteArray ( row . key . key ) ; 
+ InetAddress target = StorageService . instance . getTokenMetadata ( ) . getEndpoint ( token ) ; 
+ - scheduleHintDelivery ( target ) ; 
+ + / / token may have since been removed ( in which case we have just read back a tombstone ) 
+ + if ( target ! = null ) 
+ + scheduleHintDelivery ( target ) ; 
+ } 
+ 
+ if ( logger _ . isDebugEnabled ( ) )

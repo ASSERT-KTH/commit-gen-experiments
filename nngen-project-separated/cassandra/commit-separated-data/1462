@@ -1,0 +1,1196 @@
+BLEU SCORE: 4.93690004030094E-7
+
+TEST MSG: Serialize ClusteringPrefix in microbatches , using vint encoding
+GENERATED MSG: Replace PriorityQueue mess with a CompactionIterator that efficiently yields compacted Rows from a set of sstables by feeding CollationIterator into a ReducingIterator transform . ( " Efficiently " means we never deserialize data until it is needed , so the number of sstables that can be compacted at once is virtually unlimited , and if only one sstable contains a given key that row data will be copied over without an intermediate de / serialize step . ) This is a very natural fit for the compaction algorithm and almost entirely gets rid of duplicated code between doFileCompaction and doAntiCompaction .
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / ClusteringPrefix . java b / src / java / org / apache / cassandra / db / ClusteringPrefix . java <nl> index 7b9d582 . . 713ad1b 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ClusteringPrefix . java <nl> + + + b / src / java / org / apache / cassandra / db / ClusteringPrefix . java <nl> @ @ - 286 , 109 + 286 , 103 @ @ public interface ClusteringPrefix extends IMeasurableMemory , Clusterable <nl> <nl> void serializeValuesWithoutSize ( ClusteringPrefix clustering , DataOutputPlus out , int version , List < AbstractType < ? > > types ) throws IOException <nl> { <nl> - if ( clustering . size ( ) = = 0 ) <nl> - return ; <nl> - <nl> - writeHeader ( clustering , out ) ; <nl> - for ( int i = 0 ; i < clustering . size ( ) ; i + + ) <nl> + int offset = 0 ; <nl> + int clusteringSize = clustering . size ( ) ; <nl> + / / serialize in batches of 32 , to avoid garbage when deserializing headers <nl> + while ( offset < clusteringSize ) <nl> { <nl> - ByteBuffer v = clustering . get ( i ) ; <nl> - if ( v = = null | | ! v . hasRemaining ( ) ) <nl> - continue ; / / handled in the header <nl> - <nl> - types . get ( i ) . writeValue ( v , out ) ; <nl> + / / we micro - batch the headers , so that we can incur fewer method calls , <nl> + / / and generate no garbage on deserialization ; <nl> + / / we piggyback on vint encoding so that , typically , only 1 byte is used per 32 clustering values , <nl> + / / i . e . more than we ever expect to see <nl> + int limit = Math . min ( clusteringSize , offset + 32 ) ; <nl> + out . writeUnsignedVInt ( makeHeader ( clustering , offset , limit ) ) ; <nl> + while ( offset < limit ) <nl> + { <nl> + ByteBuffer v = clustering . get ( offset ) ; <nl> + if ( v ! = null & & v . hasRemaining ( ) ) <nl> + types . get ( offset ) . writeValue ( v , out ) ; <nl> + offset + + ; <nl> + } <nl> } <nl> } <nl> <nl> long valuesWithoutSizeSerializedSize ( ClusteringPrefix clustering , int version , List < AbstractType < ? > > types ) <nl> { <nl> - if ( clustering . size ( ) = = 0 ) <nl> - return 0 ; <nl> - <nl> - long size = headerBytesCount ( clustering . size ( ) ) ; <nl> - for ( int i = 0 ; i < clustering . size ( ) ; i + + ) <nl> + long result = 0 ; <nl> + int offset = 0 ; <nl> + int clusteringSize = clustering . size ( ) ; <nl> + while ( offset < clusteringSize ) <nl> + { <nl> + int limit = Math . min ( clusteringSize , offset + 32 ) ; <nl> + result + = TypeSizes . sizeofUnsignedVInt ( makeHeader ( clustering , offset , limit ) ) ; <nl> + offset = limit ; <nl> + } <nl> + for ( int i = 0 ; i < clusteringSize ; i + + ) <nl> { <nl> ByteBuffer v = clustering . get ( i ) ; <nl> if ( v = = null | | ! v . hasRemaining ( ) ) <nl> continue ; / / handled in the header <nl> <nl> - size + = types . get ( i ) . writtenLength ( v ) ; <nl> + result + = types . get ( i ) . writtenLength ( v ) ; <nl> } <nl> - return size ; <nl> + return result ; <nl> } <nl> <nl> ByteBuffer [ ] deserializeValuesWithoutSize ( DataInputPlus in , int size , int version , List < AbstractType < ? > > types ) throws IOException <nl> { <nl> / / Callers of this method should handle the case where size = 0 ( in all case we want to return a special value anyway ) . <nl> assert size > 0 ; <nl> - <nl> ByteBuffer [ ] values = new ByteBuffer [ size ] ; <nl> - int [ ] header = readHeader ( size , in ) ; <nl> - for ( int i = 0 ; i < size ; i + + ) <nl> + int offset = 0 ; <nl> + while ( offset < size ) <nl> { <nl> - values [ i ] = isNull ( header , i ) <nl> - ? null <nl> - : ( isEmpty ( header , i ) ? ByteBufferUtil . EMPTY _ BYTE _ BUFFER : types . get ( i ) . readValue ( in ) ) ; <nl> + long header = in . readUnsignedVInt ( ) ; <nl> + int limit = Math . min ( size , offset + 32 ) ; <nl> + while ( offset < limit ) <nl> + { <nl> + values [ offset ] = isNull ( header , offset ) <nl> + ? null <nl> + : ( isEmpty ( header , offset ) ? ByteBufferUtil . EMPTY _ BYTE _ BUFFER : types . get ( offset ) . readValue ( in ) ) ; <nl> + offset + + ; <nl> + } <nl> } <nl> return values ; <nl> } <nl> <nl> - private int headerBytesCount ( int size ) <nl> - { <nl> - / / For each component , we store 2 bit to know if the component is empty or null ( or neither ) . <nl> - / / We thus handle 4 component per byte <nl> - return size / 4 + ( size % 4 = = 0 ? 0 : 1 ) ; <nl> - } <nl> - <nl> / * * <nl> * Whatever the type of a given clustering column is , its value can always be either empty or null . So we at least need to distinguish those <nl> * 2 values , and because we want to be able to store fixed width values without appending their ( fixed ) size first , we need a way to encode <nl> * empty values too . So for that , every clustering prefix includes a " header " that contains 2 bits per element in the prefix . For each element , <nl> * those 2 bits encode whether the element is null , empty , or none of those . <nl> * / <nl> - private void writeHeader ( ClusteringPrefix clustering , DataOutputPlus out ) throws IOException <nl> + private static long makeHeader ( ClusteringPrefix clustering , int offset , int limit ) <nl> { <nl> - int nbBytes = headerBytesCount ( clustering . size ( ) ) ; <nl> - for ( int i = 0 ; i < nbBytes ; i + + ) <nl> + long header = 0 ; <nl> + for ( int i = offset ; i < limit ; i + + ) <nl> { <nl> - int b = 0 ; <nl> - for ( int j = 0 ; j < 4 ; j + + ) <nl> - { <nl> - int c = i * 4 + j ; <nl> - if ( c > = clustering . size ( ) ) <nl> - break ; <nl> - <nl> - ByteBuffer v = clustering . get ( c ) ; <nl> - if ( v = = null ) <nl> - b | = ( 1 < < ( j * 2 ) + 1 ) ; <nl> - else if ( ! v . hasRemaining ( ) ) <nl> - b | = ( 1 < < ( j * 2 ) ) ; <nl> - } <nl> - out . writeByte ( ( byte ) b ) ; <nl> + ByteBuffer v = clustering . get ( i ) ; <nl> + / / no need to do modulo arithmetic for i , since the left - shift execute on the modulus of RH operand by definition <nl> + if ( v = = null ) <nl> + header | = ( 1L < < ( i * 2 ) + 1 ) ; <nl> + else if ( ! v . hasRemaining ( ) ) <nl> + header | = ( 1L < < ( i * 2 ) ) ; <nl> } <nl> - } <nl> - <nl> - private int [ ] readHeader ( int size , DataInputPlus in ) throws IOException <nl> - { <nl> - int nbBytes = headerBytesCount ( size ) ; <nl> - int [ ] header = new int [ nbBytes ] ; <nl> - for ( int i = 0 ; i < nbBytes ; i + + ) <nl> - header [ i ] = in . readUnsignedByte ( ) ; <nl> return header ; <nl> } <nl> <nl> - private static boolean isNull ( int [ ] header , int i ) <nl> + / / no need to do modulo arithmetic for i , since the left - shift execute on the modulus of RH operand by definition <nl> + private static boolean isNull ( long header , int i ) <nl> { <nl> - int b = header [ i / 4 ] ; <nl> - int mask = 1 < < ( ( i % 4 ) * 2 ) + 1 ; <nl> - return ( b & mask ) ! = 0 ; <nl> + long mask = 1L < < ( i * 2 ) + 1 ; <nl> + return ( header & mask ) ! = 0 ; <nl> } <nl> <nl> - private static boolean isEmpty ( int [ ] header , int i ) <nl> + / / no need to do modulo arithmetic for i , since the left - shift execute on the modulus of RH operand by definition <nl> + private static boolean isEmpty ( long header , int i ) <nl> { <nl> - int b = header [ i / 4 ] ; <nl> - int mask = 1 < < ( ( i % 4 ) * 2 ) ; <nl> - return ( b & mask ) ! = 0 ; <nl> + long mask = 1L < < ( i * 2 ) ; <nl> + return ( header & mask ) ! = 0 ; <nl> } <nl> } <nl> <nl> @ @ - 408 , 7 + 402 , 7 @ @ public interface ClusteringPrefix extends IMeasurableMemory , Clusterable <nl> private final SerializationHeader serializationHeader ; <nl> <nl> private boolean nextIsRow ; <nl> - private int [ ] nextHeader ; <nl> + private long nextHeader ; <nl> <nl> private int nextSize ; <nl> private ClusteringPrefix . Kind nextKind ; <nl> @ @ - 428 , 7 + 422 , 6 @ @ public interface ClusteringPrefix extends IMeasurableMemory , Clusterable <nl> this . nextIsRow = UnfilteredSerializer . kind ( flags ) = = Unfiltered . Kind . ROW ; <nl> this . nextKind = nextIsRow ? Kind . CLUSTERING : ClusteringPrefix . Kind . values ( ) [ in . readByte ( ) ] ; <nl> this . nextSize = nextIsRow ? comparator . size ( ) : in . readUnsignedShort ( ) ; <nl> - this . nextHeader = serializer . readHeader ( nextSize , in ) ; <nl> this . deserializedSize = 0 ; <nl> <nl> / / The point of the deserializer is that some of the clustering prefix won ' t actually be used ( because they are not <nl> @ @ - 478 , 6 + 471 , 9 @ @ public interface ClusteringPrefix extends IMeasurableMemory , Clusterable <nl> if ( deserializedSize = = nextSize ) <nl> return false ; <nl> <nl> + if ( ( deserializedSize % 32 ) = = 0 ) <nl> + nextHeader = in . readUnsignedVInt ( ) ; <nl> + <nl> int i = deserializedSize + + ; <nl> nextValues [ i ] = Serializer . isNull ( nextHeader , i ) <nl> ? null <nl> @ @ - 513 , 9 + 509 , 12 @ @ public interface ClusteringPrefix extends IMeasurableMemory , Clusterable <nl> { <nl> for ( int i = deserializedSize ; i < nextSize ; i + + ) <nl> { <nl> + if ( ( i % 32 ) = = 0 ) <nl> + nextHeader = in . readUnsignedVInt ( ) ; <nl> if ( ! Serializer . isNull ( nextHeader , i ) & & ! Serializer . isEmpty ( nextHeader , i ) ) <nl> serializationHeader . clusteringTypes ( ) . get ( i ) . skipValue ( in ) ; <nl> } <nl> + deserializedSize = nextSize ; <nl> return nextKind ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / TypeSizes . java b / src / java / org / apache / cassandra / db / TypeSizes . java <nl> index 73766c8 . . 7e5bd87 100644 <nl> - - - a / src / java / org / apache / cassandra / db / TypeSizes . java <nl> + + + b / src / java / org / apache / cassandra / db / TypeSizes . java <nl> @ @ - 102 , 4 + 102 , 9 @ @ public final class TypeSizes <nl> { <nl> return VIntCoding . computeVIntSize ( value ) ; <nl> } <nl> + <nl> + public static int sizeofUnsignedVInt ( long value ) <nl> + { <nl> + return VIntCoding . computeUnsignedVIntSize ( value ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / rows / UnfilteredSerializer . java b / src / java / org / apache / cassandra / db / rows / UnfilteredSerializer . java <nl> index 4072f8d . . 11fa800 100644 <nl> - - - a / src / java / org / apache / cassandra / db / rows / UnfilteredSerializer . java <nl> + + + b / src / java / org / apache / cassandra / db / rows / UnfilteredSerializer . java <nl> @ @ - 21 , 8 + 21 , 8 @ @ import java . io . IOException ; <nl> <nl> import org . apache . cassandra . config . ColumnDefinition ; <nl> import org . apache . cassandra . db . * ; <nl> - import org . apache . cassandra . io . util . DataOutputPlus ; <nl> import org . apache . cassandra . io . util . DataInputPlus ; <nl> + import org . apache . cassandra . io . util . DataOutputPlus ; <nl> import org . apache . cassandra . utils . SearchIterator ; <nl> <nl> / * * <nl> diff - - git a / test / unit / org / apache / cassandra / cql3 / SerializationMirrorTest . java b / test / unit / org / apache / cassandra / cql3 / SerializationMirrorTest . java <nl> new file mode 100644 <nl> index 0000000 . . 49f77a7 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / cql3 / SerializationMirrorTest . java <nl> @ @ - 0 , 0 + 1 , 63 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + package org . apache . cassandra . cql3 ; <nl> + <nl> + import java . util . ArrayList ; <nl> + import java . util . List ; <nl> + import java . util . concurrent . ThreadLocalRandom ; <nl> + <nl> + import org . junit . Test ; <nl> + <nl> + import junit . framework . Assert ; <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> + <nl> + public class SerializationMirrorTest extends CQLTester <nl> + { <nl> + <nl> + @ Test <nl> + public void testManyClusterings ( ) throws Throwable <nl> + { <nl> + StringBuilder table = new StringBuilder ( " CREATE TABLE % s ( a TEXT " ) ; <nl> + StringBuilder cols = new StringBuilder ( ) ; <nl> + StringBuilder args = new StringBuilder ( " ? " ) ; <nl> + List < Object > vals = new ArrayList < > ( ) ; <nl> + vals . add ( " a " ) ; <nl> + for ( int i = 0 ; i < 40 ; i + + ) <nl> + { <nl> + table . append ( " , c " ) . append ( i ) . append ( " text " ) ; <nl> + cols . append ( " , c " ) . append ( i ) ; <nl> + if ( ThreadLocalRandom . current ( ) . nextBoolean ( ) ) <nl> + vals . add ( Integer . toString ( i ) ) ; <nl> + else <nl> + vals . add ( " " ) ; <nl> + args . append ( " , ? " ) ; <nl> + } <nl> + args . append ( " , ? " ) ; <nl> + vals . add ( " value " ) ; <nl> + table . append ( " , v text , PRIMARY KEY ( ( a ) " ) . append ( cols ) . append ( " ) ) " ) ; <nl> + createTable ( table . toString ( ) ) ; <nl> + <nl> + execute ( " INSERT INTO % s ( a " + cols + " , v ) VALUES ( " + args + " ) " , vals . toArray ( ) ) ; <nl> + flush ( ) ; <nl> + UntypedResultSet . Row row = execute ( " SELECT * FROM % s " ) . one ( ) ; <nl> + for ( int i = 0 ; i < row . getColumns ( ) . size ( ) ; i + + ) <nl> + Assert . assertEquals ( vals . get ( i ) , row . getString ( i = = 0 ? " a " : i < 41 ? " c " + ( i - 1 ) : " v " ) ) ; <nl> + } <nl> + <nl> + }
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> index c3bddd4 . . cb87833 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> @ @ - 35 , 7 + 35 , 6 @ @ import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . io . ICompactSerializer2 ; <nl> import org . apache . cassandra . db . filter . QueryPath ; <nl> import org . apache . cassandra . db . marshal . AbstractType ; <nl> - import org . apache . cassandra . db . marshal . MarshalException ; <nl> <nl> <nl> public final class ColumnFamily implements IColumnContainer <nl> @ @ - 121 , 12 + 120 , 13 @ @ public final class ColumnFamily implements IColumnContainer <nl> * We need to go through each column <nl> * in the column family and resolve it before adding <nl> * / <nl> - void addColumns ( ColumnFamily cf ) <nl> + public void addAll ( ColumnFamily cf ) <nl> { <nl> for ( IColumn column : cf . getSortedColumns ( ) ) <nl> { <nl> addColumn ( column ) ; <nl> } <nl> + delete ( cf ) ; <nl> } <nl> <nl> public ICompactSerializer2 < IColumn > getColumnSerializer ( ) <nl> @ @ - 415 , 8 + 415 , 7 @ @ public final class ColumnFamily implements IColumnContainer <nl> for ( ColumnFamily cf2 : columnFamilies ) <nl> { <nl> assert cf . name ( ) . equals ( cf2 . name ( ) ) ; <nl> - cf . addColumns ( cf2 ) ; <nl> - cf . delete ( cf2 ) ; <nl> + cf . addAll ( cf2 ) ; <nl> } <nl> return cf ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 001c644 . . 96bb18b 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 560 , 26 + 560 , 6 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> CompactionManager . instance ( ) . submit ( this ) ; <nl> } <nl> <nl> - private PriorityQueue < FileStruct > initializePriorityQueue ( Collection < SSTableReader > sstables , List < Range > ranges ) throws IOException <nl> - { <nl> - PriorityQueue < FileStruct > pq = new PriorityQueue < FileStruct > ( ) ; <nl> - if ( sstables . size ( ) > 1 | | ( ranges ! = null & & sstables . size ( ) > 0 ) ) <nl> - { <nl> - FileStruct fs = null ; <nl> - for ( SSTableReader sstable : sstables ) <nl> - { <nl> - fs = sstable . getFileStruct ( ) ; <nl> - fs . advance ( true ) ; <nl> - if ( fs . isExhausted ( ) ) <nl> - { <nl> - continue ; <nl> - } <nl> - pq . add ( fs ) ; <nl> - } <nl> - } <nl> - return pq ; <nl> - } <nl> - <nl> / * <nl> * Group files of similar size into buckets . <nl> * / <nl> @ @ - 766 , 150 + 746 , 67 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> * / <nl> List < SSTableReader > doFileAntiCompaction ( Collection < SSTableReader > sstables , List < Range > ranges , EndPoint target ) throws IOException <nl> { <nl> - List < SSTableReader > results = new ArrayList < SSTableReader > ( ) ; <nl> - long startTime = System . currentTimeMillis ( ) ; <nl> - long totalBytesRead = 0 ; <nl> - long totalBytesWritten = 0 ; <nl> - long totalkeysRead = 0 ; <nl> - long totalkeysWritten = 0 ; <nl> - String rangeFileLocation ; <nl> - String mergedFileName ; <nl> + logger _ . info ( " AntiCompacting [ " + StringUtils . join ( sstables , " , " ) + " ] " ) ; <nl> / / Calculate the expected compacted filesize <nl> - long expectedRangeFileSize = getExpectedCompactedFileSize ( sstables ) ; <nl> - / * in the worst case a node will be giving out half of its data so we take a chance * / <nl> - expectedRangeFileSize = expectedRangeFileSize / 2 ; <nl> - rangeFileLocation = DatabaseDescriptor . getDataFileLocationForTable ( table _ , expectedRangeFileSize ) ; <nl> - / / If the compaction file path is null that means we have no space left for this compaction . <nl> - if ( rangeFileLocation = = null ) <nl> - { <nl> - logger _ . error ( " Total bytes to be written for range compaction . . . " <nl> - + expectedRangeFileSize + " is greater than the safe limit of the disk space available . " ) ; <nl> - return results ; <nl> - } <nl> - PriorityQueue < FileStruct > pq = initializePriorityQueue ( sstables , ranges ) ; <nl> - if ( pq . isEmpty ( ) ) <nl> + long expectedRangeFileSize = getExpectedCompactedFileSize ( sstables ) / 2 ; <nl> + String compactionFileLocation = DatabaseDescriptor . getDataFileLocationForTable ( table _ , expectedRangeFileSize ) ; <nl> + if ( compactionFileLocation = = null ) <nl> { <nl> - return results ; <nl> + throw new UnsupportedOperationException ( " disk full " ) ; <nl> } <nl> + List < SSTableReader > results = new ArrayList < SSTableReader > ( ) ; <nl> <nl> - mergedFileName = getTempSSTableFileName ( ) ; <nl> - SSTableWriter rangeWriter = null ; <nl> - String lastkey = null ; <nl> - List < FileStruct > lfs = new ArrayList < FileStruct > ( ) ; <nl> - DataOutputBuffer bufOut = new DataOutputBuffer ( ) ; <nl> - int expectedBloomFilterSize = SSTableReader . getApproximateKeyCount ( sstables ) ; <nl> - expectedBloomFilterSize = ( expectedBloomFilterSize > 0 ) ? expectedBloomFilterSize : SSTableReader . indexInterval ( ) ; <nl> + long startTime = System . currentTimeMillis ( ) ; <nl> + long totalkeysWritten = 0 ; <nl> + <nl> + int expectedBloomFilterSize = Math . max ( SSTableReader . indexInterval ( ) , SSTableReader . getApproximateKeyCount ( sstables ) / 2 ) ; <nl> if ( logger _ . isDebugEnabled ( ) ) <nl> logger _ . debug ( " Expected bloom filter size : " + expectedBloomFilterSize ) ; <nl> - List < ColumnFamily > columnFamilies = new ArrayList < ColumnFamily > ( ) ; <nl> <nl> - while ( pq . size ( ) > 0 | | lfs . size ( ) > 0 ) <nl> + SSTableWriter writer = null ; <nl> + CompactionIterator ci = new CompactionIterator ( sstables ) ; <nl> + <nl> + try <nl> { <nl> - FileStruct fs = null ; <nl> - if ( pq . size ( ) > 0 ) <nl> + if ( ! ci . hasNext ( ) ) <nl> { <nl> - fs = pq . poll ( ) ; <nl> + logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; <nl> + return results ; <nl> } <nl> - if ( fs ! = null <nl> - & & ( lastkey = = null | | lastkey . equals ( fs . getKey ( ) ) ) ) <nl> - { <nl> - / / The keys are the same so we need to add this to the <nl> - / / ldfs list <nl> - lastkey = fs . getKey ( ) ; <nl> - lfs . add ( fs ) ; <nl> - } <nl> - else <nl> + <nl> + while ( ci . hasNext ( ) ) <nl> { <nl> - Collections . sort ( lfs , new FileStructComparator ( ) ) ; <nl> - ColumnFamily columnFamily ; <nl> - bufOut . reset ( ) ; <nl> - if ( lfs . size ( ) > 1 ) <nl> + CompactionIterator . CompactedRow row = ci . next ( ) ; <nl> + if ( Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( row . key ) , ranges ) ) <nl> { <nl> - for ( FileStruct filestruct : lfs ) <nl> - { <nl> - / / We want to add only 2 and resolve them right there in order to save on memory footprint <nl> - if ( columnFamilies . size ( ) > 1 ) <nl> - { <nl> - / / Now merge the 2 column families <nl> - merge ( columnFamilies ) ; <nl> - } <nl> - / / deserialize into column families <nl> - columnFamilies . add ( filestruct . getColumnFamily ( ) ) ; <nl> - } <nl> - / / Now after merging all crap append to the sstable <nl> - columnFamily = resolveAndRemoveDeleted ( columnFamilies ) ; <nl> - columnFamilies . clear ( ) ; <nl> - if ( columnFamily ! = null ) <nl> - { <nl> - ColumnFamily . serializer ( ) . serializeWithIndexes ( columnFamily , bufOut ) ; <nl> - } <nl> - } <nl> - else <nl> - { <nl> - / / TODO deserializing only to reserialize is dumb <nl> - FileStruct filestruct = lfs . get ( 0 ) ; <nl> - ColumnFamily . serializer ( ) . serializeWithIndexes ( filestruct . getColumnFamily ( ) , bufOut ) ; <nl> - } <nl> - if ( Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( lastkey ) , ranges ) ) <nl> - { <nl> - if ( rangeWriter = = null ) <nl> + if ( writer = = null ) <nl> { <nl> if ( target ! = null ) <nl> { <nl> - rangeFileLocation = rangeFileLocation + File . separator + " bootstrap " ; <nl> + compactionFileLocation = compactionFileLocation + File . separator + " bootstrap " ; <nl> } <nl> - FileUtils . createDirectory ( rangeFileLocation ) ; <nl> - String fname = new File ( rangeFileLocation , mergedFileName ) . getAbsolutePath ( ) ; <nl> - rangeWriter = new SSTableWriter ( fname , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; <nl> + FileUtils . createDirectory ( compactionFileLocation ) ; <nl> + String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; <nl> + writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; <nl> } <nl> - rangeWriter . append ( lastkey , bufOut ) ; <nl> - } <nl> - totalkeysWritten + + ; <nl> - for ( FileStruct filestruct : lfs ) <nl> - { <nl> - filestruct . advance ( true ) ; <nl> - if ( filestruct . isExhausted ( ) ) <nl> - { <nl> - continue ; <nl> - } <nl> - / * keep on looping until we find a key in the range * / <nl> - while ( ! Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( filestruct . getKey ( ) ) , ranges ) ) <nl> - { <nl> - filestruct . advance ( true ) ; <nl> - if ( filestruct . isExhausted ( ) ) <nl> - { <nl> - break ; <nl> - } <nl> - } <nl> - if ( ! filestruct . isExhausted ( ) ) <nl> - { <nl> - pq . add ( filestruct ) ; <nl> - } <nl> - totalkeysRead + + ; <nl> - } <nl> - lfs . clear ( ) ; <nl> - lastkey = null ; <nl> - if ( fs ! = null ) <nl> - { <nl> - / / Add back the fs since we processed the rest of <nl> - / / filestructs <nl> - pq . add ( fs ) ; <nl> + writer . append ( row . key , row . buffer ) ; <nl> + totalkeysWritten + + ; <nl> } <nl> } <nl> } <nl> - <nl> - if ( rangeWriter ! = null ) <nl> + finally <nl> { <nl> - results . add ( rangeWriter . closeAndOpenReader ( ) ) ; <nl> + ci . close ( ) ; <nl> } <nl> <nl> - if ( logger _ . isDebugEnabled ( ) ) <nl> + if ( writer ! = null ) <nl> { <nl> - logger _ . debug ( " Total time taken for range split . . . " + ( System . currentTimeMillis ( ) - startTime ) ) ; <nl> - logger _ . debug ( " Total bytes Read for range split . . . " + totalBytesRead ) ; <nl> - logger _ . debug ( " Total bytes written for range split . . . " <nl> - + totalBytesWritten + " Total keys read . . . " + totalkeysRead ) ; <nl> + results . add ( writer . closeAndOpenReader ( ) ) ; <nl> + String format = " AntiCompacted to % s . % d / % d bytes for % d keys . Time : % dms . " ; <nl> + long dTime = System . currentTimeMillis ( ) - startTime ; <nl> + logger _ . info ( String . format ( format , writer . getFilename ( ) , getTotalBytes ( sstables ) , results . get ( 0 ) . length ( ) , totalkeysWritten , dTime ) ) ; <nl> } <nl> + <nl> return results ; <nl> } <nl> <nl> @ @ - 938 , 111 + 835 , 59 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> } <nl> <nl> long startTime = System . currentTimeMillis ( ) ; <nl> - long totalBytesRead = 0 ; <nl> - long totalkeysRead = 0 ; <nl> long totalkeysWritten = 0 ; <nl> - PriorityQueue < FileStruct > pq = initializePriorityQueue ( sstables , null ) ; <nl> - <nl> - if ( pq . isEmpty ( ) ) <nl> - { <nl> - logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; <nl> - / / TODO clean out bad files , if any <nl> - return 0 ; <nl> - } <nl> <nl> - int expectedBloomFilterSize = SSTableReader . getApproximateKeyCount ( sstables ) ; <nl> - if ( expectedBloomFilterSize < 0 ) <nl> - expectedBloomFilterSize = SSTableReader . indexInterval ( ) ; <nl> - String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; <nl> - SSTableWriter writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; <nl> - SSTableReader ssTable = null ; <nl> - String lastkey = null ; <nl> - List < FileStruct > lfs = new ArrayList < FileStruct > ( ) ; <nl> - DataOutputBuffer bufOut = new DataOutputBuffer ( ) ; <nl> + int expectedBloomFilterSize = Math . max ( SSTableReader . indexInterval ( ) , SSTableReader . getApproximateKeyCount ( sstables ) ) ; <nl> if ( logger _ . isDebugEnabled ( ) ) <nl> logger _ . debug ( " Expected bloom filter size : " + expectedBloomFilterSize ) ; <nl> - List < ColumnFamily > columnFamilies = new ArrayList < ColumnFamily > ( ) ; <nl> <nl> - while ( pq . size ( ) > 0 | | lfs . size ( ) > 0 ) <nl> + SSTableWriter writer ; <nl> + CompactionIterator ci = new CompactionIterator ( sstables ) ; <nl> + <nl> + try <nl> { <nl> - FileStruct fs = null ; <nl> - if ( pq . size ( ) > 0 ) <nl> + if ( ! ci . hasNext ( ) ) <nl> { <nl> - fs = pq . poll ( ) ; <nl> + logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; <nl> + return 0 ; <nl> } <nl> - if ( fs ! = null <nl> - & & ( lastkey = = null | | lastkey . equals ( fs . getKey ( ) ) ) ) <nl> - { <nl> - / / The keys are the same so we need to add this to the <nl> - / / ldfs list <nl> - lastkey = fs . getKey ( ) ; <nl> - lfs . add ( fs ) ; <nl> - } <nl> - else <nl> - { <nl> - Collections . sort ( lfs , new FileStructComparator ( ) ) ; <nl> - ColumnFamily columnFamily ; <nl> - bufOut . reset ( ) ; <nl> - if ( lfs . size ( ) > 1 ) <nl> - { <nl> - for ( FileStruct filestruct : lfs ) <nl> - { <nl> - / / We want to add only 2 and resolve them right there in order to save on memory footprint <nl> - if ( columnFamilies . size ( ) > 1 ) <nl> - { <nl> - merge ( columnFamilies ) ; <nl> - } <nl> - / / deserialize into column families <nl> - columnFamilies . add ( filestruct . getColumnFamily ( ) ) ; <nl> - } <nl> - / / Now after merging all crap append to the sstable <nl> - columnFamily = resolveAndRemoveDeleted ( columnFamilies ) ; <nl> - columnFamilies . clear ( ) ; <nl> - if ( columnFamily ! = null ) <nl> - { <nl> - ColumnFamily . serializer ( ) . serializeWithIndexes ( columnFamily , bufOut ) ; <nl> - } <nl> - } <nl> - else <nl> - { <nl> - / / TODO deserializing only to reserialize is dumb <nl> - FileStruct filestruct = lfs . get ( 0 ) ; <nl> - ColumnFamily . serializer ( ) . serializeWithIndexes ( filestruct . getColumnFamily ( ) , bufOut ) ; <nl> - } <nl> <nl> - writer . append ( lastkey , bufOut ) ; <nl> - totalkeysWritten + + ; <nl> + String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; <nl> + writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; <nl> <nl> - for ( FileStruct filestruct : lfs ) <nl> - { <nl> - filestruct . advance ( true ) ; <nl> - if ( filestruct . isExhausted ( ) ) <nl> - { <nl> - continue ; <nl> - } <nl> - pq . add ( filestruct ) ; <nl> - totalkeysRead + + ; <nl> - } <nl> - lfs . clear ( ) ; <nl> - lastkey = null ; <nl> - if ( fs ! = null ) <nl> - { <nl> - / * Add back the fs since we processed the rest of filestructs * / <nl> - pq . add ( fs ) ; <nl> - } <nl> + while ( ci . hasNext ( ) ) <nl> + { <nl> + CompactionIterator . CompactedRow row = ci . next ( ) ; <nl> + writer . append ( row . key , row . buffer ) ; <nl> + totalkeysWritten + + ; <nl> } <nl> } <nl> - ssTable = writer . closeAndOpenReader ( ) ; <nl> + finally <nl> + { <nl> + ci . close ( ) ; <nl> + } <nl> + <nl> + SSTableReader ssTable = writer . closeAndOpenReader ( ) ; <nl> ssTables _ . add ( ssTable ) ; <nl> ssTables _ . markCompacted ( sstables ) ; <nl> CompactionManager . instance ( ) . submit ( ColumnFamilyStore . this ) ; <nl> <nl> - String format = " Compacted to % s . % d / % d bytes for % d / % d keys read / written . Time : % dms . " ; <nl> + String format = " Compacted to % s . % d / % d bytes for % d keys . Time : % dms . " ; <nl> long dTime = System . currentTimeMillis ( ) - startTime ; <nl> - logger _ . info ( String . format ( format , writer . getFilename ( ) , totalBytesRead , ssTable . length ( ) , totalkeysRead , totalkeysWritten , dTime ) ) ; <nl> + logger _ . info ( String . format ( format , writer . getFilename ( ) , getTotalBytes ( sstables ) , ssTable . length ( ) , totalkeysWritten , dTime ) ) ; <nl> return sstables . size ( ) ; <nl> } <nl> <nl> + private long getTotalBytes ( Iterable < SSTableReader > sstables ) <nl> + { <nl> + long sum = 0 ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + { <nl> + sum + = sstable . length ( ) ; <nl> + } <nl> + return sum ; <nl> + } <nl> + <nl> public static List < Memtable > getUnflushedMemtables ( String cfName ) <nl> { <nl> return new ArrayList < Memtable > ( getMemtablesPendingFlushNotNull ( cfName ) ) ; <nl> @ @ - 1341 , 23 + 1186 , 24 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> / / sstables <nl> for ( SSTableReader sstable : ssTables _ ) <nl> { <nl> - final SSTableScanner fs = sstable . getScanner ( ) ; <nl> - fs . seekTo ( startWith ) ; <nl> - iterators . add ( new Iterator < String > ( ) <nl> + final SSTableScanner scanner = sstable . getScanner ( ) ; <nl> + scanner . seekTo ( startWith ) ; <nl> + Iterator < String > iter = new Iterator < String > ( ) <nl> { <nl> public boolean hasNext ( ) <nl> { <nl> - return fs . hasNext ( ) ; <nl> + return scanner . hasNext ( ) ; <nl> } <nl> public String next ( ) <nl> { <nl> - return fs . next ( ) . getKey ( ) ; <nl> + return scanner . next ( ) . getKey ( ) ; <nl> } <nl> public void remove ( ) <nl> { <nl> throw new UnsupportedOperationException ( ) ; <nl> } <nl> - } ) ; <nl> + } ; <nl> + iterators . add ( iter ) ; <nl> } <nl> <nl> Iterator < String > collated = IteratorUtils . collatedIterator ( comparator , iterators ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / FileStructComparator . java b / src / java / org / apache / cassandra / db / FileStructComparator . java <nl> deleted file mode 100644 <nl> index e81a992 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / db / FileStructComparator . java <nl> + + + / dev / null <nl> @ @ - 1 , 31 + 0 , 0 @ @ <nl> - / * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , <nl> - * software distributed under the License is distributed on an <nl> - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> - * KIND , either express or implied . See the License for the <nl> - * specific language governing permissions and limitations <nl> - * under the License . <nl> - * / <nl> - package org . apache . cassandra . db ; <nl> - <nl> - import java . util . Comparator ; <nl> - <nl> - import org . apache . cassandra . io . FileStruct ; <nl> - <nl> - class FileStructComparator implements Comparator < FileStruct > <nl> - { <nl> - public int compare ( FileStruct f , FileStruct f2 ) <nl> - { <nl> - return f . getFileName ( ) . compareTo ( f2 . getFileName ( ) ) ; <nl> - } <nl> - } <nl> \ No newline at end of file <nl> diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java <nl> index d88e004 . . 696ae5a 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Memtable . java <nl> + + + b / src / java / org / apache / cassandra / db / Memtable . java <nl> @ @ - 153 , 7 + 153 , 7 @ @ public class Memtable implements Comparable < Memtable > <nl> { <nl> int oldSize = oldCf . size ( ) ; <nl> int oldObjectCount = oldCf . getColumnCount ( ) ; <nl> - oldCf . addColumns ( columnFamily ) ; <nl> + oldCf . addAll ( columnFamily ) ; <nl> int newSize = oldCf . size ( ) ; <nl> int newObjectCount = oldCf . getColumnCount ( ) ; <nl> resolveSize ( oldSize , newSize ) ; <nl> diff - - git a / src / java / org / apache / cassandra / io / CompactionIterator . java b / src / java / org / apache / cassandra / io / CompactionIterator . java <nl> new file mode 100644 <nl> index 0000000 . . b65e132 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / io / CompactionIterator . java <nl> @ @ - 0 , 0 + 1 , 113 @ @ <nl> + package org . apache . cassandra . io ; <nl> + <nl> + import java . io . Closeable ; <nl> + import java . io . IOException ; <nl> + import java . util . List ; <nl> + import java . util . ArrayList ; <nl> + import java . util . Comparator ; <nl> + <nl> + import org . apache . commons . collections . iterators . CollatingIterator ; <nl> + <nl> + import org . apache . cassandra . utils . ReducingIterator ; <nl> + import org . apache . cassandra . db . ColumnFamily ; <nl> + <nl> + public class CompactionIterator extends ReducingIterator < IteratingRow , CompactionIterator . CompactedRow > implements Closeable <nl> + { <nl> + private final List < IteratingRow > rows = new ArrayList < IteratingRow > ( ) ; <nl> + <nl> + @ SuppressWarnings ( " unchecked " ) <nl> + public CompactionIterator ( Iterable < SSTableReader > sstables ) throws IOException <nl> + { <nl> + super ( getCollatingIterator ( sstables ) ) ; <nl> + } <nl> + <nl> + @ SuppressWarnings ( " unchecked " ) <nl> + private static CollatingIterator getCollatingIterator ( Iterable < SSTableReader > sstables ) throws IOException <nl> + { <nl> + / / CollatingIterator has a bug that causes NPE when you try to use default comparator . : ( <nl> + CollatingIterator iter = new CollatingIterator ( new Comparator ( ) <nl> + { <nl> + public int compare ( Object o1 , Object o2 ) <nl> + { <nl> + return ( ( Comparable ) o1 ) . compareTo ( o2 ) ; <nl> + } <nl> + } ) ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + { <nl> + iter . addIterator ( sstable . getScanner ( ) ) ; <nl> + } <nl> + return iter ; <nl> + } <nl> + <nl> + @ Override <nl> + protected boolean isEqual ( IteratingRow o1 , IteratingRow o2 ) <nl> + { <nl> + return o1 . getKey ( ) . equals ( o2 . getKey ( ) ) ; <nl> + } <nl> + <nl> + public void reduce ( IteratingRow current ) <nl> + { <nl> + rows . add ( current ) ; <nl> + } <nl> + <nl> + protected CompactedRow getReduced ( ) <nl> + { <nl> + try <nl> + { <nl> + return getReducedRaw ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + protected CompactedRow getReducedRaw ( ) throws IOException <nl> + { <nl> + DataOutputBuffer buffer = new DataOutputBuffer ( ) ; <nl> + String key = rows . get ( 0 ) . getKey ( ) ; <nl> + if ( rows . size ( ) > 1 ) <nl> + { <nl> + ColumnFamily cf = null ; <nl> + for ( IteratingRow row : rows ) <nl> + { <nl> + if ( cf = = null ) <nl> + { <nl> + cf = row . getColumnFamily ( ) ; <nl> + } <nl> + else <nl> + { <nl> + cf . addAll ( row . getColumnFamily ( ) ) ; <nl> + } <nl> + } <nl> + ColumnFamily . serializer ( ) . serializeWithIndexes ( cf , buffer ) ; <nl> + } <nl> + else <nl> + { <nl> + assert rows . size ( ) = = 1 ; <nl> + rows . get ( 0 ) . echoData ( buffer ) ; <nl> + } <nl> + rows . clear ( ) ; <nl> + return new CompactedRow ( key , buffer ) ; <nl> + } <nl> + <nl> + public void close ( ) throws IOException <nl> + { <nl> + for ( Object o : ( ( CollatingIterator ) source ) . getIterators ( ) ) <nl> + { <nl> + ( ( SSTableScanner ) o ) . close ( ) ; <nl> + } <nl> + } <nl> + <nl> + public static class CompactedRow <nl> + { <nl> + public final String key ; <nl> + public final DataOutputBuffer buffer ; <nl> + <nl> + public CompactedRow ( String key , DataOutputBuffer buffer ) <nl> + { <nl> + this . key = key ; <nl> + this . buffer = buffer ; <nl> + } <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / io / FileStruct . java b / src / java / org / apache / cassandra / io / FileStruct . java <nl> deleted file mode 100644 <nl> index b561239 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / io / FileStruct . java <nl> + + + / dev / null <nl> @ @ - 1 , 195 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . io ; <nl> - <nl> - import java . io . IOException ; <nl> - import java . io . File ; <nl> - import java . util . Iterator ; <nl> - <nl> - import org . apache . cassandra . db . IColumn ; <nl> - import org . apache . cassandra . db . ColumnFamily ; <nl> - import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - <nl> - import org . apache . log4j . Logger ; <nl> - import com . google . common . collect . AbstractIterator ; <nl> - <nl> - <nl> - public class FileStruct implements Comparable < FileStruct > , Iterator < String > <nl> - { <nl> - private static Logger logger = Logger . getLogger ( FileStruct . class ) ; <nl> - <nl> - private IteratingRow row ; <nl> - private boolean exhausted = false ; <nl> - private BufferedRandomAccessFile file ; <nl> - private SSTableReader sstable ; <nl> - private FileStructIterator iterator ; <nl> - <nl> - FileStruct ( SSTableReader sstable ) throws IOException <nl> - { <nl> - / / TODO this is used for both compactions and key ranges . the buffer sizes we want <nl> - / / to use for these ops are very different . here we are leaning towards the key - range <nl> - / / use case since that is more common . What we really want is to split those <nl> - / / two uses of this class up . <nl> - this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , 256 * 1024 ) ; <nl> - this . sstable = sstable ; <nl> - } <nl> - <nl> - public String getFileName ( ) <nl> - { <nl> - return file . getPath ( ) ; <nl> - } <nl> - <nl> - public void close ( ) throws IOException <nl> - { <nl> - file . close ( ) ; <nl> - } <nl> - <nl> - public boolean isExhausted ( ) <nl> - { <nl> - return exhausted ; <nl> - } <nl> - <nl> - public String getKey ( ) <nl> - { <nl> - return row . getKey ( ) ; <nl> - } <nl> - <nl> - public ColumnFamily getColumnFamily ( ) <nl> - { <nl> - return row . getEmptyColumnFamily ( ) ; <nl> - } <nl> - <nl> - public int compareTo ( FileStruct f ) <nl> - { <nl> - return sstable . getPartitioner ( ) . getDecoratedKeyComparator ( ) . compare ( getKey ( ) , f . getKey ( ) ) ; <nl> - } <nl> - <nl> - public void seekTo ( String seekKey ) <nl> - { <nl> - try <nl> - { <nl> - long position = sstable . getNearestPosition ( seekKey ) ; <nl> - if ( position < 0 ) <nl> - { <nl> - exhausted = true ; <nl> - return ; <nl> - } <nl> - file . seek ( position ) ; <nl> - advance ( false ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( " corrupt sstable " , e ) ; <nl> - } <nl> - } <nl> - <nl> - / * <nl> - * Read the next key from the data file . <nl> - * Caller must check isExhausted after each call to see if further <nl> - * reads are valid . <nl> - * Do not mix with calls to the iterator interface ( next / hasnext ) . <nl> - * @ deprecated - - prefer the iterator interface . <nl> - * / <nl> - public void advance ( boolean materialize ) throws IOException <nl> - { <nl> - / / TODO r / m materialize option - - use iterableness ! <nl> - if ( exhausted ) <nl> - { <nl> - throw new IndexOutOfBoundsException ( ) ; <nl> - } <nl> - <nl> - if ( file . isEOF ( ) ) <nl> - { <nl> - file . close ( ) ; <nl> - exhausted = true ; <nl> - return ; <nl> - } <nl> - <nl> - row = new IteratingRow ( file , sstable ) ; <nl> - if ( materialize ) <nl> - { <nl> - while ( row . hasNext ( ) ) <nl> - { <nl> - IColumn column = row . next ( ) ; <nl> - row . getEmptyColumnFamily ( ) . addColumn ( column ) ; <nl> - } <nl> - } <nl> - else <nl> - { <nl> - row . skipRemaining ( ) ; <nl> - } <nl> - } <nl> - <nl> - public boolean hasNext ( ) <nl> - { <nl> - if ( iterator = = null ) <nl> - iterator = new FileStructIterator ( ) ; <nl> - return iterator . hasNext ( ) ; <nl> - } <nl> - <nl> - / * * do not mix with manual calls to advance ( ) . * / <nl> - public String next ( ) <nl> - { <nl> - if ( iterator = = null ) <nl> - iterator = new FileStructIterator ( ) ; <nl> - return iterator . next ( ) ; <nl> - } <nl> - <nl> - public void remove ( ) <nl> - { <nl> - throw new UnsupportedOperationException ( ) ; <nl> - } <nl> - <nl> - private class FileStructIterator extends AbstractIterator < String > <nl> - { <nl> - public FileStructIterator ( ) <nl> - { <nl> - if ( row = = null ) <nl> - { <nl> - if ( ! isExhausted ( ) ) <nl> - { <nl> - forward ( ) ; <nl> - } <nl> - } <nl> - } <nl> - <nl> - private void forward ( ) <nl> - { <nl> - try <nl> - { <nl> - advance ( false ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> - } <nl> - <nl> - protected String computeNext ( ) <nl> - { <nl> - if ( isExhausted ( ) ) <nl> - { <nl> - return endOfData ( ) ; <nl> - } <nl> - String oldKey = getKey ( ) ; <nl> - forward ( ) ; <nl> - return oldKey ; <nl> - } <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / io / IteratingRow . java b / src / java / org / apache / cassandra / io / IteratingRow . java <nl> index 5ace95f . . 628fe50 100644 <nl> - - - a / src / java / org / apache / cassandra / io / IteratingRow . java <nl> + + + b / src / java / org / apache / cassandra / io / IteratingRow . java <nl> @ @ - 37 , 7 + 37 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl <nl> { <nl> private final String key ; <nl> private final long finishedAt ; <nl> - private final ColumnFamily emptyColumnFamily ; <nl> private final BufferedRandomAccessFile file ; <nl> private SSTableReader sstable ; <nl> private long dataStart ; <nl> @ @ - 51 , 10 + 50 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl <nl> int dataSize = file . readInt ( ) ; <nl> dataStart = file . getFilePointer ( ) ; <nl> finishedAt = dataStart + dataSize ; <nl> - / / legacy stuff to support FileStruct : <nl> - IndexHelper . skipBloomFilterAndIndex ( file ) ; <nl> - emptyColumnFamily = ColumnFamily . serializer ( ) . deserializeFromSSTableNoColumns ( sstable . makeColumnFamily ( ) , file ) ; <nl> - file . readInt ( ) ; <nl> } <nl> <nl> public String getKey ( ) <nl> @ @ - 62 , 11 + 57 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl <nl> return key ; <nl> } <nl> <nl> - public ColumnFamily getEmptyColumnFamily ( ) <nl> - { <nl> - return emptyColumnFamily ; <nl> - } <nl> - <nl> public void echoData ( DataOutput out ) throws IOException <nl> { <nl> file . seek ( dataStart ) ; <nl> diff - - git a / src / java / org / apache / cassandra / io / SSTableReader . java b / src / java / org / apache / cassandra / io / SSTableReader . java <nl> index fc94fca . . 81a71fd 100644 <nl> - - - a / src / java / org / apache / cassandra / io / SSTableReader . java <nl> + + + b / src / java / org / apache / cassandra / io / SSTableReader . java <nl> @ @ - 333 , 11 + 333 , 6 @ @ public class SSTableReader extends SSTable implements Comparable < SSTableReader > <nl> return partitioner ; <nl> } <nl> <nl> - public FileStruct getFileStruct ( ) throws IOException <nl> - { <nl> - return new FileStruct ( this ) ; <nl> - } <nl> - <nl> public SSTableScanner getScanner ( ) throws IOException <nl> { <nl> return new SSTableScanner ( this ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java b / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java <nl> index 40e5889 . . 4219ff9 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java <nl> @ @ - 20 , 8 + 20 , 6 @ @ package org . apache . cassandra . db ; <nl> <nl> import java . io . IOException ; <nl> import java . util . Arrays ; <nl> - import java . util . HashSet ; <nl> - import java . util . Random ; <nl> import java . util . TreeMap ; <nl> <nl> import org . junit . Test ; <nl> @ @ - 125 , 8 + 123 , 8 @ @ public class ColumnFamilyTest <nl> cf _ old . addColumn ( QueryPath . column ( " col2 " . getBytes ( ) ) , val2 , 1 ) ; <nl> cf _ old . addColumn ( QueryPath . column ( " col3 " . getBytes ( ) ) , val2 , 2 ) ; <nl> <nl> - cf _ result . addColumns ( cf _ new ) ; <nl> - cf _ result . addColumns ( cf _ old ) ; <nl> + cf _ result . addAll ( cf _ new ) ; <nl> + cf _ result . addAll ( cf _ old ) ; <nl> <nl> assert 3 = = cf _ result . getColumnCount ( ) : " Count is " + cf _ new . getColumnCount ( ) ; <nl> / / addcolumns will only add if timestamp > = old timestamp
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / ClusteringPrefix . java b / src / java / org / apache / cassandra / db / ClusteringPrefix . java 
+ index 7b9d582 . . 713ad1b 100644 
+ - - - a / src / java / org / apache / cassandra / db / ClusteringPrefix . java 
+ + + + b / src / java / org / apache / cassandra / db / ClusteringPrefix . java 
+ @ @ - 286 , 109 + 286 , 103 @ @ public interface ClusteringPrefix extends IMeasurableMemory , Clusterable 
+ 
+ void serializeValuesWithoutSize ( ClusteringPrefix clustering , DataOutputPlus out , int version , List < AbstractType < ? > > types ) throws IOException 
+ { 
+ - if ( clustering . size ( ) = = 0 ) 
+ - return ; 
+ - 
+ - writeHeader ( clustering , out ) ; 
+ - for ( int i = 0 ; i < clustering . size ( ) ; i + + ) 
+ + int offset = 0 ; 
+ + int clusteringSize = clustering . size ( ) ; 
+ + / / serialize in batches of 32 , to avoid garbage when deserializing headers 
+ + while ( offset < clusteringSize ) 
+ { 
+ - ByteBuffer v = clustering . get ( i ) ; 
+ - if ( v = = null | | ! v . hasRemaining ( ) ) 
+ - continue ; / / handled in the header 
+ - 
+ - types . get ( i ) . writeValue ( v , out ) ; 
+ + / / we micro - batch the headers , so that we can incur fewer method calls , 
+ + / / and generate no garbage on deserialization ; 
+ + / / we piggyback on vint encoding so that , typically , only 1 byte is used per 32 clustering values , 
+ + / / i . e . more than we ever expect to see 
+ + int limit = Math . min ( clusteringSize , offset + 32 ) ; 
+ + out . writeUnsignedVInt ( makeHeader ( clustering , offset , limit ) ) ; 
+ + while ( offset < limit ) 
+ + { 
+ + ByteBuffer v = clustering . get ( offset ) ; 
+ + if ( v ! = null & & v . hasRemaining ( ) ) 
+ + types . get ( offset ) . writeValue ( v , out ) ; 
+ + offset + + ; 
+ + } 
+ } 
+ } 
+ 
+ long valuesWithoutSizeSerializedSize ( ClusteringPrefix clustering , int version , List < AbstractType < ? > > types ) 
+ { 
+ - if ( clustering . size ( ) = = 0 ) 
+ - return 0 ; 
+ - 
+ - long size = headerBytesCount ( clustering . size ( ) ) ; 
+ - for ( int i = 0 ; i < clustering . size ( ) ; i + + ) 
+ + long result = 0 ; 
+ + int offset = 0 ; 
+ + int clusteringSize = clustering . size ( ) ; 
+ + while ( offset < clusteringSize ) 
+ + { 
+ + int limit = Math . min ( clusteringSize , offset + 32 ) ; 
+ + result + = TypeSizes . sizeofUnsignedVInt ( makeHeader ( clustering , offset , limit ) ) ; 
+ + offset = limit ; 
+ + } 
+ + for ( int i = 0 ; i < clusteringSize ; i + + ) 
+ { 
+ ByteBuffer v = clustering . get ( i ) ; 
+ if ( v = = null | | ! v . hasRemaining ( ) ) 
+ continue ; / / handled in the header 
+ 
+ - size + = types . get ( i ) . writtenLength ( v ) ; 
+ + result + = types . get ( i ) . writtenLength ( v ) ; 
+ } 
+ - return size ; 
+ + return result ; 
+ } 
+ 
+ ByteBuffer [ ] deserializeValuesWithoutSize ( DataInputPlus in , int size , int version , List < AbstractType < ? > > types ) throws IOException 
+ { 
+ / / Callers of this method should handle the case where size = 0 ( in all case we want to return a special value anyway ) . 
+ assert size > 0 ; 
+ - 
+ ByteBuffer [ ] values = new ByteBuffer [ size ] ; 
+ - int [ ] header = readHeader ( size , in ) ; 
+ - for ( int i = 0 ; i < size ; i + + ) 
+ + int offset = 0 ; 
+ + while ( offset < size ) 
+ { 
+ - values [ i ] = isNull ( header , i ) 
+ - ? null 
+ - : ( isEmpty ( header , i ) ? ByteBufferUtil . EMPTY _ BYTE _ BUFFER : types . get ( i ) . readValue ( in ) ) ; 
+ + long header = in . readUnsignedVInt ( ) ; 
+ + int limit = Math . min ( size , offset + 32 ) ; 
+ + while ( offset < limit ) 
+ + { 
+ + values [ offset ] = isNull ( header , offset ) 
+ + ? null 
+ + : ( isEmpty ( header , offset ) ? ByteBufferUtil . EMPTY _ BYTE _ BUFFER : types . get ( offset ) . readValue ( in ) ) ; 
+ + offset + + ; 
+ + } 
+ } 
+ return values ; 
+ } 
+ 
+ - private int headerBytesCount ( int size ) 
+ - { 
+ - / / For each component , we store 2 bit to know if the component is empty or null ( or neither ) . 
+ - / / We thus handle 4 component per byte 
+ - return size / 4 + ( size % 4 = = 0 ? 0 : 1 ) ; 
+ - } 
+ - 
+ / * * 
+ * Whatever the type of a given clustering column is , its value can always be either empty or null . So we at least need to distinguish those 
+ * 2 values , and because we want to be able to store fixed width values without appending their ( fixed ) size first , we need a way to encode 
+ * empty values too . So for that , every clustering prefix includes a " header " that contains 2 bits per element in the prefix . For each element , 
+ * those 2 bits encode whether the element is null , empty , or none of those . 
+ * / 
+ - private void writeHeader ( ClusteringPrefix clustering , DataOutputPlus out ) throws IOException 
+ + private static long makeHeader ( ClusteringPrefix clustering , int offset , int limit ) 
+ { 
+ - int nbBytes = headerBytesCount ( clustering . size ( ) ) ; 
+ - for ( int i = 0 ; i < nbBytes ; i + + ) 
+ + long header = 0 ; 
+ + for ( int i = offset ; i < limit ; i + + ) 
+ { 
+ - int b = 0 ; 
+ - for ( int j = 0 ; j < 4 ; j + + ) 
+ - { 
+ - int c = i * 4 + j ; 
+ - if ( c > = clustering . size ( ) ) 
+ - break ; 
+ - 
+ - ByteBuffer v = clustering . get ( c ) ; 
+ - if ( v = = null ) 
+ - b | = ( 1 < < ( j * 2 ) + 1 ) ; 
+ - else if ( ! v . hasRemaining ( ) ) 
+ - b | = ( 1 < < ( j * 2 ) ) ; 
+ - } 
+ - out . writeByte ( ( byte ) b ) ; 
+ + ByteBuffer v = clustering . get ( i ) ; 
+ + / / no need to do modulo arithmetic for i , since the left - shift execute on the modulus of RH operand by definition 
+ + if ( v = = null ) 
+ + header | = ( 1L < < ( i * 2 ) + 1 ) ; 
+ + else if ( ! v . hasRemaining ( ) ) 
+ + header | = ( 1L < < ( i * 2 ) ) ; 
+ } 
+ - } 
+ - 
+ - private int [ ] readHeader ( int size , DataInputPlus in ) throws IOException 
+ - { 
+ - int nbBytes = headerBytesCount ( size ) ; 
+ - int [ ] header = new int [ nbBytes ] ; 
+ - for ( int i = 0 ; i < nbBytes ; i + + ) 
+ - header [ i ] = in . readUnsignedByte ( ) ; 
+ return header ; 
+ } 
+ 
+ - private static boolean isNull ( int [ ] header , int i ) 
+ + / / no need to do modulo arithmetic for i , since the left - shift execute on the modulus of RH operand by definition 
+ + private static boolean isNull ( long header , int i ) 
+ { 
+ - int b = header [ i / 4 ] ; 
+ - int mask = 1 < < ( ( i % 4 ) * 2 ) + 1 ; 
+ - return ( b & mask ) ! = 0 ; 
+ + long mask = 1L < < ( i * 2 ) + 1 ; 
+ + return ( header & mask ) ! = 0 ; 
+ } 
+ 
+ - private static boolean isEmpty ( int [ ] header , int i ) 
+ + / / no need to do modulo arithmetic for i , since the left - shift execute on the modulus of RH operand by definition 
+ + private static boolean isEmpty ( long header , int i ) 
+ { 
+ - int b = header [ i / 4 ] ; 
+ - int mask = 1 < < ( ( i % 4 ) * 2 ) ; 
+ - return ( b & mask ) ! = 0 ; 
+ + long mask = 1L < < ( i * 2 ) ; 
+ + return ( header & mask ) ! = 0 ; 
+ } 
+ } 
+ 
+ @ @ - 408 , 7 + 402 , 7 @ @ public interface ClusteringPrefix extends IMeasurableMemory , Clusterable 
+ private final SerializationHeader serializationHeader ; 
+ 
+ private boolean nextIsRow ; 
+ - private int [ ] nextHeader ; 
+ + private long nextHeader ; 
+ 
+ private int nextSize ; 
+ private ClusteringPrefix . Kind nextKind ; 
+ @ @ - 428 , 7 + 422 , 6 @ @ public interface ClusteringPrefix extends IMeasurableMemory , Clusterable 
+ this . nextIsRow = UnfilteredSerializer . kind ( flags ) = = Unfiltered . Kind . ROW ; 
+ this . nextKind = nextIsRow ? Kind . CLUSTERING : ClusteringPrefix . Kind . values ( ) [ in . readByte ( ) ] ; 
+ this . nextSize = nextIsRow ? comparator . size ( ) : in . readUnsignedShort ( ) ; 
+ - this . nextHeader = serializer . readHeader ( nextSize , in ) ; 
+ this . deserializedSize = 0 ; 
+ 
+ / / The point of the deserializer is that some of the clustering prefix won ' t actually be used ( because they are not 
+ @ @ - 478 , 6 + 471 , 9 @ @ public interface ClusteringPrefix extends IMeasurableMemory , Clusterable 
+ if ( deserializedSize = = nextSize ) 
+ return false ; 
+ 
+ + if ( ( deserializedSize % 32 ) = = 0 ) 
+ + nextHeader = in . readUnsignedVInt ( ) ; 
+ + 
+ int i = deserializedSize + + ; 
+ nextValues [ i ] = Serializer . isNull ( nextHeader , i ) 
+ ? null 
+ @ @ - 513 , 9 + 509 , 12 @ @ public interface ClusteringPrefix extends IMeasurableMemory , Clusterable 
+ { 
+ for ( int i = deserializedSize ; i < nextSize ; i + + ) 
+ { 
+ + if ( ( i % 32 ) = = 0 ) 
+ + nextHeader = in . readUnsignedVInt ( ) ; 
+ if ( ! Serializer . isNull ( nextHeader , i ) & & ! Serializer . isEmpty ( nextHeader , i ) ) 
+ serializationHeader . clusteringTypes ( ) . get ( i ) . skipValue ( in ) ; 
+ } 
+ + deserializedSize = nextSize ; 
+ return nextKind ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / TypeSizes . java b / src / java / org / apache / cassandra / db / TypeSizes . java 
+ index 73766c8 . . 7e5bd87 100644 
+ - - - a / src / java / org / apache / cassandra / db / TypeSizes . java 
+ + + + b / src / java / org / apache / cassandra / db / TypeSizes . java 
+ @ @ - 102 , 4 + 102 , 9 @ @ public final class TypeSizes 
+ { 
+ return VIntCoding . computeVIntSize ( value ) ; 
+ } 
+ + 
+ + public static int sizeofUnsignedVInt ( long value ) 
+ + { 
+ + return VIntCoding . computeUnsignedVIntSize ( value ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / rows / UnfilteredSerializer . java b / src / java / org / apache / cassandra / db / rows / UnfilteredSerializer . java 
+ index 4072f8d . . 11fa800 100644 
+ - - - a / src / java / org / apache / cassandra / db / rows / UnfilteredSerializer . java 
+ + + + b / src / java / org / apache / cassandra / db / rows / UnfilteredSerializer . java 
+ @ @ - 21 , 8 + 21 , 8 @ @ import java . io . IOException ; 
+ 
+ import org . apache . cassandra . config . ColumnDefinition ; 
+ import org . apache . cassandra . db . * ; 
+ - import org . apache . cassandra . io . util . DataOutputPlus ; 
+ import org . apache . cassandra . io . util . DataInputPlus ; 
+ + import org . apache . cassandra . io . util . DataOutputPlus ; 
+ import org . apache . cassandra . utils . SearchIterator ; 
+ 
+ / * * 
+ diff - - git a / test / unit / org / apache / cassandra / cql3 / SerializationMirrorTest . java b / test / unit / org / apache / cassandra / cql3 / SerializationMirrorTest . java 
+ new file mode 100644 
+ index 0000000 . . 49f77a7 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / cql3 / SerializationMirrorTest . java 
+ @ @ - 0 , 0 + 1 , 63 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + package org . apache . cassandra . cql3 ; 
+ + 
+ + import java . util . ArrayList ; 
+ + import java . util . List ; 
+ + import java . util . concurrent . ThreadLocalRandom ; 
+ + 
+ + import org . junit . Test ; 
+ + 
+ + import junit . framework . Assert ; 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ + 
+ + public class SerializationMirrorTest extends CQLTester 
+ + { 
+ + 
+ + @ Test 
+ + public void testManyClusterings ( ) throws Throwable 
+ + { 
+ + StringBuilder table = new StringBuilder ( " CREATE TABLE % s ( a TEXT " ) ; 
+ + StringBuilder cols = new StringBuilder ( ) ; 
+ + StringBuilder args = new StringBuilder ( " ? " ) ; 
+ + List < Object > vals = new ArrayList < > ( ) ; 
+ + vals . add ( " a " ) ; 
+ + for ( int i = 0 ; i < 40 ; i + + ) 
+ + { 
+ + table . append ( " , c " ) . append ( i ) . append ( " text " ) ; 
+ + cols . append ( " , c " ) . append ( i ) ; 
+ + if ( ThreadLocalRandom . current ( ) . nextBoolean ( ) ) 
+ + vals . add ( Integer . toString ( i ) ) ; 
+ + else 
+ + vals . add ( " " ) ; 
+ + args . append ( " , ? " ) ; 
+ + } 
+ + args . append ( " , ? " ) ; 
+ + vals . add ( " value " ) ; 
+ + table . append ( " , v text , PRIMARY KEY ( ( a ) " ) . append ( cols ) . append ( " ) ) " ) ; 
+ + createTable ( table . toString ( ) ) ; 
+ + 
+ + execute ( " INSERT INTO % s ( a " + cols + " , v ) VALUES ( " + args + " ) " , vals . toArray ( ) ) ; 
+ + flush ( ) ; 
+ + UntypedResultSet . Row row = execute ( " SELECT * FROM % s " ) . one ( ) ; 
+ + for ( int i = 0 ; i < row . getColumns ( ) . size ( ) ; i + + ) 
+ + Assert . assertEquals ( vals . get ( i ) , row . getString ( i = = 0 ? " a " : i < 41 ? " c " + ( i - 1 ) : " v " ) ) ; 
+ + } 
+ + 
+ + }
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ index c3bddd4 . . cb87833 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ @ @ - 35 , 7 + 35 , 6 @ @ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . io . ICompactSerializer2 ; 
+ import org . apache . cassandra . db . filter . QueryPath ; 
+ import org . apache . cassandra . db . marshal . AbstractType ; 
+ - import org . apache . cassandra . db . marshal . MarshalException ; 
+ 
+ 
+ public final class ColumnFamily implements IColumnContainer 
+ @ @ - 121 , 12 + 120 , 13 @ @ public final class ColumnFamily implements IColumnContainer 
+ * We need to go through each column 
+ * in the column family and resolve it before adding 
+ * / 
+ - void addColumns ( ColumnFamily cf ) 
+ + public void addAll ( ColumnFamily cf ) 
+ { 
+ for ( IColumn column : cf . getSortedColumns ( ) ) 
+ { 
+ addColumn ( column ) ; 
+ } 
+ + delete ( cf ) ; 
+ } 
+ 
+ public ICompactSerializer2 < IColumn > getColumnSerializer ( ) 
+ @ @ - 415 , 8 + 415 , 7 @ @ public final class ColumnFamily implements IColumnContainer 
+ for ( ColumnFamily cf2 : columnFamilies ) 
+ { 
+ assert cf . name ( ) . equals ( cf2 . name ( ) ) ; 
+ - cf . addColumns ( cf2 ) ; 
+ - cf . delete ( cf2 ) ; 
+ + cf . addAll ( cf2 ) ; 
+ } 
+ return cf ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 001c644 . . 96bb18b 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 560 , 26 + 560 , 6 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ CompactionManager . instance ( ) . submit ( this ) ; 
+ } 
+ 
+ - private PriorityQueue < FileStruct > initializePriorityQueue ( Collection < SSTableReader > sstables , List < Range > ranges ) throws IOException 
+ - { 
+ - PriorityQueue < FileStruct > pq = new PriorityQueue < FileStruct > ( ) ; 
+ - if ( sstables . size ( ) > 1 | | ( ranges ! = null & & sstables . size ( ) > 0 ) ) 
+ - { 
+ - FileStruct fs = null ; 
+ - for ( SSTableReader sstable : sstables ) 
+ - { 
+ - fs = sstable . getFileStruct ( ) ; 
+ - fs . advance ( true ) ; 
+ - if ( fs . isExhausted ( ) ) 
+ - { 
+ - continue ; 
+ - } 
+ - pq . add ( fs ) ; 
+ - } 
+ - } 
+ - return pq ; 
+ - } 
+ - 
+ / * 
+ * Group files of similar size into buckets . 
+ * / 
+ @ @ - 766 , 150 + 746 , 67 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ * / 
+ List < SSTableReader > doFileAntiCompaction ( Collection < SSTableReader > sstables , List < Range > ranges , EndPoint target ) throws IOException 
+ { 
+ - List < SSTableReader > results = new ArrayList < SSTableReader > ( ) ; 
+ - long startTime = System . currentTimeMillis ( ) ; 
+ - long totalBytesRead = 0 ; 
+ - long totalBytesWritten = 0 ; 
+ - long totalkeysRead = 0 ; 
+ - long totalkeysWritten = 0 ; 
+ - String rangeFileLocation ; 
+ - String mergedFileName ; 
+ + logger _ . info ( " AntiCompacting [ " + StringUtils . join ( sstables , " , " ) + " ] " ) ; 
+ / / Calculate the expected compacted filesize 
+ - long expectedRangeFileSize = getExpectedCompactedFileSize ( sstables ) ; 
+ - / * in the worst case a node will be giving out half of its data so we take a chance * / 
+ - expectedRangeFileSize = expectedRangeFileSize / 2 ; 
+ - rangeFileLocation = DatabaseDescriptor . getDataFileLocationForTable ( table _ , expectedRangeFileSize ) ; 
+ - / / If the compaction file path is null that means we have no space left for this compaction . 
+ - if ( rangeFileLocation = = null ) 
+ - { 
+ - logger _ . error ( " Total bytes to be written for range compaction . . . " 
+ - + expectedRangeFileSize + " is greater than the safe limit of the disk space available . " ) ; 
+ - return results ; 
+ - } 
+ - PriorityQueue < FileStruct > pq = initializePriorityQueue ( sstables , ranges ) ; 
+ - if ( pq . isEmpty ( ) ) 
+ + long expectedRangeFileSize = getExpectedCompactedFileSize ( sstables ) / 2 ; 
+ + String compactionFileLocation = DatabaseDescriptor . getDataFileLocationForTable ( table _ , expectedRangeFileSize ) ; 
+ + if ( compactionFileLocation = = null ) 
+ { 
+ - return results ; 
+ + throw new UnsupportedOperationException ( " disk full " ) ; 
+ } 
+ + List < SSTableReader > results = new ArrayList < SSTableReader > ( ) ; 
+ 
+ - mergedFileName = getTempSSTableFileName ( ) ; 
+ - SSTableWriter rangeWriter = null ; 
+ - String lastkey = null ; 
+ - List < FileStruct > lfs = new ArrayList < FileStruct > ( ) ; 
+ - DataOutputBuffer bufOut = new DataOutputBuffer ( ) ; 
+ - int expectedBloomFilterSize = SSTableReader . getApproximateKeyCount ( sstables ) ; 
+ - expectedBloomFilterSize = ( expectedBloomFilterSize > 0 ) ? expectedBloomFilterSize : SSTableReader . indexInterval ( ) ; 
+ + long startTime = System . currentTimeMillis ( ) ; 
+ + long totalkeysWritten = 0 ; 
+ + 
+ + int expectedBloomFilterSize = Math . max ( SSTableReader . indexInterval ( ) , SSTableReader . getApproximateKeyCount ( sstables ) / 2 ) ; 
+ if ( logger _ . isDebugEnabled ( ) ) 
+ logger _ . debug ( " Expected bloom filter size : " + expectedBloomFilterSize ) ; 
+ - List < ColumnFamily > columnFamilies = new ArrayList < ColumnFamily > ( ) ; 
+ 
+ - while ( pq . size ( ) > 0 | | lfs . size ( ) > 0 ) 
+ + SSTableWriter writer = null ; 
+ + CompactionIterator ci = new CompactionIterator ( sstables ) ; 
+ + 
+ + try 
+ { 
+ - FileStruct fs = null ; 
+ - if ( pq . size ( ) > 0 ) 
+ + if ( ! ci . hasNext ( ) ) 
+ { 
+ - fs = pq . poll ( ) ; 
+ + logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; 
+ + return results ; 
+ } 
+ - if ( fs ! = null 
+ - & & ( lastkey = = null | | lastkey . equals ( fs . getKey ( ) ) ) ) 
+ - { 
+ - / / The keys are the same so we need to add this to the 
+ - / / ldfs list 
+ - lastkey = fs . getKey ( ) ; 
+ - lfs . add ( fs ) ; 
+ - } 
+ - else 
+ + 
+ + while ( ci . hasNext ( ) ) 
+ { 
+ - Collections . sort ( lfs , new FileStructComparator ( ) ) ; 
+ - ColumnFamily columnFamily ; 
+ - bufOut . reset ( ) ; 
+ - if ( lfs . size ( ) > 1 ) 
+ + CompactionIterator . CompactedRow row = ci . next ( ) ; 
+ + if ( Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( row . key ) , ranges ) ) 
+ { 
+ - for ( FileStruct filestruct : lfs ) 
+ - { 
+ - / / We want to add only 2 and resolve them right there in order to save on memory footprint 
+ - if ( columnFamilies . size ( ) > 1 ) 
+ - { 
+ - / / Now merge the 2 column families 
+ - merge ( columnFamilies ) ; 
+ - } 
+ - / / deserialize into column families 
+ - columnFamilies . add ( filestruct . getColumnFamily ( ) ) ; 
+ - } 
+ - / / Now after merging all crap append to the sstable 
+ - columnFamily = resolveAndRemoveDeleted ( columnFamilies ) ; 
+ - columnFamilies . clear ( ) ; 
+ - if ( columnFamily ! = null ) 
+ - { 
+ - ColumnFamily . serializer ( ) . serializeWithIndexes ( columnFamily , bufOut ) ; 
+ - } 
+ - } 
+ - else 
+ - { 
+ - / / TODO deserializing only to reserialize is dumb 
+ - FileStruct filestruct = lfs . get ( 0 ) ; 
+ - ColumnFamily . serializer ( ) . serializeWithIndexes ( filestruct . getColumnFamily ( ) , bufOut ) ; 
+ - } 
+ - if ( Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( lastkey ) , ranges ) ) 
+ - { 
+ - if ( rangeWriter = = null ) 
+ + if ( writer = = null ) 
+ { 
+ if ( target ! = null ) 
+ { 
+ - rangeFileLocation = rangeFileLocation + File . separator + " bootstrap " ; 
+ + compactionFileLocation = compactionFileLocation + File . separator + " bootstrap " ; 
+ } 
+ - FileUtils . createDirectory ( rangeFileLocation ) ; 
+ - String fname = new File ( rangeFileLocation , mergedFileName ) . getAbsolutePath ( ) ; 
+ - rangeWriter = new SSTableWriter ( fname , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; 
+ + FileUtils . createDirectory ( compactionFileLocation ) ; 
+ + String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; 
+ + writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; 
+ } 
+ - rangeWriter . append ( lastkey , bufOut ) ; 
+ - } 
+ - totalkeysWritten + + ; 
+ - for ( FileStruct filestruct : lfs ) 
+ - { 
+ - filestruct . advance ( true ) ; 
+ - if ( filestruct . isExhausted ( ) ) 
+ - { 
+ - continue ; 
+ - } 
+ - / * keep on looping until we find a key in the range * / 
+ - while ( ! Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( filestruct . getKey ( ) ) , ranges ) ) 
+ - { 
+ - filestruct . advance ( true ) ; 
+ - if ( filestruct . isExhausted ( ) ) 
+ - { 
+ - break ; 
+ - } 
+ - } 
+ - if ( ! filestruct . isExhausted ( ) ) 
+ - { 
+ - pq . add ( filestruct ) ; 
+ - } 
+ - totalkeysRead + + ; 
+ - } 
+ - lfs . clear ( ) ; 
+ - lastkey = null ; 
+ - if ( fs ! = null ) 
+ - { 
+ - / / Add back the fs since we processed the rest of 
+ - / / filestructs 
+ - pq . add ( fs ) ; 
+ + writer . append ( row . key , row . buffer ) ; 
+ + totalkeysWritten + + ; 
+ } 
+ } 
+ } 
+ - 
+ - if ( rangeWriter ! = null ) 
+ + finally 
+ { 
+ - results . add ( rangeWriter . closeAndOpenReader ( ) ) ; 
+ + ci . close ( ) ; 
+ } 
+ 
+ - if ( logger _ . isDebugEnabled ( ) ) 
+ + if ( writer ! = null ) 
+ { 
+ - logger _ . debug ( " Total time taken for range split . . . " + ( System . currentTimeMillis ( ) - startTime ) ) ; 
+ - logger _ . debug ( " Total bytes Read for range split . . . " + totalBytesRead ) ; 
+ - logger _ . debug ( " Total bytes written for range split . . . " 
+ - + totalBytesWritten + " Total keys read . . . " + totalkeysRead ) ; 
+ + results . add ( writer . closeAndOpenReader ( ) ) ; 
+ + String format = " AntiCompacted to % s . % d / % d bytes for % d keys . Time : % dms . " ; 
+ + long dTime = System . currentTimeMillis ( ) - startTime ; 
+ + logger _ . info ( String . format ( format , writer . getFilename ( ) , getTotalBytes ( sstables ) , results . get ( 0 ) . length ( ) , totalkeysWritten , dTime ) ) ; 
+ } 
+ + 
+ return results ; 
+ } 
+ 
+ @ @ - 938 , 111 + 835 , 59 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ } 
+ 
+ long startTime = System . currentTimeMillis ( ) ; 
+ - long totalBytesRead = 0 ; 
+ - long totalkeysRead = 0 ; 
+ long totalkeysWritten = 0 ; 
+ - PriorityQueue < FileStruct > pq = initializePriorityQueue ( sstables , null ) ; 
+ - 
+ - if ( pq . isEmpty ( ) ) 
+ - { 
+ - logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; 
+ - / / TODO clean out bad files , if any 
+ - return 0 ; 
+ - } 
+ 
+ - int expectedBloomFilterSize = SSTableReader . getApproximateKeyCount ( sstables ) ; 
+ - if ( expectedBloomFilterSize < 0 ) 
+ - expectedBloomFilterSize = SSTableReader . indexInterval ( ) ; 
+ - String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; 
+ - SSTableWriter writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; 
+ - SSTableReader ssTable = null ; 
+ - String lastkey = null ; 
+ - List < FileStruct > lfs = new ArrayList < FileStruct > ( ) ; 
+ - DataOutputBuffer bufOut = new DataOutputBuffer ( ) ; 
+ + int expectedBloomFilterSize = Math . max ( SSTableReader . indexInterval ( ) , SSTableReader . getApproximateKeyCount ( sstables ) ) ; 
+ if ( logger _ . isDebugEnabled ( ) ) 
+ logger _ . debug ( " Expected bloom filter size : " + expectedBloomFilterSize ) ; 
+ - List < ColumnFamily > columnFamilies = new ArrayList < ColumnFamily > ( ) ; 
+ 
+ - while ( pq . size ( ) > 0 | | lfs . size ( ) > 0 ) 
+ + SSTableWriter writer ; 
+ + CompactionIterator ci = new CompactionIterator ( sstables ) ; 
+ + 
+ + try 
+ { 
+ - FileStruct fs = null ; 
+ - if ( pq . size ( ) > 0 ) 
+ + if ( ! ci . hasNext ( ) ) 
+ { 
+ - fs = pq . poll ( ) ; 
+ + logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; 
+ + return 0 ; 
+ } 
+ - if ( fs ! = null 
+ - & & ( lastkey = = null | | lastkey . equals ( fs . getKey ( ) ) ) ) 
+ - { 
+ - / / The keys are the same so we need to add this to the 
+ - / / ldfs list 
+ - lastkey = fs . getKey ( ) ; 
+ - lfs . add ( fs ) ; 
+ - } 
+ - else 
+ - { 
+ - Collections . sort ( lfs , new FileStructComparator ( ) ) ; 
+ - ColumnFamily columnFamily ; 
+ - bufOut . reset ( ) ; 
+ - if ( lfs . size ( ) > 1 ) 
+ - { 
+ - for ( FileStruct filestruct : lfs ) 
+ - { 
+ - / / We want to add only 2 and resolve them right there in order to save on memory footprint 
+ - if ( columnFamilies . size ( ) > 1 ) 
+ - { 
+ - merge ( columnFamilies ) ; 
+ - } 
+ - / / deserialize into column families 
+ - columnFamilies . add ( filestruct . getColumnFamily ( ) ) ; 
+ - } 
+ - / / Now after merging all crap append to the sstable 
+ - columnFamily = resolveAndRemoveDeleted ( columnFamilies ) ; 
+ - columnFamilies . clear ( ) ; 
+ - if ( columnFamily ! = null ) 
+ - { 
+ - ColumnFamily . serializer ( ) . serializeWithIndexes ( columnFamily , bufOut ) ; 
+ - } 
+ - } 
+ - else 
+ - { 
+ - / / TODO deserializing only to reserialize is dumb 
+ - FileStruct filestruct = lfs . get ( 0 ) ; 
+ - ColumnFamily . serializer ( ) . serializeWithIndexes ( filestruct . getColumnFamily ( ) , bufOut ) ; 
+ - } 
+ 
+ - writer . append ( lastkey , bufOut ) ; 
+ - totalkeysWritten + + ; 
+ + String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; 
+ + writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; 
+ 
+ - for ( FileStruct filestruct : lfs ) 
+ - { 
+ - filestruct . advance ( true ) ; 
+ - if ( filestruct . isExhausted ( ) ) 
+ - { 
+ - continue ; 
+ - } 
+ - pq . add ( filestruct ) ; 
+ - totalkeysRead + + ; 
+ - } 
+ - lfs . clear ( ) ; 
+ - lastkey = null ; 
+ - if ( fs ! = null ) 
+ - { 
+ - / * Add back the fs since we processed the rest of filestructs * / 
+ - pq . add ( fs ) ; 
+ - } 
+ + while ( ci . hasNext ( ) ) 
+ + { 
+ + CompactionIterator . CompactedRow row = ci . next ( ) ; 
+ + writer . append ( row . key , row . buffer ) ; 
+ + totalkeysWritten + + ; 
+ } 
+ } 
+ - ssTable = writer . closeAndOpenReader ( ) ; 
+ + finally 
+ + { 
+ + ci . close ( ) ; 
+ + } 
+ + 
+ + SSTableReader ssTable = writer . closeAndOpenReader ( ) ; 
+ ssTables _ . add ( ssTable ) ; 
+ ssTables _ . markCompacted ( sstables ) ; 
+ CompactionManager . instance ( ) . submit ( ColumnFamilyStore . this ) ; 
+ 
+ - String format = " Compacted to % s . % d / % d bytes for % d / % d keys read / written . Time : % dms . " ; 
+ + String format = " Compacted to % s . % d / % d bytes for % d keys . Time : % dms . " ; 
+ long dTime = System . currentTimeMillis ( ) - startTime ; 
+ - logger _ . info ( String . format ( format , writer . getFilename ( ) , totalBytesRead , ssTable . length ( ) , totalkeysRead , totalkeysWritten , dTime ) ) ; 
+ + logger _ . info ( String . format ( format , writer . getFilename ( ) , getTotalBytes ( sstables ) , ssTable . length ( ) , totalkeysWritten , dTime ) ) ; 
+ return sstables . size ( ) ; 
+ } 
+ 
+ + private long getTotalBytes ( Iterable < SSTableReader > sstables ) 
+ + { 
+ + long sum = 0 ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + { 
+ + sum + = sstable . length ( ) ; 
+ + } 
+ + return sum ; 
+ + } 
+ + 
+ public static List < Memtable > getUnflushedMemtables ( String cfName ) 
+ { 
+ return new ArrayList < Memtable > ( getMemtablesPendingFlushNotNull ( cfName ) ) ; 
+ @ @ - 1341 , 23 + 1186 , 24 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ / / sstables 
+ for ( SSTableReader sstable : ssTables _ ) 
+ { 
+ - final SSTableScanner fs = sstable . getScanner ( ) ; 
+ - fs . seekTo ( startWith ) ; 
+ - iterators . add ( new Iterator < String > ( ) 
+ + final SSTableScanner scanner = sstable . getScanner ( ) ; 
+ + scanner . seekTo ( startWith ) ; 
+ + Iterator < String > iter = new Iterator < String > ( ) 
+ { 
+ public boolean hasNext ( ) 
+ { 
+ - return fs . hasNext ( ) ; 
+ + return scanner . hasNext ( ) ; 
+ } 
+ public String next ( ) 
+ { 
+ - return fs . next ( ) . getKey ( ) ; 
+ + return scanner . next ( ) . getKey ( ) ; 
+ } 
+ public void remove ( ) 
+ { 
+ throw new UnsupportedOperationException ( ) ; 
+ } 
+ - } ) ; 
+ + } ; 
+ + iterators . add ( iter ) ; 
+ } 
+ 
+ Iterator < String > collated = IteratorUtils . collatedIterator ( comparator , iterators ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / FileStructComparator . java b / src / java / org / apache / cassandra / db / FileStructComparator . java 
+ deleted file mode 100644 
+ index e81a992 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / db / FileStructComparator . java 
+ + + + / dev / null 
+ @ @ - 1 , 31 + 0 , 0 @ @ 
+ - / * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , 
+ - * software distributed under the License is distributed on an 
+ - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ - * KIND , either express or implied . See the License for the 
+ - * specific language governing permissions and limitations 
+ - * under the License . 
+ - * / 
+ - package org . apache . cassandra . db ; 
+ - 
+ - import java . util . Comparator ; 
+ - 
+ - import org . apache . cassandra . io . FileStruct ; 
+ - 
+ - class FileStructComparator implements Comparator < FileStruct > 
+ - { 
+ - public int compare ( FileStruct f , FileStruct f2 ) 
+ - { 
+ - return f . getFileName ( ) . compareTo ( f2 . getFileName ( ) ) ; 
+ - } 
+ - } 
+ \ No newline at end of file 
+ diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java 
+ index d88e004 . . 696ae5a 100644 
+ - - - a / src / java / org / apache / cassandra / db / Memtable . java 
+ + + + b / src / java / org / apache / cassandra / db / Memtable . java 
+ @ @ - 153 , 7 + 153 , 7 @ @ public class Memtable implements Comparable < Memtable > 
+ { 
+ int oldSize = oldCf . size ( ) ; 
+ int oldObjectCount = oldCf . getColumnCount ( ) ; 
+ - oldCf . addColumns ( columnFamily ) ; 
+ + oldCf . addAll ( columnFamily ) ; 
+ int newSize = oldCf . size ( ) ; 
+ int newObjectCount = oldCf . getColumnCount ( ) ; 
+ resolveSize ( oldSize , newSize ) ; 
+ diff - - git a / src / java / org / apache / cassandra / io / CompactionIterator . java b / src / java / org / apache / cassandra / io / CompactionIterator . java 
+ new file mode 100644 
+ index 0000000 . . b65e132 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / io / CompactionIterator . java 
+ @ @ - 0 , 0 + 1 , 113 @ @ 
+ + package org . apache . cassandra . io ; 
+ + 
+ + import java . io . Closeable ; 
+ + import java . io . IOException ; 
+ + import java . util . List ; 
+ + import java . util . ArrayList ; 
+ + import java . util . Comparator ; 
+ + 
+ + import org . apache . commons . collections . iterators . CollatingIterator ; 
+ + 
+ + import org . apache . cassandra . utils . ReducingIterator ; 
+ + import org . apache . cassandra . db . ColumnFamily ; 
+ + 
+ + public class CompactionIterator extends ReducingIterator < IteratingRow , CompactionIterator . CompactedRow > implements Closeable 
+ + { 
+ + private final List < IteratingRow > rows = new ArrayList < IteratingRow > ( ) ; 
+ + 
+ + @ SuppressWarnings ( " unchecked " ) 
+ + public CompactionIterator ( Iterable < SSTableReader > sstables ) throws IOException 
+ + { 
+ + super ( getCollatingIterator ( sstables ) ) ; 
+ + } 
+ + 
+ + @ SuppressWarnings ( " unchecked " ) 
+ + private static CollatingIterator getCollatingIterator ( Iterable < SSTableReader > sstables ) throws IOException 
+ + { 
+ + / / CollatingIterator has a bug that causes NPE when you try to use default comparator . : ( 
+ + CollatingIterator iter = new CollatingIterator ( new Comparator ( ) 
+ + { 
+ + public int compare ( Object o1 , Object o2 ) 
+ + { 
+ + return ( ( Comparable ) o1 ) . compareTo ( o2 ) ; 
+ + } 
+ + } ) ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + { 
+ + iter . addIterator ( sstable . getScanner ( ) ) ; 
+ + } 
+ + return iter ; 
+ + } 
+ + 
+ + @ Override 
+ + protected boolean isEqual ( IteratingRow o1 , IteratingRow o2 ) 
+ + { 
+ + return o1 . getKey ( ) . equals ( o2 . getKey ( ) ) ; 
+ + } 
+ + 
+ + public void reduce ( IteratingRow current ) 
+ + { 
+ + rows . add ( current ) ; 
+ + } 
+ + 
+ + protected CompactedRow getReduced ( ) 
+ + { 
+ + try 
+ + { 
+ + return getReducedRaw ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + protected CompactedRow getReducedRaw ( ) throws IOException 
+ + { 
+ + DataOutputBuffer buffer = new DataOutputBuffer ( ) ; 
+ + String key = rows . get ( 0 ) . getKey ( ) ; 
+ + if ( rows . size ( ) > 1 ) 
+ + { 
+ + ColumnFamily cf = null ; 
+ + for ( IteratingRow row : rows ) 
+ + { 
+ + if ( cf = = null ) 
+ + { 
+ + cf = row . getColumnFamily ( ) ; 
+ + } 
+ + else 
+ + { 
+ + cf . addAll ( row . getColumnFamily ( ) ) ; 
+ + } 
+ + } 
+ + ColumnFamily . serializer ( ) . serializeWithIndexes ( cf , buffer ) ; 
+ + } 
+ + else 
+ + { 
+ + assert rows . size ( ) = = 1 ; 
+ + rows . get ( 0 ) . echoData ( buffer ) ; 
+ + } 
+ + rows . clear ( ) ; 
+ + return new CompactedRow ( key , buffer ) ; 
+ + } 
+ + 
+ + public void close ( ) throws IOException 
+ + { 
+ + for ( Object o : ( ( CollatingIterator ) source ) . getIterators ( ) ) 
+ + { 
+ + ( ( SSTableScanner ) o ) . close ( ) ; 
+ + } 
+ + } 
+ + 
+ + public static class CompactedRow 
+ + { 
+ + public final String key ; 
+ + public final DataOutputBuffer buffer ; 
+ + 
+ + public CompactedRow ( String key , DataOutputBuffer buffer ) 
+ + { 
+ + this . key = key ; 
+ + this . buffer = buffer ; 
+ + } 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / io / FileStruct . java b / src / java / org / apache / cassandra / io / FileStruct . java 
+ deleted file mode 100644 
+ index b561239 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / io / FileStruct . java 
+ + + + / dev / null 
+ @ @ - 1 , 195 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . io ; 
+ - 
+ - import java . io . IOException ; 
+ - import java . io . File ; 
+ - import java . util . Iterator ; 
+ - 
+ - import org . apache . cassandra . db . IColumn ; 
+ - import org . apache . cassandra . db . ColumnFamily ; 
+ - import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - 
+ - import org . apache . log4j . Logger ; 
+ - import com . google . common . collect . AbstractIterator ; 
+ - 
+ - 
+ - public class FileStruct implements Comparable < FileStruct > , Iterator < String > 
+ - { 
+ - private static Logger logger = Logger . getLogger ( FileStruct . class ) ; 
+ - 
+ - private IteratingRow row ; 
+ - private boolean exhausted = false ; 
+ - private BufferedRandomAccessFile file ; 
+ - private SSTableReader sstable ; 
+ - private FileStructIterator iterator ; 
+ - 
+ - FileStruct ( SSTableReader sstable ) throws IOException 
+ - { 
+ - / / TODO this is used for both compactions and key ranges . the buffer sizes we want 
+ - / / to use for these ops are very different . here we are leaning towards the key - range 
+ - / / use case since that is more common . What we really want is to split those 
+ - / / two uses of this class up . 
+ - this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , 256 * 1024 ) ; 
+ - this . sstable = sstable ; 
+ - } 
+ - 
+ - public String getFileName ( ) 
+ - { 
+ - return file . getPath ( ) ; 
+ - } 
+ - 
+ - public void close ( ) throws IOException 
+ - { 
+ - file . close ( ) ; 
+ - } 
+ - 
+ - public boolean isExhausted ( ) 
+ - { 
+ - return exhausted ; 
+ - } 
+ - 
+ - public String getKey ( ) 
+ - { 
+ - return row . getKey ( ) ; 
+ - } 
+ - 
+ - public ColumnFamily getColumnFamily ( ) 
+ - { 
+ - return row . getEmptyColumnFamily ( ) ; 
+ - } 
+ - 
+ - public int compareTo ( FileStruct f ) 
+ - { 
+ - return sstable . getPartitioner ( ) . getDecoratedKeyComparator ( ) . compare ( getKey ( ) , f . getKey ( ) ) ; 
+ - } 
+ - 
+ - public void seekTo ( String seekKey ) 
+ - { 
+ - try 
+ - { 
+ - long position = sstable . getNearestPosition ( seekKey ) ; 
+ - if ( position < 0 ) 
+ - { 
+ - exhausted = true ; 
+ - return ; 
+ - } 
+ - file . seek ( position ) ; 
+ - advance ( false ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( " corrupt sstable " , e ) ; 
+ - } 
+ - } 
+ - 
+ - / * 
+ - * Read the next key from the data file . 
+ - * Caller must check isExhausted after each call to see if further 
+ - * reads are valid . 
+ - * Do not mix with calls to the iterator interface ( next / hasnext ) . 
+ - * @ deprecated - - prefer the iterator interface . 
+ - * / 
+ - public void advance ( boolean materialize ) throws IOException 
+ - { 
+ - / / TODO r / m materialize option - - use iterableness ! 
+ - if ( exhausted ) 
+ - { 
+ - throw new IndexOutOfBoundsException ( ) ; 
+ - } 
+ - 
+ - if ( file . isEOF ( ) ) 
+ - { 
+ - file . close ( ) ; 
+ - exhausted = true ; 
+ - return ; 
+ - } 
+ - 
+ - row = new IteratingRow ( file , sstable ) ; 
+ - if ( materialize ) 
+ - { 
+ - while ( row . hasNext ( ) ) 
+ - { 
+ - IColumn column = row . next ( ) ; 
+ - row . getEmptyColumnFamily ( ) . addColumn ( column ) ; 
+ - } 
+ - } 
+ - else 
+ - { 
+ - row . skipRemaining ( ) ; 
+ - } 
+ - } 
+ - 
+ - public boolean hasNext ( ) 
+ - { 
+ - if ( iterator = = null ) 
+ - iterator = new FileStructIterator ( ) ; 
+ - return iterator . hasNext ( ) ; 
+ - } 
+ - 
+ - / * * do not mix with manual calls to advance ( ) . * / 
+ - public String next ( ) 
+ - { 
+ - if ( iterator = = null ) 
+ - iterator = new FileStructIterator ( ) ; 
+ - return iterator . next ( ) ; 
+ - } 
+ - 
+ - public void remove ( ) 
+ - { 
+ - throw new UnsupportedOperationException ( ) ; 
+ - } 
+ - 
+ - private class FileStructIterator extends AbstractIterator < String > 
+ - { 
+ - public FileStructIterator ( ) 
+ - { 
+ - if ( row = = null ) 
+ - { 
+ - if ( ! isExhausted ( ) ) 
+ - { 
+ - forward ( ) ; 
+ - } 
+ - } 
+ - } 
+ - 
+ - private void forward ( ) 
+ - { 
+ - try 
+ - { 
+ - advance ( false ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ - } 
+ - 
+ - protected String computeNext ( ) 
+ - { 
+ - if ( isExhausted ( ) ) 
+ - { 
+ - return endOfData ( ) ; 
+ - } 
+ - String oldKey = getKey ( ) ; 
+ - forward ( ) ; 
+ - return oldKey ; 
+ - } 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / io / IteratingRow . java b / src / java / org / apache / cassandra / io / IteratingRow . java 
+ index 5ace95f . . 628fe50 100644 
+ - - - a / src / java / org / apache / cassandra / io / IteratingRow . java 
+ + + + b / src / java / org / apache / cassandra / io / IteratingRow . java 
+ @ @ - 37 , 7 + 37 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl 
+ { 
+ private final String key ; 
+ private final long finishedAt ; 
+ - private final ColumnFamily emptyColumnFamily ; 
+ private final BufferedRandomAccessFile file ; 
+ private SSTableReader sstable ; 
+ private long dataStart ; 
+ @ @ - 51 , 10 + 50 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl 
+ int dataSize = file . readInt ( ) ; 
+ dataStart = file . getFilePointer ( ) ; 
+ finishedAt = dataStart + dataSize ; 
+ - / / legacy stuff to support FileStruct : 
+ - IndexHelper . skipBloomFilterAndIndex ( file ) ; 
+ - emptyColumnFamily = ColumnFamily . serializer ( ) . deserializeFromSSTableNoColumns ( sstable . makeColumnFamily ( ) , file ) ; 
+ - file . readInt ( ) ; 
+ } 
+ 
+ public String getKey ( ) 
+ @ @ - 62 , 11 + 57 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl 
+ return key ; 
+ } 
+ 
+ - public ColumnFamily getEmptyColumnFamily ( ) 
+ - { 
+ - return emptyColumnFamily ; 
+ - } 
+ - 
+ public void echoData ( DataOutput out ) throws IOException 
+ { 
+ file . seek ( dataStart ) ; 
+ diff - - git a / src / java / org / apache / cassandra / io / SSTableReader . java b / src / java / org / apache / cassandra / io / SSTableReader . java 
+ index fc94fca . . 81a71fd 100644 
+ - - - a / src / java / org / apache / cassandra / io / SSTableReader . java 
+ + + + b / src / java / org / apache / cassandra / io / SSTableReader . java 
+ @ @ - 333 , 11 + 333 , 6 @ @ public class SSTableReader extends SSTable implements Comparable < SSTableReader > 
+ return partitioner ; 
+ } 
+ 
+ - public FileStruct getFileStruct ( ) throws IOException 
+ - { 
+ - return new FileStruct ( this ) ; 
+ - } 
+ - 
+ public SSTableScanner getScanner ( ) throws IOException 
+ { 
+ return new SSTableScanner ( this ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java b / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java 
+ index 40e5889 . . 4219ff9 100644 
+ - - - a / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java 
+ @ @ - 20 , 8 + 20 , 6 @ @ package org . apache . cassandra . db ; 
+ 
+ import java . io . IOException ; 
+ import java . util . Arrays ; 
+ - import java . util . HashSet ; 
+ - import java . util . Random ; 
+ import java . util . TreeMap ; 
+ 
+ import org . junit . Test ; 
+ @ @ - 125 , 8 + 123 , 8 @ @ public class ColumnFamilyTest 
+ cf _ old . addColumn ( QueryPath . column ( " col2 " . getBytes ( ) ) , val2 , 1 ) ; 
+ cf _ old . addColumn ( QueryPath . column ( " col3 " . getBytes ( ) ) , val2 , 2 ) ; 
+ 
+ - cf _ result . addColumns ( cf _ new ) ; 
+ - cf _ result . addColumns ( cf _ old ) ; 
+ + cf _ result . addAll ( cf _ new ) ; 
+ + cf _ result . addAll ( cf _ old ) ; 
+ 
+ assert 3 = = cf _ result . getColumnCount ( ) : " Count is " + cf _ new . getColumnCount ( ) ; 
+ / / addcolumns will only add if timestamp > = old timestamp

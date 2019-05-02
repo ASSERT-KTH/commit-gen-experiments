@@ -1,0 +1,1119 @@
+BLEU SCORE: 0.004137511999313648
+
+TEST MSG: Resumable bootstrap streaming
+GENERATED MSG: Bulk loader is no longer a fat client , hadoop bulk loader output format .
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index c07599a . . 955d8e3 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 71 , 6 + 71 , 7 @ @ <nl> * Select optimal CRC32 implementation at runtime ( CASSANDRA - 8614 ) <nl> * Evaluate MurmurHash of Token once per query ( CASSANDRA - 7096 ) <nl> * Generalize progress reporting ( CASSANDRA - 8901 ) <nl> + * Resumable bootstrap streaming ( CASSANDRA - 8838 ) <nl> <nl> 2 . 1 . 4 <nl> * Use correct bounds for page cache eviction of compressed files ( CASSANDRA - 8746 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / SystemKeyspace . java b / src / java / org / apache / cassandra / db / SystemKeyspace . java <nl> index dcd0e55 . . 9fa3c6b 100644 <nl> - - - a / src / java / org / apache / cassandra / db / SystemKeyspace . java <nl> + + + b / src / java / org / apache / cassandra / db / SystemKeyspace . java <nl> @ @ - 18 , 6 + 18 , 7 @ @ <nl> package org . apache . cassandra . db ; <nl> <nl> import java . io . DataInputStream ; <nl> + import java . io . IOError ; <nl> import java . io . IOException ; <nl> import java . net . InetAddress ; <nl> import java . nio . ByteBuffer ; <nl> @ @ - 27 , 6 + 28 , 7 @ @ import javax . management . openmbean . * ; <nl> <nl> import com . google . common . base . Function ; <nl> import com . google . common . collect . * ; <nl> + import com . google . common . io . ByteStreams ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 35 , 12 + 37 , 13 @ @ import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . config . KSMetaData ; <nl> import org . apache . cassandra . cql3 . QueryProcessor ; <nl> import org . apache . cassandra . cql3 . UntypedResultSet ; <nl> - import org . apache . cassandra . db . compaction . CompactionHistoryTabularData ; <nl> import org . apache . cassandra . db . commitlog . ReplayPosition ; <nl> + import org . apache . cassandra . db . compaction . CompactionHistoryTabularData ; <nl> import org . apache . cassandra . db . compaction . LeveledCompactionStrategy ; <nl> import org . apache . cassandra . db . composites . Composite ; <nl> import org . apache . cassandra . db . filter . QueryFilter ; <nl> import org . apache . cassandra . db . marshal . * ; <nl> + import org . apache . cassandra . dht . IPartitioner ; <nl> import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . exceptions . ConfigurationException ; <nl> @ @ - 49 , 6 + 52 , 7 @ @ import org . apache . cassandra . io . util . DataOutputBuffer ; <nl> import org . apache . cassandra . locator . IEndpointSnitch ; <nl> import org . apache . cassandra . locator . LocalStrategy ; <nl> import org . apache . cassandra . metrics . RestorableMeter ; <nl> + import org . apache . cassandra . net . MessagingService ; <nl> import org . apache . cassandra . schema . LegacySchemaTables ; <nl> import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . service . paxos . Commit ; <nl> @ @ - 78 , 6 + 82 , 7 @ @ public final class SystemKeyspace <nl> public static final String COMPACTION _ HISTORY = " compaction _ history " ; <nl> public static final String SSTABLE _ ACTIVITY = " sstable _ activity " ; <nl> public static final String SIZE _ ESTIMATES = " size _ estimates " ; <nl> + public static final String AVAILABLE _ RANGES = " available _ ranges " ; <nl> <nl> public static final CFMetaData Hints = <nl> compile ( HINTS , <nl> @ @ - 218 , 7 + 223 , 7 @ @ public final class SystemKeyspace <nl> private static final CFMetaData SizeEstimates = <nl> compile ( SIZE _ ESTIMATES , <nl> " per - table primary range size estimates " , <nl> - " CREATE TABLE % S ( " <nl> + " CREATE TABLE % s ( " <nl> + " keyspace _ name text , " <nl> + " table _ name text , " <nl> + " range _ start text , " <nl> @ @ - 228 , 6 + 233 , 14 @ @ public final class SystemKeyspace <nl> + " PRIMARY KEY ( ( keyspace _ name ) , table _ name , range _ start , range _ end ) ) " ) <nl> . gcGraceSeconds ( 0 ) ; <nl> <nl> + private static final CFMetaData AvailableRanges = <nl> + compile ( AVAILABLE _ RANGES , <nl> + " Available keyspace / ranges during bootstrap / replace that are ready to be served " , <nl> + " CREATE TABLE % s ( " <nl> + + " keyspace _ name text PRIMARY KEY , " <nl> + + " ranges set < blob > " <nl> + + " ) " ) ; <nl> + <nl> private static CFMetaData compile ( String name , String description , String schema ) <nl> { <nl> return CFMetaData . compile ( String . format ( schema , name ) , NAME ) <nl> @ @ - 249 , 7 + 262 , 8 @ @ public final class SystemKeyspace <nl> CompactionsInProgress , <nl> CompactionHistory , <nl> SSTableActivity , <nl> - SizeEstimates ) ) ; <nl> + SizeEstimates , <nl> + AvailableRanges ) ) ; <nl> return new KSMetaData ( NAME , LocalStrategy . class , Collections . < String , String > emptyMap ( ) , true , tables ) ; <nl> } <nl> <nl> @ @ - 954 , 4 + 968 , 67 @ @ public final class SystemKeyspace <nl> String cql = String . format ( " DELETE FROM % s . % s WHERE keyspace _ name = ? AND table _ name = ? " , NAME , SIZE _ ESTIMATES ) ; <nl> executeInternal ( cql , keyspace , table ) ; <nl> } <nl> + <nl> + public static synchronized void updateAvailableRanges ( String keyspace , Collection < Range < Token > > completedRanges ) <nl> + { <nl> + String cql = " UPDATE system . % s SET ranges = ranges + ? WHERE keyspace _ name = ? " ; <nl> + Set < ByteBuffer > rangesToUpdate = new HashSet < > ( completedRanges . size ( ) ) ; <nl> + for ( Range < Token > range : completedRanges ) <nl> + { <nl> + rangesToUpdate . add ( rangeToBytes ( range ) ) ; <nl> + } <nl> + executeInternal ( String . format ( cql , AVAILABLE _ RANGES ) , rangesToUpdate , keyspace ) ; <nl> + } <nl> + <nl> + public static synchronized Set < Range < Token > > getAvailableRanges ( String keyspace , IPartitioner partitioner ) <nl> + { <nl> + Set < Range < Token > > result = new HashSet < > ( ) ; <nl> + String query = " SELECT * FROM system . % s WHERE keyspace _ name = ? " ; <nl> + UntypedResultSet rs = executeInternal ( String . format ( query , AVAILABLE _ RANGES ) , keyspace ) ; <nl> + for ( UntypedResultSet . Row row : rs ) <nl> + { <nl> + Set < ByteBuffer > rawRanges = row . getSet ( " ranges " , BytesType . instance ) ; <nl> + for ( ByteBuffer rawRange : rawRanges ) <nl> + { <nl> + result . add ( byteBufferToRange ( rawRange , partitioner ) ) ; <nl> + } <nl> + } <nl> + return ImmutableSet . copyOf ( result ) ; <nl> + } <nl> + <nl> + public static void resetAvailableRanges ( ) <nl> + { <nl> + ColumnFamilyStore availableRanges = Keyspace . open ( NAME ) . getColumnFamilyStore ( AVAILABLE _ RANGES ) ; <nl> + availableRanges . truncateBlocking ( ) ; <nl> + } <nl> + <nl> + private static ByteBuffer rangeToBytes ( Range < Token > range ) <nl> + { <nl> + try <nl> + { <nl> + DataOutputBuffer out = new DataOutputBuffer ( ) ; <nl> + Range . tokenSerializer . serialize ( range , out , MessagingService . VERSION _ 30 ) ; <nl> + return out . asByteBuffer ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + } <nl> + <nl> + @ SuppressWarnings ( " unchecked " ) <nl> + private static Range < Token > byteBufferToRange ( ByteBuffer rawRange , IPartitioner partitioner ) <nl> + { <nl> + try <nl> + { <nl> + return ( Range < Token > ) Range . tokenSerializer . deserialize ( ByteStreams . newDataInput ( ByteBufferUtil . getArray ( rawRange ) ) , <nl> + partitioner , <nl> + MessagingService . VERSION _ 30 ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + } <nl> + <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / dht / BootStrapper . java b / src / java / org / apache / cassandra / dht / BootStrapper . java <nl> index cbbd100 . . 8f52f7e 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / BootStrapper . java <nl> + + + b / src / java / org / apache / cassandra / dht / BootStrapper . java <nl> @ @ - 55 , 15 + 55 , 20 @ @ public class BootStrapper <nl> <nl> this . address = address ; <nl> this . tokens = tokens ; <nl> - tokenMetadata = tmd ; <nl> + this . tokenMetadata = tmd ; <nl> } <nl> <nl> - public void bootstrap ( ) <nl> + public void bootstrap ( StreamStateStore stateStore , boolean useStrictConsistency ) <nl> { <nl> - if ( logger . isDebugEnabled ( ) ) <nl> - logger . debug ( " Beginning bootstrap process " ) ; <nl> - <nl> - RangeStreamer streamer = new RangeStreamer ( tokenMetadata , tokens , address , " Bootstrap " ) ; <nl> + logger . debug ( " Beginning bootstrap process " ) ; <nl> + <nl> + RangeStreamer streamer = new RangeStreamer ( tokenMetadata , <nl> + tokens , <nl> + address , <nl> + " Bootstrap " , <nl> + useStrictConsistency , <nl> + DatabaseDescriptor . getEndpointSnitch ( ) , <nl> + stateStore ) ; <nl> streamer . addSourceFilter ( new RangeStreamer . FailureDetectorSourceFilter ( FailureDetector . instance ) ) ; <nl> <nl> for ( String keyspaceName : Schema . instance . getNonSystemKeyspaces ( ) ) <nl> @ @ - 83 , 7 + 88 , 7 @ @ public class BootStrapper <nl> } <nl> catch ( ExecutionException e ) <nl> { <nl> - throw new RuntimeException ( " Error during boostrap : " + e . getCause ( ) . getMessage ( ) , e . getCause ( ) ) ; <nl> + throw new RuntimeException ( " Error during bootstrap : " + e . getCause ( ) . getMessage ( ) , e . getCause ( ) ) ; <nl> } <nl> } <nl> <nl> @ @ - 99 , 7 + 104 , 7 @ @ public class BootStrapper <nl> if ( initialTokens . size ( ) > 0 ) <nl> { <nl> logger . debug ( " tokens manually specified as { } " , initialTokens ) ; <nl> - List < Token > tokens = new ArrayList < Token > ( initialTokens . size ( ) ) ; <nl> + List < Token > tokens = new ArrayList < > ( initialTokens . size ( ) ) ; <nl> for ( String tokenString : initialTokens ) <nl> { <nl> Token token = StorageService . getPartitioner ( ) . getTokenFactory ( ) . fromString ( tokenString ) ; <nl> @ @ - 122 , 7 + 127 , 7 @ @ public class BootStrapper <nl> <nl> public static Collection < Token > getRandomTokens ( TokenMetadata metadata , int numTokens ) <nl> { <nl> - Set < Token > tokens = new HashSet < Token > ( numTokens ) ; <nl> + Set < Token > tokens = new HashSet < > ( numTokens ) ; <nl> while ( tokens . size ( ) < numTokens ) <nl> { <nl> Token token = StorageService . getPartitioner ( ) . getRandomToken ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / dht / RangeStreamer . java b / src / java / org / apache / cassandra / dht / RangeStreamer . java <nl> index 72679cc . . fecb308 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / RangeStreamer . java <nl> + + + b / src / java / org / apache / cassandra / dht / RangeStreamer . java <nl> @ @ - 20 , 24 + 20 , 24 @ @ package org . apache . cassandra . dht ; <nl> import java . net . InetAddress ; <nl> import java . util . * ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . collect . ArrayListMultimap ; <nl> import com . google . common . collect . HashMultimap ; <nl> import com . google . common . collect . Multimap ; <nl> import com . google . common . collect . Sets ; <nl> - import org . apache . cassandra . gms . EndpointState ; <nl> import org . apache . commons . lang3 . StringUtils ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> - import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . Keyspace ; <nl> import org . apache . cassandra . db . SystemKeyspace ; <nl> - import org . apache . cassandra . gms . FailureDetector ; <nl> + import org . apache . cassandra . gms . EndpointState ; <nl> import org . apache . cassandra . gms . Gossiper ; <nl> import org . apache . cassandra . gms . IFailureDetector ; <nl> import org . apache . cassandra . locator . AbstractReplicationStrategy ; <nl> import org . apache . cassandra . locator . IEndpointSnitch ; <nl> import org . apache . cassandra . locator . TokenMetadata ; <nl> + import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . streaming . StreamPlan ; <nl> import org . apache . cassandra . streaming . StreamResultFuture ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> @ @ - 48 , 14 + 48 , 21 @ @ import org . apache . cassandra . utils . FBUtilities ; <nl> public class RangeStreamer <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( RangeStreamer . class ) ; <nl> - public static final boolean useStrictConsistency = Boolean . parseBoolean ( System . getProperty ( " cassandra . consistent . rangemovement " , " true " ) ) ; <nl> + <nl> + / * bootstrap tokens . can be null if replacing the node . * / <nl> private final Collection < Token > tokens ; <nl> + / * current token ring * / <nl> private final TokenMetadata metadata ; <nl> + / * address of this node * / <nl> private final InetAddress address ; <nl> + / * streaming description * / <nl> private final String description ; <nl> private final Multimap < String , Map . Entry < InetAddress , Collection < Range < Token > > > > toFetch = HashMultimap . create ( ) ; <nl> - private final Set < ISourceFilter > sourceFilters = new HashSet < ISourceFilter > ( ) ; <nl> + private final Set < ISourceFilter > sourceFilters = new HashSet < > ( ) ; <nl> private final StreamPlan streamPlan ; <nl> + private final boolean useStrictConsistency ; <nl> + private final IEndpointSnitch snitch ; <nl> + private final StreamStateStore stateStore ; <nl> <nl> / * * <nl> * A filter applied to sources to stream from when constructing a fetch map . <nl> @ @ - 104 , 18 + 111 , 23 @ @ public class RangeStreamer <nl> } <nl> } <nl> <nl> - public RangeStreamer ( TokenMetadata metadata , Collection < Token > tokens , InetAddress address , String description ) <nl> + public RangeStreamer ( TokenMetadata metadata , <nl> + Collection < Token > tokens , <nl> + InetAddress address , <nl> + String description , <nl> + boolean useStrictConsistency , <nl> + IEndpointSnitch snitch , <nl> + StreamStateStore stateStore ) <nl> { <nl> this . metadata = metadata ; <nl> this . tokens = tokens ; <nl> this . address = address ; <nl> this . description = description ; <nl> this . streamPlan = new StreamPlan ( description , true ) ; <nl> - } <nl> - <nl> - public RangeStreamer ( TokenMetadata metadata , InetAddress address , String description ) <nl> - { <nl> - this ( metadata , null , address , description ) ; <nl> + this . useStrictConsistency = useStrictConsistency ; <nl> + this . snitch = snitch ; <nl> + this . stateStore = stateStore ; <nl> + streamPlan . listeners ( this . stateStore ) ; <nl> } <nl> <nl> public void addSourceFilter ( ISourceFilter filter ) <nl> @ @ - 123 , 6 + 135 , 12 @ @ public class RangeStreamer <nl> sourceFilters . add ( filter ) ; <nl> } <nl> <nl> + / * * <nl> + * Add ranges to be streamed for given keyspace . <nl> + * <nl> + * @ param keyspaceName keyspace name <nl> + * @ param ranges ranges to be streamed <nl> + * / <nl> public void addRanges ( String keyspaceName , Collection < Range < Token > > ranges ) <nl> { <nl> Multimap < Range < Token > , InetAddress > rangesForKeyspace = useStrictSourcesForRanges ( keyspaceName ) <nl> @ @ - 145 , 11 + 163 , 14 @ @ public class RangeStreamer <nl> } <nl> } <nl> <nl> + / * * <nl> + * @ param keyspaceName keyspace name to check <nl> + * @ return true when the node is bootstrapping , useStrictConsistency is true and # of nodes in the cluster is more than # of replica <nl> + * / <nl> private boolean useStrictSourcesForRanges ( String keyspaceName ) <nl> { <nl> AbstractReplicationStrategy strat = Keyspace . open ( keyspaceName ) . getReplicationStrategy ( ) ; <nl> - return ! DatabaseDescriptor . isReplacing ( ) <nl> - & & useStrictConsistency <nl> + return useStrictConsistency <nl> & & tokens ! = null <nl> & & metadata . getAllEndpoints ( ) . size ( ) ! = strat . getReplicationFactor ( ) ; <nl> } <nl> @ @ - 157 , 6 + 178 , 8 @ @ public class RangeStreamer <nl> / * * <nl> * Get a map of all ranges and their respective sources that are candidates for streaming the given ranges <nl> * to us . For each range , the list of sources is sorted by proximity relative to the given destAddress . <nl> + * <nl> + * @ throws java . lang . IllegalStateException when there is no source to get data streamed <nl> * / <nl> private Multimap < Range < Token > , InetAddress > getAllRangesWithSourcesFor ( String keyspaceName , Collection < Range < Token > > desiredRanges ) <nl> { <nl> @ @ - 170 , 7 + 193 , 7 @ @ public class RangeStreamer <nl> { <nl> if ( range . contains ( desiredRange ) ) <nl> { <nl> - List < InetAddress > preferred = DatabaseDescriptor . getEndpointSnitch ( ) . getSortedListByProximity ( address , rangeAddresses . get ( range ) ) ; <nl> + List < InetAddress > preferred = snitch . getSortedListByProximity ( address , rangeAddresses . get ( range ) ) ; <nl> rangeSources . putAll ( desiredRange , preferred ) ; <nl> break ; <nl> } <nl> @ @ - 187 , 22 + 210 , 23 @ @ public class RangeStreamer <nl> * Get a map of all ranges and the source that will be cleaned up once this bootstrapped node is added for the given ranges . <nl> * For each range , the list should only contain a single source . This allows us to consistently migrate data without violating <nl> * consistency . <nl> + * <nl> + * @ throws java . lang . IllegalStateException when there is no source to get data streamed , or more than 1 source found . <nl> * / <nl> - private Multimap < Range < Token > , InetAddress > getAllRangesWithStrictSourcesFor ( String table , Collection < Range < Token > > desiredRanges ) <nl> + private Multimap < Range < Token > , InetAddress > getAllRangesWithStrictSourcesFor ( String keyspace , Collection < Range < Token > > desiredRanges ) <nl> { <nl> - <nl> assert tokens ! = null ; <nl> - AbstractReplicationStrategy strat = Keyspace . open ( table ) . getReplicationStrategy ( ) ; <nl> + AbstractReplicationStrategy strat = Keyspace . open ( keyspace ) . getReplicationStrategy ( ) ; <nl> <nl> - / / Active ranges <nl> + / / Active ranges <nl> TokenMetadata metadataClone = metadata . cloneOnlyTokenMap ( ) ; <nl> - Multimap < Range < Token > , InetAddress > addressRanges = strat . getRangeAddresses ( metadataClone ) ; <nl> + Multimap < Range < Token > , InetAddress > addressRanges = strat . getRangeAddresses ( metadataClone ) ; <nl> <nl> - / / Pending ranges <nl> + / / Pending ranges <nl> metadataClone . updateNormalTokens ( tokens , address ) ; <nl> - Multimap < Range < Token > , InetAddress > pendingRangeAddresses = strat . getRangeAddresses ( metadataClone ) ; <nl> + Multimap < Range < Token > , InetAddress > pendingRangeAddresses = strat . getRangeAddresses ( metadataClone ) ; <nl> <nl> - / / Collects the source that will have its range moved to the new node <nl> + / / Collects the source that will have its range moved to the new node <nl> Multimap < Range < Token > , InetAddress > rangeSources = ArrayListMultimap . create ( ) ; <nl> <nl> for ( Range < Token > desiredRange : desiredRanges ) <nl> @ @ - 214 , 8 + 238 , 8 @ @ public class RangeStreamer <nl> Set < InetAddress > oldEndpoints = Sets . newHashSet ( preEntry . getValue ( ) ) ; <nl> Set < InetAddress > newEndpoints = Sets . newHashSet ( pendingRangeAddresses . get ( desiredRange ) ) ; <nl> <nl> - / / Due to CASSANDRA - 5953 we can have a higher RF then we have endpoints . <nl> - / / So we need to be careful to only be strict when endpoints = = RF <nl> + / / Due to CASSANDRA - 5953 we can have a higher RF then we have endpoints . <nl> + / / So we need to be careful to only be strict when endpoints = = RF <nl> if ( oldEndpoints . size ( ) = = strat . getReplicationFactor ( ) ) <nl> { <nl> oldEndpoints . removeAll ( newEndpoints ) ; <nl> @ @ - 226 , 7 + 250 , 7 @ @ public class RangeStreamer <nl> } <nl> } <nl> <nl> - / / Validate <nl> + / / Validate <nl> Collection < InetAddress > addressList = rangeSources . get ( desiredRange ) ; <nl> if ( addressList = = null | | addressList . isEmpty ( ) ) <nl> throw new IllegalStateException ( " No sources found for " + desiredRange ) ; <nl> @ @ - 237 , 7 + 261 , 8 @ @ public class RangeStreamer <nl> InetAddress sourceIp = addressList . iterator ( ) . next ( ) ; <nl> EndpointState sourceState = Gossiper . instance . getEndpointStateForEndpoint ( sourceIp ) ; <nl> if ( Gossiper . instance . isEnabled ( ) & & ( sourceState = = null | | ! sourceState . isAlive ( ) ) ) <nl> - throw new RuntimeException ( " A node required to move the data consistently is down ( " + sourceIp + " ) . If you wish to move the data from a potentially inconsistent replica , restart the node with - Dcassandra . consistent . rangemovement = false " ) ; <nl> + throw new RuntimeException ( " A node required to move the data consistently is down ( " + sourceIp + " ) . " + <nl> + " If you wish to move the data from a potentially inconsistent replica , restart the node with - Dcassandra . consistent . rangemovement = false " ) ; <nl> } <nl> <nl> return rangeSources ; <nl> @ @ - 247 , 7 + 272 , 8 @ @ public class RangeStreamer <nl> * @ param rangesWithSources The ranges we want to fetch ( key ) and their potential sources ( value ) <nl> * @ param sourceFilters A ( possibly empty ) collection of source filters to apply . In addition to any filters given <nl> * here , we always exclude ourselves . <nl> - * @ return <nl> + * @ param keyspace keyspace name <nl> + * @ return Map of source endpoint to collection of ranges <nl> * / <nl> private static Multimap < InetAddress , Range < Token > > getRangeFetchMap ( Multimap < Range < Token > , InetAddress > rangesWithSources , <nl> Collection < ISourceFilter > sourceFilters , String keyspace ) <nl> @ @ - 285 , 12 + 311 , 13 @ @ public class RangeStreamer <nl> return rangeFetchMapMap ; <nl> } <nl> <nl> - public static Multimap < InetAddress , Range < Token > > getWorkMap ( Multimap < Range < Token > , InetAddress > rangesWithSourceTarget , String keyspace ) <nl> + public static Multimap < InetAddress , Range < Token > > getWorkMap ( Multimap < Range < Token > , InetAddress > rangesWithSourceTarget , String keyspace , IFailureDetector fd ) <nl> { <nl> - return getRangeFetchMap ( rangesWithSourceTarget , Collections . < ISourceFilter > singleton ( new FailureDetectorSourceFilter ( FailureDetector . instance ) ) , keyspace ) ; <nl> + return getRangeFetchMap ( rangesWithSourceTarget , Collections . < ISourceFilter > singleton ( new FailureDetectorSourceFilter ( fd ) ) , keyspace ) ; <nl> } <nl> <nl> / / For testing purposes <nl> + @ VisibleForTesting <nl> Multimap < String , Map . Entry < InetAddress , Collection < Range < Token > > > > toFetch ( ) <nl> { <nl> return toFetch ; <nl> @ @ - 304 , 9 + 331 , 17 @ @ public class RangeStreamer <nl> InetAddress source = entry . getValue ( ) . getKey ( ) ; <nl> InetAddress preferred = SystemKeyspace . getPreferredIP ( source ) ; <nl> Collection < Range < Token > > ranges = entry . getValue ( ) . getValue ( ) ; <nl> - / * Send messages to respective folks to stream data over to me * / <nl> + <nl> + / / filter out already streamed ranges <nl> + Set < Range < Token > > availableRanges = stateStore . getAvailableRanges ( keyspace , StorageService . getPartitioner ( ) ) ; <nl> + if ( ranges . removeAll ( availableRanges ) ) <nl> + { <nl> + logger . info ( availableRanges + " already available . Skipping streaming . " ) ; <nl> + } <nl> + <nl> if ( logger . isDebugEnabled ( ) ) <nl> logger . debug ( " { } ing from { } ranges { } " , description , source , StringUtils . join ( ranges , " , " ) ) ; <nl> + / * Send messages to respective folks to stream data over to me * / <nl> streamPlan . requestRanges ( source , preferred , keyspace , ranges ) ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / dht / StreamStateStore . java b / src / java / org / apache / cassandra / dht / StreamStateStore . java <nl> new file mode 100644 <nl> index 0000000 . . f6046aa <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / dht / StreamStateStore . java <nl> @ @ - 0 , 0 + 1 , 82 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . dht ; <nl> + <nl> + import java . util . Set ; <nl> + <nl> + import org . apache . cassandra . db . SystemKeyspace ; <nl> + import org . apache . cassandra . streaming . StreamEvent ; <nl> + import org . apache . cassandra . streaming . StreamEventHandler ; <nl> + import org . apache . cassandra . streaming . StreamRequest ; <nl> + import org . apache . cassandra . streaming . StreamState ; <nl> + <nl> + / * * <nl> + * Store and update available ranges ( data already received ) to system keyspace . <nl> + * / <nl> + public class StreamStateStore implements StreamEventHandler <nl> + { <nl> + public Set < Range < Token > > getAvailableRanges ( String keyspace , IPartitioner partitioner ) <nl> + { <nl> + return SystemKeyspace . getAvailableRanges ( keyspace , partitioner ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Check if given token ' s data is available in this node . <nl> + * <nl> + * @ param keyspace keyspace name <nl> + * @ param token token to check <nl> + * @ return true if given token in the keyspace is already streamed and ready to be served . <nl> + * / <nl> + public boolean isDataAvailable ( String keyspace , Token token ) <nl> + { <nl> + Set < Range < Token > > availableRanges = getAvailableRanges ( keyspace , token . getPartitioner ( ) ) ; <nl> + for ( Range < Token > range : availableRanges ) <nl> + { <nl> + if ( range . contains ( token ) ) <nl> + return true ; <nl> + } <nl> + return false ; <nl> + } <nl> + <nl> + / * * <nl> + * When StreamSession completes , make all keyspaces / ranges in session available to be served . <nl> + * <nl> + * @ param event Stream event . <nl> + * / <nl> + @ Override <nl> + public void handleStreamEvent ( StreamEvent event ) <nl> + { <nl> + if ( event . eventType = = StreamEvent . Type . STREAM _ COMPLETE ) <nl> + { <nl> + StreamEvent . SessionCompleteEvent se = ( StreamEvent . SessionCompleteEvent ) event ; <nl> + if ( se . success ) <nl> + { <nl> + for ( StreamRequest request : se . requests ) <nl> + { <nl> + SystemKeyspace . updateAvailableRanges ( request . keyspace , request . ranges ) ; <nl> + } <nl> + } <nl> + } <nl> + } <nl> + <nl> + @ Override <nl> + public void onSuccess ( StreamState streamState ) { } <nl> + <nl> + @ Override <nl> + public void onFailure ( Throwable throwable ) { } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index 3e8ad9d . . 6a39945 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 162 , 6 + 162 , 12 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> <nl> private Collection < Token > bootstrapTokens = null ; <nl> <nl> + / / true when keeping strict consistency while bootstrapping <nl> + private boolean useStrictConsistency = Boolean . parseBoolean ( System . getProperty ( " cassandra . consistent . rangemovement " , " true " ) ) ; <nl> + private boolean replacing ; <nl> + <nl> + private final StreamStateStore streamStateStore = new StreamStateStore ( ) ; <nl> + <nl> public void finishBootstrapping ( ) <nl> { <nl> isBootstrapMode = false ; <nl> @ @ - 425 , 13 + 431 , 13 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> " Use cassandra . replace _ address if you want to replace this node . " , <nl> FBUtilities . getBroadcastAddress ( ) ) ) ; <nl> } <nl> - if ( RangeStreamer . useStrictConsistency ) <nl> + if ( useStrictConsistency ) <nl> { <nl> for ( Map . Entry < InetAddress , EndpointState > entry : Gossiper . instance . getEndpointStates ( ) ) <nl> { <nl> - <nl> - if ( entry . getValue ( ) . getApplicationState ( ApplicationState . STATUS ) = = null ) <nl> - continue ; <nl> + / / ignore local node or empty status <nl> + if ( entry . getKey ( ) . equals ( FBUtilities . getBroadcastAddress ( ) ) | | entry . getValue ( ) . getApplicationState ( ApplicationState . STATUS ) = = null ) <nl> + continue ; <nl> String [ ] pieces = entry . getValue ( ) . getApplicationState ( ApplicationState . STATUS ) . value . split ( VersionedValue . DELIMITER _ STR , - 1 ) ; <nl> assert ( pieces . length > 0 ) ; <nl> String state = pieces [ 0 ] ; <nl> @ @ - 556 , 6 + 562 , 8 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> } , " StorageServiceShutdownHook " ) ; <nl> Runtime . getRuntime ( ) . addShutdownHook ( drainOnShutdown ) ; <nl> <nl> + replacing = DatabaseDescriptor . isReplacing ( ) ; <nl> + <nl> prepareToJoin ( ) ; <nl> <nl> / / Has to be called after the host id has potentially changed in prepareToJoin ( ) . <nl> @ @ - 603 , 11 + 611 , 11 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> { <nl> Map < ApplicationState , VersionedValue > appStates = new HashMap < > ( ) ; <nl> <nl> - if ( DatabaseDescriptor . isReplacing ( ) & & ! ( Boolean . parseBoolean ( System . getProperty ( " cassandra . join _ ring " , " true " ) ) ) ) <nl> + if ( replacing & & ! ( Boolean . parseBoolean ( System . getProperty ( " cassandra . join _ ring " , " true " ) ) ) ) <nl> throw new ConfigurationException ( " Cannot set both join _ ring = false and attempt to replace a node " ) ; <nl> if ( DatabaseDescriptor . getReplaceTokens ( ) . size ( ) > 0 | | DatabaseDescriptor . getReplaceNode ( ) ! = null ) <nl> throw new RuntimeException ( " Replace method removed ; use cassandra . replace _ address instead " ) ; <nl> - if ( DatabaseDescriptor . isReplacing ( ) ) <nl> + if ( replacing ) <nl> { <nl> if ( SystemKeyspace . bootstrapComplete ( ) ) <nl> throw new RuntimeException ( " Cannot replace address with a node that is already bootstrapped " ) ; <nl> @ @ - 712 , 7 + 720 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> ) ) <nl> throw new UnsupportedOperationException ( " Other bootstrapping / leaving / moving nodes detected , cannot bootstrap while cassandra . consistent . rangemovement is true " ) ; <nl> <nl> - if ( ! DatabaseDescriptor . isReplacing ( ) ) <nl> + if ( ! replacing ) <nl> { <nl> if ( tokenMetadata . isMember ( FBUtilities . getBroadcastAddress ( ) ) ) <nl> { <nl> @ @ - 925 , 7 + 933 , 13 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> { <nl> logger . info ( " rebuild from dc : { } " , sourceDc = = null ? " ( any dc ) " : sourceDc ) ; <nl> <nl> - RangeStreamer streamer = new RangeStreamer ( tokenMetadata , FBUtilities . getBroadcastAddress ( ) , " Rebuild " ) ; <nl> + RangeStreamer streamer = new RangeStreamer ( tokenMetadata , <nl> + null , <nl> + FBUtilities . getBroadcastAddress ( ) , <nl> + " Rebuild " , <nl> + ! replacing & & useStrictConsistency , <nl> + DatabaseDescriptor . getEndpointSnitch ( ) , <nl> + streamStateStore ) ; <nl> streamer . addSourceFilter ( new RangeStreamer . FailureDetectorSourceFilter ( FailureDetector . instance ) ) ; <nl> if ( sourceDc ! = null ) <nl> streamer . addSourceFilter ( new RangeStreamer . SingleDatacenterFilter ( DatabaseDescriptor . getEndpointSnitch ( ) , sourceDc ) ) ; <nl> @ @ - 999 , 10 + 1013 , 10 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> { <nl> isBootstrapMode = true ; <nl> SystemKeyspace . updateTokens ( tokens ) ; / / DON ' T use setToken , that makes us part of the ring locally which is incorrect until we are done bootstrapping <nl> - if ( ! DatabaseDescriptor . isReplacing ( ) ) <nl> + if ( ! replacing ) <nl> { <nl> / / if not an existing token then bootstrap <nl> - List < Pair < ApplicationState , VersionedValue > > states = new ArrayList < Pair < ApplicationState , VersionedValue > > ( ) ; <nl> + List < Pair < ApplicationState , VersionedValue > > states = new ArrayList < > ( ) ; <nl> states . add ( Pair . create ( ApplicationState . TOKENS , valueFactory . tokens ( tokens ) ) ) ; <nl> states . add ( Pair . create ( ApplicationState . STATUS , valueFactory . bootstrapping ( tokens ) ) ) ; <nl> Gossiper . instance . addLocalApplicationStates ( states ) ; <nl> @ @ - 1017 , 8 + 1031 , 15 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> } <nl> if ( ! Gossiper . instance . seenAnySeed ( ) ) <nl> throw new IllegalStateException ( " Unable to contact any seeds ! " ) ; <nl> + <nl> + if ( Boolean . getBoolean ( " cassandra . reset _ bootstrap _ progress " ) ) <nl> + { <nl> + logger . info ( " Resetting bootstrap progress to start fresh " ) ; <nl> + SystemKeyspace . resetAvailableRanges ( ) ; <nl> + } <nl> + <nl> setMode ( Mode . JOINING , " Starting to bootstrap . . . " , true ) ; <nl> - new BootStrapper ( FBUtilities . getBroadcastAddress ( ) , tokens , tokenMetadata ) . bootstrap ( ) ; / / handles token update <nl> + new BootStrapper ( FBUtilities . getBroadcastAddress ( ) , tokens , tokenMetadata ) . bootstrap ( streamStateStore , ! replacing & & useStrictConsistency ) ; / / handles token update <nl> logger . info ( " Bootstrap completed ! for the tokens { } " , tokens ) ; <nl> } <nl> <nl> @ @ - 1544 , 7 + 1565 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> { <nl> UUID hostId = Gossiper . instance . getHostId ( endpoint ) ; <nl> InetAddress existing = tokenMetadata . getEndpointForHostId ( hostId ) ; <nl> - if ( DatabaseDescriptor . isReplacing ( ) & & Gossiper . instance . getEndpointStateForEndpoint ( DatabaseDescriptor . getReplaceAddress ( ) ) ! = null & & ( hostId . equals ( Gossiper . instance . getHostId ( DatabaseDescriptor . getReplaceAddress ( ) ) ) ) ) <nl> + if ( replacing & & Gossiper . instance . getEndpointStateForEndpoint ( DatabaseDescriptor . getReplaceAddress ( ) ) ! = null & & ( hostId . equals ( Gossiper . instance . getHostId ( DatabaseDescriptor . getReplaceAddress ( ) ) ) ) ) <nl> logger . warn ( " Not updating token metadata for { } because I am replacing it " , endpoint ) ; <nl> else <nl> { <nl> @ @ - 1624 , 7 + 1645 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> for ( InetAddress ep : endpointsToRemove ) <nl> { <nl> removeEndpoint ( ep ) ; <nl> - if ( DatabaseDescriptor . isReplacing ( ) & & DatabaseDescriptor . getReplaceAddress ( ) . equals ( ep ) ) <nl> + if ( replacing & & DatabaseDescriptor . getReplaceAddress ( ) . equals ( ep ) ) <nl> Gossiper . instance . replacementQuarantine ( ep ) ; / / quarantine locally longer than normally ; see CASSANDRA - 8260 <nl> } <nl> if ( ! tokensToUpdateInSystemKeyspace . isEmpty ( ) ) <nl> @ @ - 3208 , 7 + 3229 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> { <nl> List < InetAddress > endpoints = null ; <nl> <nl> - if ( RangeStreamer . useStrictConsistency ) <nl> + if ( useStrictConsistency ) <nl> { <nl> Set < InetAddress > oldEndpoints = Sets . newHashSet ( rangeAddresses . get ( range ) ) ; <nl> Set < InetAddress > newEndpoints = Sets . newHashSet ( strategy . calculateNaturalEndpoints ( toFetch . right , tokenMetaCloneAllSettled ) ) ; <nl> @ @ - 3242 , 7 + 3263 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> if ( addressList = = null | | addressList . isEmpty ( ) ) <nl> continue ; <nl> <nl> - if ( RangeStreamer . useStrictConsistency ) <nl> + if ( useStrictConsistency ) <nl> { <nl> if ( addressList . size ( ) > 1 ) <nl> throw new IllegalStateException ( " Multiple strict sources found for " + toFetch ) ; <nl> @ @ - 3277 , 7 + 3298 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> } <nl> <nl> / / stream requests <nl> - Multimap < InetAddress , Range < Token > > workMap = RangeStreamer . getWorkMap ( rangesToFetchWithPreferredEndpoints , keyspace ) ; <nl> + Multimap < InetAddress , Range < Token > > workMap = RangeStreamer . getWorkMap ( rangesToFetchWithPreferredEndpoints , keyspace , FailureDetector . instance ) ; <nl> for ( InetAddress address : workMap . keySet ( ) ) <nl> { <nl> logger . debug ( " Will request range { } of keyspace { } from endpoint { } " , workMap . get ( address ) , keyspace , address ) ; <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamEvent . java b / src / java / org / apache / cassandra / streaming / StreamEvent . java <nl> index e3cdce5 . . de3db9c 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamEvent . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamEvent . java <nl> @ @ - 18 , 8 + 18 , 11 @ @ <nl> package org . apache . cassandra . streaming ; <nl> <nl> import java . net . InetAddress ; <nl> + import java . util . Set ; <nl> import java . util . UUID ; <nl> <nl> + import com . google . common . collect . ImmutableSet ; <nl> + <nl> public abstract class StreamEvent <nl> { <nl> public static enum Type <nl> @ @ - 43 , 6 + 46 , 7 @ @ public abstract class StreamEvent <nl> public final InetAddress peer ; <nl> public final boolean success ; <nl> public final int sessionIndex ; <nl> + public final Set < StreamRequest > requests ; <nl> <nl> public SessionCompleteEvent ( StreamSession session ) <nl> { <nl> @ @ - 50 , 6 + 54 , 7 @ @ public abstract class StreamEvent <nl> this . peer = session . peer ; <nl> this . success = session . isSuccess ( ) ; <nl> this . sessionIndex = session . sessionIndex ( ) ; <nl> + this . requests = ImmutableSet . copyOf ( session . requests ) ; <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamSession . java b / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> index 1b529ed . . 5a056c4 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> @ @ - 45 , 8 + 45 , 6 @ @ import org . apache . cassandra . streaming . messages . * ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . JVMStabilityInspector ; <nl> import org . apache . cassandra . utils . Pair ; <nl> - import org . apache . cassandra . utils . concurrent . RefCounted ; <nl> - <nl> import org . apache . cassandra . utils . concurrent . Ref ; <nl> import org . apache . cassandra . utils . concurrent . Refs ; <nl> <nl> @ @ - 132 , 7 + 130 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber <nl> private StreamResultFuture streamResult ; <nl> <nl> / / stream requests to send to the peer <nl> - private final Set < StreamRequest > requests = Sets . newConcurrentHashSet ( ) ; <nl> + protected final Set < StreamRequest > requests = Sets . newConcurrentHashSet ( ) ; <nl> / / streaming tasks are created and managed per ColumnFamily ID <nl> private final Map < UUID , StreamTransferTask > transfers = new ConcurrentHashMap < > ( ) ; <nl> / / data receivers , filled after receiving prepare message <nl> diff - - git a / test / unit / org / apache / cassandra / db / SystemKeyspaceTest . java b / test / unit / org / apache / cassandra / db / SystemKeyspaceTest . java <nl> index b66a0bd . . 25bb584 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / SystemKeyspaceTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / SystemKeyspaceTest . java <nl> @ @ - 1 , 6 + 1 , 4 @ @ <nl> - package org . apache . cassandra . db ; <nl> / * <nl> - * <nl> * Licensed to the Apache Software Foundation ( ASF ) under one <nl> * or more contributor license agreements . See the NOTICE file <nl> * distributed with this work for additional information <nl> @ @ - 9 , 25 + 7 , 19 @ @ package org . apache . cassandra . db ; <nl> * " License " ) ; you may not use this file except in compliance <nl> * with the License . You may obtain a copy of the License at <nl> * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , <nl> - * software distributed under the License is distributed on an <nl> - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> - * KIND , either express or implied . See the License for the <nl> - * specific language governing permissions and limitations <nl> - * under the License . <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> * / <nl> - <nl> + package org . apache . cassandra . db ; <nl> <nl> import java . net . InetAddress ; <nl> import java . net . UnknownHostException ; <nl> - import java . util . ArrayList ; <nl> - import java . util . Collections ; <nl> - import java . util . Collection ; <nl> - import java . util . List ; <nl> - import java . util . UUID ; <nl> + import java . util . * ; <nl> <nl> import org . junit . Test ; <nl> <nl> diff - - git a / test / unit / org / apache / cassandra / dht / BootStrapperTest . java b / test / unit / org / apache / cassandra / dht / BootStrapperTest . java <nl> index 5d1d8c6 . . ababd99 100644 <nl> - - - a / test / unit / org / apache / cassandra / dht / BootStrapperTest . java <nl> + + + b / test / unit / org / apache / cassandra / dht / BootStrapperTest . java <nl> @ @ - 31 , 6 + 31 , 7 @ @ import org . junit . runner . RunWith ; <nl> <nl> import org . apache . cassandra . OrderedJUnit4ClassRunner ; <nl> import org . apache . cassandra . SchemaLoader ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . config . Schema ; <nl> import org . apache . cassandra . db . Keyspace ; <nl> import org . apache . cassandra . exceptions . ConfigurationException ; <nl> @ @ - 75 , 7 + 76 , 7 @ @ public class BootStrapperTest <nl> <nl> TokenMetadata tmd = ss . getTokenMetadata ( ) ; <nl> assertEquals ( numOldNodes , tmd . sortedTokens ( ) . size ( ) ) ; <nl> - RangeStreamer s = new RangeStreamer ( tmd , myEndpoint , " Bootstrap " ) ; <nl> + RangeStreamer s = new RangeStreamer ( tmd , null , myEndpoint , " Bootstrap " , true , DatabaseDescriptor . getEndpointSnitch ( ) , new StreamStateStore ( ) ) ; <nl> IFailureDetector mockFailureDetector = new IFailureDetector ( ) <nl> { <nl> public boolean isAlive ( InetAddress ep ) <nl> @ @ - 96 , 7 + 97 , 7 @ @ public class BootStrapperTest <nl> Collection < Map . Entry < InetAddress , Collection < Range < Token > > > > toFetch = s . toFetch ( ) . get ( keyspaceName ) ; <nl> <nl> / / Check we get get RF new ranges in total <nl> - Set < Range < Token > > ranges = new HashSet < Range < Token > > ( ) ; <nl> + Set < Range < Token > > ranges = new HashSet < > ( ) ; <nl> for ( Map . Entry < InetAddress , Collection < Range < Token > > > e : toFetch ) <nl> ranges . addAll ( e . getValue ( ) ) ; <nl> <nl> diff - - git a / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java b / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java <nl> new file mode 100644 <nl> index 0000000 . . c8b9f05 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java <nl> @ @ - 0 , 0 + 1 , 76 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . dht ; <nl> + <nl> + import java . net . InetAddress ; <nl> + import java . util . Collections ; <nl> + <nl> + import org . junit . Test ; <nl> + <nl> + import org . apache . cassandra . streaming . DefaultConnectionFactory ; <nl> + import org . apache . cassandra . streaming . StreamEvent ; <nl> + import org . apache . cassandra . streaming . StreamSession ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> + <nl> + import static org . junit . Assert . assertFalse ; <nl> + import static org . junit . Assert . assertTrue ; <nl> + <nl> + public class StreamStateStoreTest <nl> + { <nl> + <nl> + @ Test <nl> + public void testUpdateAndQueryAvailableRanges ( ) <nl> + { <nl> + / / let range ( 0 , 100 ] of keyspace1 be bootstrapped . <nl> + IPartitioner p = new Murmur3Partitioner ( ) ; <nl> + Token . TokenFactory factory = p . getTokenFactory ( ) ; <nl> + Range < Token > range = new Range < > ( factory . fromString ( " 0 " ) , factory . fromString ( " 100 " ) ) ; <nl> + <nl> + InetAddress local = FBUtilities . getBroadcastAddress ( ) ; <nl> + StreamSession session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true ) ; <nl> + session . addStreamRequest ( " keyspace1 " , Collections . singleton ( range ) , Collections . singleton ( " cf " ) , 0 ) ; <nl> + <nl> + StreamStateStore store = new StreamStateStore ( ) ; <nl> + / / session complete event that is not completed makes data not available for keyspace / ranges <nl> + store . handleStreamEvent ( new StreamEvent . SessionCompleteEvent ( session ) ) ; <nl> + assertFalse ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 50 " ) ) ) ; <nl> + <nl> + / / successfully completed session adds available keyspace / ranges <nl> + session . state ( StreamSession . State . COMPLETE ) ; <nl> + store . handleStreamEvent ( new StreamEvent . SessionCompleteEvent ( session ) ) ; <nl> + / / check if token in range ( 0 , 100 ] appears available . <nl> + assertTrue ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 50 " ) ) ) ; <nl> + / / check if token out of range returns false <nl> + assertFalse ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 0 " ) ) ) ; <nl> + assertFalse ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 101 " ) ) ) ; <nl> + / / check if different keyspace returns false <nl> + assertFalse ( store . isDataAvailable ( " keyspace2 " , factory . fromString ( " 50 " ) ) ) ; <nl> + <nl> + / / add different range within the same keyspace <nl> + Range < Token > range2 = new Range < > ( factory . fromString ( " 100 " ) , factory . fromString ( " 200 " ) ) ; <nl> + session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true ) ; <nl> + session . addStreamRequest ( " keyspace1 " , Collections . singleton ( range2 ) , Collections . singleton ( " cf " ) , 0 ) ; <nl> + session . state ( StreamSession . State . COMPLETE ) ; <nl> + store . handleStreamEvent ( new StreamEvent . SessionCompleteEvent ( session ) ) ; <nl> + <nl> + / / newly added range should be available <nl> + assertTrue ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 101 " ) ) ) ; <nl> + / / as well as the old one <nl> + assertTrue ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 50 " ) ) ) ; <nl> + } <nl> + } <nl> \ No newline at end of file
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 7be913e . . 7c5a752 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 2 , 6 + 2 , 8 @ @ <nl> * add command to stop compactions ( CASSANDRA - 1740 ) <nl> * filter out unavailable cipher suites when using encryption ( CASSANDRA - 3178 ) <nl> * ( HADOOP ) add old - style api support for CFIF and CFRR ( CASSANDRA - 2799 ) <nl> + * Support TimeUUIDType column names in Stress . java tool ( CASSANDRA - 3541 ) <nl> + <nl> <nl> 1 . 0 . 5 <nl> * revert CASSANDRA - 3407 ( see CASSANDRA - 3540 ) <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / Session . java b / tools / stress / src / org / apache / cassandra / stress / Session . java <nl> index abbea50 . . ddc6a69 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / Session . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / Session . java <nl> @ @ - 27 , 9 + 27 , 7 @ @ import java . util . concurrent . atomic . AtomicLong ; <nl> <nl> import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . config . ConfigurationException ; <nl> - import org . apache . cassandra . db . compaction . AbstractCompactionStrategy ; <nl> - import org . apache . cassandra . db . marshal . AbstractType ; <nl> - import org . apache . cassandra . db . marshal . TypeParser ; <nl> + import org . apache . cassandra . db . marshal . * ; <nl> import org . apache . commons . cli . * ; <nl> <nl> import org . apache . cassandra . db . ColumnFamilyType ; <nl> @ @ - 50 , 6 + 48 , 8 @ @ public class Session implements Serializable <nl> public static final String DEFAULT _ COMPARATOR = " AsciiType " ; <nl> public static final String DEFAULT _ VALIDATOR = " BytesType " ; <nl> <nl> + private static InetAddress localInetAddress ; <nl> + <nl> public final AtomicInteger operations ; <nl> public final AtomicInteger keys ; <nl> public final AtomicLong latency ; <nl> @ @ - 89 , 6 + 89 , 7 @ @ public class Session implements Serializable <nl> availableOptions . addOption ( " I " , " compression " , true , " Specify the compression to use for sstable , default : no compression " ) ; <nl> availableOptions . addOption ( " Q " , " query - names " , true , " Comma - separated list of column names to retrieve from each row . " ) ; <nl> availableOptions . addOption ( " Z " , " compaction - strategy " , true , " CompactionStrategy to use . " ) ; <nl> + availableOptions . addOption ( " U " , " comparator " , true , " Column Comparator to use . Currently supported types are : TimeUUIDType , AsciiType , UTF8Type . " ) ; <nl> } <nl> <nl> private int numKeys = 1000 * 1000 ; <nl> @ @ - 131 , 6 + 132 , 8 @ @ public class Session implements Serializable <nl> protected float sigma ; <nl> <nl> public final InetAddress sendToDaemon ; <nl> + public final String comparator ; <nl> + public final boolean timeUUIDComparator ; <nl> <nl> public Session ( String [ ] arguments ) throws IllegalArgumentException <nl> { <nl> @ @ - 321 , 6 + 324 , 35 @ @ public class Session implements Serializable <nl> System . exit ( 1 ) ; <nl> } <nl> } <nl> + <nl> + if ( cmd . hasOption ( " U " ) ) <nl> + { <nl> + AbstractType parsed = null ; <nl> + <nl> + try <nl> + { <nl> + parsed = TypeParser . parse ( cmd . getOptionValue ( " U " ) ) ; <nl> + } <nl> + catch ( ConfigurationException e ) <nl> + { <nl> + System . err . println ( e . getMessage ( ) ) ; <nl> + System . exit ( 1 ) ; <nl> + } <nl> + <nl> + comparator = cmd . getOptionValue ( " U " ) ; <nl> + timeUUIDComparator = parsed instanceof TimeUUIDType ; <nl> + <nl> + if ( ! ( parsed instanceof TimeUUIDType | | parsed instanceof AsciiType | | parsed instanceof UTF8Type ) ) <nl> + { <nl> + System . err . println ( " Currently supported types are : TimeUUIDType , AsciiType , UTF8Type . " ) ; <nl> + System . exit ( 1 ) ; <nl> + } <nl> + } <nl> + else <nl> + { <nl> + comparator = null ; <nl> + timeUUIDComparator = false ; <nl> + } <nl> } <nl> catch ( ParseException e ) <nl> { <nl> @ @ - 464 , 6 + 496 , 7 @ @ public class Session implements Serializable <nl> public void createKeySpaces ( ) <nl> { <nl> KsDef keyspace = new KsDef ( ) ; <nl> + String defaultComparator = comparator = = null ? DEFAULT _ COMPARATOR : comparator ; <nl> <nl> / / column family for standard columns <nl> CfDef standardCfDef = new CfDef ( " Keyspace1 " , " Standard1 " ) ; <nl> @ @ - 471 , 7 + 504 , 7 @ @ public class Session implements Serializable <nl> if ( compression ! = null ) <nl> compressionOptions . put ( " sstable _ compression " , compression ) ; <nl> <nl> - standardCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) <nl> + standardCfDef . setComparator _ type ( defaultComparator ) <nl> . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) <nl> . setCompression _ options ( compressionOptions ) ; <nl> <nl> @ @ - 485 , 7 + 518 , 7 @ @ public class Session implements Serializable <nl> / / column family with super columns <nl> CfDef superCfDef = new CfDef ( " Keyspace1 " , " Super1 " ) . setColumn _ type ( " Super " ) ; <nl> superCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) <nl> - . setSubcomparator _ type ( DEFAULT _ COMPARATOR ) <nl> + . setSubcomparator _ type ( defaultComparator ) <nl> . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) <nl> . setCompression _ options ( compressionOptions ) ; <nl> <nl> @ @ - 574 , 4 + 607 , 20 @ @ public class Session implements Serializable <nl> return client ; <nl> } <nl> <nl> + public static InetAddress getLocalAddress ( ) <nl> + { <nl> + if ( localInetAddress = = null ) <nl> + { <nl> + try <nl> + { <nl> + localInetAddress = InetAddress . getLocalHost ( ) ; <nl> + } <nl> + catch ( UnknownHostException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + return localInetAddress ; <nl> + } <nl> } <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java b / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java <nl> index 45d33cb . . c81df6f 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java <nl> @ @ - 52 , 9 + 52 , 9 @ @ public class Inserter extends Operation <nl> <nl> for ( int i = 0 ; i < session . getColumnsPerKey ( ) ; i + + ) <nl> { <nl> - String columnName = ( " C " + Integer . toString ( i ) ) ; <nl> - ByteBuffer columnValue = values . get ( i % values . size ( ) ) ; <nl> - columns . add ( new Column ( ByteBufferUtil . bytes ( columnName ) ) . setValue ( columnValue ) . setTimestamp ( System . currentTimeMillis ( ) ) ) ; <nl> + columns . add ( new Column ( columnName ( i , session . timeUUIDComparator ) ) <nl> + . setValue ( values . get ( i % values . size ( ) ) ) <nl> + . setTimestamp ( System . currentTimeMillis ( ) ) ) ; <nl> } <nl> <nl> if ( session . getColumnFamilyType ( ) = = ColumnFamilyType . Super ) <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / util / Operation . java b / tools / stress / src / org / apache / cassandra / stress / util / Operation . java <nl> index 10b97ad . . dd5128f 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / util / Operation . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / util / Operation . java <nl> @ @ - 27 , 11 + 27 , 14 @ @ import java . util . Random ; <nl> <nl> import static com . google . common . base . Charsets . UTF _ 8 ; <nl> <nl> + import org . apache . cassandra . db . marshal . TimeUUIDType ; <nl> import org . apache . cassandra . stress . Session ; <nl> import org . apache . cassandra . stress . Stress ; <nl> import org . apache . cassandra . thrift . Cassandra ; <nl> import org . apache . cassandra . thrift . InvalidRequestException ; <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . apache . cassandra . utils . UUIDGen ; <nl> <nl> public abstract class Operation <nl> { <nl> @ @ - 200 , 6 + 203 , 13 @ @ public abstract class Operation <nl> return result . toString ( ) ; <nl> } <nl> <nl> + protected ByteBuffer columnName ( int index , boolean timeUUIDComparator ) <nl> + { <nl> + return timeUUIDComparator <nl> + ? TimeUUIDType . instance . decompose ( UUIDGen . makeType1UUIDFromHost ( Session . getLocalAddress ( ) ) ) <nl> + : ByteBufferUtil . bytes ( String . format ( " C % d " , index ) ) ; <nl> + } <nl> + <nl> protected String getExceptionMessage ( Exception e ) <nl> { <nl> String className = e . getClass ( ) . getSimpleName ( ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index c07599a . . 955d8e3 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 71 , 6 + 71 , 7 @ @ 
+ * Select optimal CRC32 implementation at runtime ( CASSANDRA - 8614 ) 
+ * Evaluate MurmurHash of Token once per query ( CASSANDRA - 7096 ) 
+ * Generalize progress reporting ( CASSANDRA - 8901 ) 
+ + * Resumable bootstrap streaming ( CASSANDRA - 8838 ) 
+ 
+ 2 . 1 . 4 
+ * Use correct bounds for page cache eviction of compressed files ( CASSANDRA - 8746 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / SystemKeyspace . java b / src / java / org / apache / cassandra / db / SystemKeyspace . java 
+ index dcd0e55 . . 9fa3c6b 100644 
+ - - - a / src / java / org / apache / cassandra / db / SystemKeyspace . java 
+ + + + b / src / java / org / apache / cassandra / db / SystemKeyspace . java 
+ @ @ - 18 , 6 + 18 , 7 @ @ 
+ package org . apache . cassandra . db ; 
+ 
+ import java . io . DataInputStream ; 
+ + import java . io . IOError ; 
+ import java . io . IOException ; 
+ import java . net . InetAddress ; 
+ import java . nio . ByteBuffer ; 
+ @ @ - 27 , 6 + 28 , 7 @ @ import javax . management . openmbean . * ; 
+ 
+ import com . google . common . base . Function ; 
+ import com . google . common . collect . * ; 
+ + import com . google . common . io . ByteStreams ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 35 , 12 + 37 , 13 @ @ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . config . KSMetaData ; 
+ import org . apache . cassandra . cql3 . QueryProcessor ; 
+ import org . apache . cassandra . cql3 . UntypedResultSet ; 
+ - import org . apache . cassandra . db . compaction . CompactionHistoryTabularData ; 
+ import org . apache . cassandra . db . commitlog . ReplayPosition ; 
+ + import org . apache . cassandra . db . compaction . CompactionHistoryTabularData ; 
+ import org . apache . cassandra . db . compaction . LeveledCompactionStrategy ; 
+ import org . apache . cassandra . db . composites . Composite ; 
+ import org . apache . cassandra . db . filter . QueryFilter ; 
+ import org . apache . cassandra . db . marshal . * ; 
+ + import org . apache . cassandra . dht . IPartitioner ; 
+ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . exceptions . ConfigurationException ; 
+ @ @ - 49 , 6 + 52 , 7 @ @ import org . apache . cassandra . io . util . DataOutputBuffer ; 
+ import org . apache . cassandra . locator . IEndpointSnitch ; 
+ import org . apache . cassandra . locator . LocalStrategy ; 
+ import org . apache . cassandra . metrics . RestorableMeter ; 
+ + import org . apache . cassandra . net . MessagingService ; 
+ import org . apache . cassandra . schema . LegacySchemaTables ; 
+ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . service . paxos . Commit ; 
+ @ @ - 78 , 6 + 82 , 7 @ @ public final class SystemKeyspace 
+ public static final String COMPACTION _ HISTORY = " compaction _ history " ; 
+ public static final String SSTABLE _ ACTIVITY = " sstable _ activity " ; 
+ public static final String SIZE _ ESTIMATES = " size _ estimates " ; 
+ + public static final String AVAILABLE _ RANGES = " available _ ranges " ; 
+ 
+ public static final CFMetaData Hints = 
+ compile ( HINTS , 
+ @ @ - 218 , 7 + 223 , 7 @ @ public final class SystemKeyspace 
+ private static final CFMetaData SizeEstimates = 
+ compile ( SIZE _ ESTIMATES , 
+ " per - table primary range size estimates " , 
+ - " CREATE TABLE % S ( " 
+ + " CREATE TABLE % s ( " 
+ + " keyspace _ name text , " 
+ + " table _ name text , " 
+ + " range _ start text , " 
+ @ @ - 228 , 6 + 233 , 14 @ @ public final class SystemKeyspace 
+ + " PRIMARY KEY ( ( keyspace _ name ) , table _ name , range _ start , range _ end ) ) " ) 
+ . gcGraceSeconds ( 0 ) ; 
+ 
+ + private static final CFMetaData AvailableRanges = 
+ + compile ( AVAILABLE _ RANGES , 
+ + " Available keyspace / ranges during bootstrap / replace that are ready to be served " , 
+ + " CREATE TABLE % s ( " 
+ + + " keyspace _ name text PRIMARY KEY , " 
+ + + " ranges set < blob > " 
+ + + " ) " ) ; 
+ + 
+ private static CFMetaData compile ( String name , String description , String schema ) 
+ { 
+ return CFMetaData . compile ( String . format ( schema , name ) , NAME ) 
+ @ @ - 249 , 7 + 262 , 8 @ @ public final class SystemKeyspace 
+ CompactionsInProgress , 
+ CompactionHistory , 
+ SSTableActivity , 
+ - SizeEstimates ) ) ; 
+ + SizeEstimates , 
+ + AvailableRanges ) ) ; 
+ return new KSMetaData ( NAME , LocalStrategy . class , Collections . < String , String > emptyMap ( ) , true , tables ) ; 
+ } 
+ 
+ @ @ - 954 , 4 + 968 , 67 @ @ public final class SystemKeyspace 
+ String cql = String . format ( " DELETE FROM % s . % s WHERE keyspace _ name = ? AND table _ name = ? " , NAME , SIZE _ ESTIMATES ) ; 
+ executeInternal ( cql , keyspace , table ) ; 
+ } 
+ + 
+ + public static synchronized void updateAvailableRanges ( String keyspace , Collection < Range < Token > > completedRanges ) 
+ + { 
+ + String cql = " UPDATE system . % s SET ranges = ranges + ? WHERE keyspace _ name = ? " ; 
+ + Set < ByteBuffer > rangesToUpdate = new HashSet < > ( completedRanges . size ( ) ) ; 
+ + for ( Range < Token > range : completedRanges ) 
+ + { 
+ + rangesToUpdate . add ( rangeToBytes ( range ) ) ; 
+ + } 
+ + executeInternal ( String . format ( cql , AVAILABLE _ RANGES ) , rangesToUpdate , keyspace ) ; 
+ + } 
+ + 
+ + public static synchronized Set < Range < Token > > getAvailableRanges ( String keyspace , IPartitioner partitioner ) 
+ + { 
+ + Set < Range < Token > > result = new HashSet < > ( ) ; 
+ + String query = " SELECT * FROM system . % s WHERE keyspace _ name = ? " ; 
+ + UntypedResultSet rs = executeInternal ( String . format ( query , AVAILABLE _ RANGES ) , keyspace ) ; 
+ + for ( UntypedResultSet . Row row : rs ) 
+ + { 
+ + Set < ByteBuffer > rawRanges = row . getSet ( " ranges " , BytesType . instance ) ; 
+ + for ( ByteBuffer rawRange : rawRanges ) 
+ + { 
+ + result . add ( byteBufferToRange ( rawRange , partitioner ) ) ; 
+ + } 
+ + } 
+ + return ImmutableSet . copyOf ( result ) ; 
+ + } 
+ + 
+ + public static void resetAvailableRanges ( ) 
+ + { 
+ + ColumnFamilyStore availableRanges = Keyspace . open ( NAME ) . getColumnFamilyStore ( AVAILABLE _ RANGES ) ; 
+ + availableRanges . truncateBlocking ( ) ; 
+ + } 
+ + 
+ + private static ByteBuffer rangeToBytes ( Range < Token > range ) 
+ + { 
+ + try 
+ + { 
+ + DataOutputBuffer out = new DataOutputBuffer ( ) ; 
+ + Range . tokenSerializer . serialize ( range , out , MessagingService . VERSION _ 30 ) ; 
+ + return out . asByteBuffer ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + } 
+ + 
+ + @ SuppressWarnings ( " unchecked " ) 
+ + private static Range < Token > byteBufferToRange ( ByteBuffer rawRange , IPartitioner partitioner ) 
+ + { 
+ + try 
+ + { 
+ + return ( Range < Token > ) Range . tokenSerializer . deserialize ( ByteStreams . newDataInput ( ByteBufferUtil . getArray ( rawRange ) ) , 
+ + partitioner , 
+ + MessagingService . VERSION _ 30 ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + } 
+ + 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / dht / BootStrapper . java b / src / java / org / apache / cassandra / dht / BootStrapper . java 
+ index cbbd100 . . 8f52f7e 100644 
+ - - - a / src / java / org / apache / cassandra / dht / BootStrapper . java 
+ + + + b / src / java / org / apache / cassandra / dht / BootStrapper . java 
+ @ @ - 55 , 15 + 55 , 20 @ @ public class BootStrapper 
+ 
+ this . address = address ; 
+ this . tokens = tokens ; 
+ - tokenMetadata = tmd ; 
+ + this . tokenMetadata = tmd ; 
+ } 
+ 
+ - public void bootstrap ( ) 
+ + public void bootstrap ( StreamStateStore stateStore , boolean useStrictConsistency ) 
+ { 
+ - if ( logger . isDebugEnabled ( ) ) 
+ - logger . debug ( " Beginning bootstrap process " ) ; 
+ - 
+ - RangeStreamer streamer = new RangeStreamer ( tokenMetadata , tokens , address , " Bootstrap " ) ; 
+ + logger . debug ( " Beginning bootstrap process " ) ; 
+ + 
+ + RangeStreamer streamer = new RangeStreamer ( tokenMetadata , 
+ + tokens , 
+ + address , 
+ + " Bootstrap " , 
+ + useStrictConsistency , 
+ + DatabaseDescriptor . getEndpointSnitch ( ) , 
+ + stateStore ) ; 
+ streamer . addSourceFilter ( new RangeStreamer . FailureDetectorSourceFilter ( FailureDetector . instance ) ) ; 
+ 
+ for ( String keyspaceName : Schema . instance . getNonSystemKeyspaces ( ) ) 
+ @ @ - 83 , 7 + 88 , 7 @ @ public class BootStrapper 
+ } 
+ catch ( ExecutionException e ) 
+ { 
+ - throw new RuntimeException ( " Error during boostrap : " + e . getCause ( ) . getMessage ( ) , e . getCause ( ) ) ; 
+ + throw new RuntimeException ( " Error during bootstrap : " + e . getCause ( ) . getMessage ( ) , e . getCause ( ) ) ; 
+ } 
+ } 
+ 
+ @ @ - 99 , 7 + 104 , 7 @ @ public class BootStrapper 
+ if ( initialTokens . size ( ) > 0 ) 
+ { 
+ logger . debug ( " tokens manually specified as { } " , initialTokens ) ; 
+ - List < Token > tokens = new ArrayList < Token > ( initialTokens . size ( ) ) ; 
+ + List < Token > tokens = new ArrayList < > ( initialTokens . size ( ) ) ; 
+ for ( String tokenString : initialTokens ) 
+ { 
+ Token token = StorageService . getPartitioner ( ) . getTokenFactory ( ) . fromString ( tokenString ) ; 
+ @ @ - 122 , 7 + 127 , 7 @ @ public class BootStrapper 
+ 
+ public static Collection < Token > getRandomTokens ( TokenMetadata metadata , int numTokens ) 
+ { 
+ - Set < Token > tokens = new HashSet < Token > ( numTokens ) ; 
+ + Set < Token > tokens = new HashSet < > ( numTokens ) ; 
+ while ( tokens . size ( ) < numTokens ) 
+ { 
+ Token token = StorageService . getPartitioner ( ) . getRandomToken ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / dht / RangeStreamer . java b / src / java / org / apache / cassandra / dht / RangeStreamer . java 
+ index 72679cc . . fecb308 100644 
+ - - - a / src / java / org / apache / cassandra / dht / RangeStreamer . java 
+ + + + b / src / java / org / apache / cassandra / dht / RangeStreamer . java 
+ @ @ - 20 , 24 + 20 , 24 @ @ package org . apache . cassandra . dht ; 
+ import java . net . InetAddress ; 
+ import java . util . * ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . collect . ArrayListMultimap ; 
+ import com . google . common . collect . HashMultimap ; 
+ import com . google . common . collect . Multimap ; 
+ import com . google . common . collect . Sets ; 
+ - import org . apache . cassandra . gms . EndpointState ; 
+ import org . apache . commons . lang3 . StringUtils ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ - import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . Keyspace ; 
+ import org . apache . cassandra . db . SystemKeyspace ; 
+ - import org . apache . cassandra . gms . FailureDetector ; 
+ + import org . apache . cassandra . gms . EndpointState ; 
+ import org . apache . cassandra . gms . Gossiper ; 
+ import org . apache . cassandra . gms . IFailureDetector ; 
+ import org . apache . cassandra . locator . AbstractReplicationStrategy ; 
+ import org . apache . cassandra . locator . IEndpointSnitch ; 
+ import org . apache . cassandra . locator . TokenMetadata ; 
+ + import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . streaming . StreamPlan ; 
+ import org . apache . cassandra . streaming . StreamResultFuture ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ @ @ - 48 , 14 + 48 , 21 @ @ import org . apache . cassandra . utils . FBUtilities ; 
+ public class RangeStreamer 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( RangeStreamer . class ) ; 
+ - public static final boolean useStrictConsistency = Boolean . parseBoolean ( System . getProperty ( " cassandra . consistent . rangemovement " , " true " ) ) ; 
+ + 
+ + / * bootstrap tokens . can be null if replacing the node . * / 
+ private final Collection < Token > tokens ; 
+ + / * current token ring * / 
+ private final TokenMetadata metadata ; 
+ + / * address of this node * / 
+ private final InetAddress address ; 
+ + / * streaming description * / 
+ private final String description ; 
+ private final Multimap < String , Map . Entry < InetAddress , Collection < Range < Token > > > > toFetch = HashMultimap . create ( ) ; 
+ - private final Set < ISourceFilter > sourceFilters = new HashSet < ISourceFilter > ( ) ; 
+ + private final Set < ISourceFilter > sourceFilters = new HashSet < > ( ) ; 
+ private final StreamPlan streamPlan ; 
+ + private final boolean useStrictConsistency ; 
+ + private final IEndpointSnitch snitch ; 
+ + private final StreamStateStore stateStore ; 
+ 
+ / * * 
+ * A filter applied to sources to stream from when constructing a fetch map . 
+ @ @ - 104 , 18 + 111 , 23 @ @ public class RangeStreamer 
+ } 
+ } 
+ 
+ - public RangeStreamer ( TokenMetadata metadata , Collection < Token > tokens , InetAddress address , String description ) 
+ + public RangeStreamer ( TokenMetadata metadata , 
+ + Collection < Token > tokens , 
+ + InetAddress address , 
+ + String description , 
+ + boolean useStrictConsistency , 
+ + IEndpointSnitch snitch , 
+ + StreamStateStore stateStore ) 
+ { 
+ this . metadata = metadata ; 
+ this . tokens = tokens ; 
+ this . address = address ; 
+ this . description = description ; 
+ this . streamPlan = new StreamPlan ( description , true ) ; 
+ - } 
+ - 
+ - public RangeStreamer ( TokenMetadata metadata , InetAddress address , String description ) 
+ - { 
+ - this ( metadata , null , address , description ) ; 
+ + this . useStrictConsistency = useStrictConsistency ; 
+ + this . snitch = snitch ; 
+ + this . stateStore = stateStore ; 
+ + streamPlan . listeners ( this . stateStore ) ; 
+ } 
+ 
+ public void addSourceFilter ( ISourceFilter filter ) 
+ @ @ - 123 , 6 + 135 , 12 @ @ public class RangeStreamer 
+ sourceFilters . add ( filter ) ; 
+ } 
+ 
+ + / * * 
+ + * Add ranges to be streamed for given keyspace . 
+ + * 
+ + * @ param keyspaceName keyspace name 
+ + * @ param ranges ranges to be streamed 
+ + * / 
+ public void addRanges ( String keyspaceName , Collection < Range < Token > > ranges ) 
+ { 
+ Multimap < Range < Token > , InetAddress > rangesForKeyspace = useStrictSourcesForRanges ( keyspaceName ) 
+ @ @ - 145 , 11 + 163 , 14 @ @ public class RangeStreamer 
+ } 
+ } 
+ 
+ + / * * 
+ + * @ param keyspaceName keyspace name to check 
+ + * @ return true when the node is bootstrapping , useStrictConsistency is true and # of nodes in the cluster is more than # of replica 
+ + * / 
+ private boolean useStrictSourcesForRanges ( String keyspaceName ) 
+ { 
+ AbstractReplicationStrategy strat = Keyspace . open ( keyspaceName ) . getReplicationStrategy ( ) ; 
+ - return ! DatabaseDescriptor . isReplacing ( ) 
+ - & & useStrictConsistency 
+ + return useStrictConsistency 
+ & & tokens ! = null 
+ & & metadata . getAllEndpoints ( ) . size ( ) ! = strat . getReplicationFactor ( ) ; 
+ } 
+ @ @ - 157 , 6 + 178 , 8 @ @ public class RangeStreamer 
+ / * * 
+ * Get a map of all ranges and their respective sources that are candidates for streaming the given ranges 
+ * to us . For each range , the list of sources is sorted by proximity relative to the given destAddress . 
+ + * 
+ + * @ throws java . lang . IllegalStateException when there is no source to get data streamed 
+ * / 
+ private Multimap < Range < Token > , InetAddress > getAllRangesWithSourcesFor ( String keyspaceName , Collection < Range < Token > > desiredRanges ) 
+ { 
+ @ @ - 170 , 7 + 193 , 7 @ @ public class RangeStreamer 
+ { 
+ if ( range . contains ( desiredRange ) ) 
+ { 
+ - List < InetAddress > preferred = DatabaseDescriptor . getEndpointSnitch ( ) . getSortedListByProximity ( address , rangeAddresses . get ( range ) ) ; 
+ + List < InetAddress > preferred = snitch . getSortedListByProximity ( address , rangeAddresses . get ( range ) ) ; 
+ rangeSources . putAll ( desiredRange , preferred ) ; 
+ break ; 
+ } 
+ @ @ - 187 , 22 + 210 , 23 @ @ public class RangeStreamer 
+ * Get a map of all ranges and the source that will be cleaned up once this bootstrapped node is added for the given ranges . 
+ * For each range , the list should only contain a single source . This allows us to consistently migrate data without violating 
+ * consistency . 
+ + * 
+ + * @ throws java . lang . IllegalStateException when there is no source to get data streamed , or more than 1 source found . 
+ * / 
+ - private Multimap < Range < Token > , InetAddress > getAllRangesWithStrictSourcesFor ( String table , Collection < Range < Token > > desiredRanges ) 
+ + private Multimap < Range < Token > , InetAddress > getAllRangesWithStrictSourcesFor ( String keyspace , Collection < Range < Token > > desiredRanges ) 
+ { 
+ - 
+ assert tokens ! = null ; 
+ - AbstractReplicationStrategy strat = Keyspace . open ( table ) . getReplicationStrategy ( ) ; 
+ + AbstractReplicationStrategy strat = Keyspace . open ( keyspace ) . getReplicationStrategy ( ) ; 
+ 
+ - / / Active ranges 
+ + / / Active ranges 
+ TokenMetadata metadataClone = metadata . cloneOnlyTokenMap ( ) ; 
+ - Multimap < Range < Token > , InetAddress > addressRanges = strat . getRangeAddresses ( metadataClone ) ; 
+ + Multimap < Range < Token > , InetAddress > addressRanges = strat . getRangeAddresses ( metadataClone ) ; 
+ 
+ - / / Pending ranges 
+ + / / Pending ranges 
+ metadataClone . updateNormalTokens ( tokens , address ) ; 
+ - Multimap < Range < Token > , InetAddress > pendingRangeAddresses = strat . getRangeAddresses ( metadataClone ) ; 
+ + Multimap < Range < Token > , InetAddress > pendingRangeAddresses = strat . getRangeAddresses ( metadataClone ) ; 
+ 
+ - / / Collects the source that will have its range moved to the new node 
+ + / / Collects the source that will have its range moved to the new node 
+ Multimap < Range < Token > , InetAddress > rangeSources = ArrayListMultimap . create ( ) ; 
+ 
+ for ( Range < Token > desiredRange : desiredRanges ) 
+ @ @ - 214 , 8 + 238 , 8 @ @ public class RangeStreamer 
+ Set < InetAddress > oldEndpoints = Sets . newHashSet ( preEntry . getValue ( ) ) ; 
+ Set < InetAddress > newEndpoints = Sets . newHashSet ( pendingRangeAddresses . get ( desiredRange ) ) ; 
+ 
+ - / / Due to CASSANDRA - 5953 we can have a higher RF then we have endpoints . 
+ - / / So we need to be careful to only be strict when endpoints = = RF 
+ + / / Due to CASSANDRA - 5953 we can have a higher RF then we have endpoints . 
+ + / / So we need to be careful to only be strict when endpoints = = RF 
+ if ( oldEndpoints . size ( ) = = strat . getReplicationFactor ( ) ) 
+ { 
+ oldEndpoints . removeAll ( newEndpoints ) ; 
+ @ @ - 226 , 7 + 250 , 7 @ @ public class RangeStreamer 
+ } 
+ } 
+ 
+ - / / Validate 
+ + / / Validate 
+ Collection < InetAddress > addressList = rangeSources . get ( desiredRange ) ; 
+ if ( addressList = = null | | addressList . isEmpty ( ) ) 
+ throw new IllegalStateException ( " No sources found for " + desiredRange ) ; 
+ @ @ - 237 , 7 + 261 , 8 @ @ public class RangeStreamer 
+ InetAddress sourceIp = addressList . iterator ( ) . next ( ) ; 
+ EndpointState sourceState = Gossiper . instance . getEndpointStateForEndpoint ( sourceIp ) ; 
+ if ( Gossiper . instance . isEnabled ( ) & & ( sourceState = = null | | ! sourceState . isAlive ( ) ) ) 
+ - throw new RuntimeException ( " A node required to move the data consistently is down ( " + sourceIp + " ) . If you wish to move the data from a potentially inconsistent replica , restart the node with - Dcassandra . consistent . rangemovement = false " ) ; 
+ + throw new RuntimeException ( " A node required to move the data consistently is down ( " + sourceIp + " ) . " + 
+ + " If you wish to move the data from a potentially inconsistent replica , restart the node with - Dcassandra . consistent . rangemovement = false " ) ; 
+ } 
+ 
+ return rangeSources ; 
+ @ @ - 247 , 7 + 272 , 8 @ @ public class RangeStreamer 
+ * @ param rangesWithSources The ranges we want to fetch ( key ) and their potential sources ( value ) 
+ * @ param sourceFilters A ( possibly empty ) collection of source filters to apply . In addition to any filters given 
+ * here , we always exclude ourselves . 
+ - * @ return 
+ + * @ param keyspace keyspace name 
+ + * @ return Map of source endpoint to collection of ranges 
+ * / 
+ private static Multimap < InetAddress , Range < Token > > getRangeFetchMap ( Multimap < Range < Token > , InetAddress > rangesWithSources , 
+ Collection < ISourceFilter > sourceFilters , String keyspace ) 
+ @ @ - 285 , 12 + 311 , 13 @ @ public class RangeStreamer 
+ return rangeFetchMapMap ; 
+ } 
+ 
+ - public static Multimap < InetAddress , Range < Token > > getWorkMap ( Multimap < Range < Token > , InetAddress > rangesWithSourceTarget , String keyspace ) 
+ + public static Multimap < InetAddress , Range < Token > > getWorkMap ( Multimap < Range < Token > , InetAddress > rangesWithSourceTarget , String keyspace , IFailureDetector fd ) 
+ { 
+ - return getRangeFetchMap ( rangesWithSourceTarget , Collections . < ISourceFilter > singleton ( new FailureDetectorSourceFilter ( FailureDetector . instance ) ) , keyspace ) ; 
+ + return getRangeFetchMap ( rangesWithSourceTarget , Collections . < ISourceFilter > singleton ( new FailureDetectorSourceFilter ( fd ) ) , keyspace ) ; 
+ } 
+ 
+ / / For testing purposes 
+ + @ VisibleForTesting 
+ Multimap < String , Map . Entry < InetAddress , Collection < Range < Token > > > > toFetch ( ) 
+ { 
+ return toFetch ; 
+ @ @ - 304 , 9 + 331 , 17 @ @ public class RangeStreamer 
+ InetAddress source = entry . getValue ( ) . getKey ( ) ; 
+ InetAddress preferred = SystemKeyspace . getPreferredIP ( source ) ; 
+ Collection < Range < Token > > ranges = entry . getValue ( ) . getValue ( ) ; 
+ - / * Send messages to respective folks to stream data over to me * / 
+ + 
+ + / / filter out already streamed ranges 
+ + Set < Range < Token > > availableRanges = stateStore . getAvailableRanges ( keyspace , StorageService . getPartitioner ( ) ) ; 
+ + if ( ranges . removeAll ( availableRanges ) ) 
+ + { 
+ + logger . info ( availableRanges + " already available . Skipping streaming . " ) ; 
+ + } 
+ + 
+ if ( logger . isDebugEnabled ( ) ) 
+ logger . debug ( " { } ing from { } ranges { } " , description , source , StringUtils . join ( ranges , " , " ) ) ; 
+ + / * Send messages to respective folks to stream data over to me * / 
+ streamPlan . requestRanges ( source , preferred , keyspace , ranges ) ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / dht / StreamStateStore . java b / src / java / org / apache / cassandra / dht / StreamStateStore . java 
+ new file mode 100644 
+ index 0000000 . . f6046aa 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / dht / StreamStateStore . java 
+ @ @ - 0 , 0 + 1 , 82 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . dht ; 
+ + 
+ + import java . util . Set ; 
+ + 
+ + import org . apache . cassandra . db . SystemKeyspace ; 
+ + import org . apache . cassandra . streaming . StreamEvent ; 
+ + import org . apache . cassandra . streaming . StreamEventHandler ; 
+ + import org . apache . cassandra . streaming . StreamRequest ; 
+ + import org . apache . cassandra . streaming . StreamState ; 
+ + 
+ + / * * 
+ + * Store and update available ranges ( data already received ) to system keyspace . 
+ + * / 
+ + public class StreamStateStore implements StreamEventHandler 
+ + { 
+ + public Set < Range < Token > > getAvailableRanges ( String keyspace , IPartitioner partitioner ) 
+ + { 
+ + return SystemKeyspace . getAvailableRanges ( keyspace , partitioner ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Check if given token ' s data is available in this node . 
+ + * 
+ + * @ param keyspace keyspace name 
+ + * @ param token token to check 
+ + * @ return true if given token in the keyspace is already streamed and ready to be served . 
+ + * / 
+ + public boolean isDataAvailable ( String keyspace , Token token ) 
+ + { 
+ + Set < Range < Token > > availableRanges = getAvailableRanges ( keyspace , token . getPartitioner ( ) ) ; 
+ + for ( Range < Token > range : availableRanges ) 
+ + { 
+ + if ( range . contains ( token ) ) 
+ + return true ; 
+ + } 
+ + return false ; 
+ + } 
+ + 
+ + / * * 
+ + * When StreamSession completes , make all keyspaces / ranges in session available to be served . 
+ + * 
+ + * @ param event Stream event . 
+ + * / 
+ + @ Override 
+ + public void handleStreamEvent ( StreamEvent event ) 
+ + { 
+ + if ( event . eventType = = StreamEvent . Type . STREAM _ COMPLETE ) 
+ + { 
+ + StreamEvent . SessionCompleteEvent se = ( StreamEvent . SessionCompleteEvent ) event ; 
+ + if ( se . success ) 
+ + { 
+ + for ( StreamRequest request : se . requests ) 
+ + { 
+ + SystemKeyspace . updateAvailableRanges ( request . keyspace , request . ranges ) ; 
+ + } 
+ + } 
+ + } 
+ + } 
+ + 
+ + @ Override 
+ + public void onSuccess ( StreamState streamState ) { } 
+ + 
+ + @ Override 
+ + public void onFailure ( Throwable throwable ) { } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index 3e8ad9d . . 6a39945 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 162 , 6 + 162 , 12 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ 
+ private Collection < Token > bootstrapTokens = null ; 
+ 
+ + / / true when keeping strict consistency while bootstrapping 
+ + private boolean useStrictConsistency = Boolean . parseBoolean ( System . getProperty ( " cassandra . consistent . rangemovement " , " true " ) ) ; 
+ + private boolean replacing ; 
+ + 
+ + private final StreamStateStore streamStateStore = new StreamStateStore ( ) ; 
+ + 
+ public void finishBootstrapping ( ) 
+ { 
+ isBootstrapMode = false ; 
+ @ @ - 425 , 13 + 431 , 13 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ " Use cassandra . replace _ address if you want to replace this node . " , 
+ FBUtilities . getBroadcastAddress ( ) ) ) ; 
+ } 
+ - if ( RangeStreamer . useStrictConsistency ) 
+ + if ( useStrictConsistency ) 
+ { 
+ for ( Map . Entry < InetAddress , EndpointState > entry : Gossiper . instance . getEndpointStates ( ) ) 
+ { 
+ - 
+ - if ( entry . getValue ( ) . getApplicationState ( ApplicationState . STATUS ) = = null ) 
+ - continue ; 
+ + / / ignore local node or empty status 
+ + if ( entry . getKey ( ) . equals ( FBUtilities . getBroadcastAddress ( ) ) | | entry . getValue ( ) . getApplicationState ( ApplicationState . STATUS ) = = null ) 
+ + continue ; 
+ String [ ] pieces = entry . getValue ( ) . getApplicationState ( ApplicationState . STATUS ) . value . split ( VersionedValue . DELIMITER _ STR , - 1 ) ; 
+ assert ( pieces . length > 0 ) ; 
+ String state = pieces [ 0 ] ; 
+ @ @ - 556 , 6 + 562 , 8 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ } , " StorageServiceShutdownHook " ) ; 
+ Runtime . getRuntime ( ) . addShutdownHook ( drainOnShutdown ) ; 
+ 
+ + replacing = DatabaseDescriptor . isReplacing ( ) ; 
+ + 
+ prepareToJoin ( ) ; 
+ 
+ / / Has to be called after the host id has potentially changed in prepareToJoin ( ) . 
+ @ @ - 603 , 11 + 611 , 11 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ { 
+ Map < ApplicationState , VersionedValue > appStates = new HashMap < > ( ) ; 
+ 
+ - if ( DatabaseDescriptor . isReplacing ( ) & & ! ( Boolean . parseBoolean ( System . getProperty ( " cassandra . join _ ring " , " true " ) ) ) ) 
+ + if ( replacing & & ! ( Boolean . parseBoolean ( System . getProperty ( " cassandra . join _ ring " , " true " ) ) ) ) 
+ throw new ConfigurationException ( " Cannot set both join _ ring = false and attempt to replace a node " ) ; 
+ if ( DatabaseDescriptor . getReplaceTokens ( ) . size ( ) > 0 | | DatabaseDescriptor . getReplaceNode ( ) ! = null ) 
+ throw new RuntimeException ( " Replace method removed ; use cassandra . replace _ address instead " ) ; 
+ - if ( DatabaseDescriptor . isReplacing ( ) ) 
+ + if ( replacing ) 
+ { 
+ if ( SystemKeyspace . bootstrapComplete ( ) ) 
+ throw new RuntimeException ( " Cannot replace address with a node that is already bootstrapped " ) ; 
+ @ @ - 712 , 7 + 720 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ ) ) 
+ throw new UnsupportedOperationException ( " Other bootstrapping / leaving / moving nodes detected , cannot bootstrap while cassandra . consistent . rangemovement is true " ) ; 
+ 
+ - if ( ! DatabaseDescriptor . isReplacing ( ) ) 
+ + if ( ! replacing ) 
+ { 
+ if ( tokenMetadata . isMember ( FBUtilities . getBroadcastAddress ( ) ) ) 
+ { 
+ @ @ - 925 , 7 + 933 , 13 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ { 
+ logger . info ( " rebuild from dc : { } " , sourceDc = = null ? " ( any dc ) " : sourceDc ) ; 
+ 
+ - RangeStreamer streamer = new RangeStreamer ( tokenMetadata , FBUtilities . getBroadcastAddress ( ) , " Rebuild " ) ; 
+ + RangeStreamer streamer = new RangeStreamer ( tokenMetadata , 
+ + null , 
+ + FBUtilities . getBroadcastAddress ( ) , 
+ + " Rebuild " , 
+ + ! replacing & & useStrictConsistency , 
+ + DatabaseDescriptor . getEndpointSnitch ( ) , 
+ + streamStateStore ) ; 
+ streamer . addSourceFilter ( new RangeStreamer . FailureDetectorSourceFilter ( FailureDetector . instance ) ) ; 
+ if ( sourceDc ! = null ) 
+ streamer . addSourceFilter ( new RangeStreamer . SingleDatacenterFilter ( DatabaseDescriptor . getEndpointSnitch ( ) , sourceDc ) ) ; 
+ @ @ - 999 , 10 + 1013 , 10 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ { 
+ isBootstrapMode = true ; 
+ SystemKeyspace . updateTokens ( tokens ) ; / / DON ' T use setToken , that makes us part of the ring locally which is incorrect until we are done bootstrapping 
+ - if ( ! DatabaseDescriptor . isReplacing ( ) ) 
+ + if ( ! replacing ) 
+ { 
+ / / if not an existing token then bootstrap 
+ - List < Pair < ApplicationState , VersionedValue > > states = new ArrayList < Pair < ApplicationState , VersionedValue > > ( ) ; 
+ + List < Pair < ApplicationState , VersionedValue > > states = new ArrayList < > ( ) ; 
+ states . add ( Pair . create ( ApplicationState . TOKENS , valueFactory . tokens ( tokens ) ) ) ; 
+ states . add ( Pair . create ( ApplicationState . STATUS , valueFactory . bootstrapping ( tokens ) ) ) ; 
+ Gossiper . instance . addLocalApplicationStates ( states ) ; 
+ @ @ - 1017 , 8 + 1031 , 15 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ } 
+ if ( ! Gossiper . instance . seenAnySeed ( ) ) 
+ throw new IllegalStateException ( " Unable to contact any seeds ! " ) ; 
+ + 
+ + if ( Boolean . getBoolean ( " cassandra . reset _ bootstrap _ progress " ) ) 
+ + { 
+ + logger . info ( " Resetting bootstrap progress to start fresh " ) ; 
+ + SystemKeyspace . resetAvailableRanges ( ) ; 
+ + } 
+ + 
+ setMode ( Mode . JOINING , " Starting to bootstrap . . . " , true ) ; 
+ - new BootStrapper ( FBUtilities . getBroadcastAddress ( ) , tokens , tokenMetadata ) . bootstrap ( ) ; / / handles token update 
+ + new BootStrapper ( FBUtilities . getBroadcastAddress ( ) , tokens , tokenMetadata ) . bootstrap ( streamStateStore , ! replacing & & useStrictConsistency ) ; / / handles token update 
+ logger . info ( " Bootstrap completed ! for the tokens { } " , tokens ) ; 
+ } 
+ 
+ @ @ - 1544 , 7 + 1565 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ { 
+ UUID hostId = Gossiper . instance . getHostId ( endpoint ) ; 
+ InetAddress existing = tokenMetadata . getEndpointForHostId ( hostId ) ; 
+ - if ( DatabaseDescriptor . isReplacing ( ) & & Gossiper . instance . getEndpointStateForEndpoint ( DatabaseDescriptor . getReplaceAddress ( ) ) ! = null & & ( hostId . equals ( Gossiper . instance . getHostId ( DatabaseDescriptor . getReplaceAddress ( ) ) ) ) ) 
+ + if ( replacing & & Gossiper . instance . getEndpointStateForEndpoint ( DatabaseDescriptor . getReplaceAddress ( ) ) ! = null & & ( hostId . equals ( Gossiper . instance . getHostId ( DatabaseDescriptor . getReplaceAddress ( ) ) ) ) ) 
+ logger . warn ( " Not updating token metadata for { } because I am replacing it " , endpoint ) ; 
+ else 
+ { 
+ @ @ - 1624 , 7 + 1645 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ for ( InetAddress ep : endpointsToRemove ) 
+ { 
+ removeEndpoint ( ep ) ; 
+ - if ( DatabaseDescriptor . isReplacing ( ) & & DatabaseDescriptor . getReplaceAddress ( ) . equals ( ep ) ) 
+ + if ( replacing & & DatabaseDescriptor . getReplaceAddress ( ) . equals ( ep ) ) 
+ Gossiper . instance . replacementQuarantine ( ep ) ; / / quarantine locally longer than normally ; see CASSANDRA - 8260 
+ } 
+ if ( ! tokensToUpdateInSystemKeyspace . isEmpty ( ) ) 
+ @ @ - 3208 , 7 + 3229 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ { 
+ List < InetAddress > endpoints = null ; 
+ 
+ - if ( RangeStreamer . useStrictConsistency ) 
+ + if ( useStrictConsistency ) 
+ { 
+ Set < InetAddress > oldEndpoints = Sets . newHashSet ( rangeAddresses . get ( range ) ) ; 
+ Set < InetAddress > newEndpoints = Sets . newHashSet ( strategy . calculateNaturalEndpoints ( toFetch . right , tokenMetaCloneAllSettled ) ) ; 
+ @ @ - 3242 , 7 + 3263 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ if ( addressList = = null | | addressList . isEmpty ( ) ) 
+ continue ; 
+ 
+ - if ( RangeStreamer . useStrictConsistency ) 
+ + if ( useStrictConsistency ) 
+ { 
+ if ( addressList . size ( ) > 1 ) 
+ throw new IllegalStateException ( " Multiple strict sources found for " + toFetch ) ; 
+ @ @ - 3277 , 7 + 3298 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ } 
+ 
+ / / stream requests 
+ - Multimap < InetAddress , Range < Token > > workMap = RangeStreamer . getWorkMap ( rangesToFetchWithPreferredEndpoints , keyspace ) ; 
+ + Multimap < InetAddress , Range < Token > > workMap = RangeStreamer . getWorkMap ( rangesToFetchWithPreferredEndpoints , keyspace , FailureDetector . instance ) ; 
+ for ( InetAddress address : workMap . keySet ( ) ) 
+ { 
+ logger . debug ( " Will request range { } of keyspace { } from endpoint { } " , workMap . get ( address ) , keyspace , address ) ; 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamEvent . java b / src / java / org / apache / cassandra / streaming / StreamEvent . java 
+ index e3cdce5 . . de3db9c 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamEvent . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamEvent . java 
+ @ @ - 18 , 8 + 18 , 11 @ @ 
+ package org . apache . cassandra . streaming ; 
+ 
+ import java . net . InetAddress ; 
+ + import java . util . Set ; 
+ import java . util . UUID ; 
+ 
+ + import com . google . common . collect . ImmutableSet ; 
+ + 
+ public abstract class StreamEvent 
+ { 
+ public static enum Type 
+ @ @ - 43 , 6 + 46 , 7 @ @ public abstract class StreamEvent 
+ public final InetAddress peer ; 
+ public final boolean success ; 
+ public final int sessionIndex ; 
+ + public final Set < StreamRequest > requests ; 
+ 
+ public SessionCompleteEvent ( StreamSession session ) 
+ { 
+ @ @ - 50 , 6 + 54 , 7 @ @ public abstract class StreamEvent 
+ this . peer = session . peer ; 
+ this . success = session . isSuccess ( ) ; 
+ this . sessionIndex = session . sessionIndex ( ) ; 
+ + this . requests = ImmutableSet . copyOf ( session . requests ) ; 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamSession . java b / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ index 1b529ed . . 5a056c4 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ @ @ - 45 , 8 + 45 , 6 @ @ import org . apache . cassandra . streaming . messages . * ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . JVMStabilityInspector ; 
+ import org . apache . cassandra . utils . Pair ; 
+ - import org . apache . cassandra . utils . concurrent . RefCounted ; 
+ - 
+ import org . apache . cassandra . utils . concurrent . Ref ; 
+ import org . apache . cassandra . utils . concurrent . Refs ; 
+ 
+ @ @ - 132 , 7 + 130 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber 
+ private StreamResultFuture streamResult ; 
+ 
+ / / stream requests to send to the peer 
+ - private final Set < StreamRequest > requests = Sets . newConcurrentHashSet ( ) ; 
+ + protected final Set < StreamRequest > requests = Sets . newConcurrentHashSet ( ) ; 
+ / / streaming tasks are created and managed per ColumnFamily ID 
+ private final Map < UUID , StreamTransferTask > transfers = new ConcurrentHashMap < > ( ) ; 
+ / / data receivers , filled after receiving prepare message 
+ diff - - git a / test / unit / org / apache / cassandra / db / SystemKeyspaceTest . java b / test / unit / org / apache / cassandra / db / SystemKeyspaceTest . java 
+ index b66a0bd . . 25bb584 100644 
+ - - - a / test / unit / org / apache / cassandra / db / SystemKeyspaceTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / SystemKeyspaceTest . java 
+ @ @ - 1 , 6 + 1 , 4 @ @ 
+ - package org . apache . cassandra . db ; 
+ / * 
+ - * 
+ * Licensed to the Apache Software Foundation ( ASF ) under one 
+ * or more contributor license agreements . See the NOTICE file 
+ * distributed with this work for additional information 
+ @ @ - 9 , 25 + 7 , 19 @ @ package org . apache . cassandra . db ; 
+ * " License " ) ; you may not use this file except in compliance 
+ * with the License . You may obtain a copy of the License at 
+ * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , 
+ - * software distributed under the License is distributed on an 
+ - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ - * KIND , either express or implied . See the License for the 
+ - * specific language governing permissions and limitations 
+ - * under the License . 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ * / 
+ - 
+ + package org . apache . cassandra . db ; 
+ 
+ import java . net . InetAddress ; 
+ import java . net . UnknownHostException ; 
+ - import java . util . ArrayList ; 
+ - import java . util . Collections ; 
+ - import java . util . Collection ; 
+ - import java . util . List ; 
+ - import java . util . UUID ; 
+ + import java . util . * ; 
+ 
+ import org . junit . Test ; 
+ 
+ diff - - git a / test / unit / org / apache / cassandra / dht / BootStrapperTest . java b / test / unit / org / apache / cassandra / dht / BootStrapperTest . java 
+ index 5d1d8c6 . . ababd99 100644 
+ - - - a / test / unit / org / apache / cassandra / dht / BootStrapperTest . java 
+ + + + b / test / unit / org / apache / cassandra / dht / BootStrapperTest . java 
+ @ @ - 31 , 6 + 31 , 7 @ @ import org . junit . runner . RunWith ; 
+ 
+ import org . apache . cassandra . OrderedJUnit4ClassRunner ; 
+ import org . apache . cassandra . SchemaLoader ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . config . Schema ; 
+ import org . apache . cassandra . db . Keyspace ; 
+ import org . apache . cassandra . exceptions . ConfigurationException ; 
+ @ @ - 75 , 7 + 76 , 7 @ @ public class BootStrapperTest 
+ 
+ TokenMetadata tmd = ss . getTokenMetadata ( ) ; 
+ assertEquals ( numOldNodes , tmd . sortedTokens ( ) . size ( ) ) ; 
+ - RangeStreamer s = new RangeStreamer ( tmd , myEndpoint , " Bootstrap " ) ; 
+ + RangeStreamer s = new RangeStreamer ( tmd , null , myEndpoint , " Bootstrap " , true , DatabaseDescriptor . getEndpointSnitch ( ) , new StreamStateStore ( ) ) ; 
+ IFailureDetector mockFailureDetector = new IFailureDetector ( ) 
+ { 
+ public boolean isAlive ( InetAddress ep ) 
+ @ @ - 96 , 7 + 97 , 7 @ @ public class BootStrapperTest 
+ Collection < Map . Entry < InetAddress , Collection < Range < Token > > > > toFetch = s . toFetch ( ) . get ( keyspaceName ) ; 
+ 
+ / / Check we get get RF new ranges in total 
+ - Set < Range < Token > > ranges = new HashSet < Range < Token > > ( ) ; 
+ + Set < Range < Token > > ranges = new HashSet < > ( ) ; 
+ for ( Map . Entry < InetAddress , Collection < Range < Token > > > e : toFetch ) 
+ ranges . addAll ( e . getValue ( ) ) ; 
+ 
+ diff - - git a / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java b / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java 
+ new file mode 100644 
+ index 0000000 . . c8b9f05 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java 
+ @ @ - 0 , 0 + 1 , 76 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . dht ; 
+ + 
+ + import java . net . InetAddress ; 
+ + import java . util . Collections ; 
+ + 
+ + import org . junit . Test ; 
+ + 
+ + import org . apache . cassandra . streaming . DefaultConnectionFactory ; 
+ + import org . apache . cassandra . streaming . StreamEvent ; 
+ + import org . apache . cassandra . streaming . StreamSession ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ + 
+ + import static org . junit . Assert . assertFalse ; 
+ + import static org . junit . Assert . assertTrue ; 
+ + 
+ + public class StreamStateStoreTest 
+ + { 
+ + 
+ + @ Test 
+ + public void testUpdateAndQueryAvailableRanges ( ) 
+ + { 
+ + / / let range ( 0 , 100 ] of keyspace1 be bootstrapped . 
+ + IPartitioner p = new Murmur3Partitioner ( ) ; 
+ + Token . TokenFactory factory = p . getTokenFactory ( ) ; 
+ + Range < Token > range = new Range < > ( factory . fromString ( " 0 " ) , factory . fromString ( " 100 " ) ) ; 
+ + 
+ + InetAddress local = FBUtilities . getBroadcastAddress ( ) ; 
+ + StreamSession session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true ) ; 
+ + session . addStreamRequest ( " keyspace1 " , Collections . singleton ( range ) , Collections . singleton ( " cf " ) , 0 ) ; 
+ + 
+ + StreamStateStore store = new StreamStateStore ( ) ; 
+ + / / session complete event that is not completed makes data not available for keyspace / ranges 
+ + store . handleStreamEvent ( new StreamEvent . SessionCompleteEvent ( session ) ) ; 
+ + assertFalse ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 50 " ) ) ) ; 
+ + 
+ + / / successfully completed session adds available keyspace / ranges 
+ + session . state ( StreamSession . State . COMPLETE ) ; 
+ + store . handleStreamEvent ( new StreamEvent . SessionCompleteEvent ( session ) ) ; 
+ + / / check if token in range ( 0 , 100 ] appears available . 
+ + assertTrue ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 50 " ) ) ) ; 
+ + / / check if token out of range returns false 
+ + assertFalse ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 0 " ) ) ) ; 
+ + assertFalse ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 101 " ) ) ) ; 
+ + / / check if different keyspace returns false 
+ + assertFalse ( store . isDataAvailable ( " keyspace2 " , factory . fromString ( " 50 " ) ) ) ; 
+ + 
+ + / / add different range within the same keyspace 
+ + Range < Token > range2 = new Range < > ( factory . fromString ( " 100 " ) , factory . fromString ( " 200 " ) ) ; 
+ + session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true ) ; 
+ + session . addStreamRequest ( " keyspace1 " , Collections . singleton ( range2 ) , Collections . singleton ( " cf " ) , 0 ) ; 
+ + session . state ( StreamSession . State . COMPLETE ) ; 
+ + store . handleStreamEvent ( new StreamEvent . SessionCompleteEvent ( session ) ) ; 
+ + 
+ + / / newly added range should be available 
+ + assertTrue ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 101 " ) ) ) ; 
+ + / / as well as the old one 
+ + assertTrue ( store . isDataAvailable ( " keyspace1 " , factory . fromString ( " 50 " ) ) ) ; 
+ + } 
+ + } 
+ \ No newline at end of file
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 7be913e . . 7c5a752 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 2 , 6 + 2 , 8 @ @ 
+ * add command to stop compactions ( CASSANDRA - 1740 ) 
+ * filter out unavailable cipher suites when using encryption ( CASSANDRA - 3178 ) 
+ * ( HADOOP ) add old - style api support for CFIF and CFRR ( CASSANDRA - 2799 ) 
+ + * Support TimeUUIDType column names in Stress . java tool ( CASSANDRA - 3541 ) 
+ + 
+ 
+ 1 . 0 . 5 
+ * revert CASSANDRA - 3407 ( see CASSANDRA - 3540 ) 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / Session . java b / tools / stress / src / org / apache / cassandra / stress / Session . java 
+ index abbea50 . . ddc6a69 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / Session . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / Session . java 
+ @ @ - 27 , 9 + 27 , 7 @ @ import java . util . concurrent . atomic . AtomicLong ; 
+ 
+ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . config . ConfigurationException ; 
+ - import org . apache . cassandra . db . compaction . AbstractCompactionStrategy ; 
+ - import org . apache . cassandra . db . marshal . AbstractType ; 
+ - import org . apache . cassandra . db . marshal . TypeParser ; 
+ + import org . apache . cassandra . db . marshal . * ; 
+ import org . apache . commons . cli . * ; 
+ 
+ import org . apache . cassandra . db . ColumnFamilyType ; 
+ @ @ - 50 , 6 + 48 , 8 @ @ public class Session implements Serializable 
+ public static final String DEFAULT _ COMPARATOR = " AsciiType " ; 
+ public static final String DEFAULT _ VALIDATOR = " BytesType " ; 
+ 
+ + private static InetAddress localInetAddress ; 
+ + 
+ public final AtomicInteger operations ; 
+ public final AtomicInteger keys ; 
+ public final AtomicLong latency ; 
+ @ @ - 89 , 6 + 89 , 7 @ @ public class Session implements Serializable 
+ availableOptions . addOption ( " I " , " compression " , true , " Specify the compression to use for sstable , default : no compression " ) ; 
+ availableOptions . addOption ( " Q " , " query - names " , true , " Comma - separated list of column names to retrieve from each row . " ) ; 
+ availableOptions . addOption ( " Z " , " compaction - strategy " , true , " CompactionStrategy to use . " ) ; 
+ + availableOptions . addOption ( " U " , " comparator " , true , " Column Comparator to use . Currently supported types are : TimeUUIDType , AsciiType , UTF8Type . " ) ; 
+ } 
+ 
+ private int numKeys = 1000 * 1000 ; 
+ @ @ - 131 , 6 + 132 , 8 @ @ public class Session implements Serializable 
+ protected float sigma ; 
+ 
+ public final InetAddress sendToDaemon ; 
+ + public final String comparator ; 
+ + public final boolean timeUUIDComparator ; 
+ 
+ public Session ( String [ ] arguments ) throws IllegalArgumentException 
+ { 
+ @ @ - 321 , 6 + 324 , 35 @ @ public class Session implements Serializable 
+ System . exit ( 1 ) ; 
+ } 
+ } 
+ + 
+ + if ( cmd . hasOption ( " U " ) ) 
+ + { 
+ + AbstractType parsed = null ; 
+ + 
+ + try 
+ + { 
+ + parsed = TypeParser . parse ( cmd . getOptionValue ( " U " ) ) ; 
+ + } 
+ + catch ( ConfigurationException e ) 
+ + { 
+ + System . err . println ( e . getMessage ( ) ) ; 
+ + System . exit ( 1 ) ; 
+ + } 
+ + 
+ + comparator = cmd . getOptionValue ( " U " ) ; 
+ + timeUUIDComparator = parsed instanceof TimeUUIDType ; 
+ + 
+ + if ( ! ( parsed instanceof TimeUUIDType | | parsed instanceof AsciiType | | parsed instanceof UTF8Type ) ) 
+ + { 
+ + System . err . println ( " Currently supported types are : TimeUUIDType , AsciiType , UTF8Type . " ) ; 
+ + System . exit ( 1 ) ; 
+ + } 
+ + } 
+ + else 
+ + { 
+ + comparator = null ; 
+ + timeUUIDComparator = false ; 
+ + } 
+ } 
+ catch ( ParseException e ) 
+ { 
+ @ @ - 464 , 6 + 496 , 7 @ @ public class Session implements Serializable 
+ public void createKeySpaces ( ) 
+ { 
+ KsDef keyspace = new KsDef ( ) ; 
+ + String defaultComparator = comparator = = null ? DEFAULT _ COMPARATOR : comparator ; 
+ 
+ / / column family for standard columns 
+ CfDef standardCfDef = new CfDef ( " Keyspace1 " , " Standard1 " ) ; 
+ @ @ - 471 , 7 + 504 , 7 @ @ public class Session implements Serializable 
+ if ( compression ! = null ) 
+ compressionOptions . put ( " sstable _ compression " , compression ) ; 
+ 
+ - standardCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) 
+ + standardCfDef . setComparator _ type ( defaultComparator ) 
+ . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) 
+ . setCompression _ options ( compressionOptions ) ; 
+ 
+ @ @ - 485 , 7 + 518 , 7 @ @ public class Session implements Serializable 
+ / / column family with super columns 
+ CfDef superCfDef = new CfDef ( " Keyspace1 " , " Super1 " ) . setColumn _ type ( " Super " ) ; 
+ superCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) 
+ - . setSubcomparator _ type ( DEFAULT _ COMPARATOR ) 
+ + . setSubcomparator _ type ( defaultComparator ) 
+ . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) 
+ . setCompression _ options ( compressionOptions ) ; 
+ 
+ @ @ - 574 , 4 + 607 , 20 @ @ public class Session implements Serializable 
+ return client ; 
+ } 
+ 
+ + public static InetAddress getLocalAddress ( ) 
+ + { 
+ + if ( localInetAddress = = null ) 
+ + { 
+ + try 
+ + { 
+ + localInetAddress = InetAddress . getLocalHost ( ) ; 
+ + } 
+ + catch ( UnknownHostException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + return localInetAddress ; 
+ + } 
+ } 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java b / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java 
+ index 45d33cb . . c81df6f 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java 
+ @ @ - 52 , 9 + 52 , 9 @ @ public class Inserter extends Operation 
+ 
+ for ( int i = 0 ; i < session . getColumnsPerKey ( ) ; i + + ) 
+ { 
+ - String columnName = ( " C " + Integer . toString ( i ) ) ; 
+ - ByteBuffer columnValue = values . get ( i % values . size ( ) ) ; 
+ - columns . add ( new Column ( ByteBufferUtil . bytes ( columnName ) ) . setValue ( columnValue ) . setTimestamp ( System . currentTimeMillis ( ) ) ) ; 
+ + columns . add ( new Column ( columnName ( i , session . timeUUIDComparator ) ) 
+ + . setValue ( values . get ( i % values . size ( ) ) ) 
+ + . setTimestamp ( System . currentTimeMillis ( ) ) ) ; 
+ } 
+ 
+ if ( session . getColumnFamilyType ( ) = = ColumnFamilyType . Super ) 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / util / Operation . java b / tools / stress / src / org / apache / cassandra / stress / util / Operation . java 
+ index 10b97ad . . dd5128f 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / util / Operation . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / util / Operation . java 
+ @ @ - 27 , 11 + 27 , 14 @ @ import java . util . Random ; 
+ 
+ import static com . google . common . base . Charsets . UTF _ 8 ; 
+ 
+ + import org . apache . cassandra . db . marshal . TimeUUIDType ; 
+ import org . apache . cassandra . stress . Session ; 
+ import org . apache . cassandra . stress . Stress ; 
+ import org . apache . cassandra . thrift . Cassandra ; 
+ import org . apache . cassandra . thrift . InvalidRequestException ; 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . apache . cassandra . utils . UUIDGen ; 
+ 
+ public abstract class Operation 
+ { 
+ @ @ - 200 , 6 + 203 , 13 @ @ public abstract class Operation 
+ return result . toString ( ) ; 
+ } 
+ 
+ + protected ByteBuffer columnName ( int index , boolean timeUUIDComparator ) 
+ + { 
+ + return timeUUIDComparator 
+ + ? TimeUUIDType . instance . decompose ( UUIDGen . makeType1UUIDFromHost ( Session . getLocalAddress ( ) ) ) 
+ + : ByteBufferUtil . bytes ( String . format ( " C % d " , index ) ) ; 
+ + } 
+ + 
+ protected String getExceptionMessage ( Exception e ) 
+ { 
+ String className = e . getClass ( ) . getSimpleName ( ) ;

@@ -1,0 +1,315 @@
+BLEU SCORE: 0.019470723011608928
+
+TEST MSG: Tool to create a leveling based on an existing set of sstables .
+GENERATED MSG: Add tool to reset SSTable level ; patch by Marcus Eriksson , reviewed by yukim for CASSANDRA - 5271
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 3a8d824 . . f98bb3f 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 0 . 13 : <nl> + * Add offline tool to relevel sstables ( CASSANDRA - 8301 ) <nl> * Preserve stream ID for more protocol errors ( CASSANDRA - 8848 ) <nl> * Fix combining token ( ) function with multi - column relations on <nl> clustering columns ( CASSANDRA - 8797 ) <nl> diff - - git a / src / java / org / apache / cassandra / tools / SSTableOfflineRelevel . java b / src / java / org / apache / cassandra / tools / SSTableOfflineRelevel . java <nl> new file mode 100644 <nl> index 0000000 . . 3fb2f7a <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / tools / SSTableOfflineRelevel . java <nl> @ @ - 0 , 0 + 1 , 191 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . tools ; <nl> + <nl> + import java . io . IOException ; <nl> + import java . io . PrintStream ; <nl> + import java . util . ArrayList ; <nl> + import java . util . Collections ; <nl> + import java . util . Comparator ; <nl> + import java . util . HashSet ; <nl> + import java . util . Iterator ; <nl> + import java . util . List ; <nl> + import java . util . Map ; <nl> + import java . util . Set ; <nl> + <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . config . Schema ; <nl> + import org . apache . cassandra . db . DecoratedKey ; <nl> + import org . apache . cassandra . db . Directories ; <nl> + import org . apache . cassandra . db . Keyspace ; <nl> + import org . apache . cassandra . db . compaction . LeveledManifest ; <nl> + import org . apache . cassandra . io . sstable . Component ; <nl> + import org . apache . cassandra . io . sstable . Descriptor ; <nl> + import org . apache . cassandra . io . sstable . SSTableReader ; <nl> + import org . apache . cassandra . utils . Pair ; <nl> + <nl> + / * * <nl> + * Create a decent leveling for the given keyspace / column family <nl> + * <nl> + * Approach is to sort the sstables by their last token <nl> + * <nl> + * given an original leveling like this ( note that [ ] indicates token boundaries , not sstable size on disk , all sstables are the same size ) <nl> + * <nl> + * L3 [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] <nl> + * L2 [ ] [ ] [ ] [ ] <nl> + * L1 [ ] [ ] <nl> + * L0 [ ] <nl> + * <nl> + * Will look like this after being dropped to L0 and sorted by last token ( and , to illustrate overlap , the overlapping ones are put on a new line ) : <nl> + * <nl> + * [ ] [ ] [ ] <nl> + * [ ] [ ] [ ] [ ] <nl> + * [ ] <nl> + * [ ] <nl> + * . . . <nl> + * <nl> + * Then , we start iterating from the smallest last - token and adding all sstables that do not cause an overlap to <nl> + * a level , we will reconstruct the original leveling top - down . Whenever we add an sstable to the level , we remove it from <nl> + * the sorted list . Once we reach the end of the sorted list , we have a full level , and can start over with the level below . <nl> + * <nl> + * If we end up with more levels than expected , we put all levels exceeding the expected in L0 , for example , original L0 <nl> + * files will most likely be put in a level of its own since they most often overlap many other sstables <nl> + * / <nl> + public class SSTableOfflineRelevel <nl> + { <nl> + / * * <nl> + * @ param args a list of sstables whose metadata we are changing <nl> + * / <nl> + public static void main ( String [ ] args ) throws IOException <nl> + { <nl> + PrintStream out = System . out ; <nl> + if ( args . length < 2 ) <nl> + { <nl> + out . println ( " This command should be run with Cassandra stopped ! " ) ; <nl> + out . println ( " Usage : sstableofflinerelevel [ - - dry - run ] < keyspace > < columnfamily > " ) ; <nl> + System . exit ( 1 ) ; <nl> + } <nl> + boolean dryRun = args [ 0 ] . equals ( " - - dry - run " ) ; <nl> + String keyspace = args [ args . length - 2 ] ; <nl> + String columnfamily = args [ args . length - 1 ] ; <nl> + DatabaseDescriptor . loadSchemas ( ) ; <nl> + <nl> + if ( Schema . instance . getCFMetaData ( keyspace , columnfamily ) = = null ) <nl> + throw new IllegalArgumentException ( String . format ( " Unknown keyspace / columnFamily % s . % s " , <nl> + keyspace , <nl> + columnfamily ) ) ; <nl> + <nl> + Keyspace . openWithoutSSTables ( keyspace ) ; <nl> + Directories directories = Directories . create ( keyspace , columnfamily ) ; <nl> + Set < SSTableReader > sstables = new HashSet < > ( ) ; <nl> + for ( Map . Entry < Descriptor , Set < Component > > sstable : directories . sstableLister ( ) . list ( ) . entrySet ( ) ) <nl> + { <nl> + if ( sstable . getKey ( ) ! = null ) <nl> + { <nl> + SSTableReader reader = SSTableReader . open ( sstable . getKey ( ) ) ; <nl> + sstables . add ( reader ) ; <nl> + } <nl> + } <nl> + if ( sstables . isEmpty ( ) ) <nl> + { <nl> + out . println ( " No sstables to relevel for " + keyspace + " . " + columnfamily ) ; <nl> + System . exit ( 1 ) ; <nl> + } <nl> + Relevel rl = new Relevel ( sstables ) ; <nl> + rl . relevel ( dryRun ) ; <nl> + System . exit ( 0 ) ; <nl> + <nl> + } <nl> + <nl> + private static class Relevel <nl> + { <nl> + private final Set < SSTableReader > sstables ; <nl> + private final int approxExpectedLevels ; <nl> + public Relevel ( Set < SSTableReader > sstables ) <nl> + { <nl> + this . sstables = sstables ; <nl> + approxExpectedLevels = ( int ) Math . ceil ( Math . log10 ( sstables . size ( ) ) ) ; <nl> + } <nl> + <nl> + public void relevel ( boolean dryRun ) throws IOException <nl> + { <nl> + List < SSTableReader > sortedSSTables = new ArrayList < > ( sstables ) ; <nl> + Collections . sort ( sortedSSTables , new Comparator < SSTableReader > ( ) <nl> + { <nl> + @ Override <nl> + public int compare ( SSTableReader o1 , SSTableReader o2 ) <nl> + { <nl> + return o1 . last . compareTo ( o2 . last ) ; <nl> + } <nl> + } ) ; <nl> + <nl> + List < List < SSTableReader > > levels = new ArrayList < > ( ) ; <nl> + <nl> + while ( ! sortedSSTables . isEmpty ( ) ) <nl> + { <nl> + Iterator < SSTableReader > it = sortedSSTables . iterator ( ) ; <nl> + List < SSTableReader > level = new ArrayList < > ( ) ; <nl> + DecoratedKey lastLast = null ; <nl> + while ( it . hasNext ( ) ) <nl> + { <nl> + SSTableReader sstable = it . next ( ) ; <nl> + if ( lastLast = = null | | lastLast . compareTo ( sstable . first ) < 0 ) <nl> + { <nl> + level . add ( sstable ) ; <nl> + lastLast = sstable . last ; <nl> + it . remove ( ) ; <nl> + } <nl> + } <nl> + levels . add ( level ) ; <nl> + } <nl> + List < SSTableReader > l0 = new ArrayList < > ( ) ; <nl> + if ( approxExpectedLevels < levels . size ( ) ) <nl> + { <nl> + for ( int i = approxExpectedLevels ; i < levels . size ( ) ; i + + ) <nl> + l0 . addAll ( levels . get ( i ) ) ; <nl> + levels = levels . subList ( 0 , approxExpectedLevels ) ; <nl> + } <nl> + if ( dryRun ) <nl> + System . out . println ( " Potential leveling : " ) ; <nl> + else <nl> + System . out . println ( " New leveling : " ) ; <nl> + <nl> + System . out . println ( " L0 = " + l0 . size ( ) ) ; <nl> + for ( int i = levels . size ( ) - 1 ; i > = 0 ; i - - ) <nl> + System . out . println ( String . format ( " L % d % d " , levels . size ( ) - i , levels . get ( i ) . size ( ) ) ) ; <nl> + <nl> + if ( ! dryRun ) <nl> + { <nl> + for ( SSTableReader sstable : l0 ) <nl> + { <nl> + if ( sstable . getSSTableLevel ( ) ! = 0 ) <nl> + LeveledManifest . mutateLevel ( Pair . create ( sstable . getSSTableMetadata ( ) , sstable . getAncestors ( ) ) , sstable . descriptor , sstable . descriptor . filenameFor ( Component . STATS ) , 0 ) ; <nl> + } <nl> + for ( int i = levels . size ( ) - 1 ; i > = 0 ; i - - ) <nl> + { <nl> + for ( SSTableReader sstable : levels . get ( i ) ) <nl> + { <nl> + int newLevel = levels . size ( ) - i ; <nl> + if ( newLevel ! = sstable . getSSTableLevel ( ) ) <nl> + LeveledManifest . mutateLevel ( Pair . create ( sstable . getSSTableMetadata ( ) , sstable . getAncestors ( ) ) , sstable . descriptor , sstable . descriptor . filenameFor ( Component . STATS ) , newLevel ) ; <nl> + } <nl> + } <nl> + } <nl> + } <nl> + } <nl> + } <nl> diff - - git a / tools / bin / sstableofflinerelevel b / tools / bin / sstableofflinerelevel <nl> new file mode 100755 <nl> index 0000000 . . 19cb4c1 <nl> - - - / dev / null <nl> + + + b / tools / bin / sstableofflinerelevel <nl> @ @ - 0 , 0 + 1 , 49 @ @ <nl> + # ! / bin / sh <nl> + <nl> + # Licensed to the Apache Software Foundation ( ASF ) under one <nl> + # or more contributor license agreements . See the NOTICE file <nl> + # distributed with this work for additional information <nl> + # regarding copyright ownership . The ASF licenses this file <nl> + # to you under the Apache License , Version 2 . 0 ( the <nl> + # " License " ) ; you may not use this file except in compliance <nl> + # with the License . You may obtain a copy of the License at <nl> + # <nl> + # http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + # <nl> + # Unless required by applicable law or agreed to in writing , software <nl> + # distributed under the License is distributed on an " AS IS " BASIS , <nl> + # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + # See the License for the specific language governing permissions and <nl> + # limitations under the License . <nl> + <nl> + if [ " x $ CASSANDRA _ INCLUDE " = " x " ] ; then <nl> + for include in " ` dirname $ 0 ` / cassandra . in . sh " \ <nl> + " $ HOME / . cassandra . in . sh " \ <nl> + / usr / share / cassandra / cassandra . in . sh \ <nl> + / usr / local / share / cassandra / cassandra . in . sh \ <nl> + / opt / cassandra / cassandra . in . sh ; do <nl> + if [ - r $ include ] ; then <nl> + . $ include <nl> + break <nl> + fi <nl> + done <nl> + elif [ - r $ CASSANDRA _ INCLUDE ] ; then <nl> + . $ CASSANDRA _ INCLUDE <nl> + fi <nl> + <nl> + <nl> + # Use JAVA _ HOME if set , otherwise look for java in PATH <nl> + if [ - x $ JAVA _ HOME / bin / java ] ; then <nl> + JAVA = $ JAVA _ HOME / bin / java <nl> + else <nl> + JAVA = ` which java ` <nl> + fi <nl> + <nl> + if [ - z $ CLASSPATH ] ; then <nl> + echo " You must set the CLASSPATH var " > & 2 <nl> + exit 1 <nl> + fi <nl> + <nl> + $ JAVA - cp $ CLASSPATH - Dstorage - config = $ CASSANDRA _ CONF \ <nl> + - Dlog4j . configuration = log4j - tools . properties \ <nl> + org . apache . cassandra . tools . SSTableOfflineRelevel " $ @ "
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 04dcee7 . . 924eeeb 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 10 , 6 + 10 , 7 @ @ <nl> * Handle null values when executing prepared statement ( CASSANDRA - 5081 ) <nl> * Add netty to pom dependencies ( CASSANDRA - 5181 ) <nl> * Include type arguments in Thrift CQLPreparedResult ( CASSANDRA - 5311 ) <nl> + * Fix compaction not removing columns when bf _ fp _ ratio is 1 ( CASSANDRA - 5182 ) <nl> Merged from 1 . 1 : <nl> * nodetool : ability to repair specific range ( CASSANDRA - 5280 ) <nl> * Fix possible assertion triggered in SliceFromReadCommand ( CASSANDRA - 5284 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionController . java b / src / java / org / apache / cassandra / db / compaction / CompactionController . java <nl> index ff3de53 . . f3198ff 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionController . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionController . java <nl> @ @ - 34 , 6 + 34 , 7 @ @ import org . apache . cassandra . io . sstable . SSTableIdentityIterator ; <nl> import org . apache . cassandra . io . sstable . SSTableReader ; <nl> import org . apache . cassandra . service . CacheService ; <nl> import org . apache . cassandra . service . StorageService ; <nl> + import org . apache . cassandra . utils . AlwaysPresentFilter ; <nl> import org . apache . cassandra . utils . Throttle ; <nl> <nl> / * * <nl> @ @ - 114 , 8 + 115 , 15 @ @ public class CompactionController <nl> List < SSTableReader > filteredSSTables = overlappingTree . search ( key ) ; <nl> for ( SSTableReader sstable : filteredSSTables ) <nl> { <nl> - if ( sstable . getBloomFilter ( ) . isPresent ( key . key ) & & sstable . getMinTimestamp ( ) < = maxDeletionTimestamp ) <nl> - return false ; <nl> + if ( sstable . getMinTimestamp ( ) < = maxDeletionTimestamp ) <nl> + { <nl> + / / if we don ' t have bloom filter ( bf _ fp _ chance = 1 . 0 or filter file is missing ) , <nl> + / / we check index file instead . <nl> + if ( sstable . getBloomFilter ( ) instanceof AlwaysPresentFilter & & sstable . getPosition ( key , SSTableReader . Operator . EQ ) ! = null ) <nl> + return false ; <nl> + else if ( sstable . getBloomFilter ( ) . isPresent ( key . key ) ) <nl> + return false ; <nl> + } <nl> } <nl> return true ; <nl> }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 3a8d824 . . f98bb3f 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 0 . 13 : 
+ + * Add offline tool to relevel sstables ( CASSANDRA - 8301 ) 
+ * Preserve stream ID for more protocol errors ( CASSANDRA - 8848 ) 
+ * Fix combining token ( ) function with multi - column relations on 
+ clustering columns ( CASSANDRA - 8797 ) 
+ diff - - git a / src / java / org / apache / cassandra / tools / SSTableOfflineRelevel . java b / src / java / org / apache / cassandra / tools / SSTableOfflineRelevel . java 
+ new file mode 100644 
+ index 0000000 . . 3fb2f7a 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / tools / SSTableOfflineRelevel . java 
+ @ @ - 0 , 0 + 1 , 191 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . tools ; 
+ + 
+ + import java . io . IOException ; 
+ + import java . io . PrintStream ; 
+ + import java . util . ArrayList ; 
+ + import java . util . Collections ; 
+ + import java . util . Comparator ; 
+ + import java . util . HashSet ; 
+ + import java . util . Iterator ; 
+ + import java . util . List ; 
+ + import java . util . Map ; 
+ + import java . util . Set ; 
+ + 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . config . Schema ; 
+ + import org . apache . cassandra . db . DecoratedKey ; 
+ + import org . apache . cassandra . db . Directories ; 
+ + import org . apache . cassandra . db . Keyspace ; 
+ + import org . apache . cassandra . db . compaction . LeveledManifest ; 
+ + import org . apache . cassandra . io . sstable . Component ; 
+ + import org . apache . cassandra . io . sstable . Descriptor ; 
+ + import org . apache . cassandra . io . sstable . SSTableReader ; 
+ + import org . apache . cassandra . utils . Pair ; 
+ + 
+ + / * * 
+ + * Create a decent leveling for the given keyspace / column family 
+ + * 
+ + * Approach is to sort the sstables by their last token 
+ + * 
+ + * given an original leveling like this ( note that [ ] indicates token boundaries , not sstable size on disk , all sstables are the same size ) 
+ + * 
+ + * L3 [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] 
+ + * L2 [ ] [ ] [ ] [ ] 
+ + * L1 [ ] [ ] 
+ + * L0 [ ] 
+ + * 
+ + * Will look like this after being dropped to L0 and sorted by last token ( and , to illustrate overlap , the overlapping ones are put on a new line ) : 
+ + * 
+ + * [ ] [ ] [ ] 
+ + * [ ] [ ] [ ] [ ] 
+ + * [ ] 
+ + * [ ] 
+ + * . . . 
+ + * 
+ + * Then , we start iterating from the smallest last - token and adding all sstables that do not cause an overlap to 
+ + * a level , we will reconstruct the original leveling top - down . Whenever we add an sstable to the level , we remove it from 
+ + * the sorted list . Once we reach the end of the sorted list , we have a full level , and can start over with the level below . 
+ + * 
+ + * If we end up with more levels than expected , we put all levels exceeding the expected in L0 , for example , original L0 
+ + * files will most likely be put in a level of its own since they most often overlap many other sstables 
+ + * / 
+ + public class SSTableOfflineRelevel 
+ + { 
+ + / * * 
+ + * @ param args a list of sstables whose metadata we are changing 
+ + * / 
+ + public static void main ( String [ ] args ) throws IOException 
+ + { 
+ + PrintStream out = System . out ; 
+ + if ( args . length < 2 ) 
+ + { 
+ + out . println ( " This command should be run with Cassandra stopped ! " ) ; 
+ + out . println ( " Usage : sstableofflinerelevel [ - - dry - run ] < keyspace > < columnfamily > " ) ; 
+ + System . exit ( 1 ) ; 
+ + } 
+ + boolean dryRun = args [ 0 ] . equals ( " - - dry - run " ) ; 
+ + String keyspace = args [ args . length - 2 ] ; 
+ + String columnfamily = args [ args . length - 1 ] ; 
+ + DatabaseDescriptor . loadSchemas ( ) ; 
+ + 
+ + if ( Schema . instance . getCFMetaData ( keyspace , columnfamily ) = = null ) 
+ + throw new IllegalArgumentException ( String . format ( " Unknown keyspace / columnFamily % s . % s " , 
+ + keyspace , 
+ + columnfamily ) ) ; 
+ + 
+ + Keyspace . openWithoutSSTables ( keyspace ) ; 
+ + Directories directories = Directories . create ( keyspace , columnfamily ) ; 
+ + Set < SSTableReader > sstables = new HashSet < > ( ) ; 
+ + for ( Map . Entry < Descriptor , Set < Component > > sstable : directories . sstableLister ( ) . list ( ) . entrySet ( ) ) 
+ + { 
+ + if ( sstable . getKey ( ) ! = null ) 
+ + { 
+ + SSTableReader reader = SSTableReader . open ( sstable . getKey ( ) ) ; 
+ + sstables . add ( reader ) ; 
+ + } 
+ + } 
+ + if ( sstables . isEmpty ( ) ) 
+ + { 
+ + out . println ( " No sstables to relevel for " + keyspace + " . " + columnfamily ) ; 
+ + System . exit ( 1 ) ; 
+ + } 
+ + Relevel rl = new Relevel ( sstables ) ; 
+ + rl . relevel ( dryRun ) ; 
+ + System . exit ( 0 ) ; 
+ + 
+ + } 
+ + 
+ + private static class Relevel 
+ + { 
+ + private final Set < SSTableReader > sstables ; 
+ + private final int approxExpectedLevels ; 
+ + public Relevel ( Set < SSTableReader > sstables ) 
+ + { 
+ + this . sstables = sstables ; 
+ + approxExpectedLevels = ( int ) Math . ceil ( Math . log10 ( sstables . size ( ) ) ) ; 
+ + } 
+ + 
+ + public void relevel ( boolean dryRun ) throws IOException 
+ + { 
+ + List < SSTableReader > sortedSSTables = new ArrayList < > ( sstables ) ; 
+ + Collections . sort ( sortedSSTables , new Comparator < SSTableReader > ( ) 
+ + { 
+ + @ Override 
+ + public int compare ( SSTableReader o1 , SSTableReader o2 ) 
+ + { 
+ + return o1 . last . compareTo ( o2 . last ) ; 
+ + } 
+ + } ) ; 
+ + 
+ + List < List < SSTableReader > > levels = new ArrayList < > ( ) ; 
+ + 
+ + while ( ! sortedSSTables . isEmpty ( ) ) 
+ + { 
+ + Iterator < SSTableReader > it = sortedSSTables . iterator ( ) ; 
+ + List < SSTableReader > level = new ArrayList < > ( ) ; 
+ + DecoratedKey lastLast = null ; 
+ + while ( it . hasNext ( ) ) 
+ + { 
+ + SSTableReader sstable = it . next ( ) ; 
+ + if ( lastLast = = null | | lastLast . compareTo ( sstable . first ) < 0 ) 
+ + { 
+ + level . add ( sstable ) ; 
+ + lastLast = sstable . last ; 
+ + it . remove ( ) ; 
+ + } 
+ + } 
+ + levels . add ( level ) ; 
+ + } 
+ + List < SSTableReader > l0 = new ArrayList < > ( ) ; 
+ + if ( approxExpectedLevels < levels . size ( ) ) 
+ + { 
+ + for ( int i = approxExpectedLevels ; i < levels . size ( ) ; i + + ) 
+ + l0 . addAll ( levels . get ( i ) ) ; 
+ + levels = levels . subList ( 0 , approxExpectedLevels ) ; 
+ + } 
+ + if ( dryRun ) 
+ + System . out . println ( " Potential leveling : " ) ; 
+ + else 
+ + System . out . println ( " New leveling : " ) ; 
+ + 
+ + System . out . println ( " L0 = " + l0 . size ( ) ) ; 
+ + for ( int i = levels . size ( ) - 1 ; i > = 0 ; i - - ) 
+ + System . out . println ( String . format ( " L % d % d " , levels . size ( ) - i , levels . get ( i ) . size ( ) ) ) ; 
+ + 
+ + if ( ! dryRun ) 
+ + { 
+ + for ( SSTableReader sstable : l0 ) 
+ + { 
+ + if ( sstable . getSSTableLevel ( ) ! = 0 ) 
+ + LeveledManifest . mutateLevel ( Pair . create ( sstable . getSSTableMetadata ( ) , sstable . getAncestors ( ) ) , sstable . descriptor , sstable . descriptor . filenameFor ( Component . STATS ) , 0 ) ; 
+ + } 
+ + for ( int i = levels . size ( ) - 1 ; i > = 0 ; i - - ) 
+ + { 
+ + for ( SSTableReader sstable : levels . get ( i ) ) 
+ + { 
+ + int newLevel = levels . size ( ) - i ; 
+ + if ( newLevel ! = sstable . getSSTableLevel ( ) ) 
+ + LeveledManifest . mutateLevel ( Pair . create ( sstable . getSSTableMetadata ( ) , sstable . getAncestors ( ) ) , sstable . descriptor , sstable . descriptor . filenameFor ( Component . STATS ) , newLevel ) ; 
+ + } 
+ + } 
+ + } 
+ + } 
+ + } 
+ + } 
+ diff - - git a / tools / bin / sstableofflinerelevel b / tools / bin / sstableofflinerelevel 
+ new file mode 100755 
+ index 0000000 . . 19cb4c1 
+ - - - / dev / null 
+ + + + b / tools / bin / sstableofflinerelevel 
+ @ @ - 0 , 0 + 1 , 49 @ @ 
+ + # ! / bin / sh 
+ + 
+ + # Licensed to the Apache Software Foundation ( ASF ) under one 
+ + # or more contributor license agreements . See the NOTICE file 
+ + # distributed with this work for additional information 
+ + # regarding copyright ownership . The ASF licenses this file 
+ + # to you under the Apache License , Version 2 . 0 ( the 
+ + # " License " ) ; you may not use this file except in compliance 
+ + # with the License . You may obtain a copy of the License at 
+ + # 
+ + # http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + # 
+ + # Unless required by applicable law or agreed to in writing , software 
+ + # distributed under the License is distributed on an " AS IS " BASIS , 
+ + # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + # See the License for the specific language governing permissions and 
+ + # limitations under the License . 
+ + 
+ + if [ " x $ CASSANDRA _ INCLUDE " = " x " ] ; then 
+ + for include in " ` dirname $ 0 ` / cassandra . in . sh " \ 
+ + " $ HOME / . cassandra . in . sh " \ 
+ + / usr / share / cassandra / cassandra . in . sh \ 
+ + / usr / local / share / cassandra / cassandra . in . sh \ 
+ + / opt / cassandra / cassandra . in . sh ; do 
+ + if [ - r $ include ] ; then 
+ + . $ include 
+ + break 
+ + fi 
+ + done 
+ + elif [ - r $ CASSANDRA _ INCLUDE ] ; then 
+ + . $ CASSANDRA _ INCLUDE 
+ + fi 
+ + 
+ + 
+ + # Use JAVA _ HOME if set , otherwise look for java in PATH 
+ + if [ - x $ JAVA _ HOME / bin / java ] ; then 
+ + JAVA = $ JAVA _ HOME / bin / java 
+ + else 
+ + JAVA = ` which java ` 
+ + fi 
+ + 
+ + if [ - z $ CLASSPATH ] ; then 
+ + echo " You must set the CLASSPATH var " > & 2 
+ + exit 1 
+ + fi 
+ + 
+ + $ JAVA - cp $ CLASSPATH - Dstorage - config = $ CASSANDRA _ CONF \ 
+ + - Dlog4j . configuration = log4j - tools . properties \ 
+ + org . apache . cassandra . tools . SSTableOfflineRelevel " $ @ "
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 04dcee7 . . 924eeeb 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 10 , 6 + 10 , 7 @ @ 
+ * Handle null values when executing prepared statement ( CASSANDRA - 5081 ) 
+ * Add netty to pom dependencies ( CASSANDRA - 5181 ) 
+ * Include type arguments in Thrift CQLPreparedResult ( CASSANDRA - 5311 ) 
+ + * Fix compaction not removing columns when bf _ fp _ ratio is 1 ( CASSANDRA - 5182 ) 
+ Merged from 1 . 1 : 
+ * nodetool : ability to repair specific range ( CASSANDRA - 5280 ) 
+ * Fix possible assertion triggered in SliceFromReadCommand ( CASSANDRA - 5284 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionController . java b / src / java / org / apache / cassandra / db / compaction / CompactionController . java 
+ index ff3de53 . . f3198ff 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionController . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionController . java 
+ @ @ - 34 , 6 + 34 , 7 @ @ import org . apache . cassandra . io . sstable . SSTableIdentityIterator ; 
+ import org . apache . cassandra . io . sstable . SSTableReader ; 
+ import org . apache . cassandra . service . CacheService ; 
+ import org . apache . cassandra . service . StorageService ; 
+ + import org . apache . cassandra . utils . AlwaysPresentFilter ; 
+ import org . apache . cassandra . utils . Throttle ; 
+ 
+ / * * 
+ @ @ - 114 , 8 + 115 , 15 @ @ public class CompactionController 
+ List < SSTableReader > filteredSSTables = overlappingTree . search ( key ) ; 
+ for ( SSTableReader sstable : filteredSSTables ) 
+ { 
+ - if ( sstable . getBloomFilter ( ) . isPresent ( key . key ) & & sstable . getMinTimestamp ( ) < = maxDeletionTimestamp ) 
+ - return false ; 
+ + if ( sstable . getMinTimestamp ( ) < = maxDeletionTimestamp ) 
+ + { 
+ + / / if we don ' t have bloom filter ( bf _ fp _ chance = 1 . 0 or filter file is missing ) , 
+ + / / we check index file instead . 
+ + if ( sstable . getBloomFilter ( ) instanceof AlwaysPresentFilter & & sstable . getPosition ( key , SSTableReader . Operator . EQ ) ! = null ) 
+ + return false ; 
+ + else if ( sstable . getBloomFilter ( ) . isPresent ( key . key ) ) 
+ + return false ; 
+ + } 
+ } 
+ return true ; 
+ }

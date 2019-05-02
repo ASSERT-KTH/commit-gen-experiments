@@ -1,0 +1,448 @@
+BLEU SCORE: 0.5156626918239822
+
+TEST MSG: fix ( server : files ) : use protobuf to encode seed
+GENERATED MSG: fix ( server : files ) : reimplement file url builder
+
+TEST DIFF (one line): diff - - git a / actor - server / actor - fs - adapters / src / main / protobuf / file . proto b / actor - server / actor - fs - adapters / src / main / protobuf / file . proto < nl > index 600e98c . . 30fdbc2 100644 < nl > - - - a / actor - server / actor - fs - adapters / src / main / protobuf / file . proto < nl > + + + b / actor - server / actor - fs - adapters / src / main / protobuf / file . proto < nl > @ @ - 20 , 4 + 20 , 10 @ @ message Avatar { < nl > optional AvatarImage smallImage = 1 ; < nl > optional AvatarImage largeImage = 2 ; < nl > optional AvatarImage fullImage = 3 ; < nl > + } < nl > + < nl > + message UrlBuilderSeed { < nl > + required int32 version = 1 ; < nl > + required int32 expire = 2 ; < nl > + required string random _ part = 3 ; < nl > } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala b / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala < nl > index e26096d . . 1b1bf95 100644 < nl > - - - a / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala < nl > + + + b / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala < nl > @ @ - 14 , 25 + 14 , 23 @ @ import im . actor . server . db . DbExtension < nl > import im . actor . server . model . { File ⇒ FileModel } < nl > import im . actor . server . persist . files . FileRepo < nl > import im . actor . util . log . AnyRefLogSource < nl > + import org . apache . commons . codec . binary . Hex < nl > import org . apache . commons . codec . digest . HmacUtils < nl > import scodec . bits . BitVector < nl > import scodec . _ < nl > import scodec . codecs . { ascii32 , byte , int32 } < nl > < nl > + import scala . util . Success < nl > + < nl > object FileUrlBuilderRejections { < nl > case object FileBuilderExpiredRejection extends ActorCustomRejection < nl > case object FileNotFoundRejection extends ActorCustomRejection < nl > + case object InvalidVersionRejection extends ActorCustomRejection < nl > case object InvalidBuilderSignatureRejection extends ActorCustomRejection < nl > } < nl > < nl > - final case class Seed ( version : Byte , expire : Int , randomPart : String ) < nl > - object SeedCodec { < nl > - implicit val seedCodec : Codec [ Seed ] = ( byte : : int32 : : ascii32 ) . as [ Seed ] < nl > - } < nl > - < nl > private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapter ) ( implicit system : ActorSystem ) extends HttpHandler with AnyRefLogSource { < nl > import FileUrlBuilderRejections . _ < nl > - import SeedCodec . _ < nl > < nl > private val db = DbExtension ( system ) . db < nl > private val log = Logging ( system , this ) < nl > @ @ - 51 , 6 + 49 , 10 @ @ private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapte < nl > case InvalidBuilderSignatureRejection ⇒ < nl > complete ( StatusCodes . Forbidden → " Invalid file signature in file builder " ) < nl > } < nl > + . handle { < nl > + case InvalidVersionRejection ⇒ < nl > + complete ( StatusCodes . BadRequest → " Wrong version " ) < nl > + } < nl > . result ( ) < nl > < nl > / / format : OFF < nl > @ @ - 78 , 39 + 80 , 42 @ @ private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapte < nl > case s ⇒ < nl > s split " _ " match { < nl > case Array ( hexSeed , hexSignature ) ⇒ < nl > - ( for { < nl > - bitSeed ← BitVector . fromHex ( hexSeed ) < nl > - seed ← Codec . decode [ Seed ] ( bitSeed ) . toOption < nl > - } yield bitSeed → seed ) match { < nl > - case Some ( ( bitSeed , DecodeResult ( seed , BitVector . empty ) ) ) ⇒ < nl > - onSuccess ( db . run ( FileRepo . find ( fileId ) ) ) flatMap { < nl > - case Some ( file ) ⇒ < nl > - val expire = seed . expire < nl > - val secret = ACLFiles . fileUrlBuilderSecret ( bitSeed . toByteArray ) < nl > - val accessHash = ACLFiles . fileAccessHash ( file . id , file . accessSalt ) < nl > - val valueToDigest = bitSeed + + BitVector . fromLong ( fileId ) + + BitVector . fromLong ( accessHash ) < nl > - val calculatedSignature = HmacUtils . hmacSha256Hex ( secret , valueToDigest . toByteArray ) < nl > - if ( hexSignature = = calculatedSignature ) { < nl > - val now = Instant . now < nl > - if ( isExpired ( expire , now ) ) { < nl > + UrlBuilderSeed . validate ( Hex . decodeHex ( hexSeed . toCharArray ) ) match { < nl > + case Success ( seed ) ⇒ < nl > + if ( seed . version = = 0 ) { < nl > + onSuccess ( db . run ( FileRepo . find ( fileId ) ) ) flatMap { < nl > + case Some ( file ) ⇒ < nl > + val seedBytes = seed . toByteArray < nl > + val expire = seed . expire < nl > + val secret = ACLFiles . fileUrlBuilderSecret ( seedBytes ) < nl > + val accessHash = ACLFiles . fileAccessHash ( file . id , file . accessSalt ) < nl > + val valueToDigest = BitVector ( seedBytes ) + + BitVector . fromLong ( fileId ) + + BitVector . fromLong ( accessHash ) < nl > + val calculatedSignature = HmacUtils . hmacSha256Hex ( secret , valueToDigest . toByteArray ) < nl > + if ( hexSignature = = calculatedSignature ) { < nl > + val now = Instant . now < nl > + if ( isExpired ( expire , now ) ) { < nl > + log . debug ( < nl > + " Signature expired . Signature : { } , expire : { } , now : { } " , < nl > + hexSignature , expire , Instant . now < nl > + ) < nl > + reject ( FileBuilderExpiredRejection ) < nl > + } else { < nl > + provide ( ( file , accessHash ) ) < nl > + } < nl > + } else { < nl > log . debug ( < nl > - " Signature expired . Signature : { } , expire : { } , now : { } " , < nl > - hexSignature , expire , Instant . now < nl > + " Incorrect signature . Signature from request : { } , calculated signature : { } " , < nl > + hexSignature , calculatedSignature < nl > ) < nl > - reject ( FileBuilderExpiredRejection ) < nl > - } else { < nl > - provide ( ( file , accessHash ) ) < nl > + reject ( InvalidBuilderSignatureRejection ) < nl > } < nl > - } else { < nl > - log . debug ( < nl > - " Incorrect signature . Signature from request : { } , calculated signature : { } " , < nl > - hexSignature , calculatedSignature < nl > - ) < nl > - reject ( InvalidBuilderSignatureRejection ) < nl > - } < nl > - case None ⇒ < nl > - log . debug ( " File not found , id : { } " , fileId ) < nl > - reject ( FileNotFoundRejection ) < nl > + case None ⇒ < nl > + log . debug ( " File not found , id : { } " , fileId ) < nl > + reject ( FileNotFoundRejection ) < nl > + } < nl > + } else { < nl > + log . debug ( " Wrong version of algo " ) < nl > + reject ( InvalidVersionRejection ) < nl > } < nl > case _ ⇒ < nl > log . debug ( " Unable to decode seed : { } " , hexSeed ) < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala < nl > index fb00bd3 . . ec63b7c 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala < nl > @ @ - 16 , 7 + 16 , 7 @ @ import im . actor . server . api . http . HttpApiConfig < nl > import im . actor . server . db . DbExtension < nl > import im . actor . server . file . _ < nl > import im . actor . server . persist . files . { FilePartRepo , FileRepo } < nl > - import scodec . Codec < nl > + import org . apache . commons . codec . binary . Hex < nl > import slick . driver . PostgresDriver . api . _ < nl > < nl > import scala . concurrent . { ExecutionContext , Future } < nl > @ @ - 90 , 21 + 90 , 18 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { < nl > < nl > protected def doHandleGetFileUrlBuilder ( supportedSignatureAlgorithms : IndexedSeq [ String ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUrlBuilder ] ] = < nl > authorized ( clientData ) { _ ⇒ < nl > - import SeedCodec . _ < nl > val result = if ( supportedSignatureAlgorithms . contains ( " HMAC _ SHA256 " ) ) { < nl > val expire = Instant . now . plus ( 1 , ChronoUnit . HOURS ) . getEpochSecond . toInt < nl > - val optSeed = Codec . encode ( Seed ( version = 0 , expire = expire , randomPart = ACLUtils . randomHash ( ) ) ) . toOption < nl > - optSeed map { seed ⇒ < nl > - Ok ( < nl > - ResponseGetFileUrlBuilder ( < nl > - baseUrl = s " $ { httpConfig . baseUri } / v1 / files " , < nl > - algo = " HMAC _ SHA256 " , < nl > - signatureSecret = ACLUtils . fileUrlBuilderSecret ( seed . toByteArray ) , < nl > - timeout = expire , < nl > - seed = seed . toHex < nl > - ) < nl > + val seedBytes = UrlBuilderSeed ( version = 0 , expire = expire , randomPart = ACLUtils . randomHash ( ) ) . toByteArray < nl > + Ok ( < nl > + ResponseGetFileUrlBuilder ( < nl > + baseUrl = s " $ { httpConfig . baseUri } / v1 / files " , < nl > + algo = " HMAC _ SHA256 " , < nl > + signatureSecret = ACLUtils . fileUrlBuilderSecret ( seedBytes ) , < nl > + timeout = expire , < nl > + seed = Hex . encodeHexString ( seedBytes ) < nl > ) < nl > - } getOrElse Error ( IntenalError ) < nl > + ) < nl > } else Error ( UnsupportedSignatureAlgorithm ) < nl > FastFuture . successful ( result ) < nl > }
+NEAREST DIFF (one line): diff - - git a / actor - server / actor - core / src / main / actor - api / actor . json b / actor - server / actor - core / src / main / actor - api / actor . json < nl > index fa26d3b . . 2fbb439 100644 < nl > - - - a / actor - server / actor - core / src / main / actor - api / actor . json < nl > + + + b / actor - server / actor - core / src / main / actor - api / actor . json < nl > @ @ - 11604 , 6 + 11604 , 12 @ @ < nl > } , < nl > { < nl > " type " : " reference " , < nl > + " argument " : " seed " , < nl > + " category " : " full " , < nl > + " description " : " Public - visible seed of signature " < nl > + } , < nl > + { < nl > + " type " : " reference " , < nl > " argument " : " signatureSecret " , < nl > " category " : " full " , < nl > " description " : " Signature Secret " < nl > @ @ - 11627 , 6 + 11633 , 11 @ @ < nl > " name " : " algo " < nl > } , < nl > { < nl > + " type " : " string " , < nl > + " id " : 5 , < nl > + " name " : " seed " < nl > + } , < nl > + { < nl > " type " : " bytes " , < nl > " id " : 3 , < nl > " name " : " signatureSecret " < nl > diff - - git a / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala b / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala < nl > index b56cf76 . . 373f0d7 100644 < nl > - - - a / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala < nl > + + + b / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala < nl > @ @ - 15 , 6 + 15 , 8 @ @ import im . actor . server . persist . files . FileRepo < nl > import im . actor . util . log . AnyRefLogSource < nl > import org . apache . commons . codec . digest . HmacUtils < nl > import scodec . bits . BitVector < nl > + import scodec . _ < nl > + import scodec . codecs . { byte , int32 , long } < nl > < nl > object FileUrlBuilderRejections { < nl > case object SecretExpiredRejection extends Rejection < nl > @ @ - 22 , 8 + 24 , 14 @ @ object FileUrlBuilderRejections { < nl > case object IncorrectSignatureRejection extends Rejection < nl > } < nl > < nl > + final case class Seed ( version : Byte , expire : Int , randomPart : Long ) < nl > + object SeedDecoder { < nl > + implicit val seedDecoder = ( byte : : int32 : : long ( 64 ) ) . as [ Seed ] < nl > + } < nl > + < nl > private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapter ) ( implicit system : ActorSystem ) extends HttpHandler with AnyRefLogSource { < nl > import FileUrlBuilderRejections . _ < nl > + import SeedDecoder . _ < nl > < nl > private val db = DbExtension ( system ) . db < nl > private val log = Logging ( system , this ) < nl > @ @ - 46 , 10 + 54 , 11 @ @ private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapte < nl > < nl > / / format : OFF < nl > def routes : Route = < nl > - handleRejections ( myRejectionHandler ) { < nl > - defaultVersion { < nl > - pathPrefix ( " fileUrlBuilder " ) { < nl > - parameter ( " fileId " . as [ Long ] ) { fileId = > < nl > + extractRequest { request = > < nl > + log . debug ( " Got file url builder request : { } " , request ) < nl > + handleRejections ( myRejectionHandler ) { < nl > + defaultVersion { < nl > + pathPrefix ( " files " / SignedLongNumber ) { fileId = > < nl > get { < nl > validateBuilderRequest ( fileId ) { case ( fileModel , accessHash ) = > < nl > onSuccess ( fsAdapter . getFileDownloadUrl ( fileModel , accessHash ) ) { < nl > @ @ - 64 , 24 + 73 , 55 @ @ private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapte < nl > } < nl > / / format : ON < nl > < nl > + / / monad transformers could make this code easier < nl > def validateBuilderRequest ( fileId : Long ) : Directive1 [ ( FileModel , Long ) ] = < nl > - parameters ( ( " seed " , " expire " . as [ Long ] , " signature " , " accessHash " . as [ Long ] ) ) tflatMap { < nl > - case ( seed , expire , signature , accessHash ) ⇒ < nl > - val secret = BitVector . fromLong ( ACLFiles . fileUrlBuilderSecret ( seed , expire ) ) . toByteArray < nl > - if ( signature = = HmacUtils . hmacSha256Hex ( secret , s " $ fileId $ accessHash " . getBytes ) ) { < nl > - if ( isExpired ( expire ) ) { < nl > - reject ( SecretExpiredRejection ) < nl > - } else { < nl > - onSuccess ( db . run ( FileRepo . find ( fileId ) ) ) flatMap { < nl > - case Some ( file ) ⇒ provide ( ( file , accessHash ) ) < nl > - case None ⇒ reject ( FileNotFoundRejection ) < nl > + parameter ( " signature " ) flatMap { < nl > + case s ⇒ < nl > + s split " _ " match { < nl > + case Array ( originalSeed , originalSignature ) ⇒ < nl > + ( for { < nl > + bitSeed ← BitVector . fromHex ( originalSeed ) < nl > + seed ← Codec . decode [ Seed ] ( bitSeed ) . toOption < nl > + } yield seed ) match { < nl > + case Some ( DecodeResult ( seed , BitVector . empty ) ) ⇒ < nl > + onSuccess ( db . run ( FileRepo . find ( fileId ) ) ) flatMap { < nl > + case Some ( file ) ⇒ < nl > + val expire = seed . expire < nl > + val secret = BitVector . fromLong ( ACLFiles . fileUrlBuilderSecret ( originalSeed , expire ) ) . toHex < nl > + val accessHash = ACLFiles . fileAccessHash ( file . id , file . accessSalt ) < nl > + val calculatedSignature = HmacUtils . hmacSha256Hex ( secret , s " $ fileId $ accessHash " ) < nl > + if ( originalSignature = = calculatedSignature ) { < nl > + val now = Instant . now < nl > + if ( isExpired ( expire , now ) ) { < nl > + log . debug ( < nl > + " Signature expired . Signature : { } , expire : { } , now : { } " , < nl > + originalSignature , expire , Instant . now < nl > + ) < nl > + reject ( SecretExpiredRejection ) < nl > + } else { < nl > + provide ( ( file , accessHash ) ) < nl > + } < nl > + } else { < nl > + log . debug ( < nl > + " Incorrect signature . Signature from request : { } , calculated signature : { } " , < nl > + originalSignature , calculatedSignature < nl > + ) < nl > + reject ( IncorrectSignatureRejection ) < nl > + } < nl > + case None ⇒ < nl > + log . debug ( " File not found , id : { } " , fileId ) < nl > + reject ( FileNotFoundRejection ) < nl > + } < nl > + case _ ⇒ < nl > + log . debug ( " Unable to decode seed : { } " , originalSeed ) < nl > + reject ( IncorrectSignatureRejection ) < nl > } < nl > - } < nl > - } else { < nl > - reject ( IncorrectSignatureRejection ) < nl > + case _ ⇒ < nl > + log . debug ( " Wrong query signature : { } " , s ) < nl > + reject ( IncorrectSignatureRejection ) < nl > } < nl > } < nl > < nl > - def isExpired ( expire : Long ) : Boolean = Instant . ofEpochSecond ( expire ) . isAfter ( Instant . now ) < nl > + def isExpired ( expire : Int , now : Instant ) : Boolean = Instant . ofEpochSecond ( expire . toLong ) . isAfter ( now ) < nl > < nl > } < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala < nl > index ebf8668 . . 7b1619e 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala < nl > @ @ - 1 , 11 + 1 , 9 @ @ < nl > package im . actor . server . api . rpc . service . files < nl > < nl > - import java . nio . ByteBuffer < nl > - import java . time . temporal . ChronoUnit < nl > import java . time . Instant < nl > + import java . time . temporal . ChronoUnit < nl > < nl > import akka . actor . _ < nl > - import akka . http . scaladsl . model . Uri < nl > import akka . http . scaladsl . util . FastFuture < nl > import cats . data . Xor < nl > import im . actor . api . rpc . FileRpcErrors . UnsupportedSignatureAlgorithm < nl > @ @ - 21 , 7 + 19 , 6 @ @ import scodec . bits . BitVector < nl > import slick . driver . PostgresDriver . api . _ < nl > < nl > import scala . concurrent . { ExecutionContext , Future } < nl > - import scala . concurrent . duration . _ < nl > < nl > class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { < nl > < nl > @ @ - 32 , 10 + 29 , 9 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { < nl > private implicit val db : Database = DbExtension ( actorSystem ) . db < nl > private val fsAdapter : FileStorageAdapter = FileStorageExtension ( actorSystem ) . fsAdapter < nl > private val httpConfig = HttpApiConfig . load . get < nl > - private val urlBuilderTimeout : Int = 1 . hour . toMillis . toInt < nl > < nl > override def doHandleGetFileUrl ( location : ApiFileLocation , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUrl ] ] = < nl > - authorized ( clientData ) { client ⇒ < nl > + authorized ( clientData ) { _ ⇒ < nl > ( for { < nl > file ← fromFutureOption ( FileRpcErrors . LocationInvalid ) ( db . run ( FileRepo . find ( location . fileId ) ) ) < nl > url ← fromFutureOption ( FileRpcErrors . LocationInvalid ) ( fsAdapter . getFileDownloadUrl ( file , location . accessHash ) ) < nl > @ @ - 43 , 7 + 39 , 7 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { < nl > } < nl > < nl > override def doHandleGetFileUrls ( files : IndexedSeq [ ApiFileLocation ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUrls ] ] = < nl > - authorized ( clientData ) { client ⇒ < nl > + authorized ( clientData ) { _ ⇒ < nl > val idsHashes = files . map ( fl ⇒ fl . fileId → fl . accessHash ) . toMap < nl > ( for { < nl > models ← fromFuture ( db . run ( FileRepo . fetch ( idsHashes . keySet ) ) ) < nl > @ @ - 63 , 7 + 59 , 7 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { < nl > } < nl > < nl > override def doHandleGetFileUploadUrl ( expectedSize : Int , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUploadUrl ] ] = < nl > - authorized ( clientData ) { client ⇒ < nl > + authorized ( clientData ) { _ ⇒ < nl > val id = ACLUtils . randomLong ( ) < nl > ( for { < nl > uploadKeyUrl ← fromFuture ( fsAdapter . getFileUploadUrl ( id ) ) < nl > @ @ - 73 , 7 + 69 , 7 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { < nl > } < nl > < nl > override def doHandleGetFileUploadPartUrl ( partNumber : Int , partSize : Int , keyBytes : Array [ Byte ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUploadPartUrl ] ] = < nl > - authorized ( clientData ) { client ⇒ < nl > + authorized ( clientData ) { _ ⇒ < nl > ( for { < nl > file ← fromFutureOption ( FileRpcErrors . FileNotFound ) ( db . run ( FileRepo . findByKey ( fsAdapter . parseKey ( keyBytes ) . key ) ) ) < nl > partKeyUrl ← fromFuture ( fsAdapter . getFileUploadPartUrl ( file . id , partNumber ) ) < nl > @ @ - 83 , 7 + 79 , 7 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { < nl > } < nl > < nl > override def doHandleCommitFileUpload ( keyBytes : Array [ Byte ] , fileName : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseCommitFileUpload ] ] = < nl > - authorized ( clientData ) { client ⇒ < nl > + authorized ( clientData ) { _ ⇒ < nl > ( for { < nl > file ← fromFutureOption ( FileRpcErrors . FileNotFound ) ( db . run ( FileRepo . findByKey ( fsAdapter . parseKey ( keyBytes ) . key ) ) ) < nl > partNames ← fromFuture ( db . run ( FilePartRepo . findByFileId ( file . id ) map ( _ . map ( _ . uploadKey ) ) ) ) < nl > @ @ - 94 , 18 + 90 , 18 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { < nl > protected def doHandleGetFileUrlBuilder ( supportedSignatureAlgorithms : IndexedSeq [ String ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUrlBuilder ] ] = < nl > authorized ( clientData ) { _ ⇒ < nl > val result = if ( supportedSignatureAlgorithms . contains ( " HMAC _ SHA256 " ) ) { < nl > - val seed = ACLUtils . randomString ( ) < nl > - val expire = Instant . now . plus ( 1 , ChronoUnit . HOURS ) . getEpochSecond < nl > + val expire = Instant . now . plus ( 1 , ChronoUnit . HOURS ) . getEpochSecond . toInt < nl > + val seed = ( BitVector . fromByte ( 0 ) + + < nl > + BitVector . fromInt ( expire ) + + < nl > + BitVector . fromLong ( ACLUtils . fileUrlBuilderSeed ( ) ) ) . toHex < nl > val secret = ACLUtils . fileUrlBuilderSecret ( seed , expire ) < nl > - val baseUrl = Uri ( httpConfig . baseUri ) < nl > - . withPath ( Uri . Path ( " / v1 / fileUrlBuilder " ) ) < nl > - . withQuery ( Uri . Query ( " seed " → seed , " expire " → expire . toString ) ) < nl > Ok ( < nl > ResponseGetFileUrlBuilder ( < nl > - baseUrl = baseUrl . toString ( ) , < nl > + baseUrl = s " $ { httpConfig . baseUri } / v1 / files " , < nl > algo = " HMAC _ SHA256 " , < nl > - signatureSecret = BitVector . fromLong ( secret ) . toByteArray , < nl > - timeout = urlBuilderTimeout < nl > + signatureSecret = BitVector . fromLong ( secret ) . toHex . getBytes , < nl > + timeout = expire , < nl > + seed = seed < nl > ) < nl > ) < nl > } else Error ( UnsupportedSignatureAlgorithm ) < nl > diff - - git a / actor - server / actor - runtime / src / main / scala / im / actor / acl / ACLFiles . scala b / actor - server / actor - runtime / src / main / scala / im / actor / acl / ACLFiles . scala < nl > index 844b086 . . b2b6d01 100644 < nl > - - - a / actor - server / actor - runtime / src / main / scala / im / actor / acl / ACLFiles . scala < nl > + + + b / actor - server / actor - runtime / src / main / scala / im / actor / acl / ACLFiles . scala < nl > @ @ - 8 , 7 + 8 , 10 @ @ trait ACLFiles extends ACLBase { < nl > def fileAccessHash ( fileId : Long , accessSalt : String ) ( implicit s : ActorSystem ) : Long = < nl > hashObsolete ( s " $ fileId : $ accessSalt : $ { secretKey ( ) } " ) < nl > < nl > - def fileUrlBuilderSecret ( seed : String , expire : Long ) ( implicit s : ActorSystem ) : Long = < nl > + def fileUrlBuilderSeed ( ) ( implicit s : ActorSystem ) : Long = < nl > + hash ( s " $ { randomString ( ) } : $ { secretKey ( ) } " ) < nl > + < nl > + def fileUrlBuilderSecret ( seed : String , expire : Int ) ( implicit s : ActorSystem ) : Long = < nl > hash ( s " $ seed : $ expire : $ { secretKey ( ) } " ) < nl > < nl > }
+
+TEST DIFF:
+diff - - git a / actor - server / actor - fs - adapters / src / main / protobuf / file . proto b / actor - server / actor - fs - adapters / src / main / protobuf / file . proto 
+ index 600e98c . . 30fdbc2 100644 
+ - - - a / actor - server / actor - fs - adapters / src / main / protobuf / file . proto 
+ + + + b / actor - server / actor - fs - adapters / src / main / protobuf / file . proto 
+ @ @ - 20 , 4 + 20 , 10 @ @ message Avatar { 
+ optional AvatarImage smallImage = 1 ; 
+ optional AvatarImage largeImage = 2 ; 
+ optional AvatarImage fullImage = 3 ; 
+ + } 
+ + 
+ + message UrlBuilderSeed { 
+ + required int32 version = 1 ; 
+ + required int32 expire = 2 ; 
+ + required string random _ part = 3 ; 
+ } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala b / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala 
+ index e26096d . . 1b1bf95 100644 
+ - - - a / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala 
+ + + + b / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala 
+ @ @ - 14 , 25 + 14 , 23 @ @ import im . actor . server . db . DbExtension 
+ import im . actor . server . model . { File ⇒ FileModel } 
+ import im . actor . server . persist . files . FileRepo 
+ import im . actor . util . log . AnyRefLogSource 
+ + import org . apache . commons . codec . binary . Hex 
+ import org . apache . commons . codec . digest . HmacUtils 
+ import scodec . bits . BitVector 
+ import scodec . _ 
+ import scodec . codecs . { ascii32 , byte , int32 } 
+ 
+ + import scala . util . Success 
+ + 
+ object FileUrlBuilderRejections { 
+ case object FileBuilderExpiredRejection extends ActorCustomRejection 
+ case object FileNotFoundRejection extends ActorCustomRejection 
+ + case object InvalidVersionRejection extends ActorCustomRejection 
+ case object InvalidBuilderSignatureRejection extends ActorCustomRejection 
+ } 
+ 
+ - final case class Seed ( version : Byte , expire : Int , randomPart : String ) 
+ - object SeedCodec { 
+ - implicit val seedCodec : Codec [ Seed ] = ( byte : : int32 : : ascii32 ) . as [ Seed ] 
+ - } 
+ - 
+ private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapter ) ( implicit system : ActorSystem ) extends HttpHandler with AnyRefLogSource { 
+ import FileUrlBuilderRejections . _ 
+ - import SeedCodec . _ 
+ 
+ private val db = DbExtension ( system ) . db 
+ private val log = Logging ( system , this ) 
+ @ @ - 51 , 6 + 49 , 10 @ @ private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapte 
+ case InvalidBuilderSignatureRejection ⇒ 
+ complete ( StatusCodes . Forbidden → " Invalid file signature in file builder " ) 
+ } 
+ + . handle { 
+ + case InvalidVersionRejection ⇒ 
+ + complete ( StatusCodes . BadRequest → " Wrong version " ) 
+ + } 
+ . result ( ) 
+ 
+ / / format : OFF 
+ @ @ - 78 , 39 + 80 , 42 @ @ private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapte 
+ case s ⇒ 
+ s split " _ " match { 
+ case Array ( hexSeed , hexSignature ) ⇒ 
+ - ( for { 
+ - bitSeed ← BitVector . fromHex ( hexSeed ) 
+ - seed ← Codec . decode [ Seed ] ( bitSeed ) . toOption 
+ - } yield bitSeed → seed ) match { 
+ - case Some ( ( bitSeed , DecodeResult ( seed , BitVector . empty ) ) ) ⇒ 
+ - onSuccess ( db . run ( FileRepo . find ( fileId ) ) ) flatMap { 
+ - case Some ( file ) ⇒ 
+ - val expire = seed . expire 
+ - val secret = ACLFiles . fileUrlBuilderSecret ( bitSeed . toByteArray ) 
+ - val accessHash = ACLFiles . fileAccessHash ( file . id , file . accessSalt ) 
+ - val valueToDigest = bitSeed + + BitVector . fromLong ( fileId ) + + BitVector . fromLong ( accessHash ) 
+ - val calculatedSignature = HmacUtils . hmacSha256Hex ( secret , valueToDigest . toByteArray ) 
+ - if ( hexSignature = = calculatedSignature ) { 
+ - val now = Instant . now 
+ - if ( isExpired ( expire , now ) ) { 
+ + UrlBuilderSeed . validate ( Hex . decodeHex ( hexSeed . toCharArray ) ) match { 
+ + case Success ( seed ) ⇒ 
+ + if ( seed . version = = 0 ) { 
+ + onSuccess ( db . run ( FileRepo . find ( fileId ) ) ) flatMap { 
+ + case Some ( file ) ⇒ 
+ + val seedBytes = seed . toByteArray 
+ + val expire = seed . expire 
+ + val secret = ACLFiles . fileUrlBuilderSecret ( seedBytes ) 
+ + val accessHash = ACLFiles . fileAccessHash ( file . id , file . accessSalt ) 
+ + val valueToDigest = BitVector ( seedBytes ) + + BitVector . fromLong ( fileId ) + + BitVector . fromLong ( accessHash ) 
+ + val calculatedSignature = HmacUtils . hmacSha256Hex ( secret , valueToDigest . toByteArray ) 
+ + if ( hexSignature = = calculatedSignature ) { 
+ + val now = Instant . now 
+ + if ( isExpired ( expire , now ) ) { 
+ + log . debug ( 
+ + " Signature expired . Signature : { } , expire : { } , now : { } " , 
+ + hexSignature , expire , Instant . now 
+ + ) 
+ + reject ( FileBuilderExpiredRejection ) 
+ + } else { 
+ + provide ( ( file , accessHash ) ) 
+ + } 
+ + } else { 
+ log . debug ( 
+ - " Signature expired . Signature : { } , expire : { } , now : { } " , 
+ - hexSignature , expire , Instant . now 
+ + " Incorrect signature . Signature from request : { } , calculated signature : { } " , 
+ + hexSignature , calculatedSignature 
+ ) 
+ - reject ( FileBuilderExpiredRejection ) 
+ - } else { 
+ - provide ( ( file , accessHash ) ) 
+ + reject ( InvalidBuilderSignatureRejection ) 
+ } 
+ - } else { 
+ - log . debug ( 
+ - " Incorrect signature . Signature from request : { } , calculated signature : { } " , 
+ - hexSignature , calculatedSignature 
+ - ) 
+ - reject ( InvalidBuilderSignatureRejection ) 
+ - } 
+ - case None ⇒ 
+ - log . debug ( " File not found , id : { } " , fileId ) 
+ - reject ( FileNotFoundRejection ) 
+ + case None ⇒ 
+ + log . debug ( " File not found , id : { } " , fileId ) 
+ + reject ( FileNotFoundRejection ) 
+ + } 
+ + } else { 
+ + log . debug ( " Wrong version of algo " ) 
+ + reject ( InvalidVersionRejection ) 
+ } 
+ case _ ⇒ 
+ log . debug ( " Unable to decode seed : { } " , hexSeed ) 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala 
+ index fb00bd3 . . ec63b7c 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala 
+ @ @ - 16 , 7 + 16 , 7 @ @ import im . actor . server . api . http . HttpApiConfig 
+ import im . actor . server . db . DbExtension 
+ import im . actor . server . file . _ 
+ import im . actor . server . persist . files . { FilePartRepo , FileRepo } 
+ - import scodec . Codec 
+ + import org . apache . commons . codec . binary . Hex 
+ import slick . driver . PostgresDriver . api . _ 
+ 
+ import scala . concurrent . { ExecutionContext , Future } 
+ @ @ - 90 , 21 + 90 , 18 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { 
+ 
+ protected def doHandleGetFileUrlBuilder ( supportedSignatureAlgorithms : IndexedSeq [ String ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUrlBuilder ] ] = 
+ authorized ( clientData ) { _ ⇒ 
+ - import SeedCodec . _ 
+ val result = if ( supportedSignatureAlgorithms . contains ( " HMAC _ SHA256 " ) ) { 
+ val expire = Instant . now . plus ( 1 , ChronoUnit . HOURS ) . getEpochSecond . toInt 
+ - val optSeed = Codec . encode ( Seed ( version = 0 , expire = expire , randomPart = ACLUtils . randomHash ( ) ) ) . toOption 
+ - optSeed map { seed ⇒ 
+ - Ok ( 
+ - ResponseGetFileUrlBuilder ( 
+ - baseUrl = s " $ { httpConfig . baseUri } / v1 / files " , 
+ - algo = " HMAC _ SHA256 " , 
+ - signatureSecret = ACLUtils . fileUrlBuilderSecret ( seed . toByteArray ) , 
+ - timeout = expire , 
+ - seed = seed . toHex 
+ - ) 
+ + val seedBytes = UrlBuilderSeed ( version = 0 , expire = expire , randomPart = ACLUtils . randomHash ( ) ) . toByteArray 
+ + Ok ( 
+ + ResponseGetFileUrlBuilder ( 
+ + baseUrl = s " $ { httpConfig . baseUri } / v1 / files " , 
+ + algo = " HMAC _ SHA256 " , 
+ + signatureSecret = ACLUtils . fileUrlBuilderSecret ( seedBytes ) , 
+ + timeout = expire , 
+ + seed = Hex . encodeHexString ( seedBytes ) 
+ ) 
+ - } getOrElse Error ( IntenalError ) 
+ + ) 
+ } else Error ( UnsupportedSignatureAlgorithm ) 
+ FastFuture . successful ( result ) 
+ }
+
+NEAREST DIFF:
+diff - - git a / actor - server / actor - core / src / main / actor - api / actor . json b / actor - server / actor - core / src / main / actor - api / actor . json 
+ index fa26d3b . . 2fbb439 100644 
+ - - - a / actor - server / actor - core / src / main / actor - api / actor . json 
+ + + + b / actor - server / actor - core / src / main / actor - api / actor . json 
+ @ @ - 11604 , 6 + 11604 , 12 @ @ 
+ } , 
+ { 
+ " type " : " reference " , 
+ + " argument " : " seed " , 
+ + " category " : " full " , 
+ + " description " : " Public - visible seed of signature " 
+ + } , 
+ + { 
+ + " type " : " reference " , 
+ " argument " : " signatureSecret " , 
+ " category " : " full " , 
+ " description " : " Signature Secret " 
+ @ @ - 11627 , 6 + 11633 , 11 @ @ 
+ " name " : " algo " 
+ } , 
+ { 
+ + " type " : " string " , 
+ + " id " : 5 , 
+ + " name " : " seed " 
+ + } , 
+ + { 
+ " type " : " bytes " , 
+ " id " : 3 , 
+ " name " : " signatureSecret " 
+ diff - - git a / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala b / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala 
+ index b56cf76 . . 373f0d7 100644 
+ - - - a / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala 
+ + + + b / actor - server / actor - fs - adapters / src / main / scala / im / actor / server / file / FileUrlBuilderHttpHandler . scala 
+ @ @ - 15 , 6 + 15 , 8 @ @ import im . actor . server . persist . files . FileRepo 
+ import im . actor . util . log . AnyRefLogSource 
+ import org . apache . commons . codec . digest . HmacUtils 
+ import scodec . bits . BitVector 
+ + import scodec . _ 
+ + import scodec . codecs . { byte , int32 , long } 
+ 
+ object FileUrlBuilderRejections { 
+ case object SecretExpiredRejection extends Rejection 
+ @ @ - 22 , 8 + 24 , 14 @ @ object FileUrlBuilderRejections { 
+ case object IncorrectSignatureRejection extends Rejection 
+ } 
+ 
+ + final case class Seed ( version : Byte , expire : Int , randomPart : Long ) 
+ + object SeedDecoder { 
+ + implicit val seedDecoder = ( byte : : int32 : : long ( 64 ) ) . as [ Seed ] 
+ + } 
+ + 
+ private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapter ) ( implicit system : ActorSystem ) extends HttpHandler with AnyRefLogSource { 
+ import FileUrlBuilderRejections . _ 
+ + import SeedDecoder . _ 
+ 
+ private val db = DbExtension ( system ) . db 
+ private val log = Logging ( system , this ) 
+ @ @ - 46 , 10 + 54 , 11 @ @ private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapte 
+ 
+ / / format : OFF 
+ def routes : Route = 
+ - handleRejections ( myRejectionHandler ) { 
+ - defaultVersion { 
+ - pathPrefix ( " fileUrlBuilder " ) { 
+ - parameter ( " fileId " . as [ Long ] ) { fileId = > 
+ + extractRequest { request = > 
+ + log . debug ( " Got file url builder request : { } " , request ) 
+ + handleRejections ( myRejectionHandler ) { 
+ + defaultVersion { 
+ + pathPrefix ( " files " / SignedLongNumber ) { fileId = > 
+ get { 
+ validateBuilderRequest ( fileId ) { case ( fileModel , accessHash ) = > 
+ onSuccess ( fsAdapter . getFileDownloadUrl ( fileModel , accessHash ) ) { 
+ @ @ - 64 , 24 + 73 , 55 @ @ private [ file ] final class FileUrlBuilderHttpHandler ( fsAdapter : FileStorageAdapte 
+ } 
+ / / format : ON 
+ 
+ + / / monad transformers could make this code easier 
+ def validateBuilderRequest ( fileId : Long ) : Directive1 [ ( FileModel , Long ) ] = 
+ - parameters ( ( " seed " , " expire " . as [ Long ] , " signature " , " accessHash " . as [ Long ] ) ) tflatMap { 
+ - case ( seed , expire , signature , accessHash ) ⇒ 
+ - val secret = BitVector . fromLong ( ACLFiles . fileUrlBuilderSecret ( seed , expire ) ) . toByteArray 
+ - if ( signature = = HmacUtils . hmacSha256Hex ( secret , s " $ fileId $ accessHash " . getBytes ) ) { 
+ - if ( isExpired ( expire ) ) { 
+ - reject ( SecretExpiredRejection ) 
+ - } else { 
+ - onSuccess ( db . run ( FileRepo . find ( fileId ) ) ) flatMap { 
+ - case Some ( file ) ⇒ provide ( ( file , accessHash ) ) 
+ - case None ⇒ reject ( FileNotFoundRejection ) 
+ + parameter ( " signature " ) flatMap { 
+ + case s ⇒ 
+ + s split " _ " match { 
+ + case Array ( originalSeed , originalSignature ) ⇒ 
+ + ( for { 
+ + bitSeed ← BitVector . fromHex ( originalSeed ) 
+ + seed ← Codec . decode [ Seed ] ( bitSeed ) . toOption 
+ + } yield seed ) match { 
+ + case Some ( DecodeResult ( seed , BitVector . empty ) ) ⇒ 
+ + onSuccess ( db . run ( FileRepo . find ( fileId ) ) ) flatMap { 
+ + case Some ( file ) ⇒ 
+ + val expire = seed . expire 
+ + val secret = BitVector . fromLong ( ACLFiles . fileUrlBuilderSecret ( originalSeed , expire ) ) . toHex 
+ + val accessHash = ACLFiles . fileAccessHash ( file . id , file . accessSalt ) 
+ + val calculatedSignature = HmacUtils . hmacSha256Hex ( secret , s " $ fileId $ accessHash " ) 
+ + if ( originalSignature = = calculatedSignature ) { 
+ + val now = Instant . now 
+ + if ( isExpired ( expire , now ) ) { 
+ + log . debug ( 
+ + " Signature expired . Signature : { } , expire : { } , now : { } " , 
+ + originalSignature , expire , Instant . now 
+ + ) 
+ + reject ( SecretExpiredRejection ) 
+ + } else { 
+ + provide ( ( file , accessHash ) ) 
+ + } 
+ + } else { 
+ + log . debug ( 
+ + " Incorrect signature . Signature from request : { } , calculated signature : { } " , 
+ + originalSignature , calculatedSignature 
+ + ) 
+ + reject ( IncorrectSignatureRejection ) 
+ + } 
+ + case None ⇒ 
+ + log . debug ( " File not found , id : { } " , fileId ) 
+ + reject ( FileNotFoundRejection ) 
+ + } 
+ + case _ ⇒ 
+ + log . debug ( " Unable to decode seed : { } " , originalSeed ) 
+ + reject ( IncorrectSignatureRejection ) 
+ } 
+ - } 
+ - } else { 
+ - reject ( IncorrectSignatureRejection ) 
+ + case _ ⇒ 
+ + log . debug ( " Wrong query signature : { } " , s ) 
+ + reject ( IncorrectSignatureRejection ) 
+ } 
+ } 
+ 
+ - def isExpired ( expire : Long ) : Boolean = Instant . ofEpochSecond ( expire ) . isAfter ( Instant . now ) 
+ + def isExpired ( expire : Int , now : Instant ) : Boolean = Instant . ofEpochSecond ( expire . toLong ) . isAfter ( now ) 
+ 
+ } 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala 
+ index ebf8668 . . 7b1619e 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / files / FilesServiceImpl . scala 
+ @ @ - 1 , 11 + 1 , 9 @ @ 
+ package im . actor . server . api . rpc . service . files 
+ 
+ - import java . nio . ByteBuffer 
+ - import java . time . temporal . ChronoUnit 
+ import java . time . Instant 
+ + import java . time . temporal . ChronoUnit 
+ 
+ import akka . actor . _ 
+ - import akka . http . scaladsl . model . Uri 
+ import akka . http . scaladsl . util . FastFuture 
+ import cats . data . Xor 
+ import im . actor . api . rpc . FileRpcErrors . UnsupportedSignatureAlgorithm 
+ @ @ - 21 , 7 + 19 , 6 @ @ import scodec . bits . BitVector 
+ import slick . driver . PostgresDriver . api . _ 
+ 
+ import scala . concurrent . { ExecutionContext , Future } 
+ - import scala . concurrent . duration . _ 
+ 
+ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { 
+ 
+ @ @ - 32 , 10 + 29 , 9 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { 
+ private implicit val db : Database = DbExtension ( actorSystem ) . db 
+ private val fsAdapter : FileStorageAdapter = FileStorageExtension ( actorSystem ) . fsAdapter 
+ private val httpConfig = HttpApiConfig . load . get 
+ - private val urlBuilderTimeout : Int = 1 . hour . toMillis . toInt 
+ 
+ override def doHandleGetFileUrl ( location : ApiFileLocation , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUrl ] ] = 
+ - authorized ( clientData ) { client ⇒ 
+ + authorized ( clientData ) { _ ⇒ 
+ ( for { 
+ file ← fromFutureOption ( FileRpcErrors . LocationInvalid ) ( db . run ( FileRepo . find ( location . fileId ) ) ) 
+ url ← fromFutureOption ( FileRpcErrors . LocationInvalid ) ( fsAdapter . getFileDownloadUrl ( file , location . accessHash ) ) 
+ @ @ - 43 , 7 + 39 , 7 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { 
+ } 
+ 
+ override def doHandleGetFileUrls ( files : IndexedSeq [ ApiFileLocation ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUrls ] ] = 
+ - authorized ( clientData ) { client ⇒ 
+ + authorized ( clientData ) { _ ⇒ 
+ val idsHashes = files . map ( fl ⇒ fl . fileId → fl . accessHash ) . toMap 
+ ( for { 
+ models ← fromFuture ( db . run ( FileRepo . fetch ( idsHashes . keySet ) ) ) 
+ @ @ - 63 , 7 + 59 , 7 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { 
+ } 
+ 
+ override def doHandleGetFileUploadUrl ( expectedSize : Int , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUploadUrl ] ] = 
+ - authorized ( clientData ) { client ⇒ 
+ + authorized ( clientData ) { _ ⇒ 
+ val id = ACLUtils . randomLong ( ) 
+ ( for { 
+ uploadKeyUrl ← fromFuture ( fsAdapter . getFileUploadUrl ( id ) ) 
+ @ @ - 73 , 7 + 69 , 7 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { 
+ } 
+ 
+ override def doHandleGetFileUploadPartUrl ( partNumber : Int , partSize : Int , keyBytes : Array [ Byte ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUploadPartUrl ] ] = 
+ - authorized ( clientData ) { client ⇒ 
+ + authorized ( clientData ) { _ ⇒ 
+ ( for { 
+ file ← fromFutureOption ( FileRpcErrors . FileNotFound ) ( db . run ( FileRepo . findByKey ( fsAdapter . parseKey ( keyBytes ) . key ) ) ) 
+ partKeyUrl ← fromFuture ( fsAdapter . getFileUploadPartUrl ( file . id , partNumber ) ) 
+ @ @ - 83 , 7 + 79 , 7 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { 
+ } 
+ 
+ override def doHandleCommitFileUpload ( keyBytes : Array [ Byte ] , fileName : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseCommitFileUpload ] ] = 
+ - authorized ( clientData ) { client ⇒ 
+ + authorized ( clientData ) { _ ⇒ 
+ ( for { 
+ file ← fromFutureOption ( FileRpcErrors . FileNotFound ) ( db . run ( FileRepo . findByKey ( fsAdapter . parseKey ( keyBytes ) . key ) ) ) 
+ partNames ← fromFuture ( db . run ( FilePartRepo . findByFileId ( file . id ) map ( _ . map ( _ . uploadKey ) ) ) ) 
+ @ @ - 94 , 18 + 90 , 18 @ @ class FilesServiceImpl ( implicit actorSystem : ActorSystem ) extends FilesService { 
+ protected def doHandleGetFileUrlBuilder ( supportedSignatureAlgorithms : IndexedSeq [ String ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseGetFileUrlBuilder ] ] = 
+ authorized ( clientData ) { _ ⇒ 
+ val result = if ( supportedSignatureAlgorithms . contains ( " HMAC _ SHA256 " ) ) { 
+ - val seed = ACLUtils . randomString ( ) 
+ - val expire = Instant . now . plus ( 1 , ChronoUnit . HOURS ) . getEpochSecond 
+ + val expire = Instant . now . plus ( 1 , ChronoUnit . HOURS ) . getEpochSecond . toInt 
+ + val seed = ( BitVector . fromByte ( 0 ) + + 
+ + BitVector . fromInt ( expire ) + + 
+ + BitVector . fromLong ( ACLUtils . fileUrlBuilderSeed ( ) ) ) . toHex 
+ val secret = ACLUtils . fileUrlBuilderSecret ( seed , expire ) 
+ - val baseUrl = Uri ( httpConfig . baseUri ) 
+ - . withPath ( Uri . Path ( " / v1 / fileUrlBuilder " ) ) 
+ - . withQuery ( Uri . Query ( " seed " → seed , " expire " → expire . toString ) ) 
+ Ok ( 
+ ResponseGetFileUrlBuilder ( 
+ - baseUrl = baseUrl . toString ( ) , 
+ + baseUrl = s " $ { httpConfig . baseUri } / v1 / files " , 
+ algo = " HMAC _ SHA256 " , 
+ - signatureSecret = BitVector . fromLong ( secret ) . toByteArray , 
+ - timeout = urlBuilderTimeout 
+ + signatureSecret = BitVector . fromLong ( secret ) . toHex . getBytes , 
+ + timeout = expire , 
+ + seed = seed 
+ ) 
+ ) 
+ } else Error ( UnsupportedSignatureAlgorithm ) 
+ diff - - git a / actor - server / actor - runtime / src / main / scala / im / actor / acl / ACLFiles . scala b / actor - server / actor - runtime / src / main / scala / im / actor / acl / ACLFiles . scala 
+ index 844b086 . . b2b6d01 100644 
+ - - - a / actor - server / actor - runtime / src / main / scala / im / actor / acl / ACLFiles . scala 
+ + + + b / actor - server / actor - runtime / src / main / scala / im / actor / acl / ACLFiles . scala 
+ @ @ - 8 , 7 + 8 , 10 @ @ trait ACLFiles extends ACLBase { 
+ def fileAccessHash ( fileId : Long , accessSalt : String ) ( implicit s : ActorSystem ) : Long = 
+ hashObsolete ( s " $ fileId : $ accessSalt : $ { secretKey ( ) } " ) 
+ 
+ - def fileUrlBuilderSecret ( seed : String , expire : Long ) ( implicit s : ActorSystem ) : Long = 
+ + def fileUrlBuilderSeed ( ) ( implicit s : ActorSystem ) : Long = 
+ + hash ( s " $ { randomString ( ) } : $ { secretKey ( ) } " ) 
+ + 
+ + def fileUrlBuilderSecret ( seed : String , expire : Int ) ( implicit s : ActorSystem ) : Long = 
+ hash ( s " $ seed : $ expire : $ { secretKey ( ) } " ) 
+ 
+ }

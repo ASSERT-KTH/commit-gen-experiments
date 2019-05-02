@@ -1,0 +1,300 @@
+BLEU SCORE: 1.0
+
+TEST MSG: typo
+GENERATED MSG: typo
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 81fba5f . . 373544c 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 247 , 7 + 247 , 7 @ @ Merged from 1 . 2 : <nl> 2 . 0 . 2 <nl> * Update FailureDetector to use nanontime ( CASSANDRA - 4925 ) <nl> * Fix FileCacheService regressions ( CASSANDRA - 6149 ) <nl> - * Never return WriteTimeout for CL . ANY ( CASSANDRA - 6032 ) <nl> + * Never return WriteTimeout for CL . ANY ( CASSANDRA - 6132 ) <nl> * Fix race conditions in bulk loader ( CASSANDRA - 6129 ) <nl> * Add configurable metrics reporting ( CASSANDRA - 4430 ) <nl> * drop queries exceeding a configurable number of tombstones ( CASSANDRA - 6117 )
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 901f559 . . 6b3a705 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 6 , 6 + 6 , 7 @ @ <nl> * cli : remove default username and password ( CASSANDRA - 5208 ) <nl> * configure populate _ io _ cache _ on _ flush per - CF ( CASSANDRA - 4694 ) <nl> * allow configuration of internode socket buffer ( CASSANDRA - 3378 ) <nl> + * Make sstable directory picking blacklist - aware again ( CASSANDRA - 5193 ) <nl> <nl> 1 . 2 . 1 <nl> * stream undelivered hints on decommission ( CASSANDRA - 5128 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / Directories . java b / src / java / org / apache / cassandra / db / Directories . java <nl> index f1db5ed . . 1f68f62 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Directories . java <nl> + + + b / src / java / org / apache / cassandra / db / Directories . java <nl> @ @ - 122 , 11 + 122 , 11 @ @ public class Directories <nl> * @ param dataDirectory <nl> * @ return SSTable location <nl> * / <nl> - public File getLocationForDisk ( File dataDirectory ) <nl> + public File getLocationForDisk ( DataDirectory dataDirectory ) <nl> { <nl> for ( File dir : sstableDirectories ) <nl> { <nl> - if ( dir . getAbsolutePath ( ) . startsWith ( dataDirectory . getAbsolutePath ( ) ) ) <nl> + if ( dir . getAbsolutePath ( ) . startsWith ( dataDirectory . location . getAbsolutePath ( ) ) ) <nl> return dir ; <nl> } <nl> return null ; <nl> @ @ - 192 , 36 + 192 , 46 @ @ public class Directories <nl> } <nl> <nl> / * * <nl> - * Find location which is capable of holding given { @ code estimatedSize } . <nl> - * First it looks through for directory with no current task running and <nl> - * the most free space available . <nl> - * If no such directory is available , it just chose the one with the most <nl> - * free space available . <nl> + * Finds location which is capable of holding given { @ code estimatedSize } . <nl> + * Picks a non - blacklisted directory with most free space and least current tasks . <nl> * If no directory can hold given { @ code estimatedSize } , then returns null . <nl> * <nl> * @ param estimatedSize estimated size you need to find location to fit <nl> * @ return directory capable of given estimated size , or null if none found <nl> * / <nl> - public static DataDirectory getLocationCapableOfSize ( long estimatedSize ) <nl> + public DataDirectory getLocationCapableOfSize ( long estimatedSize ) <nl> { <nl> - / / sort by available disk space <nl> - SortedSet < DataDirectory > directories = ImmutableSortedSet . copyOf ( dataFileLocations ) ; <nl> + List < DataDirectory > candidates = new ArrayList < DataDirectory > ( ) ; <nl> <nl> - / / if there is disk with sufficient space and no activity running on it , then use it <nl> - for ( DataDirectory directory : directories ) <nl> + / / pick directories with enough space and so that resulting sstable dirs aren ' t blacklisted for writes . <nl> + for ( DataDirectory dataDir : dataFileLocations ) <nl> { <nl> - long spaceAvailable = directory . getEstimatedAvailableSpace ( ) ; <nl> - if ( estimatedSize < spaceAvailable & & directory . currentTasks . get ( ) = = 0 ) <nl> - return directory ; <nl> + File sstableDir = getLocationForDisk ( dataDir ) ; <nl> + <nl> + if ( BlacklistedDirectories . isUnwritable ( sstableDir ) ) <nl> + continue ; <nl> + <nl> + / / need a separate check for sstableDir itself - could be a mounted separate disk or SSD just for this CF . <nl> + if ( dataDir . getEstimatedAvailableSpace ( ) > estimatedSize & & sstableDir . getUsableSpace ( ) * 0 . 9 > estimatedSize ) <nl> + candidates . add ( dataDir ) ; <nl> } <nl> <nl> - / / if not , use the one that has largest free space <nl> - if ( estimatedSize < directories . first ( ) . getEstimatedAvailableSpace ( ) ) <nl> - return directories . first ( ) ; <nl> - else <nl> - return null ; <nl> + / / sort directories by free space , in _ descending _ order . <nl> + Collections . sort ( candidates ) ; <nl> + <nl> + / / sort directories by load , in _ ascending _ order . <nl> + Collections . sort ( candidates , new Comparator < DataDirectory > ( ) <nl> + { <nl> + public int compare ( DataDirectory a , DataDirectory b ) <nl> + { <nl> + return a . currentTasks . get ( ) - b . currentTasks . get ( ) ; <nl> + } <nl> + } ) ; <nl> + <nl> + return candidates . isEmpty ( ) ? null : candidates . get ( 0 ) ; <nl> } <nl> <nl> + <nl> public static File getSnapshotDirectory ( Descriptor desc , String snapshotName ) <nl> { <nl> return getOrCreate ( desc . directory , SNAPSHOT _ SUBDIR , snapshotName ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java <nl> index 990ad84 . . 301c297 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Memtable . java <nl> + + + b / src / java / org / apache / cassandra / db / Memtable . java <nl> @ @ - 433 , 22 + 433 , 28 @ @ public class Memtable <nl> return estimatedSize ; <nl> } <nl> <nl> - protected void runWith ( File dataDirectory ) throws Exception <nl> + protected void runWith ( File sstableDirectory ) throws Exception <nl> { <nl> - assert dataDirectory ! = null : " Flush task is not bound to any disk " ; <nl> + assert sstableDirectory ! = null : " Flush task is not bound to any disk " ; <nl> <nl> - SSTableReader sstable = writeSortedContents ( context , dataDirectory ) ; <nl> + SSTableReader sstable = writeSortedContents ( context , sstableDirectory ) ; <nl> cfs . replaceFlushed ( Memtable . this , sstable ) ; <nl> latch . countDown ( ) ; <nl> } <nl> <nl> - private SSTableReader writeSortedContents ( Future < ReplayPosition > context , File dataDirectory ) throws ExecutionException , InterruptedException <nl> + protected Directories getDirectories ( ) <nl> + { <nl> + return cfs . directories ; <nl> + } <nl> + <nl> + private SSTableReader writeSortedContents ( Future < ReplayPosition > context , File sstableDirectory ) <nl> + throws ExecutionException , InterruptedException <nl> { <nl> logger . info ( " Writing " + Memtable . this . toString ( ) ) ; <nl> <nl> SSTableReader ssTable ; <nl> / / errors when creating the writer that may leave empty temp files . <nl> - SSTableWriter writer = createFlushWriter ( cfs . getTempSSTablePath ( cfs . directories . getLocationForDisk ( dataDirectory ) ) ) ; <nl> + SSTableWriter writer = createFlushWriter ( cfs . getTempSSTablePath ( sstableDirectory ) ) ; <nl> try <nl> { <nl> / / ( we can ' t clear out the map as - we - go to free up memory , <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / AbstractCompactionTask . java b / src / java / org / apache / cassandra / db / compaction / AbstractCompactionTask . java <nl> index 3d64785 . . 0913765 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / AbstractCompactionTask . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / AbstractCompactionTask . java <nl> @ @ - 19 , 6 + 19 , 7 @ @ package org . apache . cassandra . db . compaction ; <nl> <nl> import java . util . Collection ; <nl> <nl> + import org . apache . cassandra . db . Directories ; <nl> import org . apache . cassandra . io . sstable . SSTableReader ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . db . compaction . CompactionManager . CompactionExecutorStatsCollector ; <nl> @ @ - 41 , 6 + 42 , 11 @ @ public abstract class AbstractCompactionTask extends DiskAwareRunnable <nl> <nl> public abstract int execute ( CompactionExecutorStatsCollector collector ) ; <nl> <nl> + protected Directories getDirectories ( ) <nl> + { <nl> + return cfs . directories ; <nl> + } <nl> + <nl> public void unmarkSSTables ( ) <nl> { <nl> cfs . getDataTracker ( ) . unmarkCompacting ( sstables ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionTask . java b / src / java / org / apache / cassandra / db / compaction / CompactionTask . java <nl> index ca1e2da . . 1b1599b 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionTask . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionTask . java <nl> @ @ - 21 , 22 + 21 , 13 @ @ import java . io . File ; <nl> import java . io . IOException ; <nl> import java . util . * ; <nl> <nl> - import javax . print . attribute . IntegerSyntax ; <nl> - <nl> - import com . google . common . base . Predicates ; <nl> import com . google . common . base . Throwables ; <nl> - import com . google . common . collect . Iterables ; <nl> - import com . google . common . collect . Iterators ; <nl> - import com . google . common . primitives . Longs ; <nl> import org . apache . commons . lang . StringUtils ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - import org . apache . cassandra . db . ColumnFamilyStore ; <nl> - import org . apache . cassandra . db . DecoratedKey ; <nl> - import org . apache . cassandra . db . RowIndexEntry ; <nl> - import org . apache . cassandra . db . SystemTable ; <nl> + import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . db . compaction . CompactionManager . CompactionExecutorStatsCollector ; <nl> import org . apache . cassandra . io . sstable . * ; <nl> import org . apache . cassandra . utils . CloseableIterator ; <nl> @ @ - 99 , 11 + 90 , 11 @ @ public class CompactionTask extends AbstractCompactionTask <nl> * which are properly serialized . <nl> * Caller is in charge of marking / unmarking the sstables as compacting . <nl> * / <nl> - protected void runWith ( File dataDirectory ) throws Exception <nl> + protected void runWith ( File sstableDirectory ) throws Exception <nl> { <nl> / / The collection of sstables passed may be empty ( but not null ) ; even if <nl> / / it is not empty , it may compact down to nothing if all rows are deleted . <nl> - assert sstables ! = null & & dataDirectory ! = null ; <nl> + assert sstables ! = null & & sstableDirectory ! = null ; <nl> <nl> if ( DatabaseDescriptor . isSnapshotBeforeCompaction ( ) ) <nl> cfs . snapshotWithoutFlush ( System . currentTimeMillis ( ) + " - compact - " + cfs . columnFamily ) ; <nl> @ @ - 156 , 7 + 147 , 7 @ @ public class CompactionTask extends AbstractCompactionTask <nl> return ; <nl> } <nl> <nl> - SSTableWriter writer = cfs . createCompactionWriter ( keysPerSSTable , cfs . directories . getLocationForDisk ( dataDirectory ) , toCompact ) ; <nl> + SSTableWriter writer = cfs . createCompactionWriter ( keysPerSSTable , sstableDirectory , toCompact ) ; <nl> writers . add ( writer ) ; <nl> while ( iter . hasNext ( ) ) <nl> { <nl> @ @ - 194 , 7 + 185 , 7 @ @ public class CompactionTask extends AbstractCompactionTask <nl> { <nl> / / tmp = false because later we want to query it with descriptor from SSTableReader <nl> cachedKeyMap . put ( writer . descriptor . asTemporary ( false ) , cachedKeys ) ; <nl> - writer = cfs . createCompactionWriter ( keysPerSSTable , cfs . directories . getLocationForDisk ( dataDirectory ) , toCompact ) ; <nl> + writer = cfs . createCompactionWriter ( keysPerSSTable , sstableDirectory , toCompact ) ; <nl> writers . add ( writer ) ; <nl> cachedKeys = new HashMap < DecoratedKey , RowIndexEntry > ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / DiskAwareRunnable . java b / src / java / org / apache / cassandra / io / util / DiskAwareRunnable . java <nl> index 6c4d95a . . 1be4803 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / DiskAwareRunnable . java <nl> + + + b / src / java / org / apache / cassandra / io / util / DiskAwareRunnable . java <nl> @ @ - 34 , 7 + 34 , 7 @ @ public abstract class DiskAwareRunnable extends WrappedRunnable <nl> while ( true ) <nl> { <nl> writeSize = getExpectedWriteSize ( ) ; <nl> - directory = Directories . getLocationCapableOfSize ( writeSize ) ; <nl> + directory = getDirectories ( ) . getLocationCapableOfSize ( writeSize ) ; <nl> if ( directory ! = null | | ! reduceScopeForLimitedSpace ( ) ) <nl> break ; <nl> } <nl> @ @ - 45 , 7 + 45 , 7 @ @ public abstract class DiskAwareRunnable extends WrappedRunnable <nl> directory . estimatedWorkingSize . addAndGet ( writeSize ) ; <nl> try <nl> { <nl> - runWith ( directory . location ) ; <nl> + runWith ( getDirectories ( ) . getLocationForDisk ( directory ) ) ; <nl> } <nl> finally <nl> { <nl> @ @ - 55 , 10 + 55 , 16 @ @ public abstract class DiskAwareRunnable extends WrappedRunnable <nl> } <nl> <nl> / * * <nl> - * Executes this task on given { @ code dataDirectory } . <nl> - * @ param dataDirectory data directory to work on <nl> + * Get sstable directories for the CF . <nl> + * @ return Directories instance for the CF . <nl> * / <nl> - protected abstract void runWith ( File dataDirectory ) throws Exception ; <nl> + protected abstract Directories getDirectories ( ) ; <nl> + <nl> + / * * <nl> + * Executes this task on given { @ code sstableDirectory } . <nl> + * @ param sstableDirectory sstable directory to work on <nl> + * / <nl> + protected abstract void runWith ( File sstableDirectory ) throws Exception ; <nl> <nl> / * * <nl> * Get expected write size to determine which disk to use for this task . <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamIn . java b / src / java / org / apache / cassandra / streaming / StreamIn . java <nl> index b8f6b90 . . 740b430 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamIn . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamIn . java <nl> @ @ - 80 , 10 + 80 , 10 @ @ public class StreamIn <nl> / / new local sstable <nl> Table table = Table . open ( remotedesc . ksname ) ; <nl> ColumnFamilyStore cfStore = table . getColumnFamilyStore ( remotedesc . cfname ) ; <nl> - Directories . DataDirectory localDir = Directories . getLocationCapableOfSize ( remote . size ) ; <nl> + Directories . DataDirectory localDir = cfStore . directories . getLocationCapableOfSize ( remote . size ) ; <nl> if ( localDir = = null ) <nl> throw new RuntimeException ( " Insufficient disk space to store " + remote . size + " bytes " ) ; <nl> - Descriptor localdesc = Descriptor . fromFilename ( cfStore . getTempSSTablePath ( cfStore . directories . getLocationForDisk ( localDir . location ) ) ) ; <nl> + Descriptor localdesc = Descriptor . fromFilename ( cfStore . getTempSSTablePath ( cfStore . directories . getLocationForDisk ( localDir ) ) ) ; <nl> <nl> return new PendingFile ( localdesc , remote ) ; <nl> }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 81fba5f . . 373544c 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 247 , 7 + 247 , 7 @ @ Merged from 1 . 2 : 
+ 2 . 0 . 2 
+ * Update FailureDetector to use nanontime ( CASSANDRA - 4925 ) 
+ * Fix FileCacheService regressions ( CASSANDRA - 6149 ) 
+ - * Never return WriteTimeout for CL . ANY ( CASSANDRA - 6032 ) 
+ + * Never return WriteTimeout for CL . ANY ( CASSANDRA - 6132 ) 
+ * Fix race conditions in bulk loader ( CASSANDRA - 6129 ) 
+ * Add configurable metrics reporting ( CASSANDRA - 4430 ) 
+ * drop queries exceeding a configurable number of tombstones ( CASSANDRA - 6117 )
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 901f559 . . 6b3a705 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 6 , 6 + 6 , 7 @ @ 
+ * cli : remove default username and password ( CASSANDRA - 5208 ) 
+ * configure populate _ io _ cache _ on _ flush per - CF ( CASSANDRA - 4694 ) 
+ * allow configuration of internode socket buffer ( CASSANDRA - 3378 ) 
+ + * Make sstable directory picking blacklist - aware again ( CASSANDRA - 5193 ) 
+ 
+ 1 . 2 . 1 
+ * stream undelivered hints on decommission ( CASSANDRA - 5128 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / Directories . java b / src / java / org / apache / cassandra / db / Directories . java 
+ index f1db5ed . . 1f68f62 100644 
+ - - - a / src / java / org / apache / cassandra / db / Directories . java 
+ + + + b / src / java / org / apache / cassandra / db / Directories . java 
+ @ @ - 122 , 11 + 122 , 11 @ @ public class Directories 
+ * @ param dataDirectory 
+ * @ return SSTable location 
+ * / 
+ - public File getLocationForDisk ( File dataDirectory ) 
+ + public File getLocationForDisk ( DataDirectory dataDirectory ) 
+ { 
+ for ( File dir : sstableDirectories ) 
+ { 
+ - if ( dir . getAbsolutePath ( ) . startsWith ( dataDirectory . getAbsolutePath ( ) ) ) 
+ + if ( dir . getAbsolutePath ( ) . startsWith ( dataDirectory . location . getAbsolutePath ( ) ) ) 
+ return dir ; 
+ } 
+ return null ; 
+ @ @ - 192 , 36 + 192 , 46 @ @ public class Directories 
+ } 
+ 
+ / * * 
+ - * Find location which is capable of holding given { @ code estimatedSize } . 
+ - * First it looks through for directory with no current task running and 
+ - * the most free space available . 
+ - * If no such directory is available , it just chose the one with the most 
+ - * free space available . 
+ + * Finds location which is capable of holding given { @ code estimatedSize } . 
+ + * Picks a non - blacklisted directory with most free space and least current tasks . 
+ * If no directory can hold given { @ code estimatedSize } , then returns null . 
+ * 
+ * @ param estimatedSize estimated size you need to find location to fit 
+ * @ return directory capable of given estimated size , or null if none found 
+ * / 
+ - public static DataDirectory getLocationCapableOfSize ( long estimatedSize ) 
+ + public DataDirectory getLocationCapableOfSize ( long estimatedSize ) 
+ { 
+ - / / sort by available disk space 
+ - SortedSet < DataDirectory > directories = ImmutableSortedSet . copyOf ( dataFileLocations ) ; 
+ + List < DataDirectory > candidates = new ArrayList < DataDirectory > ( ) ; 
+ 
+ - / / if there is disk with sufficient space and no activity running on it , then use it 
+ - for ( DataDirectory directory : directories ) 
+ + / / pick directories with enough space and so that resulting sstable dirs aren ' t blacklisted for writes . 
+ + for ( DataDirectory dataDir : dataFileLocations ) 
+ { 
+ - long spaceAvailable = directory . getEstimatedAvailableSpace ( ) ; 
+ - if ( estimatedSize < spaceAvailable & & directory . currentTasks . get ( ) = = 0 ) 
+ - return directory ; 
+ + File sstableDir = getLocationForDisk ( dataDir ) ; 
+ + 
+ + if ( BlacklistedDirectories . isUnwritable ( sstableDir ) ) 
+ + continue ; 
+ + 
+ + / / need a separate check for sstableDir itself - could be a mounted separate disk or SSD just for this CF . 
+ + if ( dataDir . getEstimatedAvailableSpace ( ) > estimatedSize & & sstableDir . getUsableSpace ( ) * 0 . 9 > estimatedSize ) 
+ + candidates . add ( dataDir ) ; 
+ } 
+ 
+ - / / if not , use the one that has largest free space 
+ - if ( estimatedSize < directories . first ( ) . getEstimatedAvailableSpace ( ) ) 
+ - return directories . first ( ) ; 
+ - else 
+ - return null ; 
+ + / / sort directories by free space , in _ descending _ order . 
+ + Collections . sort ( candidates ) ; 
+ + 
+ + / / sort directories by load , in _ ascending _ order . 
+ + Collections . sort ( candidates , new Comparator < DataDirectory > ( ) 
+ + { 
+ + public int compare ( DataDirectory a , DataDirectory b ) 
+ + { 
+ + return a . currentTasks . get ( ) - b . currentTasks . get ( ) ; 
+ + } 
+ + } ) ; 
+ + 
+ + return candidates . isEmpty ( ) ? null : candidates . get ( 0 ) ; 
+ } 
+ 
+ + 
+ public static File getSnapshotDirectory ( Descriptor desc , String snapshotName ) 
+ { 
+ return getOrCreate ( desc . directory , SNAPSHOT _ SUBDIR , snapshotName ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java 
+ index 990ad84 . . 301c297 100644 
+ - - - a / src / java / org / apache / cassandra / db / Memtable . java 
+ + + + b / src / java / org / apache / cassandra / db / Memtable . java 
+ @ @ - 433 , 22 + 433 , 28 @ @ public class Memtable 
+ return estimatedSize ; 
+ } 
+ 
+ - protected void runWith ( File dataDirectory ) throws Exception 
+ + protected void runWith ( File sstableDirectory ) throws Exception 
+ { 
+ - assert dataDirectory ! = null : " Flush task is not bound to any disk " ; 
+ + assert sstableDirectory ! = null : " Flush task is not bound to any disk " ; 
+ 
+ - SSTableReader sstable = writeSortedContents ( context , dataDirectory ) ; 
+ + SSTableReader sstable = writeSortedContents ( context , sstableDirectory ) ; 
+ cfs . replaceFlushed ( Memtable . this , sstable ) ; 
+ latch . countDown ( ) ; 
+ } 
+ 
+ - private SSTableReader writeSortedContents ( Future < ReplayPosition > context , File dataDirectory ) throws ExecutionException , InterruptedException 
+ + protected Directories getDirectories ( ) 
+ + { 
+ + return cfs . directories ; 
+ + } 
+ + 
+ + private SSTableReader writeSortedContents ( Future < ReplayPosition > context , File sstableDirectory ) 
+ + throws ExecutionException , InterruptedException 
+ { 
+ logger . info ( " Writing " + Memtable . this . toString ( ) ) ; 
+ 
+ SSTableReader ssTable ; 
+ / / errors when creating the writer that may leave empty temp files . 
+ - SSTableWriter writer = createFlushWriter ( cfs . getTempSSTablePath ( cfs . directories . getLocationForDisk ( dataDirectory ) ) ) ; 
+ + SSTableWriter writer = createFlushWriter ( cfs . getTempSSTablePath ( sstableDirectory ) ) ; 
+ try 
+ { 
+ / / ( we can ' t clear out the map as - we - go to free up memory , 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / AbstractCompactionTask . java b / src / java / org / apache / cassandra / db / compaction / AbstractCompactionTask . java 
+ index 3d64785 . . 0913765 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / AbstractCompactionTask . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / AbstractCompactionTask . java 
+ @ @ - 19 , 6 + 19 , 7 @ @ package org . apache . cassandra . db . compaction ; 
+ 
+ import java . util . Collection ; 
+ 
+ + import org . apache . cassandra . db . Directories ; 
+ import org . apache . cassandra . io . sstable . SSTableReader ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . db . compaction . CompactionManager . CompactionExecutorStatsCollector ; 
+ @ @ - 41 , 6 + 42 , 11 @ @ public abstract class AbstractCompactionTask extends DiskAwareRunnable 
+ 
+ public abstract int execute ( CompactionExecutorStatsCollector collector ) ; 
+ 
+ + protected Directories getDirectories ( ) 
+ + { 
+ + return cfs . directories ; 
+ + } 
+ + 
+ public void unmarkSSTables ( ) 
+ { 
+ cfs . getDataTracker ( ) . unmarkCompacting ( sstables ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionTask . java b / src / java / org / apache / cassandra / db / compaction / CompactionTask . java 
+ index ca1e2da . . 1b1599b 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionTask . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionTask . java 
+ @ @ - 21 , 22 + 21 , 13 @ @ import java . io . File ; 
+ import java . io . IOException ; 
+ import java . util . * ; 
+ 
+ - import javax . print . attribute . IntegerSyntax ; 
+ - 
+ - import com . google . common . base . Predicates ; 
+ import com . google . common . base . Throwables ; 
+ - import com . google . common . collect . Iterables ; 
+ - import com . google . common . collect . Iterators ; 
+ - import com . google . common . primitives . Longs ; 
+ import org . apache . commons . lang . StringUtils ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - import org . apache . cassandra . db . ColumnFamilyStore ; 
+ - import org . apache . cassandra . db . DecoratedKey ; 
+ - import org . apache . cassandra . db . RowIndexEntry ; 
+ - import org . apache . cassandra . db . SystemTable ; 
+ + import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . db . compaction . CompactionManager . CompactionExecutorStatsCollector ; 
+ import org . apache . cassandra . io . sstable . * ; 
+ import org . apache . cassandra . utils . CloseableIterator ; 
+ @ @ - 99 , 11 + 90 , 11 @ @ public class CompactionTask extends AbstractCompactionTask 
+ * which are properly serialized . 
+ * Caller is in charge of marking / unmarking the sstables as compacting . 
+ * / 
+ - protected void runWith ( File dataDirectory ) throws Exception 
+ + protected void runWith ( File sstableDirectory ) throws Exception 
+ { 
+ / / The collection of sstables passed may be empty ( but not null ) ; even if 
+ / / it is not empty , it may compact down to nothing if all rows are deleted . 
+ - assert sstables ! = null & & dataDirectory ! = null ; 
+ + assert sstables ! = null & & sstableDirectory ! = null ; 
+ 
+ if ( DatabaseDescriptor . isSnapshotBeforeCompaction ( ) ) 
+ cfs . snapshotWithoutFlush ( System . currentTimeMillis ( ) + " - compact - " + cfs . columnFamily ) ; 
+ @ @ - 156 , 7 + 147 , 7 @ @ public class CompactionTask extends AbstractCompactionTask 
+ return ; 
+ } 
+ 
+ - SSTableWriter writer = cfs . createCompactionWriter ( keysPerSSTable , cfs . directories . getLocationForDisk ( dataDirectory ) , toCompact ) ; 
+ + SSTableWriter writer = cfs . createCompactionWriter ( keysPerSSTable , sstableDirectory , toCompact ) ; 
+ writers . add ( writer ) ; 
+ while ( iter . hasNext ( ) ) 
+ { 
+ @ @ - 194 , 7 + 185 , 7 @ @ public class CompactionTask extends AbstractCompactionTask 
+ { 
+ / / tmp = false because later we want to query it with descriptor from SSTableReader 
+ cachedKeyMap . put ( writer . descriptor . asTemporary ( false ) , cachedKeys ) ; 
+ - writer = cfs . createCompactionWriter ( keysPerSSTable , cfs . directories . getLocationForDisk ( dataDirectory ) , toCompact ) ; 
+ + writer = cfs . createCompactionWriter ( keysPerSSTable , sstableDirectory , toCompact ) ; 
+ writers . add ( writer ) ; 
+ cachedKeys = new HashMap < DecoratedKey , RowIndexEntry > ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / DiskAwareRunnable . java b / src / java / org / apache / cassandra / io / util / DiskAwareRunnable . java 
+ index 6c4d95a . . 1be4803 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / DiskAwareRunnable . java 
+ + + + b / src / java / org / apache / cassandra / io / util / DiskAwareRunnable . java 
+ @ @ - 34 , 7 + 34 , 7 @ @ public abstract class DiskAwareRunnable extends WrappedRunnable 
+ while ( true ) 
+ { 
+ writeSize = getExpectedWriteSize ( ) ; 
+ - directory = Directories . getLocationCapableOfSize ( writeSize ) ; 
+ + directory = getDirectories ( ) . getLocationCapableOfSize ( writeSize ) ; 
+ if ( directory ! = null | | ! reduceScopeForLimitedSpace ( ) ) 
+ break ; 
+ } 
+ @ @ - 45 , 7 + 45 , 7 @ @ public abstract class DiskAwareRunnable extends WrappedRunnable 
+ directory . estimatedWorkingSize . addAndGet ( writeSize ) ; 
+ try 
+ { 
+ - runWith ( directory . location ) ; 
+ + runWith ( getDirectories ( ) . getLocationForDisk ( directory ) ) ; 
+ } 
+ finally 
+ { 
+ @ @ - 55 , 10 + 55 , 16 @ @ public abstract class DiskAwareRunnable extends WrappedRunnable 
+ } 
+ 
+ / * * 
+ - * Executes this task on given { @ code dataDirectory } . 
+ - * @ param dataDirectory data directory to work on 
+ + * Get sstable directories for the CF . 
+ + * @ return Directories instance for the CF . 
+ * / 
+ - protected abstract void runWith ( File dataDirectory ) throws Exception ; 
+ + protected abstract Directories getDirectories ( ) ; 
+ + 
+ + / * * 
+ + * Executes this task on given { @ code sstableDirectory } . 
+ + * @ param sstableDirectory sstable directory to work on 
+ + * / 
+ + protected abstract void runWith ( File sstableDirectory ) throws Exception ; 
+ 
+ / * * 
+ * Get expected write size to determine which disk to use for this task . 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamIn . java b / src / java / org / apache / cassandra / streaming / StreamIn . java 
+ index b8f6b90 . . 740b430 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamIn . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamIn . java 
+ @ @ - 80 , 10 + 80 , 10 @ @ public class StreamIn 
+ / / new local sstable 
+ Table table = Table . open ( remotedesc . ksname ) ; 
+ ColumnFamilyStore cfStore = table . getColumnFamilyStore ( remotedesc . cfname ) ; 
+ - Directories . DataDirectory localDir = Directories . getLocationCapableOfSize ( remote . size ) ; 
+ + Directories . DataDirectory localDir = cfStore . directories . getLocationCapableOfSize ( remote . size ) ; 
+ if ( localDir = = null ) 
+ throw new RuntimeException ( " Insufficient disk space to store " + remote . size + " bytes " ) ; 
+ - Descriptor localdesc = Descriptor . fromFilename ( cfStore . getTempSSTablePath ( cfStore . directories . getLocationForDisk ( localDir . location ) ) ) ; 
+ + Descriptor localdesc = Descriptor . fromFilename ( cfStore . getTempSSTablePath ( cfStore . directories . getLocationForDisk ( localDir ) ) ) ; 
+ 
+ return new PendingFile ( localdesc , remote ) ; 
+ }

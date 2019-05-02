@@ -1,0 +1,1031 @@
+BLEU SCORE: 0.024455939372403628
+
+TEST MSG: Update CQLSSTableWriter to allow parallel writing of SSTables on the same table within the same JVM
+GENERATED MSG: add a convenient way to reset a node ' s schema
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / io / sstable / AbstractSSTableSimpleWriter . java b / src / java / org / apache / cassandra / io / sstable / AbstractSSTableSimpleWriter . java <nl> index f8999bf . . 67d160d 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / AbstractSSTableSimpleWriter . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / AbstractSSTableSimpleWriter . java <nl> @ @ - 24 , 6 + 24 , 7 @ @ import java . io . IOException ; <nl> import java . nio . ByteBuffer ; <nl> import java . util . HashSet ; <nl> import java . util . Set ; <nl> + import java . util . concurrent . atomic . AtomicInteger ; <nl> <nl> import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> @ @ - 43 , 6 + 44 , 7 @ @ public abstract class AbstractSSTableSimpleWriter implements Closeable <nl> protected ColumnFamily columnFamily ; <nl> protected ByteBuffer currentSuperColumn ; <nl> protected final CounterId counterid = CounterId . generate ( ) ; <nl> + protected static AtomicInteger generation = new AtomicInteger ( 0 ) ; <nl> <nl> public AbstractSSTableSimpleWriter ( File directory , CFMetaData metadata , IPartitioner partitioner ) <nl> { <nl> @ @ - 81 , 9 + 83 , 15 @ @ public abstract class AbstractSSTableSimpleWriter implements Closeable <nl> return false ; <nl> } <nl> } ) ; <nl> - int maxGen = 0 ; <nl> + int maxGen = generation . getAndIncrement ( ) ; <nl> for ( Descriptor desc : existing ) <nl> - maxGen = Math . max ( maxGen , desc . generation ) ; <nl> + { <nl> + while ( desc . generation > maxGen ) <nl> + { <nl> + maxGen = generation . getAndIncrement ( ) ; <nl> + } <nl> + } <nl> + <nl> return new Descriptor ( directory , keyspace , columnFamily , maxGen + 1 , Descriptor . Type . TEMP ) . filenameFor ( Component . DATA ) ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / CQLSSTableWriter . java b / src / java / org / apache / cassandra / io / sstable / CQLSSTableWriter . java <nl> index bf4da24 . . f302599 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / CQLSSTableWriter . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / CQLSSTableWriter . java <nl> @ @ - 28 , 6 + 28 , 7 @ @ import java . util . List ; <nl> import java . util . Map ; <nl> <nl> import com . google . common . collect . ImmutableMap ; <nl> + import com . google . common . collect . Iterables ; <nl> <nl> import org . apache . cassandra . cql3 . statements . * ; <nl> import org . apache . cassandra . cql3 . * ; <nl> @ @ - 335 , 25 + 336 , 31 @ @ public class CQLSSTableWriter implements Closeable <nl> { <nl> try <nl> { <nl> - this . schema = getStatement ( schema , CreateTableStatement . class , " CREATE TABLE " ) . left . getCFMetaData ( ) . rebuild ( ) ; <nl> - <nl> - / / We need to register the keyspace / table metadata through Schema , otherwise we won ' t be able to properly <nl> - / / build the insert statement in using ( ) . <nl> - if ( Schema . instance . getKSMetaData ( this . schema . ksName ) = = null ) <nl> - { <nl> - KSMetaData ksm = KSMetaData . newKeyspace ( this . schema . ksName , <nl> - AbstractReplicationStrategy . getClass ( " org . apache . cassandra . locator . SimpleStrategy " ) , <nl> - ImmutableMap . of ( " replication _ factor " , " 1 " ) , <nl> - true , <nl> - Collections . singleton ( this . schema ) ) ; <nl> - Schema . instance . load ( ksm ) ; <nl> - } <nl> - else if ( Schema . instance . getCFMetaData ( this . schema . ksName , this . schema . cfName ) = = null ) <nl> + synchronized ( CQLSSTableWriter . class ) <nl> { <nl> - Schema . instance . load ( this . schema ) ; <nl> - } <nl> + this . schema = getStatement ( schema , CreateTableStatement . class , " CREATE TABLE " ) . left . getCFMetaData ( ) . rebuild ( ) ; <nl> <nl> - return this ; <nl> + / / We need to register the keyspace / table metadata through Schema , otherwise we won ' t be able to properly <nl> + / / build the insert statement in using ( ) . <nl> + KSMetaData ksm = Schema . instance . getKSMetaData ( this . schema . ksName ) ; <nl> + if ( ksm = = null ) <nl> + { <nl> + ksm = KSMetaData . newKeyspace ( this . schema . ksName , <nl> + AbstractReplicationStrategy . getClass ( " org . apache . cassandra . locator . SimpleStrategy " ) , <nl> + ImmutableMap . of ( " replication _ factor " , " 1 " ) , <nl> + true , <nl> + Collections . singleton ( this . schema ) ) ; <nl> + Schema . instance . load ( ksm ) ; <nl> + } <nl> + else if ( Schema . instance . getCFMetaData ( this . schema . ksName , this . schema . cfName ) = = null ) <nl> + { <nl> + Schema . instance . load ( this . schema ) ; <nl> + ksm = KSMetaData . cloneWith ( ksm , Iterables . concat ( ksm . cfMetaData ( ) . values ( ) , Collections . singleton ( this . schema ) ) ) ; <nl> + Schema . instance . setKeyspaceDefinition ( ksm ) ; <nl> + Keyspace . open ( ksm . name ) . initCf ( this . schema . cfId , this . schema . cfName , false ) ; <nl> + } <nl> + return this ; <nl> + } <nl> } <nl> catch ( RequestValidationException e ) <nl> { <nl> diff - - git a / test / unit / org / apache / cassandra / io / sstable / CQLSSTableWriterTest . java b / test / unit / org / apache / cassandra / io / sstable / CQLSSTableWriterTest . java <nl> index 5a09586 . . 6176505 100644 <nl> - - - a / test / unit / org / apache / cassandra / io / sstable / CQLSSTableWriterTest . java <nl> + + + b / test / unit / org / apache / cassandra / io / sstable / CQLSSTableWriterTest . java <nl> @ @ - 158 , 4 + 158 , 97 @ @ public class CQLSSTableWriterTest <nl> } ; <nl> assert tempdir . list ( filterDataFiles ) . length > 1 : Arrays . toString ( tempdir . list ( filterDataFiles ) ) ; <nl> } <nl> + <nl> + <nl> + private static final int NUMBER _ WRITES _ IN _ RUNNABLE = 10 ; <nl> + private class WriterThread extends Thread <nl> + { <nl> + private final File dataDir ; <nl> + private final int id ; <nl> + public volatile Exception exception ; <nl> + <nl> + public WriterThread ( File dataDir , int id ) <nl> + { <nl> + this . dataDir = dataDir ; <nl> + this . id = id ; <nl> + } <nl> + <nl> + @ Override <nl> + public void run ( ) <nl> + { <nl> + String schema = " CREATE TABLE cql _ keyspace . table2 ( " <nl> + + " k int , " <nl> + + " v int , " <nl> + + " PRIMARY KEY ( k , v ) " <nl> + + " ) " ; <nl> + String insert = " INSERT INTO cql _ keyspace . table2 ( k , v ) VALUES ( ? , ? ) " ; <nl> + CQLSSTableWriter writer = CQLSSTableWriter . builder ( ) <nl> + . inDirectory ( dataDir ) <nl> + . forTable ( schema ) <nl> + . withPartitioner ( StorageService . instance . getPartitioner ( ) ) <nl> + . using ( insert ) . build ( ) ; <nl> + <nl> + try <nl> + { <nl> + for ( int i = 0 ; i < NUMBER _ WRITES _ IN _ RUNNABLE ; i + + ) <nl> + { <nl> + writer . addRow ( id , i ) ; <nl> + } <nl> + writer . close ( ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + exception = e ; <nl> + } <nl> + } <nl> + } <nl> + <nl> + @ Test <nl> + public void testConcurrentWriters ( ) throws Exception <nl> + { <nl> + String KS = " cql _ keyspace " ; <nl> + String TABLE = " table2 " ; <nl> + <nl> + File tempdir = Files . createTempDir ( ) ; <nl> + File dataDir = new File ( tempdir . getAbsolutePath ( ) + File . separator + KS + File . separator + TABLE ) ; <nl> + assert dataDir . mkdirs ( ) ; <nl> + <nl> + WriterThread [ ] threads = new WriterThread [ 5 ] ; <nl> + for ( int i = 0 ; i < threads . length ; i + + ) <nl> + { <nl> + WriterThread thread = new WriterThread ( dataDir , i ) ; <nl> + threads [ i ] = thread ; <nl> + thread . start ( ) ; <nl> + } <nl> + <nl> + for ( WriterThread thread : threads ) <nl> + { <nl> + thread . join ( ) ; <nl> + assert ! thread . isAlive ( ) : " Thread should be dead by now " ; <nl> + if ( thread . exception ! = null ) <nl> + { <nl> + throw thread . exception ; <nl> + } <nl> + } <nl> + <nl> + SSTableLoader loader = new SSTableLoader ( dataDir , new SSTableLoader . Client ( ) <nl> + { <nl> + public void init ( String keyspace ) <nl> + { <nl> + for ( Range < Token > range : StorageService . instance . getLocalRanges ( " cql _ keyspace " ) ) <nl> + addRangeForEndpoint ( range , FBUtilities . getBroadcastAddress ( ) ) ; <nl> + setPartitioner ( StorageService . getPartitioner ( ) ) ; <nl> + } <nl> + <nl> + public CFMetaData getCFMetaData ( String keyspace , String cfName ) <nl> + { <nl> + return Schema . instance . getCFMetaData ( keyspace , cfName ) ; <nl> + } <nl> + } , new OutputHandler . SystemOutput ( false , false ) ) ; <nl> + <nl> + loader . stream ( ) . get ( ) ; <nl> + <nl> + UntypedResultSet rs = QueryProcessor . processInternal ( " SELECT * FROM cql _ keyspace . table2 ; " ) ; <nl> + assertEquals ( threads . length * NUMBER _ WRITES _ IN _ RUNNABLE , rs . size ( ) ) ; <nl> + } <nl> }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 3f5a3f4 . . c2234bf 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 6 , 6 + 6 , 8 @ @ <nl> * Update ORDER BY syntax for CQL3 ( CASSANDRA - 3925 ) <nl> * Fix BulkRecordWriter to not throw NPE if reducer gets no map data from Hadoop ( CASSANDRA - 3944 ) <nl> * Fix bug with counters in super columns ( CASSANDRA - 3821 ) <nl> + * Remove deprecated merge _ shard _ chance ( CASSANDRA - 3940 ) <nl> + * add a convenient way to reset a node ' s schema ( CASSANDRA - 2963 ) <nl> Merged from 1 . 0 : <nl> * remove the wait on hint future during write ( CASSANDRA - 3870 ) <nl> * ( cqlsh ) ignore missing CfDef opts ( CASSANDRA - 3933 ) <nl> diff - - git a / interface / cassandra . thrift b / interface / cassandra . thrift <nl> index a2275b6 . . f21845b 100644 <nl> - - - a / interface / cassandra . thrift <nl> + + + b / interface / cassandra . thrift <nl> @ @ - 407 , 7 + 407 , 6 @ @ struct CfDef { <nl> 17 : optional i32 min _ compaction _ threshold , <nl> 18 : optional i32 max _ compaction _ threshold , <nl> 24 : optional bool replicate _ on _ write , <nl> - 25 : optional double merge _ shards _ chance , <nl> 26 : optional string key _ validation _ class , <nl> 28 : optional binary key _ alias , <nl> 29 : optional string compaction _ strategy , <nl> diff - - git a / interface / thrift / gen - java / org / apache / cassandra / thrift / Cassandra . java b / interface / thrift / gen - java / org / apache / cassandra / thrift / Cassandra . java <nl> index 3cfe58c . . 5b79e18 100644 <nl> - - - a / interface / thrift / gen - java / org / apache / cassandra / thrift / Cassandra . java <nl> + + + b / interface / thrift / gen - java / org / apache / cassandra / thrift / Cassandra . java <nl> @ @ - 8526 , 8 + 8526 , 6 @ @ public class Cassandra { <nl> <nl> private void readObject ( java . io . ObjectInputStream in ) throws java . io . IOException , ClassNotFoundException { <nl> try { <nl> - / / it doesn ' t seem like you should have to do this , but java serialization is wacky , and doesn ' t call the default constructor . <nl> - _ _ isset _ bit _ vector = new BitSet ( 1 ) ; <nl> read ( new org . apache . thrift . protocol . TCompactProtocol ( new org . apache . thrift . transport . TIOStreamTransport ( in ) ) ) ; <nl> } catch ( org . apache . thrift . TException te ) { <nl> throw new java . io . IOException ( te ) ; <nl> @ @ - 17735 , 8 + 17733 , 6 @ @ public class Cassandra { <nl> <nl> private void readObject ( java . io . ObjectInputStream in ) throws java . io . IOException , ClassNotFoundException { <nl> try { <nl> - / / it doesn ' t seem like you should have to do this , but java serialization is wacky , and doesn ' t call the default constructor . <nl> - _ _ isset _ bit _ vector = new BitSet ( 1 ) ; <nl> read ( new org . apache . thrift . protocol . TCompactProtocol ( new org . apache . thrift . transport . TIOStreamTransport ( in ) ) ) ; <nl> } catch ( org . apache . thrift . TException te ) { <nl> throw new java . io . IOException ( te ) ; <nl> @ @ - 26540 , 6 + 26536 , 8 @ @ public class Cassandra { <nl> <nl> private void readObject ( java . io . ObjectInputStream in ) throws java . io . IOException , ClassNotFoundException { <nl> try { <nl> + / / it doesn ' t seem like you should have to do this , but java serialization is wacky , and doesn ' t call the default constructor . <nl> + _ _ isset _ bit _ vector = new BitSet ( 1 ) ; <nl> read ( new org . apache . thrift . protocol . TCompactProtocol ( new org . apache . thrift . transport . TIOStreamTransport ( in ) ) ) ; <nl> } catch ( org . apache . thrift . TException te ) { <nl> throw new java . io . IOException ( te ) ; <nl> diff - - git a / interface / thrift / gen - java / org / apache / cassandra / thrift / CfDef . java b / interface / thrift / gen - java / org / apache / cassandra / thrift / CfDef . java <nl> index 0fe3a7d . . 72d12cb 100644 <nl> - - - a / interface / thrift / gen - java / org / apache / cassandra / thrift / CfDef . java <nl> + + + b / interface / thrift / gen - java / org / apache / cassandra / thrift / CfDef . java <nl> @ @ - 59 , 7 + 59 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> private static final org . apache . thrift . protocol . TField MIN _ COMPACTION _ THRESHOLD _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " min _ compaction _ threshold " , org . apache . thrift . protocol . TType . I32 , ( short ) 17 ) ; <nl> private static final org . apache . thrift . protocol . TField MAX _ COMPACTION _ THRESHOLD _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " max _ compaction _ threshold " , org . apache . thrift . protocol . TType . I32 , ( short ) 18 ) ; <nl> private static final org . apache . thrift . protocol . TField REPLICATE _ ON _ WRITE _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " replicate _ on _ write " , org . apache . thrift . protocol . TType . BOOL , ( short ) 24 ) ; <nl> - private static final org . apache . thrift . protocol . TField MERGE _ SHARDS _ CHANCE _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " merge _ shards _ chance " , org . apache . thrift . protocol . TType . DOUBLE , ( short ) 25 ) ; <nl> private static final org . apache . thrift . protocol . TField KEY _ VALIDATION _ CLASS _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " key _ validation _ class " , org . apache . thrift . protocol . TType . STRING , ( short ) 26 ) ; <nl> private static final org . apache . thrift . protocol . TField KEY _ ALIAS _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " key _ alias " , org . apache . thrift . protocol . TType . STRING , ( short ) 28 ) ; <nl> private static final org . apache . thrift . protocol . TField COMPACTION _ STRATEGY _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " compaction _ strategy " , org . apache . thrift . protocol . TType . STRING , ( short ) 29 ) ; <nl> @ @ - 85 , 7 + 84 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> public int min _ compaction _ threshold ; / / required <nl> public int max _ compaction _ threshold ; / / required <nl> public boolean replicate _ on _ write ; / / required <nl> - public double merge _ shards _ chance ; / / required <nl> public String key _ validation _ class ; / / required <nl> public ByteBuffer key _ alias ; / / required <nl> public String compaction _ strategy ; / / required <nl> @ @ - 113 , 7 + 111 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> MIN _ COMPACTION _ THRESHOLD ( ( short ) 17 , " min _ compaction _ threshold " ) , <nl> MAX _ COMPACTION _ THRESHOLD ( ( short ) 18 , " max _ compaction _ threshold " ) , <nl> REPLICATE _ ON _ WRITE ( ( short ) 24 , " replicate _ on _ write " ) , <nl> - MERGE _ SHARDS _ CHANCE ( ( short ) 25 , " merge _ shards _ chance " ) , <nl> KEY _ VALIDATION _ CLASS ( ( short ) 26 , " key _ validation _ class " ) , <nl> KEY _ ALIAS ( ( short ) 28 , " key _ alias " ) , <nl> COMPACTION _ STRATEGY ( ( short ) 29 , " compaction _ strategy " ) , <nl> @ @ - 166 , 8 + 163 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> return MAX _ COMPACTION _ THRESHOLD ; <nl> case 24 : / / REPLICATE _ ON _ WRITE <nl> return REPLICATE _ ON _ WRITE ; <nl> - case 25 : / / MERGE _ SHARDS _ CHANCE <nl> - return MERGE _ SHARDS _ CHANCE ; <nl> case 26 : / / KEY _ VALIDATION _ CLASS <nl> return KEY _ VALIDATION _ CLASS ; <nl> case 28 : / / KEY _ ALIAS <nl> @ @ - 234 , 10 + 229 , 9 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> private static final int _ _ MIN _ COMPACTION _ THRESHOLD _ ISSET _ ID = 3 ; <nl> private static final int _ _ MAX _ COMPACTION _ THRESHOLD _ ISSET _ ID = 4 ; <nl> private static final int _ _ REPLICATE _ ON _ WRITE _ ISSET _ ID = 5 ; <nl> - private static final int _ _ MERGE _ SHARDS _ CHANCE _ ISSET _ ID = 6 ; <nl> - private static final int _ _ BLOOM _ FILTER _ FP _ CHANCE _ ISSET _ ID = 7 ; <nl> - private static final int _ _ DCLOCAL _ READ _ REPAIR _ CHANCE _ ISSET _ ID = 8 ; <nl> - private BitSet _ _ isset _ bit _ vector = new BitSet ( 9 ) ; <nl> + private static final int _ _ BLOOM _ FILTER _ FP _ CHANCE _ ISSET _ ID = 6 ; <nl> + private static final int _ _ DCLOCAL _ READ _ REPAIR _ CHANCE _ ISSET _ ID = 7 ; <nl> + private BitSet _ _ isset _ bit _ vector = new BitSet ( 8 ) ; <nl> <nl> public static final Map < _ Fields , org . apache . thrift . meta _ data . FieldMetaData > metaDataMap ; <nl> static { <nl> @ @ - 271 , 8 + 265 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> new org . apache . thrift . meta _ data . FieldValueMetaData ( org . apache . thrift . protocol . TType . I32 ) ) ) ; <nl> tmpMap . put ( _ Fields . REPLICATE _ ON _ WRITE , new org . apache . thrift . meta _ data . FieldMetaData ( " replicate _ on _ write " , org . apache . thrift . TFieldRequirementType . OPTIONAL , <nl> new org . apache . thrift . meta _ data . FieldValueMetaData ( org . apache . thrift . protocol . TType . BOOL ) ) ) ; <nl> - tmpMap . put ( _ Fields . MERGE _ SHARDS _ CHANCE , new org . apache . thrift . meta _ data . FieldMetaData ( " merge _ shards _ chance " , org . apache . thrift . TFieldRequirementType . OPTIONAL , <nl> - new org . apache . thrift . meta _ data . FieldValueMetaData ( org . apache . thrift . protocol . TType . DOUBLE ) ) ) ; <nl> tmpMap . put ( _ Fields . KEY _ VALIDATION _ CLASS , new org . apache . thrift . meta _ data . FieldMetaData ( " key _ validation _ class " , org . apache . thrift . TFieldRequirementType . OPTIONAL , <nl> new org . apache . thrift . meta _ data . FieldValueMetaData ( org . apache . thrift . protocol . TType . STRING ) ) ) ; <nl> tmpMap . put ( _ Fields . KEY _ ALIAS , new org . apache . thrift . meta _ data . FieldMetaData ( " key _ alias " , org . apache . thrift . TFieldRequirementType . OPTIONAL , <nl> @ @ - 364 , 7 + 356 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> this . min _ compaction _ threshold = other . min _ compaction _ threshold ; <nl> this . max _ compaction _ threshold = other . max _ compaction _ threshold ; <nl> this . replicate _ on _ write = other . replicate _ on _ write ; <nl> - this . merge _ shards _ chance = other . merge _ shards _ chance ; <nl> if ( other . isSetKey _ validation _ class ( ) ) { <nl> this . key _ validation _ class = other . key _ validation _ class ; <nl> } <nl> @ @ - 453 , 8 + 444 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> this . max _ compaction _ threshold = 0 ; <nl> setReplicate _ on _ writeIsSet ( false ) ; <nl> this . replicate _ on _ write = false ; <nl> - setMerge _ shards _ chanceIsSet ( false ) ; <nl> - this . merge _ shards _ chance = 0 . 0 ; <nl> this . key _ validation _ class = null ; <nl> this . key _ alias = null ; <nl> this . compaction _ strategy = null ; <nl> @ @ - 815 , 29 + 804 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> _ _ isset _ bit _ vector . set ( _ _ REPLICATE _ ON _ WRITE _ ISSET _ ID , value ) ; <nl> } <nl> <nl> - public double getMerge _ shards _ chance ( ) { <nl> - return this . merge _ shards _ chance ; <nl> - } <nl> - <nl> - public CfDef setMerge _ shards _ chance ( double merge _ shards _ chance ) { <nl> - this . merge _ shards _ chance = merge _ shards _ chance ; <nl> - setMerge _ shards _ chanceIsSet ( true ) ; <nl> - return this ; <nl> - } <nl> - <nl> - public void unsetMerge _ shards _ chance ( ) { <nl> - _ _ isset _ bit _ vector . clear ( _ _ MERGE _ SHARDS _ CHANCE _ ISSET _ ID ) ; <nl> - } <nl> - <nl> - / * * Returns true if field merge _ shards _ chance is set ( has been assigned a value ) and false otherwise * / <nl> - public boolean isSetMerge _ shards _ chance ( ) { <nl> - return _ _ isset _ bit _ vector . get ( _ _ MERGE _ SHARDS _ CHANCE _ ISSET _ ID ) ; <nl> - } <nl> - <nl> - public void setMerge _ shards _ chanceIsSet ( boolean value ) { <nl> - _ _ isset _ bit _ vector . set ( _ _ MERGE _ SHARDS _ CHANCE _ ISSET _ ID , value ) ; <nl> - } <nl> - <nl> public String getKey _ validation _ class ( ) { <nl> return this . key _ validation _ class ; <nl> } <nl> @ @ - 1247 , 14 + 1213 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> } <nl> break ; <nl> <nl> - case MERGE _ SHARDS _ CHANCE : <nl> - if ( value = = null ) { <nl> - unsetMerge _ shards _ chance ( ) ; <nl> - } else { <nl> - setMerge _ shards _ chance ( ( Double ) value ) ; <nl> - } <nl> - break ; <nl> - <nl> case KEY _ VALIDATION _ CLASS : <nl> if ( value = = null ) { <nl> unsetKey _ validation _ class ( ) ; <nl> @ @ - 1382 , 9 + 1340 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> case REPLICATE _ ON _ WRITE : <nl> return Boolean . valueOf ( isReplicate _ on _ write ( ) ) ; <nl> <nl> - case MERGE _ SHARDS _ CHANCE : <nl> - return Double . valueOf ( getMerge _ shards _ chance ( ) ) ; <nl> - <nl> case KEY _ VALIDATION _ CLASS : <nl> return getKey _ validation _ class ( ) ; <nl> <nl> @ @ - 1454 , 8 + 1409 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> return isSetMax _ compaction _ threshold ( ) ; <nl> case REPLICATE _ ON _ WRITE : <nl> return isSetReplicate _ on _ write ( ) ; <nl> - case MERGE _ SHARDS _ CHANCE : <nl> - return isSetMerge _ shards _ chance ( ) ; <nl> case KEY _ VALIDATION _ CLASS : <nl> return isSetKey _ validation _ class ( ) ; <nl> case KEY _ ALIAS : <nl> @ @ - 1619 , 15 + 1572 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> return false ; <nl> } <nl> <nl> - boolean this _ present _ merge _ shards _ chance = true & & this . isSetMerge _ shards _ chance ( ) ; <nl> - boolean that _ present _ merge _ shards _ chance = true & & that . isSetMerge _ shards _ chance ( ) ; <nl> - if ( this _ present _ merge _ shards _ chance | | that _ present _ merge _ shards _ chance ) { <nl> - if ( ! ( this _ present _ merge _ shards _ chance & & that _ present _ merge _ shards _ chance ) ) <nl> - return false ; <nl> - if ( this . merge _ shards _ chance ! = that . merge _ shards _ chance ) <nl> - return false ; <nl> - } <nl> - <nl> boolean this _ present _ key _ validation _ class = true & & this . isSetKey _ validation _ class ( ) ; <nl> boolean that _ present _ key _ validation _ class = true & & that . isSetKey _ validation _ class ( ) ; <nl> if ( this _ present _ key _ validation _ class | | that _ present _ key _ validation _ class ) { <nl> @ @ - 1795 , 11 + 1739 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> if ( present _ replicate _ on _ write ) <nl> builder . append ( replicate _ on _ write ) ; <nl> <nl> - boolean present _ merge _ shards _ chance = true & & ( isSetMerge _ shards _ chance ( ) ) ; <nl> - builder . append ( present _ merge _ shards _ chance ) ; <nl> - if ( present _ merge _ shards _ chance ) <nl> - builder . append ( merge _ shards _ chance ) ; <nl> - <nl> boolean present _ key _ validation _ class = true & & ( isSetKey _ validation _ class ( ) ) ; <nl> builder . append ( present _ key _ validation _ class ) ; <nl> if ( present _ key _ validation _ class ) <nl> @ @ - 2001 , 16 + 1940 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> return lastComparison ; <nl> } <nl> } <nl> - lastComparison = Boolean . valueOf ( isSetMerge _ shards _ chance ( ) ) . compareTo ( typedOther . isSetMerge _ shards _ chance ( ) ) ; <nl> - if ( lastComparison ! = 0 ) { <nl> - return lastComparison ; <nl> - } <nl> - if ( isSetMerge _ shards _ chance ( ) ) { <nl> - lastComparison = org . apache . thrift . TBaseHelper . compareTo ( this . merge _ shards _ chance , typedOther . merge _ shards _ chance ) ; <nl> - if ( lastComparison ! = 0 ) { <nl> - return lastComparison ; <nl> - } <nl> - } <nl> lastComparison = Boolean . valueOf ( isSetKey _ validation _ class ( ) ) . compareTo ( typedOther . isSetKey _ validation _ class ( ) ) ; <nl> if ( lastComparison ! = 0 ) { <nl> return lastComparison ; <nl> @ @ - 2243 , 14 + 2172 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> org . apache . thrift . protocol . TProtocolUtil . skip ( iprot , field . type ) ; <nl> } <nl> break ; <nl> - case 25 : / / MERGE _ SHARDS _ CHANCE <nl> - if ( field . type = = org . apache . thrift . protocol . TType . DOUBLE ) { <nl> - this . merge _ shards _ chance = iprot . readDouble ( ) ; <nl> - setMerge _ shards _ chanceIsSet ( true ) ; <nl> - } else { <nl> - org . apache . thrift . protocol . TProtocolUtil . skip ( iprot , field . type ) ; <nl> - } <nl> - break ; <nl> case 26 : / / KEY _ VALIDATION _ CLASS <nl> if ( field . type = = org . apache . thrift . protocol . TType . STRING ) { <nl> this . key _ validation _ class = iprot . readString ( ) ; <nl> @ @ - 2461 , 11 + 2382 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> oprot . writeBool ( this . replicate _ on _ write ) ; <nl> oprot . writeFieldEnd ( ) ; <nl> } <nl> - if ( isSetMerge _ shards _ chance ( ) ) { <nl> - oprot . writeFieldBegin ( MERGE _ SHARDS _ CHANCE _ FIELD _ DESC ) ; <nl> - oprot . writeDouble ( this . merge _ shards _ chance ) ; <nl> - oprot . writeFieldEnd ( ) ; <nl> - } <nl> if ( this . key _ validation _ class ! = null ) { <nl> if ( isSetKey _ validation _ class ( ) ) { <nl> oprot . writeFieldBegin ( KEY _ VALIDATION _ CLASS _ FIELD _ DESC ) ; <nl> @ @ - 2675 , 12 + 2591 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav <nl> sb . append ( this . replicate _ on _ write ) ; <nl> first = false ; <nl> } <nl> - if ( isSetMerge _ shards _ chance ( ) ) { <nl> - if ( ! first ) sb . append ( " , " ) ; <nl> - sb . append ( " merge _ shards _ chance : " ) ; <nl> - sb . append ( this . merge _ shards _ chance ) ; <nl> - first = false ; <nl> - } <nl> if ( isSetKey _ validation _ class ( ) ) { <nl> if ( ! first ) sb . append ( " , " ) ; <nl> sb . append ( " key _ validation _ class : " ) ; <nl> diff - - git a / src / java / org / apache / cassandra / config / CFMetaData . java b / src / java / org / apache / cassandra / config / CFMetaData . java <nl> index 96ed181 . . 1c2d1ec 100644 <nl> - - - a / src / java / org / apache / cassandra / config / CFMetaData . java <nl> + + + b / src / java / org / apache / cassandra / config / CFMetaData . java <nl> @ @ - 68 , 7 + 68 , 6 @ @ public final class CFMetaData <nl> public final static int DEFAULT _ GC _ GRACE _ SECONDS = 864000 ; <nl> public final static int DEFAULT _ MIN _ COMPACTION _ THRESHOLD = 4 ; <nl> public final static int DEFAULT _ MAX _ COMPACTION _ THRESHOLD = 32 ; <nl> - public final static double DEFAULT _ MERGE _ SHARDS _ CHANCE = 0 . 1 ; <nl> public final static String DEFAULT _ COMPACTION _ STRATEGY _ CLASS = " SizeTieredCompactionStrategy " ; <nl> public final static ByteBuffer DEFAULT _ KEY _ NAME = ByteBufferUtil . bytes ( " KEY " ) ; <nl> <nl> @ @ - 156 , 9 + 155 , 6 @ @ public final class CFMetaData <nl> private AbstractType < ? > keyValidator ; / / default BytesType ( no - op ) , use comparator types <nl> private int minCompactionThreshold ; / / default 4 <nl> private int maxCompactionThreshold ; / / default 32 <nl> - / / mergeShardsChance is now obsolete , but left here so as to not break <nl> - / / thrift compatibility <nl> - private double mergeShardsChance ; / / default 0 . 1 , chance [ 0 . 0 , 1 . 0 ] of merging old shards during replication <nl> private ByteBuffer keyAlias ; / / default NULL <nl> private List < ByteBuffer > columnAliases = new ArrayList < ByteBuffer > ( ) ; <nl> private ByteBuffer valueAlias ; / / default NULL <nl> @ @ - 185 , 7 + 181 , 6 @ @ public final class CFMetaData <nl> public CFMetaData keyValidator ( AbstractType < ? > prop ) { keyValidator = prop ; updateCfDef ( ) ; return this ; } <nl> public CFMetaData minCompactionThreshold ( int prop ) { minCompactionThreshold = prop ; return this ; } <nl> public CFMetaData maxCompactionThreshold ( int prop ) { maxCompactionThreshold = prop ; return this ; } <nl> - public CFMetaData mergeShardsChance ( double prop ) { mergeShardsChance = prop ; return this ; } <nl> public CFMetaData keyAlias ( ByteBuffer prop ) { keyAlias = prop ; updateCfDef ( ) ; return this ; } <nl> public CFMetaData columnAliases ( List < ByteBuffer > prop ) { columnAliases = prop ; updateCfDef ( ) ; return this ; } <nl> public CFMetaData valueAlias ( ByteBuffer prop ) { valueAlias = prop ; updateCfDef ( ) ; return this ; } <nl> @ @ - 237 , 7 + 232 , 6 @ @ public final class CFMetaData <nl> gcGraceSeconds = DEFAULT _ GC _ GRACE _ SECONDS ; <nl> minCompactionThreshold = DEFAULT _ MIN _ COMPACTION _ THRESHOLD ; <nl> maxCompactionThreshold = DEFAULT _ MAX _ COMPACTION _ THRESHOLD ; <nl> - mergeShardsChance = DEFAULT _ MERGE _ SHARDS _ CHANCE ; <nl> <nl> / / Defaults strange or simple enough to not need a DEFAULT _ T for <nl> defaultValidator = BytesType . instance ; <nl> @ @ - 269 , 8 + 263 , 7 @ @ public final class CFMetaData <nl> return newCFMD . comment ( comment ) <nl> . readRepairChance ( 0 ) <nl> . dclocalReadRepairChance ( 0 ) <nl> - . gcGraceSeconds ( 0 ) <nl> - . mergeShardsChance ( 0 . 0 ) ; <nl> + . gcGraceSeconds ( 0 ) ; <nl> } <nl> <nl> public static CFMetaData newIndexMetadata ( CFMetaData parent , ColumnDefinition info , AbstractType < ? > columnComparator ) <nl> @ @ - 379 , 7 + 372 , 6 @ @ public final class CFMetaData <nl> / / Isn ' t AVRO supposed to handle stuff like this ? <nl> if ( cf . min _ compaction _ threshold ! = null ) { newCFMD . minCompactionThreshold ( cf . min _ compaction _ threshold ) ; } <nl> if ( cf . max _ compaction _ threshold ! = null ) { newCFMD . maxCompactionThreshold ( cf . max _ compaction _ threshold ) ; } <nl> - if ( cf . merge _ shards _ chance ! = null ) { newCFMD . mergeShardsChance ( cf . merge _ shards _ chance ) ; } <nl> if ( cf . key _ alias ! = null ) { newCFMD . keyAlias ( cf . key _ alias ) ; } <nl> if ( cf . column _ aliases ! = null ) { newCFMD . columnAliases ( fixAvroRetardation ( cf . column _ aliases ) ) ; } <nl> if ( cf . value _ alias ! = null ) { newCFMD . valueAlias ( cf . value _ alias ) ; } <nl> @ @ - 461 , 11 + 453 , 6 @ @ public final class CFMetaData <nl> return dcLocalReadRepairChance ; <nl> } <nl> <nl> - public double getMergeShardsChance ( ) <nl> - { <nl> - return mergeShardsChance ; <nl> - } <nl> - <nl> public boolean getReplicateOnWrite ( ) <nl> { <nl> return replicateOnWrite ; <nl> @ @ - 570 , 7 + 557 , 6 @ @ public final class CFMetaData <nl> . append ( maxCompactionThreshold , rhs . maxCompactionThreshold ) <nl> . append ( cfId . intValue ( ) , rhs . cfId . intValue ( ) ) <nl> . append ( column _ metadata , rhs . column _ metadata ) <nl> - . append ( mergeShardsChance , rhs . mergeShardsChance ) <nl> . append ( keyAlias , rhs . keyAlias ) <nl> . append ( columnAliases , rhs . columnAliases ) <nl> . append ( valueAlias , rhs . valueAlias ) <nl> @ @ - 601 , 7 + 587 , 6 @ @ public final class CFMetaData <nl> . append ( maxCompactionThreshold ) <nl> . append ( cfId ) <nl> . append ( column _ metadata ) <nl> - . append ( mergeShardsChance ) <nl> . append ( keyAlias ) <nl> . append ( columnAliases ) <nl> . append ( valueAlias ) <nl> @ @ - 636 , 8 + 621 , 6 @ @ public final class CFMetaData <nl> cf _ def . setMin _ compaction _ threshold ( CFMetaData . DEFAULT _ MIN _ COMPACTION _ THRESHOLD ) ; <nl> if ( ! cf _ def . isSetMax _ compaction _ threshold ( ) ) <nl> cf _ def . setMax _ compaction _ threshold ( CFMetaData . DEFAULT _ MAX _ COMPACTION _ THRESHOLD ) ; <nl> - if ( ! cf _ def . isSetMerge _ shards _ chance ( ) ) <nl> - cf _ def . setMerge _ shards _ chance ( CFMetaData . DEFAULT _ MERGE _ SHARDS _ CHANCE ) ; <nl> if ( null = = cf _ def . compaction _ strategy ) <nl> cf _ def . compaction _ strategy = DEFAULT _ COMPACTION _ STRATEGY _ CLASS ; <nl> if ( null = = cf _ def . compaction _ strategy _ options ) <nl> @ @ - 673 , 7 + 656 , 6 @ @ public final class CFMetaData <nl> if ( cf _ def . isSetGc _ grace _ seconds ( ) ) { newCFMD . gcGraceSeconds ( cf _ def . gc _ grace _ seconds ) ; } <nl> if ( cf _ def . isSetMin _ compaction _ threshold ( ) ) { newCFMD . minCompactionThreshold ( cf _ def . min _ compaction _ threshold ) ; } <nl> if ( cf _ def . isSetMax _ compaction _ threshold ( ) ) { newCFMD . maxCompactionThreshold ( cf _ def . max _ compaction _ threshold ) ; } <nl> - if ( cf _ def . isSetMerge _ shards _ chance ( ) ) { newCFMD . mergeShardsChance ( cf _ def . merge _ shards _ chance ) ; } <nl> if ( cf _ def . isSetKey _ alias ( ) ) { newCFMD . keyAlias ( cf _ def . key _ alias ) ; } <nl> if ( cf _ def . isSetColumn _ aliases ( ) & & cf _ def . column _ aliases ! = null ) { newCFMD . columnAliases ( cf _ def . column _ aliases ) ; } <nl> if ( cf _ def . isSetValue _ alias ( ) ) { newCFMD . valueAlias ( cf _ def . value _ alias ) ; } <nl> @ @ - 776 , 7 + 758 , 6 @ @ public final class CFMetaData <nl> keyValidator = TypeParser . parse ( cf _ def . key _ validation _ class ) ; <nl> minCompactionThreshold = cf _ def . min _ compaction _ threshold ; <nl> maxCompactionThreshold = cf _ def . max _ compaction _ threshold ; <nl> - mergeShardsChance = cf _ def . merge _ shards _ chance ; <nl> keyAlias = cf _ def . key _ alias ; <nl> columnAliases = cf _ def . column _ aliases ; <nl> valueAlias = cf _ def . value _ alias ; <nl> @ @ - 907 , 7 + 888 , 6 @ @ public final class CFMetaData <nl> def . setKey _ validation _ class ( keyValidator . toString ( ) ) ; <nl> def . setMin _ compaction _ threshold ( minCompactionThreshold ) ; <nl> def . setMax _ compaction _ threshold ( maxCompactionThreshold ) ; <nl> - def . setMerge _ shards _ chance ( mergeShardsChance ) ; <nl> def . setKey _ alias ( keyAlias ) ; <nl> List < org . apache . cassandra . thrift . ColumnDef > column _ meta = new ArrayList < org . apache . cassandra . thrift . ColumnDef > ( column _ metadata . size ( ) ) ; <nl> for ( ColumnDefinition cd : column _ metadata . values ( ) ) <nl> @ @ - 1258 , 7 + 1238 , 6 @ @ public final class CFMetaData <nl> . append ( " keyValidator " , keyValidator ) <nl> . append ( " minCompactionThreshold " , minCompactionThreshold ) <nl> . append ( " maxCompactionThreshold " , maxCompactionThreshold ) <nl> - . append ( " mergeShardsChance " , mergeShardsChance ) <nl> . append ( " keyAlias " , keyAlias ) <nl> . append ( " columnAliases " , columnAliases ) <nl> . append ( " valueAlias " , keyAlias ) <nl> diff - - git a / src / java / org / apache / cassandra / config / Schema . java b / src / java / org / apache / cassandra / config / Schema . java <nl> index 89c5d1e . . d27b347 100644 <nl> - - - a / src / java / org / apache / cassandra / config / Schema . java <nl> + + + b / src / java / org / apache / cassandra / config / Schema . java <nl> @ @ - 479 , 6 + 479 , 7 @ @ public class Schema <nl> versionLock . writeLock ( ) . unlock ( ) ; <nl> } <nl> } <nl> + <nl> / * <nl> * Like updateVersion , but also announces via gossip <nl> * / <nl> @ @ - 487 , 4 + 488 , 21 @ @ public class Schema <nl> updateVersion ( ) ; <nl> MigrationManager . passiveAnnounce ( version ) ; <nl> } <nl> + <nl> + / * * <nl> + * Clear all KS / CF metadata and reset version . <nl> + * / <nl> + public synchronized void clear ( ) <nl> + { <nl> + for ( String table : getNonSystemTables ( ) ) <nl> + { <nl> + KSMetaData ksm = getTableDefinition ( table ) ; <nl> + for ( CFMetaData cfm : ksm . cfMetaData ( ) . values ( ) ) <nl> + purge ( cfm ) ; <nl> + clearTableDefinition ( ksm ) ; <nl> + } <nl> + <nl> + updateVersionAndAnnounce ( ) ; <nl> + fixCFMaxId ( ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java b / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java <nl> index 062cd90 . . 328a70b 100644 <nl> - - - a / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java <nl> + + + b / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java <nl> @ @ - 183 , 7 + 183 , 6 @ @ public class CreateColumnFamilyStatement <nl> . defaultValidator ( cfProps . getValidator ( ) ) <nl> . minCompactionThreshold ( getPropertyInt ( CFPropDefs . KW _ MINCOMPACTIONTHRESHOLD , CFMetaData . DEFAULT _ MIN _ COMPACTION _ THRESHOLD ) ) <nl> . maxCompactionThreshold ( getPropertyInt ( CFPropDefs . KW _ MAXCOMPACTIONTHRESHOLD , CFMetaData . DEFAULT _ MAX _ COMPACTION _ THRESHOLD ) ) <nl> - . mergeShardsChance ( 0 . 0 ) <nl> . columnMetadata ( getColumns ( comparator ) ) <nl> . keyValidator ( TypeParser . parse ( CFPropDefs . comparators . get ( getKeyType ( ) ) ) ) <nl> . keyAlias ( keyAlias ) <nl> diff - - git a / src / java / org / apache / cassandra / cql3 / statements / CreateColumnFamilyStatement . java b / src / java / org / apache / cassandra / cql3 / statements / CreateColumnFamilyStatement . java <nl> index 767437e . . 873c134 100644 <nl> - - - a / src / java / org / apache / cassandra / cql3 / statements / CreateColumnFamilyStatement . java <nl> + + + b / src / java / org / apache / cassandra / cql3 / statements / CreateColumnFamilyStatement . java <nl> @ @ - 113 , 7 + 113 , 6 @ @ public class CreateColumnFamilyStatement extends SchemaAlteringStatement <nl> . defaultValidator ( defaultValidator ) <nl> . minCompactionThreshold ( properties . getInt ( CFPropDefs . KW _ MINCOMPACTIONTHRESHOLD , CFMetaData . DEFAULT _ MIN _ COMPACTION _ THRESHOLD ) ) <nl> . maxCompactionThreshold ( properties . getInt ( CFPropDefs . KW _ MAXCOMPACTIONTHRESHOLD , CFMetaData . DEFAULT _ MAX _ COMPACTION _ THRESHOLD ) ) <nl> - . mergeShardsChance ( 0 . 0 ) <nl> . columnMetadata ( getColumns ( ) ) <nl> . keyValidator ( keyValidator ) <nl> . keyAlias ( keyAlias ) <nl> diff - - git a / src / java / org / apache / cassandra / db / Table . java b / src / java / org / apache / cassandra / db / Table . java <nl> index afe9a65 . . 22285be 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Table . java <nl> + + + b / src / java / org / apache / cassandra / db / Table . java <nl> @ @ - 47 , 6 + 47 , 7 @ @ import org . apache . cassandra . io . util . MmappedSegmentedFile ; <nl> import org . apache . cassandra . locator . AbstractReplicationStrategy ; <nl> import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . utils . ByteBufferUtil ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . NodeId ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 334 , 9 + 335 , 27 @ @ public class Table <nl> / * * adds a cf to internal structures , ends up creating disk files ) . * / <nl> public void initCf ( Integer cfId , String cfName ) <nl> { <nl> - assert ! columnFamilyStores . containsKey ( cfId ) : String . format ( " tried to init % s as % s , but already used by % s " , <nl> - cfName , cfId , columnFamilyStores . get ( cfId ) ) ; <nl> - columnFamilyStores . put ( cfId , ColumnFamilyStore . createColumnFamilyStore ( this , cfName ) ) ; <nl> + if ( columnFamilyStores . containsKey ( cfId ) ) <nl> + { <nl> + / / this is the case when you reset local schema <nl> + / / just reload metadata <nl> + ColumnFamilyStore cfs = columnFamilyStores . get ( cfId ) ; <nl> + assert cfs . getColumnFamilyName ( ) . equals ( cfName ) ; <nl> + <nl> + try <nl> + { <nl> + cfs . metadata . reload ( ) ; <nl> + cfs . reload ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw FBUtilities . unchecked ( e ) ; <nl> + } <nl> + } <nl> + else <nl> + { <nl> + columnFamilyStores . put ( cfId , ColumnFamilyStore . createColumnFamilyStore ( this , cfName ) ) ; <nl> + } <nl> } <nl> <nl> public Row getRow ( QueryFilter filter ) throws IOException <nl> diff - - git a / src / java / org / apache / cassandra / service / MigrationManager . java b / src / java / org / apache / cassandra / service / MigrationManager . java <nl> index d303d40 . . b37fc2b 100644 <nl> - - - a / src / java / org / apache / cassandra / service / MigrationManager . java <nl> + + + b / src / java / org / apache / cassandra / service / MigrationManager . java <nl> @ @ - 23 , 9 + 23 , 8 @ @ import java . io . DataOutputStream ; <nl> import java . io . IOError ; <nl> import java . io . IOException ; <nl> import java . net . InetAddress ; <nl> - import java . util . ArrayList ; <nl> - import java . util . Collection ; <nl> - import java . util . UUID ; <nl> + import java . util . * ; <nl> + import java . util . concurrent . ExecutionException ; <nl> import java . util . concurrent . Future ; <nl> import java . util . concurrent . TimeUnit ; <nl> import java . util . concurrent . TimeoutException ; <nl> @ @ - 37 , 8 + 36 , 7 @ @ import org . apache . cassandra . concurrent . Stage ; <nl> import org . apache . cassandra . concurrent . StageManager ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . config . Schema ; <nl> - import org . apache . cassandra . db . DefsTable ; <nl> - import org . apache . cassandra . db . RowMutation ; <nl> + import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . gms . * ; <nl> import org . apache . cassandra . io . util . FastByteArrayInputStream ; <nl> import org . apache . cassandra . io . util . FastByteArrayOutputStream ; <nl> @ @ - 96 , 41 + 94 , 7 @ @ public class MigrationManager implements IEndpointStateChangeSubscriber <nl> * Do not de - ref the future because that causes distributed deadlock ( CASSANDRA - 3832 ) because we are <nl> * running in the gossip stage . <nl> * / <nl> - <nl> - StageManager . getStage ( Stage . MIGRATION ) . submit ( new WrappedRunnable ( ) <nl> - { <nl> - public void runMayThrow ( ) throws Exception <nl> - { <nl> - Message message = new Message ( FBUtilities . getBroadcastAddress ( ) , <nl> - StorageService . Verb . MIGRATION _ REQUEST , <nl> - ArrayUtils . EMPTY _ BYTE _ ARRAY , <nl> - Gossiper . instance . getVersion ( endpoint ) ) ; <nl> - <nl> - int retries = 0 ; <nl> - while ( retries < MIGRATION _ REQUEST _ RETRIES ) <nl> - { <nl> - if ( ! FailureDetector . instance . isAlive ( endpoint ) ) <nl> - { <nl> - logger . error ( " Can ' t send migration request : node { } is down . " , endpoint ) ; <nl> - return ; <nl> - } <nl> - <nl> - IAsyncResult iar = MessagingService . instance ( ) . sendRR ( message , endpoint ) ; <nl> - <nl> - try <nl> - { <nl> - byte [ ] reply = iar . get ( DatabaseDescriptor . getRpcTimeout ( ) , TimeUnit . MILLISECONDS ) ; <nl> - <nl> - DefsTable . mergeRemoteSchema ( reply , message . getVersion ( ) ) ; <nl> - return ; <nl> - } <nl> - catch ( TimeoutException e ) <nl> - { <nl> - retries + + ; <nl> - } <nl> - } <nl> - } <nl> - } ) ; <nl> + StageManager . getStage ( Stage . MIGRATION ) . submit ( new MigrationTask ( endpoint ) ) ; <nl> } <nl> <nl> public static boolean isReadyForBootstrap ( ) <nl> @ @ - 244 , 4 + 208 , 104 @ @ public class MigrationManager implements IEndpointStateChangeSubscriber <nl> <nl> return schema ; <nl> } <nl> + <nl> + / * * <nl> + * Clear all locally stored schema information and reset schema to initial state . <nl> + * Called by user ( via JMX ) who wants to get rid of schema disagreement . <nl> + * <nl> + * @ throws IOException if schema tables truncation fails <nl> + * / <nl> + public static void resetLocalSchema ( ) throws IOException <nl> + { <nl> + logger . info ( " Starting local schema reset . . . " ) ; <nl> + <nl> + try <nl> + { <nl> + if ( logger . isDebugEnabled ( ) ) <nl> + logger . debug ( " Truncating schema tables . . . " ) ; <nl> + <nl> + / / truncate schema tables <nl> + FBUtilities . waitOnFutures ( new ArrayList < Future < ? > > ( ) <nl> + { { <nl> + SystemTable . schemaCFS ( SystemTable . SCHEMA _ KEYSPACES _ CF ) . truncate ( ) ; <nl> + SystemTable . schemaCFS ( SystemTable . SCHEMA _ COLUMNFAMILIES _ CF ) . truncate ( ) ; <nl> + SystemTable . schemaCFS ( SystemTable . SCHEMA _ COLUMNS _ CF ) . truncate ( ) ; <nl> + } } ) ; <nl> + <nl> + if ( logger . isDebugEnabled ( ) ) <nl> + logger . debug ( " Clearing local schema keyspace definitions . . . " ) ; <nl> + <nl> + Schema . instance . clear ( ) ; <nl> + <nl> + Set < InetAddress > liveEndpoints = Gossiper . instance . getLiveMembers ( ) ; <nl> + liveEndpoints . remove ( FBUtilities . getBroadcastAddress ( ) ) ; <nl> + <nl> + / / force migration is there are nodes around , first of all <nl> + / / check if there are nodes with versions > = 1 . 1 to request migrations from , <nl> + / / because migration format of the nodes with versions < 1 . 1 is incompatible with older versions <nl> + for ( InetAddress node : liveEndpoints ) <nl> + { <nl> + if ( Gossiper . instance . getVersion ( node ) > = MessagingService . VERSION _ 11 ) <nl> + { <nl> + if ( logger . isDebugEnabled ( ) ) <nl> + logger . debug ( " Requesting schema from " + node ) ; <nl> + <nl> + FBUtilities . waitOnFuture ( StageManager . getStage ( Stage . MIGRATION ) . submit ( new MigrationTask ( node ) ) ) ; <nl> + break ; <nl> + } <nl> + } <nl> + <nl> + logger . info ( " Local schema reset is complete . " ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + catch ( ExecutionException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + static class MigrationTask extends WrappedRunnable <nl> + { <nl> + private final InetAddress endpoint ; <nl> + <nl> + MigrationTask ( InetAddress endpoint ) <nl> + { <nl> + this . endpoint = endpoint ; <nl> + } <nl> + <nl> + public void runMayThrow ( ) throws Exception <nl> + { <nl> + Message message = new Message ( FBUtilities . getBroadcastAddress ( ) , <nl> + StorageService . Verb . MIGRATION _ REQUEST , <nl> + ArrayUtils . EMPTY _ BYTE _ ARRAY , <nl> + Gossiper . instance . getVersion ( endpoint ) ) ; <nl> + <nl> + int retries = 0 ; <nl> + while ( retries < MIGRATION _ REQUEST _ RETRIES ) <nl> + { <nl> + if ( ! FailureDetector . instance . isAlive ( endpoint ) ) <nl> + { <nl> + logger . error ( " Can ' t send migration request : node { } is down . " , endpoint ) ; <nl> + return ; <nl> + } <nl> + <nl> + IAsyncResult iar = MessagingService . instance ( ) . sendRR ( message , endpoint ) ; <nl> + <nl> + try <nl> + { <nl> + byte [ ] reply = iar . get ( DatabaseDescriptor . getRpcTimeout ( ) , TimeUnit . MILLISECONDS ) ; <nl> + <nl> + DefsTable . mergeRemoteSchema ( reply , message . getVersion ( ) ) ; <nl> + return ; <nl> + } <nl> + catch ( TimeoutException e ) <nl> + { <nl> + retries + + ; <nl> + } <nl> + } <nl> + } <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index 98a436a . . 6c9a26a 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 2954 , 7 + 2954 , 7 @ @ public class StorageService implements IEndpointStateChangeSubscriber , StorageSe <nl> { <nl> ColumnFamilyStore . loadNewSSTables ( ksName , cfName ) ; <nl> } <nl> - <nl> + <nl> / * * <nl> * # { @ inheritDoc } <nl> * / <nl> @ @ - 2972 , 4 + 2972 , 9 @ @ public class StorageService implements IEndpointStateChangeSubscriber , StorageSe <nl> { <nl> ColumnFamilyStore . rebuildSecondaryIndex ( ksName , cfName , idxNames ) ; <nl> } <nl> + <nl> + public void resetLocalSchema ( ) throws IOException <nl> + { <nl> + MigrationManager . resetLocalSchema ( ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageServiceMBean . java b / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> index 69b4969 . . b3949c9 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> @ @ - 374 , 7 + 374 , 7 @ @ public interface StorageServiceMBean <nl> * @ param cfName The ColumnFamily name where SSTables belong <nl> * / <nl> public void loadNewSSTables ( String ksName , String cfName ) ; <nl> - <nl> + <nl> / * * <nl> * Return a List of Tokens representing a sample of keys <nl> * across all ColumnFamilyStores <nl> @ @ - 387 , 4 + 387 , 6 @ @ public interface StorageServiceMBean <nl> * rebuild the specified indexes <nl> * / <nl> public void rebuildSecondaryIndex ( String ksName , String cfName , String . . . idxNames ) ; <nl> + <nl> + public void resetLocalSchema ( ) throws IOException ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / tools / NodeCmd . java b / src / java / org / apache / cassandra / tools / NodeCmd . java <nl> index c216560 . . 35a1db5 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / NodeCmd . java <nl> + + + b / src / java / org / apache / cassandra / tools / NodeCmd . java <nl> @ @ - 123 , 6 + 123 , 7 @ @ public class NodeCmd <nl> DESCRIBERING , <nl> RANGEKEYSAMPLE , <nl> REBUILD _ INDEX , <nl> + RESETLOCALSCHEMA <nl> } <nl> <nl> <nl> @ @ - 152 , 6 + 153 , 7 @ @ public class NodeCmd <nl> addCmdHelp ( header , " gossipinfo " , " Shows the gossip information for the cluster " ) ; <nl> addCmdHelp ( header , " invalidatekeycache " , " Invalidate the key cache " ) ; <nl> addCmdHelp ( header , " invalidaterowcache " , " Invalidate the row cache " ) ; <nl> + addCmdHelp ( header , " resetlocalschema " , " Reset node ' s local schema and resync " ) ; <nl> <nl> / / One arg <nl> addCmdHelp ( header , " netstats [ host ] " , " Print network information on provided host ( connecting node by default ) " ) ; <nl> @ @ - 684 , 6 + 686 , 7 @ @ public class NodeCmd <nl> case DISABLETHRIFT : probe . stopThriftServer ( ) ; break ; <nl> case ENABLETHRIFT : probe . startThriftServer ( ) ; break ; <nl> case STATUSTHRIFT : nodeCmd . printIsThriftServerRunning ( System . out ) ; break ; <nl> + case RESETLOCALSCHEMA : probe . resetLocalSchema ( ) ; break ; <nl> <nl> case DRAIN : <nl> try { probe . drain ( ) ; } <nl> diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> index a242243 . . 8d915c7 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> @ @ - 653 , 12 + 653 , 16 @ @ public class NodeProbe <nl> { <nl> ssProxy . rebuild ( sourceDc ) ; <nl> } <nl> - <nl> + <nl> public List < String > getRangeKeySample ( ) <nl> { <nl> return ssProxy . getRangeKeySample ( ) ; <nl> } <nl> <nl> + public void resetLocalSchema ( ) throws IOException <nl> + { <nl> + ssProxy . resetLocalSchema ( ) ; <nl> + } <nl> } <nl> <nl> class ColumnFamilyStoreMBeanIterator implements Iterator < Map . Entry < String , ColumnFamilyStoreMBean > > <nl> diff - - git a / test / unit / org / apache / cassandra / SchemaLoader . java b / test / unit / org / apache / cassandra / SchemaLoader . java <nl> index 70e95c4 . . 697d466 100644 <nl> - - - a / test / unit / org / apache / cassandra / SchemaLoader . java <nl> + + + b / test / unit / org / apache / cassandra / SchemaLoader . java <nl> @ @ - 150 , 15 + 150 , 13 @ @ public class SchemaLoader <nl> st , <nl> bytes , <nl> null ) <nl> - . defaultValidator ( CounterColumnType . instance ) <nl> - . mergeShardsChance ( 1 . 0 ) , <nl> + . defaultValidator ( CounterColumnType . instance ) , <nl> new CFMetaData ( ks1 , <nl> " SuperCounter1 " , <nl> su , <nl> bytes , <nl> bytes ) <nl> - . defaultValidator ( CounterColumnType . instance ) <nl> - . mergeShardsChance ( 1 . 0 ) , <nl> + . defaultValidator ( CounterColumnType . instance ) , <nl> superCFMD ( ks1 , " SuperDirectGC " , BytesType . instance ) . gcGraceSeconds ( 0 ) , <nl> jdbcCFMD ( ks1 , " JdbcInteger " , IntegerType . instance ) . columnMetadata ( integerColumn ) , <nl> jdbcCFMD ( ks1 , " JdbcUtf8 " , UTF8Type . instance ) . columnMetadata ( utf8Column ) , <nl> diff - - git a / test / unit / org / apache / cassandra / db / DefsTest . java b / test / unit / org / apache / cassandra / db / DefsTest . java <nl> index 01ab532 . . bd3dfa1 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / DefsTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / DefsTest . java <nl> @ @ - 84 , 7 + 84 , 6 @ @ public class DefsTest extends CleanupHelper <nl> . defaultValidator ( null ) <nl> . minCompactionThreshold ( 500 ) <nl> . maxCompactionThreshold ( 500 ) <nl> - . mergeShardsChance ( 0 . 0 ) <nl> . columnMetadata ( indexes ) ; <nl> <nl> / / we ' ll be adding this one later . make sure it ' s not already there . <nl> @ @ - 601 , 8 + 600 , 7 @ @ public class DefsTest extends CleanupHelper <nl> { <nl> CFMetaData newCFMD = new CFMetaData ( ks , cf , ColumnFamilyType . Standard , UTF8Type . instance , null ) ; <nl> newCFMD . comment ( comment ) <nl> - . readRepairChance ( 0 . 0 ) <nl> - . mergeShardsChance ( 0 . 0 ) ; <nl> + . readRepairChance ( 0 . 0 ) ; <nl> <nl> return newCFMD ; <nl> }
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / io / sstable / AbstractSSTableSimpleWriter . java b / src / java / org / apache / cassandra / io / sstable / AbstractSSTableSimpleWriter . java 
+ index f8999bf . . 67d160d 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / AbstractSSTableSimpleWriter . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / AbstractSSTableSimpleWriter . java 
+ @ @ - 24 , 6 + 24 , 7 @ @ import java . io . IOException ; 
+ import java . nio . ByteBuffer ; 
+ import java . util . HashSet ; 
+ import java . util . Set ; 
+ + import java . util . concurrent . atomic . AtomicInteger ; 
+ 
+ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ @ @ - 43 , 6 + 44 , 7 @ @ public abstract class AbstractSSTableSimpleWriter implements Closeable 
+ protected ColumnFamily columnFamily ; 
+ protected ByteBuffer currentSuperColumn ; 
+ protected final CounterId counterid = CounterId . generate ( ) ; 
+ + protected static AtomicInteger generation = new AtomicInteger ( 0 ) ; 
+ 
+ public AbstractSSTableSimpleWriter ( File directory , CFMetaData metadata , IPartitioner partitioner ) 
+ { 
+ @ @ - 81 , 9 + 83 , 15 @ @ public abstract class AbstractSSTableSimpleWriter implements Closeable 
+ return false ; 
+ } 
+ } ) ; 
+ - int maxGen = 0 ; 
+ + int maxGen = generation . getAndIncrement ( ) ; 
+ for ( Descriptor desc : existing ) 
+ - maxGen = Math . max ( maxGen , desc . generation ) ; 
+ + { 
+ + while ( desc . generation > maxGen ) 
+ + { 
+ + maxGen = generation . getAndIncrement ( ) ; 
+ + } 
+ + } 
+ + 
+ return new Descriptor ( directory , keyspace , columnFamily , maxGen + 1 , Descriptor . Type . TEMP ) . filenameFor ( Component . DATA ) ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / CQLSSTableWriter . java b / src / java / org / apache / cassandra / io / sstable / CQLSSTableWriter . java 
+ index bf4da24 . . f302599 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / CQLSSTableWriter . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / CQLSSTableWriter . java 
+ @ @ - 28 , 6 + 28 , 7 @ @ import java . util . List ; 
+ import java . util . Map ; 
+ 
+ import com . google . common . collect . ImmutableMap ; 
+ + import com . google . common . collect . Iterables ; 
+ 
+ import org . apache . cassandra . cql3 . statements . * ; 
+ import org . apache . cassandra . cql3 . * ; 
+ @ @ - 335 , 25 + 336 , 31 @ @ public class CQLSSTableWriter implements Closeable 
+ { 
+ try 
+ { 
+ - this . schema = getStatement ( schema , CreateTableStatement . class , " CREATE TABLE " ) . left . getCFMetaData ( ) . rebuild ( ) ; 
+ - 
+ - / / We need to register the keyspace / table metadata through Schema , otherwise we won ' t be able to properly 
+ - / / build the insert statement in using ( ) . 
+ - if ( Schema . instance . getKSMetaData ( this . schema . ksName ) = = null ) 
+ - { 
+ - KSMetaData ksm = KSMetaData . newKeyspace ( this . schema . ksName , 
+ - AbstractReplicationStrategy . getClass ( " org . apache . cassandra . locator . SimpleStrategy " ) , 
+ - ImmutableMap . of ( " replication _ factor " , " 1 " ) , 
+ - true , 
+ - Collections . singleton ( this . schema ) ) ; 
+ - Schema . instance . load ( ksm ) ; 
+ - } 
+ - else if ( Schema . instance . getCFMetaData ( this . schema . ksName , this . schema . cfName ) = = null ) 
+ + synchronized ( CQLSSTableWriter . class ) 
+ { 
+ - Schema . instance . load ( this . schema ) ; 
+ - } 
+ + this . schema = getStatement ( schema , CreateTableStatement . class , " CREATE TABLE " ) . left . getCFMetaData ( ) . rebuild ( ) ; 
+ 
+ - return this ; 
+ + / / We need to register the keyspace / table metadata through Schema , otherwise we won ' t be able to properly 
+ + / / build the insert statement in using ( ) . 
+ + KSMetaData ksm = Schema . instance . getKSMetaData ( this . schema . ksName ) ; 
+ + if ( ksm = = null ) 
+ + { 
+ + ksm = KSMetaData . newKeyspace ( this . schema . ksName , 
+ + AbstractReplicationStrategy . getClass ( " org . apache . cassandra . locator . SimpleStrategy " ) , 
+ + ImmutableMap . of ( " replication _ factor " , " 1 " ) , 
+ + true , 
+ + Collections . singleton ( this . schema ) ) ; 
+ + Schema . instance . load ( ksm ) ; 
+ + } 
+ + else if ( Schema . instance . getCFMetaData ( this . schema . ksName , this . schema . cfName ) = = null ) 
+ + { 
+ + Schema . instance . load ( this . schema ) ; 
+ + ksm = KSMetaData . cloneWith ( ksm , Iterables . concat ( ksm . cfMetaData ( ) . values ( ) , Collections . singleton ( this . schema ) ) ) ; 
+ + Schema . instance . setKeyspaceDefinition ( ksm ) ; 
+ + Keyspace . open ( ksm . name ) . initCf ( this . schema . cfId , this . schema . cfName , false ) ; 
+ + } 
+ + return this ; 
+ + } 
+ } 
+ catch ( RequestValidationException e ) 
+ { 
+ diff - - git a / test / unit / org / apache / cassandra / io / sstable / CQLSSTableWriterTest . java b / test / unit / org / apache / cassandra / io / sstable / CQLSSTableWriterTest . java 
+ index 5a09586 . . 6176505 100644 
+ - - - a / test / unit / org / apache / cassandra / io / sstable / CQLSSTableWriterTest . java 
+ + + + b / test / unit / org / apache / cassandra / io / sstable / CQLSSTableWriterTest . java 
+ @ @ - 158 , 4 + 158 , 97 @ @ public class CQLSSTableWriterTest 
+ } ; 
+ assert tempdir . list ( filterDataFiles ) . length > 1 : Arrays . toString ( tempdir . list ( filterDataFiles ) ) ; 
+ } 
+ + 
+ + 
+ + private static final int NUMBER _ WRITES _ IN _ RUNNABLE = 10 ; 
+ + private class WriterThread extends Thread 
+ + { 
+ + private final File dataDir ; 
+ + private final int id ; 
+ + public volatile Exception exception ; 
+ + 
+ + public WriterThread ( File dataDir , int id ) 
+ + { 
+ + this . dataDir = dataDir ; 
+ + this . id = id ; 
+ + } 
+ + 
+ + @ Override 
+ + public void run ( ) 
+ + { 
+ + String schema = " CREATE TABLE cql _ keyspace . table2 ( " 
+ + + " k int , " 
+ + + " v int , " 
+ + + " PRIMARY KEY ( k , v ) " 
+ + + " ) " ; 
+ + String insert = " INSERT INTO cql _ keyspace . table2 ( k , v ) VALUES ( ? , ? ) " ; 
+ + CQLSSTableWriter writer = CQLSSTableWriter . builder ( ) 
+ + . inDirectory ( dataDir ) 
+ + . forTable ( schema ) 
+ + . withPartitioner ( StorageService . instance . getPartitioner ( ) ) 
+ + . using ( insert ) . build ( ) ; 
+ + 
+ + try 
+ + { 
+ + for ( int i = 0 ; i < NUMBER _ WRITES _ IN _ RUNNABLE ; i + + ) 
+ + { 
+ + writer . addRow ( id , i ) ; 
+ + } 
+ + writer . close ( ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + exception = e ; 
+ + } 
+ + } 
+ + } 
+ + 
+ + @ Test 
+ + public void testConcurrentWriters ( ) throws Exception 
+ + { 
+ + String KS = " cql _ keyspace " ; 
+ + String TABLE = " table2 " ; 
+ + 
+ + File tempdir = Files . createTempDir ( ) ; 
+ + File dataDir = new File ( tempdir . getAbsolutePath ( ) + File . separator + KS + File . separator + TABLE ) ; 
+ + assert dataDir . mkdirs ( ) ; 
+ + 
+ + WriterThread [ ] threads = new WriterThread [ 5 ] ; 
+ + for ( int i = 0 ; i < threads . length ; i + + ) 
+ + { 
+ + WriterThread thread = new WriterThread ( dataDir , i ) ; 
+ + threads [ i ] = thread ; 
+ + thread . start ( ) ; 
+ + } 
+ + 
+ + for ( WriterThread thread : threads ) 
+ + { 
+ + thread . join ( ) ; 
+ + assert ! thread . isAlive ( ) : " Thread should be dead by now " ; 
+ + if ( thread . exception ! = null ) 
+ + { 
+ + throw thread . exception ; 
+ + } 
+ + } 
+ + 
+ + SSTableLoader loader = new SSTableLoader ( dataDir , new SSTableLoader . Client ( ) 
+ + { 
+ + public void init ( String keyspace ) 
+ + { 
+ + for ( Range < Token > range : StorageService . instance . getLocalRanges ( " cql _ keyspace " ) ) 
+ + addRangeForEndpoint ( range , FBUtilities . getBroadcastAddress ( ) ) ; 
+ + setPartitioner ( StorageService . getPartitioner ( ) ) ; 
+ + } 
+ + 
+ + public CFMetaData getCFMetaData ( String keyspace , String cfName ) 
+ + { 
+ + return Schema . instance . getCFMetaData ( keyspace , cfName ) ; 
+ + } 
+ + } , new OutputHandler . SystemOutput ( false , false ) ) ; 
+ + 
+ + loader . stream ( ) . get ( ) ; 
+ + 
+ + UntypedResultSet rs = QueryProcessor . processInternal ( " SELECT * FROM cql _ keyspace . table2 ; " ) ; 
+ + assertEquals ( threads . length * NUMBER _ WRITES _ IN _ RUNNABLE , rs . size ( ) ) ; 
+ + } 
+ }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 3f5a3f4 . . c2234bf 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 6 , 6 + 6 , 8 @ @ 
+ * Update ORDER BY syntax for CQL3 ( CASSANDRA - 3925 ) 
+ * Fix BulkRecordWriter to not throw NPE if reducer gets no map data from Hadoop ( CASSANDRA - 3944 ) 
+ * Fix bug with counters in super columns ( CASSANDRA - 3821 ) 
+ + * Remove deprecated merge _ shard _ chance ( CASSANDRA - 3940 ) 
+ + * add a convenient way to reset a node ' s schema ( CASSANDRA - 2963 ) 
+ Merged from 1 . 0 : 
+ * remove the wait on hint future during write ( CASSANDRA - 3870 ) 
+ * ( cqlsh ) ignore missing CfDef opts ( CASSANDRA - 3933 ) 
+ diff - - git a / interface / cassandra . thrift b / interface / cassandra . thrift 
+ index a2275b6 . . f21845b 100644 
+ - - - a / interface / cassandra . thrift 
+ + + + b / interface / cassandra . thrift 
+ @ @ - 407 , 7 + 407 , 6 @ @ struct CfDef { 
+ 17 : optional i32 min _ compaction _ threshold , 
+ 18 : optional i32 max _ compaction _ threshold , 
+ 24 : optional bool replicate _ on _ write , 
+ - 25 : optional double merge _ shards _ chance , 
+ 26 : optional string key _ validation _ class , 
+ 28 : optional binary key _ alias , 
+ 29 : optional string compaction _ strategy , 
+ diff - - git a / interface / thrift / gen - java / org / apache / cassandra / thrift / Cassandra . java b / interface / thrift / gen - java / org / apache / cassandra / thrift / Cassandra . java 
+ index 3cfe58c . . 5b79e18 100644 
+ - - - a / interface / thrift / gen - java / org / apache / cassandra / thrift / Cassandra . java 
+ + + + b / interface / thrift / gen - java / org / apache / cassandra / thrift / Cassandra . java 
+ @ @ - 8526 , 8 + 8526 , 6 @ @ public class Cassandra { 
+ 
+ private void readObject ( java . io . ObjectInputStream in ) throws java . io . IOException , ClassNotFoundException { 
+ try { 
+ - / / it doesn ' t seem like you should have to do this , but java serialization is wacky , and doesn ' t call the default constructor . 
+ - _ _ isset _ bit _ vector = new BitSet ( 1 ) ; 
+ read ( new org . apache . thrift . protocol . TCompactProtocol ( new org . apache . thrift . transport . TIOStreamTransport ( in ) ) ) ; 
+ } catch ( org . apache . thrift . TException te ) { 
+ throw new java . io . IOException ( te ) ; 
+ @ @ - 17735 , 8 + 17733 , 6 @ @ public class Cassandra { 
+ 
+ private void readObject ( java . io . ObjectInputStream in ) throws java . io . IOException , ClassNotFoundException { 
+ try { 
+ - / / it doesn ' t seem like you should have to do this , but java serialization is wacky , and doesn ' t call the default constructor . 
+ - _ _ isset _ bit _ vector = new BitSet ( 1 ) ; 
+ read ( new org . apache . thrift . protocol . TCompactProtocol ( new org . apache . thrift . transport . TIOStreamTransport ( in ) ) ) ; 
+ } catch ( org . apache . thrift . TException te ) { 
+ throw new java . io . IOException ( te ) ; 
+ @ @ - 26540 , 6 + 26536 , 8 @ @ public class Cassandra { 
+ 
+ private void readObject ( java . io . ObjectInputStream in ) throws java . io . IOException , ClassNotFoundException { 
+ try { 
+ + / / it doesn ' t seem like you should have to do this , but java serialization is wacky , and doesn ' t call the default constructor . 
+ + _ _ isset _ bit _ vector = new BitSet ( 1 ) ; 
+ read ( new org . apache . thrift . protocol . TCompactProtocol ( new org . apache . thrift . transport . TIOStreamTransport ( in ) ) ) ; 
+ } catch ( org . apache . thrift . TException te ) { 
+ throw new java . io . IOException ( te ) ; 
+ diff - - git a / interface / thrift / gen - java / org / apache / cassandra / thrift / CfDef . java b / interface / thrift / gen - java / org / apache / cassandra / thrift / CfDef . java 
+ index 0fe3a7d . . 72d12cb 100644 
+ - - - a / interface / thrift / gen - java / org / apache / cassandra / thrift / CfDef . java 
+ + + + b / interface / thrift / gen - java / org / apache / cassandra / thrift / CfDef . java 
+ @ @ - 59 , 7 + 59 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ private static final org . apache . thrift . protocol . TField MIN _ COMPACTION _ THRESHOLD _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " min _ compaction _ threshold " , org . apache . thrift . protocol . TType . I32 , ( short ) 17 ) ; 
+ private static final org . apache . thrift . protocol . TField MAX _ COMPACTION _ THRESHOLD _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " max _ compaction _ threshold " , org . apache . thrift . protocol . TType . I32 , ( short ) 18 ) ; 
+ private static final org . apache . thrift . protocol . TField REPLICATE _ ON _ WRITE _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " replicate _ on _ write " , org . apache . thrift . protocol . TType . BOOL , ( short ) 24 ) ; 
+ - private static final org . apache . thrift . protocol . TField MERGE _ SHARDS _ CHANCE _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " merge _ shards _ chance " , org . apache . thrift . protocol . TType . DOUBLE , ( short ) 25 ) ; 
+ private static final org . apache . thrift . protocol . TField KEY _ VALIDATION _ CLASS _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " key _ validation _ class " , org . apache . thrift . protocol . TType . STRING , ( short ) 26 ) ; 
+ private static final org . apache . thrift . protocol . TField KEY _ ALIAS _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " key _ alias " , org . apache . thrift . protocol . TType . STRING , ( short ) 28 ) ; 
+ private static final org . apache . thrift . protocol . TField COMPACTION _ STRATEGY _ FIELD _ DESC = new org . apache . thrift . protocol . TField ( " compaction _ strategy " , org . apache . thrift . protocol . TType . STRING , ( short ) 29 ) ; 
+ @ @ - 85 , 7 + 84 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ public int min _ compaction _ threshold ; / / required 
+ public int max _ compaction _ threshold ; / / required 
+ public boolean replicate _ on _ write ; / / required 
+ - public double merge _ shards _ chance ; / / required 
+ public String key _ validation _ class ; / / required 
+ public ByteBuffer key _ alias ; / / required 
+ public String compaction _ strategy ; / / required 
+ @ @ - 113 , 7 + 111 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ MIN _ COMPACTION _ THRESHOLD ( ( short ) 17 , " min _ compaction _ threshold " ) , 
+ MAX _ COMPACTION _ THRESHOLD ( ( short ) 18 , " max _ compaction _ threshold " ) , 
+ REPLICATE _ ON _ WRITE ( ( short ) 24 , " replicate _ on _ write " ) , 
+ - MERGE _ SHARDS _ CHANCE ( ( short ) 25 , " merge _ shards _ chance " ) , 
+ KEY _ VALIDATION _ CLASS ( ( short ) 26 , " key _ validation _ class " ) , 
+ KEY _ ALIAS ( ( short ) 28 , " key _ alias " ) , 
+ COMPACTION _ STRATEGY ( ( short ) 29 , " compaction _ strategy " ) , 
+ @ @ - 166 , 8 + 163 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ return MAX _ COMPACTION _ THRESHOLD ; 
+ case 24 : / / REPLICATE _ ON _ WRITE 
+ return REPLICATE _ ON _ WRITE ; 
+ - case 25 : / / MERGE _ SHARDS _ CHANCE 
+ - return MERGE _ SHARDS _ CHANCE ; 
+ case 26 : / / KEY _ VALIDATION _ CLASS 
+ return KEY _ VALIDATION _ CLASS ; 
+ case 28 : / / KEY _ ALIAS 
+ @ @ - 234 , 10 + 229 , 9 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ private static final int _ _ MIN _ COMPACTION _ THRESHOLD _ ISSET _ ID = 3 ; 
+ private static final int _ _ MAX _ COMPACTION _ THRESHOLD _ ISSET _ ID = 4 ; 
+ private static final int _ _ REPLICATE _ ON _ WRITE _ ISSET _ ID = 5 ; 
+ - private static final int _ _ MERGE _ SHARDS _ CHANCE _ ISSET _ ID = 6 ; 
+ - private static final int _ _ BLOOM _ FILTER _ FP _ CHANCE _ ISSET _ ID = 7 ; 
+ - private static final int _ _ DCLOCAL _ READ _ REPAIR _ CHANCE _ ISSET _ ID = 8 ; 
+ - private BitSet _ _ isset _ bit _ vector = new BitSet ( 9 ) ; 
+ + private static final int _ _ BLOOM _ FILTER _ FP _ CHANCE _ ISSET _ ID = 6 ; 
+ + private static final int _ _ DCLOCAL _ READ _ REPAIR _ CHANCE _ ISSET _ ID = 7 ; 
+ + private BitSet _ _ isset _ bit _ vector = new BitSet ( 8 ) ; 
+ 
+ public static final Map < _ Fields , org . apache . thrift . meta _ data . FieldMetaData > metaDataMap ; 
+ static { 
+ @ @ - 271 , 8 + 265 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ new org . apache . thrift . meta _ data . FieldValueMetaData ( org . apache . thrift . protocol . TType . I32 ) ) ) ; 
+ tmpMap . put ( _ Fields . REPLICATE _ ON _ WRITE , new org . apache . thrift . meta _ data . FieldMetaData ( " replicate _ on _ write " , org . apache . thrift . TFieldRequirementType . OPTIONAL , 
+ new org . apache . thrift . meta _ data . FieldValueMetaData ( org . apache . thrift . protocol . TType . BOOL ) ) ) ; 
+ - tmpMap . put ( _ Fields . MERGE _ SHARDS _ CHANCE , new org . apache . thrift . meta _ data . FieldMetaData ( " merge _ shards _ chance " , org . apache . thrift . TFieldRequirementType . OPTIONAL , 
+ - new org . apache . thrift . meta _ data . FieldValueMetaData ( org . apache . thrift . protocol . TType . DOUBLE ) ) ) ; 
+ tmpMap . put ( _ Fields . KEY _ VALIDATION _ CLASS , new org . apache . thrift . meta _ data . FieldMetaData ( " key _ validation _ class " , org . apache . thrift . TFieldRequirementType . OPTIONAL , 
+ new org . apache . thrift . meta _ data . FieldValueMetaData ( org . apache . thrift . protocol . TType . STRING ) ) ) ; 
+ tmpMap . put ( _ Fields . KEY _ ALIAS , new org . apache . thrift . meta _ data . FieldMetaData ( " key _ alias " , org . apache . thrift . TFieldRequirementType . OPTIONAL , 
+ @ @ - 364 , 7 + 356 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ this . min _ compaction _ threshold = other . min _ compaction _ threshold ; 
+ this . max _ compaction _ threshold = other . max _ compaction _ threshold ; 
+ this . replicate _ on _ write = other . replicate _ on _ write ; 
+ - this . merge _ shards _ chance = other . merge _ shards _ chance ; 
+ if ( other . isSetKey _ validation _ class ( ) ) { 
+ this . key _ validation _ class = other . key _ validation _ class ; 
+ } 
+ @ @ - 453 , 8 + 444 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ this . max _ compaction _ threshold = 0 ; 
+ setReplicate _ on _ writeIsSet ( false ) ; 
+ this . replicate _ on _ write = false ; 
+ - setMerge _ shards _ chanceIsSet ( false ) ; 
+ - this . merge _ shards _ chance = 0 . 0 ; 
+ this . key _ validation _ class = null ; 
+ this . key _ alias = null ; 
+ this . compaction _ strategy = null ; 
+ @ @ - 815 , 29 + 804 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ _ _ isset _ bit _ vector . set ( _ _ REPLICATE _ ON _ WRITE _ ISSET _ ID , value ) ; 
+ } 
+ 
+ - public double getMerge _ shards _ chance ( ) { 
+ - return this . merge _ shards _ chance ; 
+ - } 
+ - 
+ - public CfDef setMerge _ shards _ chance ( double merge _ shards _ chance ) { 
+ - this . merge _ shards _ chance = merge _ shards _ chance ; 
+ - setMerge _ shards _ chanceIsSet ( true ) ; 
+ - return this ; 
+ - } 
+ - 
+ - public void unsetMerge _ shards _ chance ( ) { 
+ - _ _ isset _ bit _ vector . clear ( _ _ MERGE _ SHARDS _ CHANCE _ ISSET _ ID ) ; 
+ - } 
+ - 
+ - / * * Returns true if field merge _ shards _ chance is set ( has been assigned a value ) and false otherwise * / 
+ - public boolean isSetMerge _ shards _ chance ( ) { 
+ - return _ _ isset _ bit _ vector . get ( _ _ MERGE _ SHARDS _ CHANCE _ ISSET _ ID ) ; 
+ - } 
+ - 
+ - public void setMerge _ shards _ chanceIsSet ( boolean value ) { 
+ - _ _ isset _ bit _ vector . set ( _ _ MERGE _ SHARDS _ CHANCE _ ISSET _ ID , value ) ; 
+ - } 
+ - 
+ public String getKey _ validation _ class ( ) { 
+ return this . key _ validation _ class ; 
+ } 
+ @ @ - 1247 , 14 + 1213 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ } 
+ break ; 
+ 
+ - case MERGE _ SHARDS _ CHANCE : 
+ - if ( value = = null ) { 
+ - unsetMerge _ shards _ chance ( ) ; 
+ - } else { 
+ - setMerge _ shards _ chance ( ( Double ) value ) ; 
+ - } 
+ - break ; 
+ - 
+ case KEY _ VALIDATION _ CLASS : 
+ if ( value = = null ) { 
+ unsetKey _ validation _ class ( ) ; 
+ @ @ - 1382 , 9 + 1340 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ case REPLICATE _ ON _ WRITE : 
+ return Boolean . valueOf ( isReplicate _ on _ write ( ) ) ; 
+ 
+ - case MERGE _ SHARDS _ CHANCE : 
+ - return Double . valueOf ( getMerge _ shards _ chance ( ) ) ; 
+ - 
+ case KEY _ VALIDATION _ CLASS : 
+ return getKey _ validation _ class ( ) ; 
+ 
+ @ @ - 1454 , 8 + 1409 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ return isSetMax _ compaction _ threshold ( ) ; 
+ case REPLICATE _ ON _ WRITE : 
+ return isSetReplicate _ on _ write ( ) ; 
+ - case MERGE _ SHARDS _ CHANCE : 
+ - return isSetMerge _ shards _ chance ( ) ; 
+ case KEY _ VALIDATION _ CLASS : 
+ return isSetKey _ validation _ class ( ) ; 
+ case KEY _ ALIAS : 
+ @ @ - 1619 , 15 + 1572 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ return false ; 
+ } 
+ 
+ - boolean this _ present _ merge _ shards _ chance = true & & this . isSetMerge _ shards _ chance ( ) ; 
+ - boolean that _ present _ merge _ shards _ chance = true & & that . isSetMerge _ shards _ chance ( ) ; 
+ - if ( this _ present _ merge _ shards _ chance | | that _ present _ merge _ shards _ chance ) { 
+ - if ( ! ( this _ present _ merge _ shards _ chance & & that _ present _ merge _ shards _ chance ) ) 
+ - return false ; 
+ - if ( this . merge _ shards _ chance ! = that . merge _ shards _ chance ) 
+ - return false ; 
+ - } 
+ - 
+ boolean this _ present _ key _ validation _ class = true & & this . isSetKey _ validation _ class ( ) ; 
+ boolean that _ present _ key _ validation _ class = true & & that . isSetKey _ validation _ class ( ) ; 
+ if ( this _ present _ key _ validation _ class | | that _ present _ key _ validation _ class ) { 
+ @ @ - 1795 , 11 + 1739 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ if ( present _ replicate _ on _ write ) 
+ builder . append ( replicate _ on _ write ) ; 
+ 
+ - boolean present _ merge _ shards _ chance = true & & ( isSetMerge _ shards _ chance ( ) ) ; 
+ - builder . append ( present _ merge _ shards _ chance ) ; 
+ - if ( present _ merge _ shards _ chance ) 
+ - builder . append ( merge _ shards _ chance ) ; 
+ - 
+ boolean present _ key _ validation _ class = true & & ( isSetKey _ validation _ class ( ) ) ; 
+ builder . append ( present _ key _ validation _ class ) ; 
+ if ( present _ key _ validation _ class ) 
+ @ @ - 2001 , 16 + 1940 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ return lastComparison ; 
+ } 
+ } 
+ - lastComparison = Boolean . valueOf ( isSetMerge _ shards _ chance ( ) ) . compareTo ( typedOther . isSetMerge _ shards _ chance ( ) ) ; 
+ - if ( lastComparison ! = 0 ) { 
+ - return lastComparison ; 
+ - } 
+ - if ( isSetMerge _ shards _ chance ( ) ) { 
+ - lastComparison = org . apache . thrift . TBaseHelper . compareTo ( this . merge _ shards _ chance , typedOther . merge _ shards _ chance ) ; 
+ - if ( lastComparison ! = 0 ) { 
+ - return lastComparison ; 
+ - } 
+ - } 
+ lastComparison = Boolean . valueOf ( isSetKey _ validation _ class ( ) ) . compareTo ( typedOther . isSetKey _ validation _ class ( ) ) ; 
+ if ( lastComparison ! = 0 ) { 
+ return lastComparison ; 
+ @ @ - 2243 , 14 + 2172 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ org . apache . thrift . protocol . TProtocolUtil . skip ( iprot , field . type ) ; 
+ } 
+ break ; 
+ - case 25 : / / MERGE _ SHARDS _ CHANCE 
+ - if ( field . type = = org . apache . thrift . protocol . TType . DOUBLE ) { 
+ - this . merge _ shards _ chance = iprot . readDouble ( ) ; 
+ - setMerge _ shards _ chanceIsSet ( true ) ; 
+ - } else { 
+ - org . apache . thrift . protocol . TProtocolUtil . skip ( iprot , field . type ) ; 
+ - } 
+ - break ; 
+ case 26 : / / KEY _ VALIDATION _ CLASS 
+ if ( field . type = = org . apache . thrift . protocol . TType . STRING ) { 
+ this . key _ validation _ class = iprot . readString ( ) ; 
+ @ @ - 2461 , 11 + 2382 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ oprot . writeBool ( this . replicate _ on _ write ) ; 
+ oprot . writeFieldEnd ( ) ; 
+ } 
+ - if ( isSetMerge _ shards _ chance ( ) ) { 
+ - oprot . writeFieldBegin ( MERGE _ SHARDS _ CHANCE _ FIELD _ DESC ) ; 
+ - oprot . writeDouble ( this . merge _ shards _ chance ) ; 
+ - oprot . writeFieldEnd ( ) ; 
+ - } 
+ if ( this . key _ validation _ class ! = null ) { 
+ if ( isSetKey _ validation _ class ( ) ) { 
+ oprot . writeFieldBegin ( KEY _ VALIDATION _ CLASS _ FIELD _ DESC ) ; 
+ @ @ - 2675 , 12 + 2591 , 6 @ @ public class CfDef implements org . apache . thrift . TBase < CfDef , CfDef . _ Fields > , jav 
+ sb . append ( this . replicate _ on _ write ) ; 
+ first = false ; 
+ } 
+ - if ( isSetMerge _ shards _ chance ( ) ) { 
+ - if ( ! first ) sb . append ( " , " ) ; 
+ - sb . append ( " merge _ shards _ chance : " ) ; 
+ - sb . append ( this . merge _ shards _ chance ) ; 
+ - first = false ; 
+ - } 
+ if ( isSetKey _ validation _ class ( ) ) { 
+ if ( ! first ) sb . append ( " , " ) ; 
+ sb . append ( " key _ validation _ class : " ) ; 
+ diff - - git a / src / java / org / apache / cassandra / config / CFMetaData . java b / src / java / org / apache / cassandra / config / CFMetaData . java 
+ index 96ed181 . . 1c2d1ec 100644 
+ - - - a / src / java / org / apache / cassandra / config / CFMetaData . java 
+ + + + b / src / java / org / apache / cassandra / config / CFMetaData . java 
+ @ @ - 68 , 7 + 68 , 6 @ @ public final class CFMetaData 
+ public final static int DEFAULT _ GC _ GRACE _ SECONDS = 864000 ; 
+ public final static int DEFAULT _ MIN _ COMPACTION _ THRESHOLD = 4 ; 
+ public final static int DEFAULT _ MAX _ COMPACTION _ THRESHOLD = 32 ; 
+ - public final static double DEFAULT _ MERGE _ SHARDS _ CHANCE = 0 . 1 ; 
+ public final static String DEFAULT _ COMPACTION _ STRATEGY _ CLASS = " SizeTieredCompactionStrategy " ; 
+ public final static ByteBuffer DEFAULT _ KEY _ NAME = ByteBufferUtil . bytes ( " KEY " ) ; 
+ 
+ @ @ - 156 , 9 + 155 , 6 @ @ public final class CFMetaData 
+ private AbstractType < ? > keyValidator ; / / default BytesType ( no - op ) , use comparator types 
+ private int minCompactionThreshold ; / / default 4 
+ private int maxCompactionThreshold ; / / default 32 
+ - / / mergeShardsChance is now obsolete , but left here so as to not break 
+ - / / thrift compatibility 
+ - private double mergeShardsChance ; / / default 0 . 1 , chance [ 0 . 0 , 1 . 0 ] of merging old shards during replication 
+ private ByteBuffer keyAlias ; / / default NULL 
+ private List < ByteBuffer > columnAliases = new ArrayList < ByteBuffer > ( ) ; 
+ private ByteBuffer valueAlias ; / / default NULL 
+ @ @ - 185 , 7 + 181 , 6 @ @ public final class CFMetaData 
+ public CFMetaData keyValidator ( AbstractType < ? > prop ) { keyValidator = prop ; updateCfDef ( ) ; return this ; } 
+ public CFMetaData minCompactionThreshold ( int prop ) { minCompactionThreshold = prop ; return this ; } 
+ public CFMetaData maxCompactionThreshold ( int prop ) { maxCompactionThreshold = prop ; return this ; } 
+ - public CFMetaData mergeShardsChance ( double prop ) { mergeShardsChance = prop ; return this ; } 
+ public CFMetaData keyAlias ( ByteBuffer prop ) { keyAlias = prop ; updateCfDef ( ) ; return this ; } 
+ public CFMetaData columnAliases ( List < ByteBuffer > prop ) { columnAliases = prop ; updateCfDef ( ) ; return this ; } 
+ public CFMetaData valueAlias ( ByteBuffer prop ) { valueAlias = prop ; updateCfDef ( ) ; return this ; } 
+ @ @ - 237 , 7 + 232 , 6 @ @ public final class CFMetaData 
+ gcGraceSeconds = DEFAULT _ GC _ GRACE _ SECONDS ; 
+ minCompactionThreshold = DEFAULT _ MIN _ COMPACTION _ THRESHOLD ; 
+ maxCompactionThreshold = DEFAULT _ MAX _ COMPACTION _ THRESHOLD ; 
+ - mergeShardsChance = DEFAULT _ MERGE _ SHARDS _ CHANCE ; 
+ 
+ / / Defaults strange or simple enough to not need a DEFAULT _ T for 
+ defaultValidator = BytesType . instance ; 
+ @ @ - 269 , 8 + 263 , 7 @ @ public final class CFMetaData 
+ return newCFMD . comment ( comment ) 
+ . readRepairChance ( 0 ) 
+ . dclocalReadRepairChance ( 0 ) 
+ - . gcGraceSeconds ( 0 ) 
+ - . mergeShardsChance ( 0 . 0 ) ; 
+ + . gcGraceSeconds ( 0 ) ; 
+ } 
+ 
+ public static CFMetaData newIndexMetadata ( CFMetaData parent , ColumnDefinition info , AbstractType < ? > columnComparator ) 
+ @ @ - 379 , 7 + 372 , 6 @ @ public final class CFMetaData 
+ / / Isn ' t AVRO supposed to handle stuff like this ? 
+ if ( cf . min _ compaction _ threshold ! = null ) { newCFMD . minCompactionThreshold ( cf . min _ compaction _ threshold ) ; } 
+ if ( cf . max _ compaction _ threshold ! = null ) { newCFMD . maxCompactionThreshold ( cf . max _ compaction _ threshold ) ; } 
+ - if ( cf . merge _ shards _ chance ! = null ) { newCFMD . mergeShardsChance ( cf . merge _ shards _ chance ) ; } 
+ if ( cf . key _ alias ! = null ) { newCFMD . keyAlias ( cf . key _ alias ) ; } 
+ if ( cf . column _ aliases ! = null ) { newCFMD . columnAliases ( fixAvroRetardation ( cf . column _ aliases ) ) ; } 
+ if ( cf . value _ alias ! = null ) { newCFMD . valueAlias ( cf . value _ alias ) ; } 
+ @ @ - 461 , 11 + 453 , 6 @ @ public final class CFMetaData 
+ return dcLocalReadRepairChance ; 
+ } 
+ 
+ - public double getMergeShardsChance ( ) 
+ - { 
+ - return mergeShardsChance ; 
+ - } 
+ - 
+ public boolean getReplicateOnWrite ( ) 
+ { 
+ return replicateOnWrite ; 
+ @ @ - 570 , 7 + 557 , 6 @ @ public final class CFMetaData 
+ . append ( maxCompactionThreshold , rhs . maxCompactionThreshold ) 
+ . append ( cfId . intValue ( ) , rhs . cfId . intValue ( ) ) 
+ . append ( column _ metadata , rhs . column _ metadata ) 
+ - . append ( mergeShardsChance , rhs . mergeShardsChance ) 
+ . append ( keyAlias , rhs . keyAlias ) 
+ . append ( columnAliases , rhs . columnAliases ) 
+ . append ( valueAlias , rhs . valueAlias ) 
+ @ @ - 601 , 7 + 587 , 6 @ @ public final class CFMetaData 
+ . append ( maxCompactionThreshold ) 
+ . append ( cfId ) 
+ . append ( column _ metadata ) 
+ - . append ( mergeShardsChance ) 
+ . append ( keyAlias ) 
+ . append ( columnAliases ) 
+ . append ( valueAlias ) 
+ @ @ - 636 , 8 + 621 , 6 @ @ public final class CFMetaData 
+ cf _ def . setMin _ compaction _ threshold ( CFMetaData . DEFAULT _ MIN _ COMPACTION _ THRESHOLD ) ; 
+ if ( ! cf _ def . isSetMax _ compaction _ threshold ( ) ) 
+ cf _ def . setMax _ compaction _ threshold ( CFMetaData . DEFAULT _ MAX _ COMPACTION _ THRESHOLD ) ; 
+ - if ( ! cf _ def . isSetMerge _ shards _ chance ( ) ) 
+ - cf _ def . setMerge _ shards _ chance ( CFMetaData . DEFAULT _ MERGE _ SHARDS _ CHANCE ) ; 
+ if ( null = = cf _ def . compaction _ strategy ) 
+ cf _ def . compaction _ strategy = DEFAULT _ COMPACTION _ STRATEGY _ CLASS ; 
+ if ( null = = cf _ def . compaction _ strategy _ options ) 
+ @ @ - 673 , 7 + 656 , 6 @ @ public final class CFMetaData 
+ if ( cf _ def . isSetGc _ grace _ seconds ( ) ) { newCFMD . gcGraceSeconds ( cf _ def . gc _ grace _ seconds ) ; } 
+ if ( cf _ def . isSetMin _ compaction _ threshold ( ) ) { newCFMD . minCompactionThreshold ( cf _ def . min _ compaction _ threshold ) ; } 
+ if ( cf _ def . isSetMax _ compaction _ threshold ( ) ) { newCFMD . maxCompactionThreshold ( cf _ def . max _ compaction _ threshold ) ; } 
+ - if ( cf _ def . isSetMerge _ shards _ chance ( ) ) { newCFMD . mergeShardsChance ( cf _ def . merge _ shards _ chance ) ; } 
+ if ( cf _ def . isSetKey _ alias ( ) ) { newCFMD . keyAlias ( cf _ def . key _ alias ) ; } 
+ if ( cf _ def . isSetColumn _ aliases ( ) & & cf _ def . column _ aliases ! = null ) { newCFMD . columnAliases ( cf _ def . column _ aliases ) ; } 
+ if ( cf _ def . isSetValue _ alias ( ) ) { newCFMD . valueAlias ( cf _ def . value _ alias ) ; } 
+ @ @ - 776 , 7 + 758 , 6 @ @ public final class CFMetaData 
+ keyValidator = TypeParser . parse ( cf _ def . key _ validation _ class ) ; 
+ minCompactionThreshold = cf _ def . min _ compaction _ threshold ; 
+ maxCompactionThreshold = cf _ def . max _ compaction _ threshold ; 
+ - mergeShardsChance = cf _ def . merge _ shards _ chance ; 
+ keyAlias = cf _ def . key _ alias ; 
+ columnAliases = cf _ def . column _ aliases ; 
+ valueAlias = cf _ def . value _ alias ; 
+ @ @ - 907 , 7 + 888 , 6 @ @ public final class CFMetaData 
+ def . setKey _ validation _ class ( keyValidator . toString ( ) ) ; 
+ def . setMin _ compaction _ threshold ( minCompactionThreshold ) ; 
+ def . setMax _ compaction _ threshold ( maxCompactionThreshold ) ; 
+ - def . setMerge _ shards _ chance ( mergeShardsChance ) ; 
+ def . setKey _ alias ( keyAlias ) ; 
+ List < org . apache . cassandra . thrift . ColumnDef > column _ meta = new ArrayList < org . apache . cassandra . thrift . ColumnDef > ( column _ metadata . size ( ) ) ; 
+ for ( ColumnDefinition cd : column _ metadata . values ( ) ) 
+ @ @ - 1258 , 7 + 1238 , 6 @ @ public final class CFMetaData 
+ . append ( " keyValidator " , keyValidator ) 
+ . append ( " minCompactionThreshold " , minCompactionThreshold ) 
+ . append ( " maxCompactionThreshold " , maxCompactionThreshold ) 
+ - . append ( " mergeShardsChance " , mergeShardsChance ) 
+ . append ( " keyAlias " , keyAlias ) 
+ . append ( " columnAliases " , columnAliases ) 
+ . append ( " valueAlias " , keyAlias ) 
+ diff - - git a / src / java / org / apache / cassandra / config / Schema . java b / src / java / org / apache / cassandra / config / Schema . java 
+ index 89c5d1e . . d27b347 100644 
+ - - - a / src / java / org / apache / cassandra / config / Schema . java 
+ + + + b / src / java / org / apache / cassandra / config / Schema . java 
+ @ @ - 479 , 6 + 479 , 7 @ @ public class Schema 
+ versionLock . writeLock ( ) . unlock ( ) ; 
+ } 
+ } 
+ + 
+ / * 
+ * Like updateVersion , but also announces via gossip 
+ * / 
+ @ @ - 487 , 4 + 488 , 21 @ @ public class Schema 
+ updateVersion ( ) ; 
+ MigrationManager . passiveAnnounce ( version ) ; 
+ } 
+ + 
+ + / * * 
+ + * Clear all KS / CF metadata and reset version . 
+ + * / 
+ + public synchronized void clear ( ) 
+ + { 
+ + for ( String table : getNonSystemTables ( ) ) 
+ + { 
+ + KSMetaData ksm = getTableDefinition ( table ) ; 
+ + for ( CFMetaData cfm : ksm . cfMetaData ( ) . values ( ) ) 
+ + purge ( cfm ) ; 
+ + clearTableDefinition ( ksm ) ; 
+ + } 
+ + 
+ + updateVersionAndAnnounce ( ) ; 
+ + fixCFMaxId ( ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java b / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java 
+ index 062cd90 . . 328a70b 100644 
+ - - - a / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java 
+ + + + b / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java 
+ @ @ - 183 , 7 + 183 , 6 @ @ public class CreateColumnFamilyStatement 
+ . defaultValidator ( cfProps . getValidator ( ) ) 
+ . minCompactionThreshold ( getPropertyInt ( CFPropDefs . KW _ MINCOMPACTIONTHRESHOLD , CFMetaData . DEFAULT _ MIN _ COMPACTION _ THRESHOLD ) ) 
+ . maxCompactionThreshold ( getPropertyInt ( CFPropDefs . KW _ MAXCOMPACTIONTHRESHOLD , CFMetaData . DEFAULT _ MAX _ COMPACTION _ THRESHOLD ) ) 
+ - . mergeShardsChance ( 0 . 0 ) 
+ . columnMetadata ( getColumns ( comparator ) ) 
+ . keyValidator ( TypeParser . parse ( CFPropDefs . comparators . get ( getKeyType ( ) ) ) ) 
+ . keyAlias ( keyAlias ) 
+ diff - - git a / src / java / org / apache / cassandra / cql3 / statements / CreateColumnFamilyStatement . java b / src / java / org / apache / cassandra / cql3 / statements / CreateColumnFamilyStatement . java 
+ index 767437e . . 873c134 100644 
+ - - - a / src / java / org / apache / cassandra / cql3 / statements / CreateColumnFamilyStatement . java 
+ + + + b / src / java / org / apache / cassandra / cql3 / statements / CreateColumnFamilyStatement . java 
+ @ @ - 113 , 7 + 113 , 6 @ @ public class CreateColumnFamilyStatement extends SchemaAlteringStatement 
+ . defaultValidator ( defaultValidator ) 
+ . minCompactionThreshold ( properties . getInt ( CFPropDefs . KW _ MINCOMPACTIONTHRESHOLD , CFMetaData . DEFAULT _ MIN _ COMPACTION _ THRESHOLD ) ) 
+ . maxCompactionThreshold ( properties . getInt ( CFPropDefs . KW _ MAXCOMPACTIONTHRESHOLD , CFMetaData . DEFAULT _ MAX _ COMPACTION _ THRESHOLD ) ) 
+ - . mergeShardsChance ( 0 . 0 ) 
+ . columnMetadata ( getColumns ( ) ) 
+ . keyValidator ( keyValidator ) 
+ . keyAlias ( keyAlias ) 
+ diff - - git a / src / java / org / apache / cassandra / db / Table . java b / src / java / org / apache / cassandra / db / Table . java 
+ index afe9a65 . . 22285be 100644 
+ - - - a / src / java / org / apache / cassandra / db / Table . java 
+ + + + b / src / java / org / apache / cassandra / db / Table . java 
+ @ @ - 47 , 6 + 47 , 7 @ @ import org . apache . cassandra . io . util . MmappedSegmentedFile ; 
+ import org . apache . cassandra . locator . AbstractReplicationStrategy ; 
+ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . NodeId ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 334 , 9 + 335 , 27 @ @ public class Table 
+ / * * adds a cf to internal structures , ends up creating disk files ) . * / 
+ public void initCf ( Integer cfId , String cfName ) 
+ { 
+ - assert ! columnFamilyStores . containsKey ( cfId ) : String . format ( " tried to init % s as % s , but already used by % s " , 
+ - cfName , cfId , columnFamilyStores . get ( cfId ) ) ; 
+ - columnFamilyStores . put ( cfId , ColumnFamilyStore . createColumnFamilyStore ( this , cfName ) ) ; 
+ + if ( columnFamilyStores . containsKey ( cfId ) ) 
+ + { 
+ + / / this is the case when you reset local schema 
+ + / / just reload metadata 
+ + ColumnFamilyStore cfs = columnFamilyStores . get ( cfId ) ; 
+ + assert cfs . getColumnFamilyName ( ) . equals ( cfName ) ; 
+ + 
+ + try 
+ + { 
+ + cfs . metadata . reload ( ) ; 
+ + cfs . reload ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw FBUtilities . unchecked ( e ) ; 
+ + } 
+ + } 
+ + else 
+ + { 
+ + columnFamilyStores . put ( cfId , ColumnFamilyStore . createColumnFamilyStore ( this , cfName ) ) ; 
+ + } 
+ } 
+ 
+ public Row getRow ( QueryFilter filter ) throws IOException 
+ diff - - git a / src / java / org / apache / cassandra / service / MigrationManager . java b / src / java / org / apache / cassandra / service / MigrationManager . java 
+ index d303d40 . . b37fc2b 100644 
+ - - - a / src / java / org / apache / cassandra / service / MigrationManager . java 
+ + + + b / src / java / org / apache / cassandra / service / MigrationManager . java 
+ @ @ - 23 , 9 + 23 , 8 @ @ import java . io . DataOutputStream ; 
+ import java . io . IOError ; 
+ import java . io . IOException ; 
+ import java . net . InetAddress ; 
+ - import java . util . ArrayList ; 
+ - import java . util . Collection ; 
+ - import java . util . UUID ; 
+ + import java . util . * ; 
+ + import java . util . concurrent . ExecutionException ; 
+ import java . util . concurrent . Future ; 
+ import java . util . concurrent . TimeUnit ; 
+ import java . util . concurrent . TimeoutException ; 
+ @ @ - 37 , 8 + 36 , 7 @ @ import org . apache . cassandra . concurrent . Stage ; 
+ import org . apache . cassandra . concurrent . StageManager ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . config . Schema ; 
+ - import org . apache . cassandra . db . DefsTable ; 
+ - import org . apache . cassandra . db . RowMutation ; 
+ + import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . gms . * ; 
+ import org . apache . cassandra . io . util . FastByteArrayInputStream ; 
+ import org . apache . cassandra . io . util . FastByteArrayOutputStream ; 
+ @ @ - 96 , 41 + 94 , 7 @ @ public class MigrationManager implements IEndpointStateChangeSubscriber 
+ * Do not de - ref the future because that causes distributed deadlock ( CASSANDRA - 3832 ) because we are 
+ * running in the gossip stage . 
+ * / 
+ - 
+ - StageManager . getStage ( Stage . MIGRATION ) . submit ( new WrappedRunnable ( ) 
+ - { 
+ - public void runMayThrow ( ) throws Exception 
+ - { 
+ - Message message = new Message ( FBUtilities . getBroadcastAddress ( ) , 
+ - StorageService . Verb . MIGRATION _ REQUEST , 
+ - ArrayUtils . EMPTY _ BYTE _ ARRAY , 
+ - Gossiper . instance . getVersion ( endpoint ) ) ; 
+ - 
+ - int retries = 0 ; 
+ - while ( retries < MIGRATION _ REQUEST _ RETRIES ) 
+ - { 
+ - if ( ! FailureDetector . instance . isAlive ( endpoint ) ) 
+ - { 
+ - logger . error ( " Can ' t send migration request : node { } is down . " , endpoint ) ; 
+ - return ; 
+ - } 
+ - 
+ - IAsyncResult iar = MessagingService . instance ( ) . sendRR ( message , endpoint ) ; 
+ - 
+ - try 
+ - { 
+ - byte [ ] reply = iar . get ( DatabaseDescriptor . getRpcTimeout ( ) , TimeUnit . MILLISECONDS ) ; 
+ - 
+ - DefsTable . mergeRemoteSchema ( reply , message . getVersion ( ) ) ; 
+ - return ; 
+ - } 
+ - catch ( TimeoutException e ) 
+ - { 
+ - retries + + ; 
+ - } 
+ - } 
+ - } 
+ - } ) ; 
+ + StageManager . getStage ( Stage . MIGRATION ) . submit ( new MigrationTask ( endpoint ) ) ; 
+ } 
+ 
+ public static boolean isReadyForBootstrap ( ) 
+ @ @ - 244 , 4 + 208 , 104 @ @ public class MigrationManager implements IEndpointStateChangeSubscriber 
+ 
+ return schema ; 
+ } 
+ + 
+ + / * * 
+ + * Clear all locally stored schema information and reset schema to initial state . 
+ + * Called by user ( via JMX ) who wants to get rid of schema disagreement . 
+ + * 
+ + * @ throws IOException if schema tables truncation fails 
+ + * / 
+ + public static void resetLocalSchema ( ) throws IOException 
+ + { 
+ + logger . info ( " Starting local schema reset . . . " ) ; 
+ + 
+ + try 
+ + { 
+ + if ( logger . isDebugEnabled ( ) ) 
+ + logger . debug ( " Truncating schema tables . . . " ) ; 
+ + 
+ + / / truncate schema tables 
+ + FBUtilities . waitOnFutures ( new ArrayList < Future < ? > > ( ) 
+ + { { 
+ + SystemTable . schemaCFS ( SystemTable . SCHEMA _ KEYSPACES _ CF ) . truncate ( ) ; 
+ + SystemTable . schemaCFS ( SystemTable . SCHEMA _ COLUMNFAMILIES _ CF ) . truncate ( ) ; 
+ + SystemTable . schemaCFS ( SystemTable . SCHEMA _ COLUMNS _ CF ) . truncate ( ) ; 
+ + } } ) ; 
+ + 
+ + if ( logger . isDebugEnabled ( ) ) 
+ + logger . debug ( " Clearing local schema keyspace definitions . . . " ) ; 
+ + 
+ + Schema . instance . clear ( ) ; 
+ + 
+ + Set < InetAddress > liveEndpoints = Gossiper . instance . getLiveMembers ( ) ; 
+ + liveEndpoints . remove ( FBUtilities . getBroadcastAddress ( ) ) ; 
+ + 
+ + / / force migration is there are nodes around , first of all 
+ + / / check if there are nodes with versions > = 1 . 1 to request migrations from , 
+ + / / because migration format of the nodes with versions < 1 . 1 is incompatible with older versions 
+ + for ( InetAddress node : liveEndpoints ) 
+ + { 
+ + if ( Gossiper . instance . getVersion ( node ) > = MessagingService . VERSION _ 11 ) 
+ + { 
+ + if ( logger . isDebugEnabled ( ) ) 
+ + logger . debug ( " Requesting schema from " + node ) ; 
+ + 
+ + FBUtilities . waitOnFuture ( StageManager . getStage ( Stage . MIGRATION ) . submit ( new MigrationTask ( node ) ) ) ; 
+ + break ; 
+ + } 
+ + } 
+ + 
+ + logger . info ( " Local schema reset is complete . " ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + catch ( ExecutionException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + static class MigrationTask extends WrappedRunnable 
+ + { 
+ + private final InetAddress endpoint ; 
+ + 
+ + MigrationTask ( InetAddress endpoint ) 
+ + { 
+ + this . endpoint = endpoint ; 
+ + } 
+ + 
+ + public void runMayThrow ( ) throws Exception 
+ + { 
+ + Message message = new Message ( FBUtilities . getBroadcastAddress ( ) , 
+ + StorageService . Verb . MIGRATION _ REQUEST , 
+ + ArrayUtils . EMPTY _ BYTE _ ARRAY , 
+ + Gossiper . instance . getVersion ( endpoint ) ) ; 
+ + 
+ + int retries = 0 ; 
+ + while ( retries < MIGRATION _ REQUEST _ RETRIES ) 
+ + { 
+ + if ( ! FailureDetector . instance . isAlive ( endpoint ) ) 
+ + { 
+ + logger . error ( " Can ' t send migration request : node { } is down . " , endpoint ) ; 
+ + return ; 
+ + } 
+ + 
+ + IAsyncResult iar = MessagingService . instance ( ) . sendRR ( message , endpoint ) ; 
+ + 
+ + try 
+ + { 
+ + byte [ ] reply = iar . get ( DatabaseDescriptor . getRpcTimeout ( ) , TimeUnit . MILLISECONDS ) ; 
+ + 
+ + DefsTable . mergeRemoteSchema ( reply , message . getVersion ( ) ) ; 
+ + return ; 
+ + } 
+ + catch ( TimeoutException e ) 
+ + { 
+ + retries + + ; 
+ + } 
+ + } 
+ + } 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index 98a436a . . 6c9a26a 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 2954 , 7 + 2954 , 7 @ @ public class StorageService implements IEndpointStateChangeSubscriber , StorageSe 
+ { 
+ ColumnFamilyStore . loadNewSSTables ( ksName , cfName ) ; 
+ } 
+ - 
+ + 
+ / * * 
+ * # { @ inheritDoc } 
+ * / 
+ @ @ - 2972 , 4 + 2972 , 9 @ @ public class StorageService implements IEndpointStateChangeSubscriber , StorageSe 
+ { 
+ ColumnFamilyStore . rebuildSecondaryIndex ( ksName , cfName , idxNames ) ; 
+ } 
+ + 
+ + public void resetLocalSchema ( ) throws IOException 
+ + { 
+ + MigrationManager . resetLocalSchema ( ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageServiceMBean . java b / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ index 69b4969 . . b3949c9 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ @ @ - 374 , 7 + 374 , 7 @ @ public interface StorageServiceMBean 
+ * @ param cfName The ColumnFamily name where SSTables belong 
+ * / 
+ public void loadNewSSTables ( String ksName , String cfName ) ; 
+ - 
+ + 
+ / * * 
+ * Return a List of Tokens representing a sample of keys 
+ * across all ColumnFamilyStores 
+ @ @ - 387 , 4 + 387 , 6 @ @ public interface StorageServiceMBean 
+ * rebuild the specified indexes 
+ * / 
+ public void rebuildSecondaryIndex ( String ksName , String cfName , String . . . idxNames ) ; 
+ + 
+ + public void resetLocalSchema ( ) throws IOException ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / tools / NodeCmd . java b / src / java / org / apache / cassandra / tools / NodeCmd . java 
+ index c216560 . . 35a1db5 100644 
+ - - - a / src / java / org / apache / cassandra / tools / NodeCmd . java 
+ + + + b / src / java / org / apache / cassandra / tools / NodeCmd . java 
+ @ @ - 123 , 6 + 123 , 7 @ @ public class NodeCmd 
+ DESCRIBERING , 
+ RANGEKEYSAMPLE , 
+ REBUILD _ INDEX , 
+ + RESETLOCALSCHEMA 
+ } 
+ 
+ 
+ @ @ - 152 , 6 + 153 , 7 @ @ public class NodeCmd 
+ addCmdHelp ( header , " gossipinfo " , " Shows the gossip information for the cluster " ) ; 
+ addCmdHelp ( header , " invalidatekeycache " , " Invalidate the key cache " ) ; 
+ addCmdHelp ( header , " invalidaterowcache " , " Invalidate the row cache " ) ; 
+ + addCmdHelp ( header , " resetlocalschema " , " Reset node ' s local schema and resync " ) ; 
+ 
+ / / One arg 
+ addCmdHelp ( header , " netstats [ host ] " , " Print network information on provided host ( connecting node by default ) " ) ; 
+ @ @ - 684 , 6 + 686 , 7 @ @ public class NodeCmd 
+ case DISABLETHRIFT : probe . stopThriftServer ( ) ; break ; 
+ case ENABLETHRIFT : probe . startThriftServer ( ) ; break ; 
+ case STATUSTHRIFT : nodeCmd . printIsThriftServerRunning ( System . out ) ; break ; 
+ + case RESETLOCALSCHEMA : probe . resetLocalSchema ( ) ; break ; 
+ 
+ case DRAIN : 
+ try { probe . drain ( ) ; } 
+ diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ index a242243 . . 8d915c7 100644 
+ - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ @ @ - 653 , 12 + 653 , 16 @ @ public class NodeProbe 
+ { 
+ ssProxy . rebuild ( sourceDc ) ; 
+ } 
+ - 
+ + 
+ public List < String > getRangeKeySample ( ) 
+ { 
+ return ssProxy . getRangeKeySample ( ) ; 
+ } 
+ 
+ + public void resetLocalSchema ( ) throws IOException 
+ + { 
+ + ssProxy . resetLocalSchema ( ) ; 
+ + } 
+ } 
+ 
+ class ColumnFamilyStoreMBeanIterator implements Iterator < Map . Entry < String , ColumnFamilyStoreMBean > > 
+ diff - - git a / test / unit / org / apache / cassandra / SchemaLoader . java b / test / unit / org / apache / cassandra / SchemaLoader . java 
+ index 70e95c4 . . 697d466 100644 
+ - - - a / test / unit / org / apache / cassandra / SchemaLoader . java 
+ + + + b / test / unit / org / apache / cassandra / SchemaLoader . java 
+ @ @ - 150 , 15 + 150 , 13 @ @ public class SchemaLoader 
+ st , 
+ bytes , 
+ null ) 
+ - . defaultValidator ( CounterColumnType . instance ) 
+ - . mergeShardsChance ( 1 . 0 ) , 
+ + . defaultValidator ( CounterColumnType . instance ) , 
+ new CFMetaData ( ks1 , 
+ " SuperCounter1 " , 
+ su , 
+ bytes , 
+ bytes ) 
+ - . defaultValidator ( CounterColumnType . instance ) 
+ - . mergeShardsChance ( 1 . 0 ) , 
+ + . defaultValidator ( CounterColumnType . instance ) , 
+ superCFMD ( ks1 , " SuperDirectGC " , BytesType . instance ) . gcGraceSeconds ( 0 ) , 
+ jdbcCFMD ( ks1 , " JdbcInteger " , IntegerType . instance ) . columnMetadata ( integerColumn ) , 
+ jdbcCFMD ( ks1 , " JdbcUtf8 " , UTF8Type . instance ) . columnMetadata ( utf8Column ) , 
+ diff - - git a / test / unit / org / apache / cassandra / db / DefsTest . java b / test / unit / org / apache / cassandra / db / DefsTest . java 
+ index 01ab532 . . bd3dfa1 100644 
+ - - - a / test / unit / org / apache / cassandra / db / DefsTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / DefsTest . java 
+ @ @ - 84 , 7 + 84 , 6 @ @ public class DefsTest extends CleanupHelper 
+ . defaultValidator ( null ) 
+ . minCompactionThreshold ( 500 ) 
+ . maxCompactionThreshold ( 500 ) 
+ - . mergeShardsChance ( 0 . 0 ) 
+ . columnMetadata ( indexes ) ; 
+ 
+ / / we ' ll be adding this one later . make sure it ' s not already there . 
+ @ @ - 601 , 8 + 600 , 7 @ @ public class DefsTest extends CleanupHelper 
+ { 
+ CFMetaData newCFMD = new CFMetaData ( ks , cf , ColumnFamilyType . Standard , UTF8Type . instance , null ) ; 
+ newCFMD . comment ( comment ) 
+ - . readRepairChance ( 0 . 0 ) 
+ - . mergeShardsChance ( 0 . 0 ) ; 
+ + . readRepairChance ( 0 . 0 ) ; 
+ 
+ return newCFMD ; 
+ }

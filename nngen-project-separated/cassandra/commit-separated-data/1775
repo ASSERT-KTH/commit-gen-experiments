@@ -1,0 +1,571 @@
+BLEU SCORE: 0.03550932348642478
+
+TEST MSG: Improve performance of cqlsh COPY FROM
+GENERATED MSG: cqlsh : add COPY command to load data from CSV flat files
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 14a45a3 . . a142999 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 4 <nl> + * ( cqlsh ) Greatly improve performance of COPY FROM ( CASSANDRA - 8225 ) <nl> * IndexSummary effectiveIndexInterval is now a guideline , not a rule ( CASSANDRA - 8993 ) <nl> * Use correct bounds for page cache eviction of compressed files ( CASSANDRA - 8746 ) <nl> * SSTableScanner enforces its bounds ( CASSANDRA - 8946 ) <nl> diff - - git a / bin / cqlsh b / bin / cqlsh <nl> index 3ec9457 . . fdf6ce1 100755 <nl> - - - a / bin / cqlsh <nl> + + + b / bin / cqlsh <nl> @ @ - 51 , 6 + 51 , 8 @ @ import platform <nl> import warnings <nl> import csv <nl> import getpass <nl> + from functools import partial <nl> + import traceback <nl> <nl> <nl> readline = None <nl> @ @ - 108 , 6 + 110 , 8 @ @ except ImportError , e : <nl> from cassandra . cluster import Cluster , PagedResult <nl> from cassandra . query import SimpleStatement , ordered _ dict _ factory <nl> from cassandra . policies import WhiteListRoundRobinPolicy <nl> + from cassandra . protocol import QueryMessage , ResultMessage <nl> + from cassandra . marshal import int16 _ pack , int32 _ pack , uint64 _ pack <nl> from cassandra . metadata import protect _ name , protect _ names , protect _ value <nl> from cassandra . auth import PlainTextAuthProvider <nl> <nl> @ @ - 117 , 7 + 121 , 7 @ @ cqlshlibdir = os . path . join ( CASSANDRA _ PATH , ' pylib ' ) <nl> if os . path . isdir ( cqlshlibdir ) : <nl> sys . path . insert ( 0 , cqlshlibdir ) <nl> <nl> - from cqlshlib import cqlhandling , cql3handling , pylexotron , sslhandling , async _ insert , meter <nl> + from cqlshlib import cqlhandling , cql3handling , pylexotron , sslhandling <nl> from cqlshlib . displaying import ( RED , BLUE , CYAN , ANSI _ RESET , COLUMN _ NAME _ COLORS , <nl> FormattedValue , colorme ) <nl> from cqlshlib . formatting import format _ by _ type , formatter _ for , format _ value _ utype <nl> @ @ - 550 , 6 + 554 , 7 @ @ class Shell ( cmd . Cmd ) : <nl> self . auth _ provider = PlainTextAuthProvider ( username = username , password = password ) <nl> self . username = username <nl> self . keyspace = keyspace <nl> + self . ssl = ssl <nl> self . tracing _ enabled = tracing _ enabled <nl> self . expand _ enabled = expand _ enabled <nl> if use _ conn : <nl> @ @ - 913 , 7 + 918 , 6 @ @ class Shell ( cmd . Cmd ) : <nl> self . handle _ statement ( st , statementtext ) <nl> except Exception , e : <nl> if self . debug : <nl> - import traceback <nl> traceback . print _ exc ( ) <nl> else : <nl> self . printerr ( e ) <nl> @ @ - 1435 , 73 + 1439 , 251 @ @ class Shell ( cmd . Cmd ) : <nl> except IOError , e : <nl> self . printerr ( " Can ' t open % r for reading : % s " % ( fname , e ) ) <nl> return 0 <nl> + <nl> + current _ record = None <nl> try : <nl> if header : <nl> linesource . next ( ) <nl> table _ meta = self . get _ table _ meta ( ks , cf ) <nl> reader = csv . reader ( linesource , * * dialect _ options ) <nl> - from functools import partial <nl> - rownum , error = \ <nl> - async _ insert . insert _ concurrent ( self . session , enumerate ( reader , start = 1 ) , <nl> - partial ( <nl> - self . create _ insert _ statement , <nl> - columns , nullval , <nl> - table _ meta ) ) <nl> - if error : <nl> - self . printerr ( str ( error [ 0 ] ) ) <nl> - self . printerr ( " Aborting import at record # % d . " <nl> - " Previously - inserted values still present . " <nl> - % error [ 1 ] ) <nl> + <nl> + from multiprocessing import Process , Pipe , cpu _ count <nl> + <nl> + # Pick a resonable number of child processes . We need to leave at <nl> + # least one core for the parent process . This doesn ' t necessarily <nl> + # need to be capped at 4 , but it ' s currently enough to keep <nl> + # a single local Cassandra node busy , and I see lower throughput <nl> + # with more processes . <nl> + try : <nl> + num _ processes = max ( 1 , min ( 4 , cpu _ count ( ) - 1 ) ) <nl> + except NotImplementedError : <nl> + num _ processes = 1 <nl> + <nl> + processes , pipes = [ ] , [ ] , <nl> + for i in range ( num _ processes ) : <nl> + parent _ conn , child _ conn = Pipe ( ) <nl> + pipes . append ( parent _ conn ) <nl> + processes . append ( Process ( target = self . multiproc _ import , args = ( child _ conn , ks , cf , columns , nullval ) ) ) <nl> + <nl> + for process in processes : <nl> + process . start ( ) <nl> + <nl> + last _ checkpoint _ time = time . time ( ) <nl> + current _ rate = 0 . 0 <nl> + for current _ record , row in enumerate ( reader , start = 1 ) : <nl> + # write to the child process <nl> + pipes [ current _ record % num _ processes ] . send ( ( current _ record , row ) ) <nl> + <nl> + # update the progress and current rate periodically <nl> + if ( current _ record % 10000 ) = = 0 : <nl> + new _ checkpoint _ time = time . time ( ) <nl> + new _ rate = 10000 . 0 / ( new _ checkpoint _ time - last _ checkpoint _ time ) <nl> + last _ checkpoint _ time = new _ checkpoint _ time <nl> + <nl> + # smooth the rate a bit <nl> + if current _ rate = = 0 . 0 : <nl> + current _ rate = new _ rate <nl> + else : <nl> + current _ rate = ( current _ rate + new _ rate ) / 2 . 0 <nl> + <nl> + output = ' Processed % s rows ; Write : % . 2f rows / s \ r ' % \ <nl> + ( current _ record , current _ rate ) <nl> + sys . stdout . write ( output ) <nl> + sys . stdout . flush ( ) <nl> + <nl> + # check for any errors reported by the children <nl> + if ( current _ record % 100 ) = = 0 : <nl> + if self . _ check _ child _ pipes ( current _ record , pipes ) : <nl> + # no errors seen , continue with outer loop <nl> + continue <nl> + else : <nl> + # errors seen , break out of outer loop <nl> + break <nl> + except Exception , exc : <nl> + if current _ record is None : <nl> + # we failed before we started <nl> + self . printerr ( " \ nError starting import process : \ n " ) <nl> + self . printerr ( str ( exc ) ) <nl> + if self . debug : <nl> + traceback . print _ exc ( ) <nl> + else : <nl> + self . printerr ( " \ n " + str ( exc ) ) <nl> + self . printerr ( " \ nAborting import at record # % d . " <nl> + " Previously inserted records and some records after " <nl> + " this number may be present . " <nl> + % ( current _ record , ) ) <nl> + if self . debug : <nl> + traceback . print _ exc ( ) <nl> finally : <nl> + # send a message that indicates we ' re done <nl> + for pipe in pipes : <nl> + pipe . send ( ( None , None ) ) <nl> + <nl> + for process in processes : <nl> + process . join ( ) <nl> + <nl> + self . _ check _ child _ pipes ( current _ record , pipes ) <nl> + <nl> + for pipe in pipes : <nl> + pipe . close ( ) <nl> + <nl> if do _ close : <nl> linesource . close ( ) <nl> elif self . tty : <nl> print <nl> - return rownum <nl> <nl> - def create _ insert _ statement ( self , columns , nullval , table _ meta , row ) : <nl> + return current _ record <nl> <nl> - if len ( row ) ! = len ( columns ) : <nl> - raise ValueError ( <nl> - " Record has the wrong number of fields ( % d instead of % d ) . " <nl> - % ( len ( row ) , len ( columns ) ) ) <nl> + def _ check _ child _ pipes ( self , current _ record , pipes ) : <nl> + # check the pipes for errors from child processes <nl> + for pipe in pipes : <nl> + if pipe . poll ( ) : <nl> + try : <nl> + ( record _ num , error ) = pipe . recv ( ) <nl> + self . printerr ( " \ n " + str ( error ) ) <nl> + self . printerr ( <nl> + " Aborting import at record # % d . " <nl> + " Previously inserted records are still present , " <nl> + " and some records after that may be present as well . " <nl> + % ( record _ num , ) ) <nl> + return False <nl> + except EOFError : <nl> + # pipe is closed , nothing to read <nl> + self . printerr ( " \ nChild process died without notification , " <nl> + " aborting import at record # % d . Previously " <nl> + " inserted records are probably still present , " <nl> + " and some records after that may be present " <nl> + " as well . " % ( current _ record , ) ) <nl> + return False <nl> + return True <nl> <nl> - rowmap = { } <nl> - primary _ key _ columns = [ col . name for col in table _ meta . primary _ key ] <nl> - for name , value in zip ( columns , row ) : <nl> - type = table _ meta . columns [ name ] . data _ type <nl> - cqltype = table _ meta . columns [ name ] . typestring <nl> + def multiproc _ import ( self , pipe , ks , cf , columns , nullval ) : <nl> + " " " <nl> + This method is where child processes start when doing a COPY FROM <nl> + operation . The child process will open one connection to the node and <nl> + interact directly with the connection , bypassing most of the driver <nl> + code . Because we don ' t need retries , connection pooling , thread safety , <nl> + and other fancy features , this is okay . <nl> + " " " <nl> <nl> - if value ! = nullval : <nl> - if cqltype in ( ' ascii ' , ' text ' , ' timestamp ' , ' date ' , ' time ' , ' inet ' ) : <nl> - rowmap [ name ] = protect _ value ( value ) <nl> - else : <nl> - rowmap [ name ] = value <nl> - elif name in primary _ key _ columns : <nl> - # By default , nullval is an empty string . See CASSANDRA - 7792 for details . <nl> - message = " Cannot insert null value for primary key column ' % s ' . " % ( name , ) <nl> - if nullval = = ' ' : <nl> - message + = " If you want to insert empty strings , consider using " \ <nl> - " the WITH NULL = < marker > option for COPY . " <nl> - self . printerr ( message ) <nl> - return False <nl> - else : <nl> - rowmap [ name ] = ' null ' <nl> - # would be nice to be able to use a prepared query here , but in order <nl> - # to use that interface , we ' d need to have all the input as native <nl> - # values already , reading them from text just like the various <nl> - # Cassandra cql types do . Better just to submit them all as intact <nl> - # CQL string literals and let Cassandra do its thing . <nl> - query = ' INSERT INTO % s . % s ( % s ) VALUES ( % s ) ' % ( <nl> - protect _ name ( table _ meta . keyspace . name ) , <nl> - protect _ name ( table _ meta . name ) , <nl> - ' , ' . join ( protect _ names ( rowmap . keys ( ) ) ) , <nl> - ' , ' . join ( rowmap . values ( ) ) <nl> - ) <nl> - if self . debug : <nl> - print ' Import using CQL : % s ' % query <nl> - return SimpleStatement ( query ) <nl> + # open a new connection for this subprocess <nl> + new _ cluster = Cluster ( <nl> + contact _ points = ( self . hostname , ) , <nl> + port = self . port , <nl> + cql _ version = self . conn . cql _ version , <nl> + protocol _ version = DEFAULT _ PROTOCOL _ VERSION , <nl> + auth _ provider = self . auth _ provider , <nl> + ssl _ options = sslhandling . ssl _ settings ( self . hostname , CONFIG _ FILE ) if self . ssl else None , <nl> + load _ balancing _ policy = WhiteListRoundRobinPolicy ( [ self . hostname ] ) , <nl> + compression = None ) <nl> + session = new _ cluster . connect ( self . keyspace ) <nl> + conn = session . _ pools . values ( ) [ 0 ] . _ connection <nl> + <nl> + # pre - build as much of the query as we can <nl> + table _ meta = self . get _ table _ meta ( ks , cf ) <nl> + pk _ cols = [ col . name for col in table _ meta . primary _ key ] <nl> + cqltypes = [ table _ meta . columns [ name ] . typestring for name in columns ] <nl> + pk _ indexes = [ columns . index ( col . name ) for col in table _ meta . primary _ key ] <nl> + query = ' INSERT INTO % s . % s ( % s ) VALUES ( % % s ) ' % ( <nl> + protect _ name ( ks ) , <nl> + protect _ name ( cf ) , <nl> + ' , ' . join ( columns ) ) <nl> + <nl> + # we need to handle some types specially <nl> + should _ escape = [ t in ( ' ascii ' , ' text ' , ' timestamp ' , ' date ' , ' time ' , ' inet ' ) for t in cqltypes ] <nl> + <nl> + insert _ timestamp = int ( time . time ( ) * 1e6 ) <nl> + <nl> + def callback ( record _ num , response ) : <nl> + # This is the callback we register for all inserts . Because this <nl> + # is run on the event - loop thread , we need to hold a lock when <nl> + # adjusting in _ flight . <nl> + with conn . lock : <nl> + conn . in _ flight - = 1 <nl> + <nl> + if not isinstance ( response , ResultMessage ) : <nl> + # It ' s an error . Notify the parent process and let it send <nl> + # a stop signal to all child processes ( including this one ) . <nl> + pipe . send ( ( record _ num , str ( response ) ) ) <nl> + if isinstance ( response , Exception ) and self . debug : <nl> + traceback . print _ exc ( response ) <nl> + <nl> + current _ record = 0 <nl> + insert _ num = 0 <nl> + try : <nl> + while True : <nl> + # To avoid totally maxing out the connection , <nl> + # defer to the reactor thread when we ' re close <nl> + # to capacity <nl> + if conn . in _ flight > ( conn . max _ request _ id * 0 . 9 ) : <nl> + conn . _ readable = True <nl> + time . sleep ( 0 . 05 ) <nl> + continue <nl> + <nl> + try : <nl> + ( current _ record , row ) = pipe . recv ( ) <nl> + except EOFError : <nl> + # the pipe was closed and there ' s nothing to receive <nl> + sys . stdout . write ( ' Failed to read from pipe : \ n \ n ' ) <nl> + sys . stdout . flush ( ) <nl> + conn . _ writable = True <nl> + conn . _ readable = True <nl> + break <nl> + <nl> + # see if the parent process has signaled that we are done <nl> + if ( current _ record , row ) = = ( None , None ) : <nl> + conn . _ writable = True <nl> + conn . _ readable = True <nl> + pipe . close ( ) <nl> + break <nl> + <nl> + # format the values in the row <nl> + for i , value in enumerate ( row ) : <nl> + if value ! = nullval : <nl> + if should _ escape [ i ] : <nl> + row [ i ] = protect _ value ( value ) <nl> + elif i in pk _ indexes : <nl> + # By default , nullval is an empty string . See CASSANDRA - 7792 for details . <nl> + message = " Cannot insert null value for primary key column ' % s ' . " % ( pk _ cols [ i ] , ) <nl> + if nullval = = ' ' : <nl> + message + = " If you want to insert empty strings , consider using " \ <nl> + " the WITH NULL = < marker > option for COPY . " <nl> + pipe . send ( ( current _ record , message ) ) <nl> + return <nl> + else : <nl> + row [ i ] = ' null ' <nl> + <nl> + full _ query = query % ( ' , ' . join ( row ) , ) <nl> + query _ message = QueryMessage ( <nl> + full _ query , self . consistency _ level , serial _ consistency _ level = None , <nl> + fetch _ size = None , paging _ state = None , timestamp = insert _ timestamp ) <nl> + <nl> + request _ id = conn . get _ request _ id ( ) <nl> + binary _ message = query _ message . to _ binary ( <nl> + stream _ id = request _ id , protocol _ version = DEFAULT _ PROTOCOL _ VERSION , compression = None ) <nl> + <nl> + # add the message directly to the connection ' s queue <nl> + with conn . lock : <nl> + conn . in _ flight + = 1 <nl> + conn . _ callbacks [ request _ id ] = partial ( callback , current _ record ) <nl> + conn . deque . append ( binary _ message ) <nl> + <nl> + # every 50 records , clear the pending writes queue and read <nl> + # any responses we have <nl> + if insert _ num % 50 = = 0 : <nl> + conn . _ writable = True <nl> + conn . _ readable = True <nl> + <nl> + insert _ num + = 1 <nl> + except Exception , exc : <nl> + pipe . send ( ( current _ record , exc ) ) <nl> + finally : <nl> + # wait for any pending requests to finish <nl> + while conn . in _ flight > 0 : <nl> + conn . _ readable = True <nl> + time . sleep ( 0 . 01 ) <nl> <nl> + new _ cluster . shutdown ( ) <nl> <nl> def perform _ csv _ export ( self , ks , cf , columns , fname , opts ) : <nl> dialect _ options = self . csv _ dialect _ defaults . copy ( ) <nl> diff - - git a / pylib / cqlshlib / async _ insert . py b / pylib / cqlshlib / async _ insert . py <nl> deleted file mode 100644 <nl> index d325716 . . 0000000 <nl> - - - a / pylib / cqlshlib / async _ insert . py <nl> + + + / dev / null <nl> @ @ - 1 , 115 + 0 , 0 @ @ <nl> - # Licensed to the Apache Software Foundation ( ASF ) under one <nl> - # or more contributor license agreements . See the NOTICE file <nl> - # distributed with this work for additional information <nl> - # regarding copyright ownership . The ASF licenses this file <nl> - # to you under the Apache License , Version 2 . 0 ( the <nl> - # " License " ) ; you may not use this file except in compliance <nl> - # with the License . You may obtain a copy of the License at <nl> - # <nl> - # http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - # <nl> - # Unless required by applicable law or agreed to in writing , software <nl> - # distributed under the License is distributed on an " AS IS " BASIS , <nl> - # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - # See the License for the specific language governing permissions and <nl> - # limitations under the License . <nl> - <nl> - from threading import Event , Condition <nl> - from . import meter <nl> - import sys <nl> - <nl> - class _ CountDownLatch ( object ) : <nl> - def _ _ init _ _ ( self , counter = 1 ) : <nl> - self . _ count = counter <nl> - self . _ lock = Condition ( ) <nl> - <nl> - def count _ down ( self ) : <nl> - with self . _ lock : <nl> - self . _ count - = 1 <nl> - if self . _ count < = 0 : <nl> - self . _ lock . notifyAll ( ) <nl> - <nl> - def await ( self ) : <nl> - with self . _ lock : <nl> - while self . _ count > 0 : <nl> - # use a timeout so that the main thread wakes up occasionally <nl> - # so it can see keyboard interrupts ( CASSANDRA - 7815 ) <nl> - self . _ lock . wait ( 0 . 5 ) <nl> - <nl> - <nl> - class _ ChainedWriter ( object ) : <nl> - <nl> - CONCURRENCY = 100 <nl> - <nl> - def _ _ init _ _ ( self , session , enumerated _ reader , statement _ func ) : <nl> - self . _ sentinel = object ( ) <nl> - self . _ session = session <nl> - self . _ cancellation _ event = Event ( ) <nl> - self . _ first _ error = None <nl> - self . _ task _ counter = _ CountDownLatch ( self . CONCURRENCY ) <nl> - self . _ enumerated _ reader = enumerated _ reader <nl> - self . _ statement _ func = statement _ func <nl> - self . _ meter = meter . Meter ( ) <nl> - <nl> - def insert ( self ) : <nl> - if not self . _ enumerated _ reader : <nl> - return 0 , None <nl> - <nl> - for i in xrange ( self . CONCURRENCY ) : <nl> - self . _ execute _ next ( self . _ sentinel , 0 ) <nl> - <nl> - try : <nl> - self . _ task _ counter . await ( ) <nl> - except KeyboardInterrupt : <nl> - self . _ cancellation _ event . set ( ) <nl> - sys . stdout . write ( ' Aborting due to keyboard interrupt \ n ' ) <nl> - self . _ task _ counter . await ( ) <nl> - self . _ meter . done ( ) <nl> - return self . _ meter . num _ finished ( ) , self . _ first _ error <nl> - <nl> - <nl> - def _ abort ( self , error , failed _ record ) : <nl> - if not self . _ first _ error : <nl> - self . _ first _ error = error , failed _ record <nl> - self . _ task _ counter . count _ down ( ) <nl> - self . _ cancellation _ event . set ( ) <nl> - <nl> - def _ handle _ error ( self , error , failed _ record ) : <nl> - self . _ abort ( error , failed _ record ) <nl> - <nl> - def _ execute _ next ( self , result , last _ completed _ record ) : <nl> - if self . _ cancellation _ event . is _ set ( ) : <nl> - self . _ task _ counter . count _ down ( ) <nl> - return <nl> - <nl> - if result is not self . _ sentinel : <nl> - self . _ meter . mark _ written ( ) <nl> - <nl> - try : <nl> - ( current _ record , row ) = next ( self . _ enumerated _ reader ) <nl> - except StopIteration : <nl> - self . _ task _ counter . count _ down ( ) <nl> - return <nl> - except Exception as exc : <nl> - self . _ abort ( exc , last _ completed _ record ) <nl> - return <nl> - <nl> - if self . _ cancellation _ event . is _ set ( ) : <nl> - self . _ task _ counter . count _ down ( ) <nl> - return <nl> - <nl> - try : <nl> - statement = self . _ statement _ func ( row ) <nl> - future = self . _ session . execute _ async ( statement ) <nl> - future . add _ callbacks ( callback = self . _ execute _ next , <nl> - callback _ args = ( current _ record , ) , <nl> - errback = self . _ handle _ error , <nl> - errback _ args = ( current _ record , ) ) <nl> - except Exception as exc : <nl> - self . _ abort ( exc , current _ record ) <nl> - return <nl> - <nl> - <nl> - def insert _ concurrent ( session , enumerated _ reader , statement _ func ) : <nl> - return _ ChainedWriter ( session , enumerated _ reader , statement _ func ) . insert ( ) <nl> - <nl> diff - - git a / pylib / cqlshlib / meter . py b / pylib / cqlshlib / meter . py <nl> deleted file mode 100644 <nl> index e1a6bfc . . 0000000 <nl> - - - a / pylib / cqlshlib / meter . py <nl> + + + / dev / null <nl> @ @ - 1 , 59 + 0 , 0 @ @ <nl> - # Licensed to the Apache Software Foundation ( ASF ) under one <nl> - # or more contributor license agreements . See the NOTICE file <nl> - # distributed with this work for additional information <nl> - # regarding copyright ownership . The ASF licenses this file <nl> - # to you under the Apache License , Version 2 . 0 ( the <nl> - # " License " ) ; you may not use this file except in compliance <nl> - # with the License . You may obtain a copy of the License at <nl> - # <nl> - # http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - # <nl> - # Unless required by applicable law or agreed to in writing , software <nl> - # distributed under the License is distributed on an " AS IS " BASIS , <nl> - # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - # See the License for the specific language governing permissions and <nl> - # limitations under the License . <nl> - <nl> - from time import time <nl> - import sys <nl> - from threading import RLock <nl> - <nl> - <nl> - class Meter ( object ) : <nl> - <nl> - def _ _ init _ _ ( self ) : <nl> - self . _ num _ finished = 0 <nl> - self . _ last _ checkpoint _ time = None <nl> - self . _ current _ rate = 0 . 0 <nl> - self . _ lock = RLock ( ) <nl> - <nl> - def mark _ written ( self ) : <nl> - with self . _ lock : <nl> - if not self . _ last _ checkpoint _ time : <nl> - self . _ last _ checkpoint _ time = time ( ) <nl> - self . _ num _ finished + = 1 <nl> - <nl> - if self . _ num _ finished % 10000 = = 0 : <nl> - previous _ checkpoint _ time = self . _ last _ checkpoint _ time <nl> - self . _ last _ checkpoint _ time = time ( ) <nl> - new _ rate = 10000 . 0 / ( self . _ last _ checkpoint _ time - previous _ checkpoint _ time ) <nl> - if self . _ current _ rate = = 0 . 0 : <nl> - self . _ current _ rate = new _ rate <nl> - else : <nl> - self . _ current _ rate = ( self . _ current _ rate + new _ rate ) / 2 . 0 <nl> - <nl> - if self . _ num _ finished % 1000 ! = 0 : <nl> - return <nl> - output = ' Processed % s rows ; Write : % . 2f rows / s \ r ' % \ <nl> - ( self . _ num _ finished , self . _ current _ rate ) <nl> - sys . stdout . write ( output ) <nl> - sys . stdout . flush ( ) <nl> - <nl> - def num _ finished ( self ) : <nl> - with self . _ lock : <nl> - return self . _ num _ finished <nl> - <nl> - def done ( self ) : <nl> - print " " <nl> - <nl> -
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index ae1ce7a . . 7943112 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 15 , 7 + 15 , 7 @ @ <nl> * Add support for range tombstones ( CASSANDRA - 3708 ) <nl> * Improve MessagingService efficiency ( CASSANDRA - 3617 ) <nl> * Avoid ID conflicts from concurrent schema changes ( CASSANDRA - 3794 ) <nl> - * Set thrift HSHA server thread limit to unlimet by default ( CASSANDRA - 4277 ) <nl> + * Set thrift HSHA server thread limit to unlimited by default ( CASSANDRA - 4277 ) <nl> * Avoids double serialization of CF id in RowMutation messages <nl> ( CASSANDRA - 4293 ) <nl> * fix Summary component and caches to use correct partitioner ( CASSANDRA - 4289 )
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 14a45a3 . . a142999 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 4 
+ + * ( cqlsh ) Greatly improve performance of COPY FROM ( CASSANDRA - 8225 ) 
+ * IndexSummary effectiveIndexInterval is now a guideline , not a rule ( CASSANDRA - 8993 ) 
+ * Use correct bounds for page cache eviction of compressed files ( CASSANDRA - 8746 ) 
+ * SSTableScanner enforces its bounds ( CASSANDRA - 8946 ) 
+ diff - - git a / bin / cqlsh b / bin / cqlsh 
+ index 3ec9457 . . fdf6ce1 100755 
+ - - - a / bin / cqlsh 
+ + + + b / bin / cqlsh 
+ @ @ - 51 , 6 + 51 , 8 @ @ import platform 
+ import warnings 
+ import csv 
+ import getpass 
+ + from functools import partial 
+ + import traceback 
+ 
+ 
+ readline = None 
+ @ @ - 108 , 6 + 110 , 8 @ @ except ImportError , e : 
+ from cassandra . cluster import Cluster , PagedResult 
+ from cassandra . query import SimpleStatement , ordered _ dict _ factory 
+ from cassandra . policies import WhiteListRoundRobinPolicy 
+ + from cassandra . protocol import QueryMessage , ResultMessage 
+ + from cassandra . marshal import int16 _ pack , int32 _ pack , uint64 _ pack 
+ from cassandra . metadata import protect _ name , protect _ names , protect _ value 
+ from cassandra . auth import PlainTextAuthProvider 
+ 
+ @ @ - 117 , 7 + 121 , 7 @ @ cqlshlibdir = os . path . join ( CASSANDRA _ PATH , ' pylib ' ) 
+ if os . path . isdir ( cqlshlibdir ) : 
+ sys . path . insert ( 0 , cqlshlibdir ) 
+ 
+ - from cqlshlib import cqlhandling , cql3handling , pylexotron , sslhandling , async _ insert , meter 
+ + from cqlshlib import cqlhandling , cql3handling , pylexotron , sslhandling 
+ from cqlshlib . displaying import ( RED , BLUE , CYAN , ANSI _ RESET , COLUMN _ NAME _ COLORS , 
+ FormattedValue , colorme ) 
+ from cqlshlib . formatting import format _ by _ type , formatter _ for , format _ value _ utype 
+ @ @ - 550 , 6 + 554 , 7 @ @ class Shell ( cmd . Cmd ) : 
+ self . auth _ provider = PlainTextAuthProvider ( username = username , password = password ) 
+ self . username = username 
+ self . keyspace = keyspace 
+ + self . ssl = ssl 
+ self . tracing _ enabled = tracing _ enabled 
+ self . expand _ enabled = expand _ enabled 
+ if use _ conn : 
+ @ @ - 913 , 7 + 918 , 6 @ @ class Shell ( cmd . Cmd ) : 
+ self . handle _ statement ( st , statementtext ) 
+ except Exception , e : 
+ if self . debug : 
+ - import traceback 
+ traceback . print _ exc ( ) 
+ else : 
+ self . printerr ( e ) 
+ @ @ - 1435 , 73 + 1439 , 251 @ @ class Shell ( cmd . Cmd ) : 
+ except IOError , e : 
+ self . printerr ( " Can ' t open % r for reading : % s " % ( fname , e ) ) 
+ return 0 
+ + 
+ + current _ record = None 
+ try : 
+ if header : 
+ linesource . next ( ) 
+ table _ meta = self . get _ table _ meta ( ks , cf ) 
+ reader = csv . reader ( linesource , * * dialect _ options ) 
+ - from functools import partial 
+ - rownum , error = \ 
+ - async _ insert . insert _ concurrent ( self . session , enumerate ( reader , start = 1 ) , 
+ - partial ( 
+ - self . create _ insert _ statement , 
+ - columns , nullval , 
+ - table _ meta ) ) 
+ - if error : 
+ - self . printerr ( str ( error [ 0 ] ) ) 
+ - self . printerr ( " Aborting import at record # % d . " 
+ - " Previously - inserted values still present . " 
+ - % error [ 1 ] ) 
+ + 
+ + from multiprocessing import Process , Pipe , cpu _ count 
+ + 
+ + # Pick a resonable number of child processes . We need to leave at 
+ + # least one core for the parent process . This doesn ' t necessarily 
+ + # need to be capped at 4 , but it ' s currently enough to keep 
+ + # a single local Cassandra node busy , and I see lower throughput 
+ + # with more processes . 
+ + try : 
+ + num _ processes = max ( 1 , min ( 4 , cpu _ count ( ) - 1 ) ) 
+ + except NotImplementedError : 
+ + num _ processes = 1 
+ + 
+ + processes , pipes = [ ] , [ ] , 
+ + for i in range ( num _ processes ) : 
+ + parent _ conn , child _ conn = Pipe ( ) 
+ + pipes . append ( parent _ conn ) 
+ + processes . append ( Process ( target = self . multiproc _ import , args = ( child _ conn , ks , cf , columns , nullval ) ) ) 
+ + 
+ + for process in processes : 
+ + process . start ( ) 
+ + 
+ + last _ checkpoint _ time = time . time ( ) 
+ + current _ rate = 0 . 0 
+ + for current _ record , row in enumerate ( reader , start = 1 ) : 
+ + # write to the child process 
+ + pipes [ current _ record % num _ processes ] . send ( ( current _ record , row ) ) 
+ + 
+ + # update the progress and current rate periodically 
+ + if ( current _ record % 10000 ) = = 0 : 
+ + new _ checkpoint _ time = time . time ( ) 
+ + new _ rate = 10000 . 0 / ( new _ checkpoint _ time - last _ checkpoint _ time ) 
+ + last _ checkpoint _ time = new _ checkpoint _ time 
+ + 
+ + # smooth the rate a bit 
+ + if current _ rate = = 0 . 0 : 
+ + current _ rate = new _ rate 
+ + else : 
+ + current _ rate = ( current _ rate + new _ rate ) / 2 . 0 
+ + 
+ + output = ' Processed % s rows ; Write : % . 2f rows / s \ r ' % \ 
+ + ( current _ record , current _ rate ) 
+ + sys . stdout . write ( output ) 
+ + sys . stdout . flush ( ) 
+ + 
+ + # check for any errors reported by the children 
+ + if ( current _ record % 100 ) = = 0 : 
+ + if self . _ check _ child _ pipes ( current _ record , pipes ) : 
+ + # no errors seen , continue with outer loop 
+ + continue 
+ + else : 
+ + # errors seen , break out of outer loop 
+ + break 
+ + except Exception , exc : 
+ + if current _ record is None : 
+ + # we failed before we started 
+ + self . printerr ( " \ nError starting import process : \ n " ) 
+ + self . printerr ( str ( exc ) ) 
+ + if self . debug : 
+ + traceback . print _ exc ( ) 
+ + else : 
+ + self . printerr ( " \ n " + str ( exc ) ) 
+ + self . printerr ( " \ nAborting import at record # % d . " 
+ + " Previously inserted records and some records after " 
+ + " this number may be present . " 
+ + % ( current _ record , ) ) 
+ + if self . debug : 
+ + traceback . print _ exc ( ) 
+ finally : 
+ + # send a message that indicates we ' re done 
+ + for pipe in pipes : 
+ + pipe . send ( ( None , None ) ) 
+ + 
+ + for process in processes : 
+ + process . join ( ) 
+ + 
+ + self . _ check _ child _ pipes ( current _ record , pipes ) 
+ + 
+ + for pipe in pipes : 
+ + pipe . close ( ) 
+ + 
+ if do _ close : 
+ linesource . close ( ) 
+ elif self . tty : 
+ print 
+ - return rownum 
+ 
+ - def create _ insert _ statement ( self , columns , nullval , table _ meta , row ) : 
+ + return current _ record 
+ 
+ - if len ( row ) ! = len ( columns ) : 
+ - raise ValueError ( 
+ - " Record has the wrong number of fields ( % d instead of % d ) . " 
+ - % ( len ( row ) , len ( columns ) ) ) 
+ + def _ check _ child _ pipes ( self , current _ record , pipes ) : 
+ + # check the pipes for errors from child processes 
+ + for pipe in pipes : 
+ + if pipe . poll ( ) : 
+ + try : 
+ + ( record _ num , error ) = pipe . recv ( ) 
+ + self . printerr ( " \ n " + str ( error ) ) 
+ + self . printerr ( 
+ + " Aborting import at record # % d . " 
+ + " Previously inserted records are still present , " 
+ + " and some records after that may be present as well . " 
+ + % ( record _ num , ) ) 
+ + return False 
+ + except EOFError : 
+ + # pipe is closed , nothing to read 
+ + self . printerr ( " \ nChild process died without notification , " 
+ + " aborting import at record # % d . Previously " 
+ + " inserted records are probably still present , " 
+ + " and some records after that may be present " 
+ + " as well . " % ( current _ record , ) ) 
+ + return False 
+ + return True 
+ 
+ - rowmap = { } 
+ - primary _ key _ columns = [ col . name for col in table _ meta . primary _ key ] 
+ - for name , value in zip ( columns , row ) : 
+ - type = table _ meta . columns [ name ] . data _ type 
+ - cqltype = table _ meta . columns [ name ] . typestring 
+ + def multiproc _ import ( self , pipe , ks , cf , columns , nullval ) : 
+ + " " " 
+ + This method is where child processes start when doing a COPY FROM 
+ + operation . The child process will open one connection to the node and 
+ + interact directly with the connection , bypassing most of the driver 
+ + code . Because we don ' t need retries , connection pooling , thread safety , 
+ + and other fancy features , this is okay . 
+ + " " " 
+ 
+ - if value ! = nullval : 
+ - if cqltype in ( ' ascii ' , ' text ' , ' timestamp ' , ' date ' , ' time ' , ' inet ' ) : 
+ - rowmap [ name ] = protect _ value ( value ) 
+ - else : 
+ - rowmap [ name ] = value 
+ - elif name in primary _ key _ columns : 
+ - # By default , nullval is an empty string . See CASSANDRA - 7792 for details . 
+ - message = " Cannot insert null value for primary key column ' % s ' . " % ( name , ) 
+ - if nullval = = ' ' : 
+ - message + = " If you want to insert empty strings , consider using " \ 
+ - " the WITH NULL = < marker > option for COPY . " 
+ - self . printerr ( message ) 
+ - return False 
+ - else : 
+ - rowmap [ name ] = ' null ' 
+ - # would be nice to be able to use a prepared query here , but in order 
+ - # to use that interface , we ' d need to have all the input as native 
+ - # values already , reading them from text just like the various 
+ - # Cassandra cql types do . Better just to submit them all as intact 
+ - # CQL string literals and let Cassandra do its thing . 
+ - query = ' INSERT INTO % s . % s ( % s ) VALUES ( % s ) ' % ( 
+ - protect _ name ( table _ meta . keyspace . name ) , 
+ - protect _ name ( table _ meta . name ) , 
+ - ' , ' . join ( protect _ names ( rowmap . keys ( ) ) ) , 
+ - ' , ' . join ( rowmap . values ( ) ) 
+ - ) 
+ - if self . debug : 
+ - print ' Import using CQL : % s ' % query 
+ - return SimpleStatement ( query ) 
+ + # open a new connection for this subprocess 
+ + new _ cluster = Cluster ( 
+ + contact _ points = ( self . hostname , ) , 
+ + port = self . port , 
+ + cql _ version = self . conn . cql _ version , 
+ + protocol _ version = DEFAULT _ PROTOCOL _ VERSION , 
+ + auth _ provider = self . auth _ provider , 
+ + ssl _ options = sslhandling . ssl _ settings ( self . hostname , CONFIG _ FILE ) if self . ssl else None , 
+ + load _ balancing _ policy = WhiteListRoundRobinPolicy ( [ self . hostname ] ) , 
+ + compression = None ) 
+ + session = new _ cluster . connect ( self . keyspace ) 
+ + conn = session . _ pools . values ( ) [ 0 ] . _ connection 
+ + 
+ + # pre - build as much of the query as we can 
+ + table _ meta = self . get _ table _ meta ( ks , cf ) 
+ + pk _ cols = [ col . name for col in table _ meta . primary _ key ] 
+ + cqltypes = [ table _ meta . columns [ name ] . typestring for name in columns ] 
+ + pk _ indexes = [ columns . index ( col . name ) for col in table _ meta . primary _ key ] 
+ + query = ' INSERT INTO % s . % s ( % s ) VALUES ( % % s ) ' % ( 
+ + protect _ name ( ks ) , 
+ + protect _ name ( cf ) , 
+ + ' , ' . join ( columns ) ) 
+ + 
+ + # we need to handle some types specially 
+ + should _ escape = [ t in ( ' ascii ' , ' text ' , ' timestamp ' , ' date ' , ' time ' , ' inet ' ) for t in cqltypes ] 
+ + 
+ + insert _ timestamp = int ( time . time ( ) * 1e6 ) 
+ + 
+ + def callback ( record _ num , response ) : 
+ + # This is the callback we register for all inserts . Because this 
+ + # is run on the event - loop thread , we need to hold a lock when 
+ + # adjusting in _ flight . 
+ + with conn . lock : 
+ + conn . in _ flight - = 1 
+ + 
+ + if not isinstance ( response , ResultMessage ) : 
+ + # It ' s an error . Notify the parent process and let it send 
+ + # a stop signal to all child processes ( including this one ) . 
+ + pipe . send ( ( record _ num , str ( response ) ) ) 
+ + if isinstance ( response , Exception ) and self . debug : 
+ + traceback . print _ exc ( response ) 
+ + 
+ + current _ record = 0 
+ + insert _ num = 0 
+ + try : 
+ + while True : 
+ + # To avoid totally maxing out the connection , 
+ + # defer to the reactor thread when we ' re close 
+ + # to capacity 
+ + if conn . in _ flight > ( conn . max _ request _ id * 0 . 9 ) : 
+ + conn . _ readable = True 
+ + time . sleep ( 0 . 05 ) 
+ + continue 
+ + 
+ + try : 
+ + ( current _ record , row ) = pipe . recv ( ) 
+ + except EOFError : 
+ + # the pipe was closed and there ' s nothing to receive 
+ + sys . stdout . write ( ' Failed to read from pipe : \ n \ n ' ) 
+ + sys . stdout . flush ( ) 
+ + conn . _ writable = True 
+ + conn . _ readable = True 
+ + break 
+ + 
+ + # see if the parent process has signaled that we are done 
+ + if ( current _ record , row ) = = ( None , None ) : 
+ + conn . _ writable = True 
+ + conn . _ readable = True 
+ + pipe . close ( ) 
+ + break 
+ + 
+ + # format the values in the row 
+ + for i , value in enumerate ( row ) : 
+ + if value ! = nullval : 
+ + if should _ escape [ i ] : 
+ + row [ i ] = protect _ value ( value ) 
+ + elif i in pk _ indexes : 
+ + # By default , nullval is an empty string . See CASSANDRA - 7792 for details . 
+ + message = " Cannot insert null value for primary key column ' % s ' . " % ( pk _ cols [ i ] , ) 
+ + if nullval = = ' ' : 
+ + message + = " If you want to insert empty strings , consider using " \ 
+ + " the WITH NULL = < marker > option for COPY . " 
+ + pipe . send ( ( current _ record , message ) ) 
+ + return 
+ + else : 
+ + row [ i ] = ' null ' 
+ + 
+ + full _ query = query % ( ' , ' . join ( row ) , ) 
+ + query _ message = QueryMessage ( 
+ + full _ query , self . consistency _ level , serial _ consistency _ level = None , 
+ + fetch _ size = None , paging _ state = None , timestamp = insert _ timestamp ) 
+ + 
+ + request _ id = conn . get _ request _ id ( ) 
+ + binary _ message = query _ message . to _ binary ( 
+ + stream _ id = request _ id , protocol _ version = DEFAULT _ PROTOCOL _ VERSION , compression = None ) 
+ + 
+ + # add the message directly to the connection ' s queue 
+ + with conn . lock : 
+ + conn . in _ flight + = 1 
+ + conn . _ callbacks [ request _ id ] = partial ( callback , current _ record ) 
+ + conn . deque . append ( binary _ message ) 
+ + 
+ + # every 50 records , clear the pending writes queue and read 
+ + # any responses we have 
+ + if insert _ num % 50 = = 0 : 
+ + conn . _ writable = True 
+ + conn . _ readable = True 
+ + 
+ + insert _ num + = 1 
+ + except Exception , exc : 
+ + pipe . send ( ( current _ record , exc ) ) 
+ + finally : 
+ + # wait for any pending requests to finish 
+ + while conn . in _ flight > 0 : 
+ + conn . _ readable = True 
+ + time . sleep ( 0 . 01 ) 
+ 
+ + new _ cluster . shutdown ( ) 
+ 
+ def perform _ csv _ export ( self , ks , cf , columns , fname , opts ) : 
+ dialect _ options = self . csv _ dialect _ defaults . copy ( ) 
+ diff - - git a / pylib / cqlshlib / async _ insert . py b / pylib / cqlshlib / async _ insert . py 
+ deleted file mode 100644 
+ index d325716 . . 0000000 
+ - - - a / pylib / cqlshlib / async _ insert . py 
+ + + + / dev / null 
+ @ @ - 1 , 115 + 0 , 0 @ @ 
+ - # Licensed to the Apache Software Foundation ( ASF ) under one 
+ - # or more contributor license agreements . See the NOTICE file 
+ - # distributed with this work for additional information 
+ - # regarding copyright ownership . The ASF licenses this file 
+ - # to you under the Apache License , Version 2 . 0 ( the 
+ - # " License " ) ; you may not use this file except in compliance 
+ - # with the License . You may obtain a copy of the License at 
+ - # 
+ - # http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - # 
+ - # Unless required by applicable law or agreed to in writing , software 
+ - # distributed under the License is distributed on an " AS IS " BASIS , 
+ - # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - # See the License for the specific language governing permissions and 
+ - # limitations under the License . 
+ - 
+ - from threading import Event , Condition 
+ - from . import meter 
+ - import sys 
+ - 
+ - class _ CountDownLatch ( object ) : 
+ - def _ _ init _ _ ( self , counter = 1 ) : 
+ - self . _ count = counter 
+ - self . _ lock = Condition ( ) 
+ - 
+ - def count _ down ( self ) : 
+ - with self . _ lock : 
+ - self . _ count - = 1 
+ - if self . _ count < = 0 : 
+ - self . _ lock . notifyAll ( ) 
+ - 
+ - def await ( self ) : 
+ - with self . _ lock : 
+ - while self . _ count > 0 : 
+ - # use a timeout so that the main thread wakes up occasionally 
+ - # so it can see keyboard interrupts ( CASSANDRA - 7815 ) 
+ - self . _ lock . wait ( 0 . 5 ) 
+ - 
+ - 
+ - class _ ChainedWriter ( object ) : 
+ - 
+ - CONCURRENCY = 100 
+ - 
+ - def _ _ init _ _ ( self , session , enumerated _ reader , statement _ func ) : 
+ - self . _ sentinel = object ( ) 
+ - self . _ session = session 
+ - self . _ cancellation _ event = Event ( ) 
+ - self . _ first _ error = None 
+ - self . _ task _ counter = _ CountDownLatch ( self . CONCURRENCY ) 
+ - self . _ enumerated _ reader = enumerated _ reader 
+ - self . _ statement _ func = statement _ func 
+ - self . _ meter = meter . Meter ( ) 
+ - 
+ - def insert ( self ) : 
+ - if not self . _ enumerated _ reader : 
+ - return 0 , None 
+ - 
+ - for i in xrange ( self . CONCURRENCY ) : 
+ - self . _ execute _ next ( self . _ sentinel , 0 ) 
+ - 
+ - try : 
+ - self . _ task _ counter . await ( ) 
+ - except KeyboardInterrupt : 
+ - self . _ cancellation _ event . set ( ) 
+ - sys . stdout . write ( ' Aborting due to keyboard interrupt \ n ' ) 
+ - self . _ task _ counter . await ( ) 
+ - self . _ meter . done ( ) 
+ - return self . _ meter . num _ finished ( ) , self . _ first _ error 
+ - 
+ - 
+ - def _ abort ( self , error , failed _ record ) : 
+ - if not self . _ first _ error : 
+ - self . _ first _ error = error , failed _ record 
+ - self . _ task _ counter . count _ down ( ) 
+ - self . _ cancellation _ event . set ( ) 
+ - 
+ - def _ handle _ error ( self , error , failed _ record ) : 
+ - self . _ abort ( error , failed _ record ) 
+ - 
+ - def _ execute _ next ( self , result , last _ completed _ record ) : 
+ - if self . _ cancellation _ event . is _ set ( ) : 
+ - self . _ task _ counter . count _ down ( ) 
+ - return 
+ - 
+ - if result is not self . _ sentinel : 
+ - self . _ meter . mark _ written ( ) 
+ - 
+ - try : 
+ - ( current _ record , row ) = next ( self . _ enumerated _ reader ) 
+ - except StopIteration : 
+ - self . _ task _ counter . count _ down ( ) 
+ - return 
+ - except Exception as exc : 
+ - self . _ abort ( exc , last _ completed _ record ) 
+ - return 
+ - 
+ - if self . _ cancellation _ event . is _ set ( ) : 
+ - self . _ task _ counter . count _ down ( ) 
+ - return 
+ - 
+ - try : 
+ - statement = self . _ statement _ func ( row ) 
+ - future = self . _ session . execute _ async ( statement ) 
+ - future . add _ callbacks ( callback = self . _ execute _ next , 
+ - callback _ args = ( current _ record , ) , 
+ - errback = self . _ handle _ error , 
+ - errback _ args = ( current _ record , ) ) 
+ - except Exception as exc : 
+ - self . _ abort ( exc , current _ record ) 
+ - return 
+ - 
+ - 
+ - def insert _ concurrent ( session , enumerated _ reader , statement _ func ) : 
+ - return _ ChainedWriter ( session , enumerated _ reader , statement _ func ) . insert ( ) 
+ - 
+ diff - - git a / pylib / cqlshlib / meter . py b / pylib / cqlshlib / meter . py 
+ deleted file mode 100644 
+ index e1a6bfc . . 0000000 
+ - - - a / pylib / cqlshlib / meter . py 
+ + + + / dev / null 
+ @ @ - 1 , 59 + 0 , 0 @ @ 
+ - # Licensed to the Apache Software Foundation ( ASF ) under one 
+ - # or more contributor license agreements . See the NOTICE file 
+ - # distributed with this work for additional information 
+ - # regarding copyright ownership . The ASF licenses this file 
+ - # to you under the Apache License , Version 2 . 0 ( the 
+ - # " License " ) ; you may not use this file except in compliance 
+ - # with the License . You may obtain a copy of the License at 
+ - # 
+ - # http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - # 
+ - # Unless required by applicable law or agreed to in writing , software 
+ - # distributed under the License is distributed on an " AS IS " BASIS , 
+ - # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - # See the License for the specific language governing permissions and 
+ - # limitations under the License . 
+ - 
+ - from time import time 
+ - import sys 
+ - from threading import RLock 
+ - 
+ - 
+ - class Meter ( object ) : 
+ - 
+ - def _ _ init _ _ ( self ) : 
+ - self . _ num _ finished = 0 
+ - self . _ last _ checkpoint _ time = None 
+ - self . _ current _ rate = 0 . 0 
+ - self . _ lock = RLock ( ) 
+ - 
+ - def mark _ written ( self ) : 
+ - with self . _ lock : 
+ - if not self . _ last _ checkpoint _ time : 
+ - self . _ last _ checkpoint _ time = time ( ) 
+ - self . _ num _ finished + = 1 
+ - 
+ - if self . _ num _ finished % 10000 = = 0 : 
+ - previous _ checkpoint _ time = self . _ last _ checkpoint _ time 
+ - self . _ last _ checkpoint _ time = time ( ) 
+ - new _ rate = 10000 . 0 / ( self . _ last _ checkpoint _ time - previous _ checkpoint _ time ) 
+ - if self . _ current _ rate = = 0 . 0 : 
+ - self . _ current _ rate = new _ rate 
+ - else : 
+ - self . _ current _ rate = ( self . _ current _ rate + new _ rate ) / 2 . 0 
+ - 
+ - if self . _ num _ finished % 1000 ! = 0 : 
+ - return 
+ - output = ' Processed % s rows ; Write : % . 2f rows / s \ r ' % \ 
+ - ( self . _ num _ finished , self . _ current _ rate ) 
+ - sys . stdout . write ( output ) 
+ - sys . stdout . flush ( ) 
+ - 
+ - def num _ finished ( self ) : 
+ - with self . _ lock : 
+ - return self . _ num _ finished 
+ - 
+ - def done ( self ) : 
+ - print " " 
+ - 
+ -
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index ae1ce7a . . 7943112 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 15 , 7 + 15 , 7 @ @ 
+ * Add support for range tombstones ( CASSANDRA - 3708 ) 
+ * Improve MessagingService efficiency ( CASSANDRA - 3617 ) 
+ * Avoid ID conflicts from concurrent schema changes ( CASSANDRA - 3794 ) 
+ - * Set thrift HSHA server thread limit to unlimet by default ( CASSANDRA - 4277 ) 
+ + * Set thrift HSHA server thread limit to unlimited by default ( CASSANDRA - 4277 ) 
+ * Avoids double serialization of CF id in RowMutation messages 
+ ( CASSANDRA - 4293 ) 
+ * fix Summary component and caches to use correct partitioner ( CASSANDRA - 4289 )

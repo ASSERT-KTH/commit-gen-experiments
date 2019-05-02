@@ -1,0 +1,915 @@
+BLEU SCORE: 0.016074772865287294
+
+TEST MSG: Expire OTC messages by a single Thread
+GENERATED MSG: improve testing of StorageService init , and fix shutdown of messagingservice .
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 19cd39c . . 9ec6c95 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 14 <nl> + * Expire OutboundTcpConnection messages by a single Thread ( CASSANDRA - 13265 ) <nl> * Fail repair if insufficient responses received ( CASSANDRA - 13397 ) <nl> * Fix SSTableLoader fail when the loaded table contains dropped columns ( CASSANDRA - 13276 ) <nl> * Avoid name clashes in CassandraIndexTest ( CASSANDRA - 13427 ) <nl> diff - - git a / conf / cassandra . yaml b / conf / cassandra . yaml <nl> index 61d3844 . . 22491c6 100644 <nl> - - - a / conf / cassandra . yaml <nl> + + + b / conf / cassandra . yaml <nl> @ @ - 989 , 3 + 989 , 12 @ @ windows _ timer _ interval : 1 <nl> <nl> # Do not try to coalesce messages if we already got that many messages . This should be more than 2 and less than 128 . <nl> # otc _ coalescing _ enough _ coalesced _ messages : 8 <nl> + <nl> + # How many milliseconds to wait between two expiration runs on the backlog ( queue ) of the OutboundTcpConnection . <nl> + # Expiration is done if messages are piling up in the backlog . Droppable messages are expired to free the memory <nl> + # taken by expired messages . The interval should be between 0 and 1000 , and in most installations the default value <nl> + # will be appropriate . A smaller value could potentially expire messages slightly sooner at the expense of more CPU <nl> + # time and queue contention while iterating the backlog of messages . <nl> + # An interval of 0 disables any wait time , which is the behavior of former Cassandra versions . <nl> + # <nl> + # otc _ backlog _ expiration _ interval _ ms : 200 <nl> diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java <nl> index 9aaf7ae . . 6a99cd3 100644 <nl> - - - a / src / java / org / apache / cassandra / config / Config . java <nl> + + + b / src / java / org / apache / cassandra / config / Config . java <nl> @ @ - 298 , 6 + 298 , 12 @ @ public class Config <nl> public int otc _ coalescing _ window _ us = otc _ coalescing _ window _ us _ default ; <nl> public int otc _ coalescing _ enough _ coalesced _ messages = 8 ; <nl> <nl> + / * * <nl> + * Backlog expiration interval in milliseconds for the OutboundTcpConnection . <nl> + * / <nl> + public static final int otc _ backlog _ expiration _ interval _ ms _ default = 200 ; <nl> + public volatile int otc _ backlog _ expiration _ interval _ ms = otc _ backlog _ expiration _ interval _ ms _ default ; <nl> + <nl> public int windows _ timer _ interval = 0 ; <nl> <nl> public boolean enable _ user _ defined _ functions = false ; <nl> diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> index 602214f . . e9e54c3 100644 <nl> - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> @ @ - 1967 , 6 + 1967 , 16 @ @ public class DatabaseDescriptor <nl> conf . otc _ coalescing _ enough _ coalesced _ messages = otc _ coalescing _ enough _ coalesced _ messages ; <nl> } <nl> <nl> + public static int getOtcBacklogExpirationInterval ( ) <nl> + { <nl> + return conf . otc _ backlog _ expiration _ interval _ ms ; <nl> + } <nl> + <nl> + public static void setOtcBacklogExpirationInterval ( int intervalInMillis ) <nl> + { <nl> + conf . otc _ backlog _ expiration _ interval _ ms = intervalInMillis ; <nl> + } <nl> + <nl> public static int getWindowsTimerInterval ( ) <nl> { <nl> return conf . windows _ timer _ interval ; <nl> diff - - git a / src / java / org / apache / cassandra / net / OutboundTcpConnection . java b / src / java / org / apache / cassandra / net / OutboundTcpConnection . java <nl> index 4608399 . . 99ad194 100644 <nl> - - - a / src / java / org / apache / cassandra / net / OutboundTcpConnection . java <nl> + + + b / src / java / org / apache / cassandra / net / OutboundTcpConnection . java <nl> @ @ - 31 , 6 + 31 , 7 @ @ import java . util . concurrent . BlockingQueue ; <nl> import java . util . concurrent . CountDownLatch ; <nl> import java . util . concurrent . LinkedBlockingQueue ; <nl> import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . atomic . AtomicBoolean ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> import java . util . concurrent . atomic . AtomicLong ; <nl> import java . util . zip . Checksum ; <nl> @ @ - 62 , 6 + 63 , 7 @ @ import org . xerial . snappy . SnappyOutputStream ; <nl> import org . apache . cassandra . config . Config ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . util . concurrent . Uninterruptibles ; <nl> <nl> public class OutboundTcpConnection extends Thread <nl> @ @ - 116 , 9 + 118 , 14 @ @ public class OutboundTcpConnection extends Thread <nl> if ( coalescingWindow < 0 ) <nl> throw new ExceptionInInitializerError ( <nl> " Value provided for coalescing window must be greather than 0 : " + coalescingWindow ) ; <nl> + <nl> + int otc _ backlog _ expiration _ interval _ in _ ms = DatabaseDescriptor . getOtcBacklogExpirationInterval ( ) ; <nl> + if ( otc _ backlog _ expiration _ interval _ in _ ms ! = Config . otc _ backlog _ expiration _ interval _ ms _ default ) <nl> + logger . info ( " OutboundTcpConnection backlog expiration interval set to to { } ms " , otc _ backlog _ expiration _ interval _ in _ ms ) ; <nl> + <nl> } <nl> <nl> - private static final MessageOut CLOSE _ SENTINEL = new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) ; <nl> + private static final MessageOut < ? > CLOSE _ SENTINEL = new MessageOut < MessagingService . Verb > ( MessagingService . Verb . INTERNAL _ RESPONSE ) ; <nl> private volatile boolean isStopped = false ; <nl> <nl> private static final int OPEN _ RETRY _ DELAY = 100 ; / / ms between retries <nl> @ @ - 128 , 6 + 135 , 11 @ @ public class OutboundTcpConnection extends Thread <nl> static final int LZ4 _ HASH _ SEED = 0x9747b28c ; <nl> <nl> private final BlockingQueue < QueuedMessage > backlog = new LinkedBlockingQueue < > ( ) ; <nl> + private static final String BACKLOG _ PURGE _ SIZE _ PROPERTY = PREFIX + " otc _ backlog _ purge _ size " ; <nl> + @ VisibleForTesting <nl> + static final int BACKLOG _ PURGE _ SIZE = Integer . getInteger ( BACKLOG _ PURGE _ SIZE _ PROPERTY , 1024 ) ; <nl> + private final AtomicBoolean backlogExpirationActive = new AtomicBoolean ( false ) ; <nl> + private volatile long backlogNextExpirationTime ; <nl> <nl> private final OutboundTcpConnectionPool poolReference ; <nl> <nl> @ @ - 164 , 11 + 176 , 11 @ @ public class OutboundTcpConnection extends Thread <nl> <nl> public void enqueue ( MessageOut < ? > message , int id ) <nl> { <nl> - if ( backlog . size ( ) > 1024 ) <nl> - expireMessages ( ) ; <nl> + long nanoTime = System . nanoTime ( ) ; <nl> + expireMessages ( nanoTime ) ; <nl> try <nl> { <nl> - backlog . put ( new QueuedMessage ( message , id ) ) ; <nl> + backlog . put ( new QueuedMessage ( message , id , nanoTime ) ) ; <nl> } <nl> catch ( InterruptedException e ) <nl> { <nl> @ @ - 176 , 6 + 188 , 18 @ @ public class OutboundTcpConnection extends Thread <nl> } <nl> } <nl> <nl> + / * * <nl> + * This is a helper method for unit testing . Disclaimer : Do not use this method outside unit tests , as <nl> + * this method is iterating the queue which can be an expensive operation ( CPU time , queue locking ) . <nl> + * <nl> + * @ return true , if the queue contains at least one expired element <nl> + * / <nl> + @ VisibleForTesting / / ( otherwise = VisibleForTesting . NONE ) <nl> + boolean backlogContainsExpiredMessages ( long nowNanos ) <nl> + { <nl> + return backlog . stream ( ) . anyMatch ( entry - > entry . isTimedOut ( nowNanos ) ) ; <nl> + } <nl> + <nl> void closeSocket ( boolean destroyThread ) <nl> { <nl> isStopped = destroyThread ; / / Exit loop to stop the thread <nl> @ @ - 214 , 9 + 238 , 8 @ @ public class OutboundTcpConnection extends Thread <nl> throw new AssertionError ( e ) ; <nl> } <nl> <nl> - currentMsgBufferCount = drainedMessages . size ( ) ; <nl> + int count = currentMsgBufferCount = drainedMessages . size ( ) ; <nl> <nl> - int count = drainedMessages . size ( ) ; <nl> / / The timestamp of the first message has already been provided to the coalescing strategy <nl> / / so skip logging it . <nl> inner : <nl> @ @ - 233 , 14 + 256 , 16 @ @ public class OutboundTcpConnection extends Thread <nl> continue ; <nl> } <nl> <nl> - if ( qm . isTimedOut ( ) ) <nl> + if ( qm . isTimedOut ( System . nanoTime ( ) ) ) <nl> dropped . incrementAndGet ( ) ; <nl> else if ( socket ! = null | | connect ( ) ) <nl> writeConnected ( qm , count = = 1 & & backlog . isEmpty ( ) ) ; <nl> else <nl> { <nl> - / / clear out the queue , else gossip messages back up . <nl> - drainedMessages . clear ( ) ; <nl> + / / Not connected ! Clear out the queue , else gossip messages back up . Update dropped <nl> + / / statistics accordingly . Hint : The statistics may be slightly too low , if messages <nl> + / / are added between the calls of backlog . size ( ) and backlog . clear ( ) <nl> + dropped . addAndGet ( backlog . size ( ) ) ; <nl> backlog . clear ( ) ; <nl> break inner ; <nl> } <nl> @ @ - 254 , 6 + 279 , 8 @ @ public class OutboundTcpConnection extends Thread <nl> } <nl> currentMsgBufferCount = - - count ; <nl> } <nl> + / / Update dropped statistics by the number of unprocessed drainedMessages <nl> + dropped . addAndGet ( currentMsgBufferCount ) ; <nl> drainedMessages . clear ( ) ; <nl> } <nl> } <nl> @ @ - 343 , 7 + 370 , 7 @ @ public class OutboundTcpConnection extends Thread <nl> } <nl> } <nl> <nl> - private void writeInternal ( MessageOut message , int id , long timestamp ) throws IOException <nl> + private void writeInternal ( MessageOut < ? > message , int id , long timestamp ) throws IOException <nl> { <nl> out . writeInt ( MessagingService . PROTOCOL _ MAGIC ) ; <nl> <nl> @ @ - 563 , 18 + 590 , 53 @ @ public class OutboundTcpConnection extends Thread <nl> return version . get ( ) ; <nl> } <nl> <nl> - private void expireMessages ( ) <nl> + / * * <nl> + * Expire elements from the queue if the queue is pretty full and expiration is not already in progress . <nl> + * This method will only remove droppable expired entries . If no such element exists , nothing is removed from the queue . <nl> + * <nl> + * @ param timestampNanos The current time as from System . nanoTime ( ) <nl> + * / <nl> + @ VisibleForTesting <nl> + void expireMessages ( long timestampNanos ) <nl> { <nl> - Iterator < QueuedMessage > iter = backlog . iterator ( ) ; <nl> - while ( iter . hasNext ( ) ) <nl> + if ( backlog . size ( ) < = BACKLOG _ PURGE _ SIZE ) <nl> + return ; / / Plenty of space <nl> + <nl> + if ( backlogNextExpirationTime - timestampNanos > 0 ) <nl> + return ; / / Expiration is not due . <nl> + <nl> + / * * <nl> + * Expiration is an expensive process . Iterating the queue locks the queue for both writes and <nl> + * reads during iter . next ( ) and iter . remove ( ) . Thus letting only a single Thread do expiration . <nl> + * / <nl> + if ( backlogExpirationActive . compareAndSet ( false , true ) ) <nl> { <nl> - QueuedMessage qm = iter . next ( ) ; <nl> - if ( ! qm . droppable ) <nl> - continue ; <nl> - if ( ! qm . isTimedOut ( ) ) <nl> - return ; <nl> - iter . remove ( ) ; <nl> - dropped . incrementAndGet ( ) ; <nl> + try <nl> + { <nl> + Iterator < QueuedMessage > iter = backlog . iterator ( ) ; <nl> + while ( iter . hasNext ( ) ) <nl> + { <nl> + QueuedMessage qm = iter . next ( ) ; <nl> + if ( ! qm . droppable ) <nl> + continue ; <nl> + if ( ! qm . isTimedOut ( timestampNanos ) ) <nl> + continue ; <nl> + iter . remove ( ) ; <nl> + dropped . incrementAndGet ( ) ; <nl> + } <nl> + <nl> + if ( logger . isTraceEnabled ( ) ) <nl> + { <nl> + long duration = TimeUnit . NANOSECONDS . toMicros ( System . nanoTime ( ) - timestampNanos ) ; <nl> + logger . trace ( " Expiration of { } took { } μ s " , getName ( ) , duration ) ; <nl> + } <nl> + } <nl> + finally <nl> + { <nl> + long backlogExpirationIntervalNanos = TimeUnit . MILLISECONDS . toNanos ( DatabaseDescriptor . getOtcBacklogExpirationInterval ( ) ) ; <nl> + backlogNextExpirationTime = timestampNanos + backlogExpirationIntervalNanos ; <nl> + backlogExpirationActive . set ( false ) ; <nl> + } <nl> } <nl> } <nl> <nl> @ @ - 586 , 18 + 648 , 19 @ @ public class OutboundTcpConnection extends Thread <nl> final long timestampNanos ; <nl> final boolean droppable ; <nl> <nl> - QueuedMessage ( MessageOut < ? > message , int id ) <nl> + QueuedMessage ( MessageOut < ? > message , int id , long timestampNanos ) <nl> { <nl> this . message = message ; <nl> this . id = id ; <nl> - this . timestampNanos = System . nanoTime ( ) ; <nl> + this . timestampNanos = timestampNanos ; <nl> this . droppable = MessagingService . DROPPABLE _ VERBS . contains ( message . verb ) ; <nl> } <nl> <nl> / * * don ' t drop a non - droppable message just because it ' s timestamp is expired * / <nl> - boolean isTimedOut ( ) <nl> + boolean isTimedOut ( long nowNanos ) <nl> { <nl> - return droppable & & timestampNanos < System . nanoTime ( ) - TimeUnit . MILLISECONDS . toNanos ( message . getTimeout ( ) ) ; <nl> + long messageTimeoutNanos = TimeUnit . MILLISECONDS . toNanos ( message . getTimeout ( ) ) ; <nl> + return droppable & & nowNanos - timestampNanos > messageTimeoutNanos ; <nl> } <nl> <nl> boolean shouldRetry ( ) <nl> @ @ - 615 , 7 + 678 , 7 @ @ public class OutboundTcpConnection extends Thread <nl> { <nl> RetriedQueuedMessage ( QueuedMessage msg ) <nl> { <nl> - super ( msg . message , msg . id ) ; <nl> + super ( msg . message , msg . id , msg . timestampNanos ) ; <nl> } <nl> <nl> boolean shouldRetry ( ) <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index cffd63c . . ea082d5 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 72 , 8 + 72 , 6 @ @ import org . apache . cassandra . triggers . TriggerExecutor ; <nl> import org . apache . cassandra . utils . * ; <nl> import org . apache . cassandra . utils . AbstractIterator ; <nl> <nl> - import static com . google . common . collect . Iterables . contains ; <nl> - <nl> public class StorageProxy implements StorageProxyMBean <nl> { <nl> public static final String MBEAN _ NAME = " org . apache . cassandra . db : type = StorageProxy " ; <nl> @ @ - 2683 , 4 + 2681 , 12 @ @ public class StorageProxy implements StorageProxyMBean <nl> public long getReadRepairRepairedBackground ( ) { <nl> return ReadRepairMetrics . repairedBackground . getCount ( ) ; <nl> } <nl> + <nl> + public int getOtcBacklogExpirationInterval ( ) { <nl> + return DatabaseDescriptor . getOtcBacklogExpirationInterval ( ) ; <nl> + } <nl> + <nl> + public void setOtcBacklogExpirationInterval ( int intervalInMillis ) { <nl> + DatabaseDescriptor . setOtcBacklogExpirationInterval ( intervalInMillis ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxyMBean . java b / src / java / org / apache / cassandra / service / StorageProxyMBean . java <nl> index 0db0ca6 . . ee82a5b 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxyMBean . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxyMBean . java <nl> @ @ - 59 , 6 + 59 , 9 @ @ public interface StorageProxyMBean <nl> public long getReadRepairRepairedBlocking ( ) ; <nl> public long getReadRepairRepairedBackground ( ) ; <nl> <nl> + public int getOtcBacklogExpirationInterval ( ) ; <nl> + public void setOtcBacklogExpirationInterval ( int intervalInMillis ) ; <nl> + <nl> / * * Returns each live node ' s schema version * / <nl> public Map < String , List < String > > getSchemaVersions ( ) ; <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / net / OutboundTcpConnectionTest . java b / test / unit / org / apache / cassandra / net / OutboundTcpConnectionTest . java <nl> new file mode 100644 <nl> index 0000000 . . c09ae0f <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / net / OutboundTcpConnectionTest . java <nl> @ @ - 0 , 0 + 1 , 170 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . net ; <nl> + <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . net . MessagingService . Verb ; <nl> + import org . junit . BeforeClass ; <nl> + import org . junit . Test ; <nl> + import static org . junit . Assert . assertFalse ; <nl> + import static org . junit . Assert . assertTrue ; <nl> + <nl> + import java . net . InetAddress ; <nl> + import java . net . UnknownHostException ; <nl> + import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . atomic . AtomicInteger ; <nl> + <nl> + / * * <nl> + * The tests check whether Queue expiration in the OutboundTcpConnection behaves properly for droppable and <nl> + * non - droppable messages . <nl> + * / <nl> + public class OutboundTcpConnectionTest <nl> + { <nl> + AtomicInteger messageId = new AtomicInteger ( 0 ) ; <nl> + <nl> + final static Verb VERB _ DROPPABLE = Verb . MUTATION ; / / Droppable , 2s timeout <nl> + final static Verb VERB _ NONDROPPABLE = Verb . GOSSIP _ DIGEST _ ACK ; / / Not droppable <nl> + <nl> + final static long NANOS _ FOR _ TIMEOUT = TimeUnit . MILLISECONDS . toNanos ( DatabaseDescriptor . getTimeout ( VERB _ DROPPABLE ) * 2 ) ; <nl> + <nl> + <nl> + / * * <nl> + * Verifies our assumptions whether a Verb can be dropped or not . The tests make use of droppabilty , and <nl> + * may produce wrong test results if their droppabilty is changed . <nl> + * / <nl> + @ BeforeClass <nl> + public static void assertDroppability ( ) <nl> + { <nl> + if ( ! MessagingService . DROPPABLE _ VERBS . contains ( VERB _ DROPPABLE ) ) <nl> + throw new AssertionError ( " Expected " + VERB _ DROPPABLE + " to be droppable " ) ; <nl> + if ( MessagingService . DROPPABLE _ VERBS . contains ( VERB _ NONDROPPABLE ) ) <nl> + throw new AssertionError ( " Expected " + VERB _ NONDROPPABLE + " not to be droppable " ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Tests that non - droppable messages are never expired <nl> + * / <nl> + @ Test <nl> + public void testNondroppable ( ) throws UnknownHostException <nl> + { <nl> + OutboundTcpConnection otc = getOutboundTcpConnectionForLocalhost ( ) ; <nl> + long nanoTimeBeforeEnqueue = System . nanoTime ( ) ; <nl> + <nl> + assertFalse ( " Fresh OutboundTcpConnection contains expired messages " , <nl> + otc . backlogContainsExpiredMessages ( nanoTimeBeforeEnqueue ) ) ; <nl> + <nl> + fillToPurgeSize ( otc , VERB _ NONDROPPABLE ) ; <nl> + fillToPurgeSize ( otc , VERB _ NONDROPPABLE ) ; <nl> + otc . expireMessages ( expirationTimeNanos ( ) ) ; <nl> + <nl> + assertFalse ( " OutboundTcpConnection with non - droppable verbs should not expire " , <nl> + otc . backlogContainsExpiredMessages ( expirationTimeNanos ( ) ) ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Tests that droppable messages will be dropped after they expire , but not before . <nl> + * <nl> + * @ throws UnknownHostException <nl> + * / <nl> + @ Test <nl> + public void testDroppable ( ) throws UnknownHostException <nl> + { <nl> + OutboundTcpConnection otc = getOutboundTcpConnectionForLocalhost ( ) ; <nl> + long nanoTimeBeforeEnqueue = System . nanoTime ( ) ; <nl> + <nl> + initialFill ( otc , VERB _ DROPPABLE ) ; <nl> + assertFalse ( " OutboundTcpConnection with droppable verbs should not expire immediately " , <nl> + otc . backlogContainsExpiredMessages ( nanoTimeBeforeEnqueue ) ) ; <nl> + <nl> + otc . expireMessages ( nanoTimeBeforeEnqueue ) ; <nl> + assertFalse ( " OutboundTcpConnection with droppable verbs should not expire with enqueue - time expiration " , <nl> + otc . backlogContainsExpiredMessages ( nanoTimeBeforeEnqueue ) ) ; <nl> + <nl> + / / Lets presume , expiration time have passed = > At that time there shall be expired messages in the Queue <nl> + long nanoTimeWhenExpired = expirationTimeNanos ( ) ; <nl> + assertTrue ( " OutboundTcpConnection with droppable verbs should have expired " , <nl> + otc . backlogContainsExpiredMessages ( nanoTimeWhenExpired ) ) ; <nl> + <nl> + / / Using the same timestamp , lets expire them and check whether they have gone <nl> + otc . expireMessages ( nanoTimeWhenExpired ) ; <nl> + assertFalse ( " OutboundTcpConnection should not have expired entries " , <nl> + otc . backlogContainsExpiredMessages ( nanoTimeWhenExpired ) ) ; <nl> + <nl> + / / Actually the previous test can be done in a harder way : As expireMessages ( ) has run , we cannot have <nl> + / / ANY expired values , thus lets test also against nanoTimeBeforeEnqueue <nl> + assertFalse ( " OutboundTcpConnection should not have any expired entries " , <nl> + otc . backlogContainsExpiredMessages ( nanoTimeBeforeEnqueue ) ) ; <nl> + <nl> + } <nl> + <nl> + / * * <nl> + * Fills the given OutboundTcpConnection with ( 1 + BACKLOG _ PURGE _ SIZE ) , elements . The first <nl> + * BACKLOG _ PURGE _ SIZE elements are non - droppable , the last one is a message with the given Verb and can be <nl> + * droppable or non - droppable . <nl> + * / <nl> + private void initialFill ( OutboundTcpConnection otc , Verb verb ) <nl> + { <nl> + assertFalse ( " Fresh OutboundTcpConnection contains expired messages " , <nl> + otc . backlogContainsExpiredMessages ( System . nanoTime ( ) ) ) ; <nl> + <nl> + fillToPurgeSize ( otc , VERB _ NONDROPPABLE ) ; <nl> + MessageOut < ? > messageDroppable10s = new MessageOut < > ( verb ) ; <nl> + otc . enqueue ( messageDroppable10s , nextMessageId ( ) ) ; <nl> + otc . expireMessages ( System . nanoTime ( ) ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Returns a nano timestamp in the far future , when expiration should have been performed for VERB _ DROPPABLE . <nl> + * The offset is chosen as 2 times of the expiration time of VERB _ DROPPABLE . <nl> + * <nl> + * @ return The future nano timestamp <nl> + * / <nl> + private long expirationTimeNanos ( ) <nl> + { <nl> + return System . nanoTime ( ) + NANOS _ FOR _ TIMEOUT ; <nl> + } <nl> + <nl> + private int nextMessageId ( ) <nl> + { <nl> + return messageId . incrementAndGet ( ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Adds BACKLOG _ PURGE _ SIZE messages to the queue . Hint : At BACKLOG _ PURGE _ SIZE expiration starts to work . <nl> + * <nl> + * @ param otc <nl> + * The OutboundTcpConnection <nl> + * @ param verb <nl> + * The verb that defines the message type <nl> + * / <nl> + private void fillToPurgeSize ( OutboundTcpConnection otc , Verb verb ) <nl> + { <nl> + for ( int i = 0 ; i < OutboundTcpConnection . BACKLOG _ PURGE _ SIZE ; i + + ) <nl> + { <nl> + otc . enqueue ( new MessageOut < > ( verb ) , nextMessageId ( ) ) ; <nl> + } <nl> + } <nl> + <nl> + private OutboundTcpConnection getOutboundTcpConnectionForLocalhost ( ) throws UnknownHostException <nl> + { <nl> + InetAddress lo = InetAddress . getByName ( " 127 . 0 . 0 . 1 " ) ; <nl> + OutboundTcpConnectionPool otcPool = new OutboundTcpConnectionPool ( lo ) ; <nl> + OutboundTcpConnection otc = new OutboundTcpConnection ( otcPool ) ; <nl> + return otc ; <nl> + } <nl> + }
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java <nl> index 1f235df . . 25e1072 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java <nl> @ @ - 19 , 6 + 19 , 7 @ @ <nl> package org . apache . cassandra . concurrent ; <nl> <nl> import java . lang . management . ManagementFactory ; <nl> + import java . util . List ; <nl> import java . util . concurrent . * ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . ObjectName ; <nl> @ @ - 34 , 6 + 35 , 7 @ @ import org . apache . log4j . Logger ; <nl> public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements DebuggableThreadPoolExecutorMBean <nl> { <nl> private static Logger logger _ = Logger . getLogger ( DebuggableThreadPoolExecutor . class ) ; <nl> + private final String mbeanName ; <nl> <nl> public DebuggableThreadPoolExecutor ( String threadPoolName ) <nl> { <nl> @ @ - 51 , 9 + 53 , 10 @ @ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements <nl> super . prestartAllCoreThreads ( ) ; <nl> <nl> MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; <nl> + mbeanName = " org . apache . cassandra . concurrent : type = " + threadFactory . id ; <nl> try <nl> { <nl> - mbs . registerMBean ( this , new ObjectName ( " org . apache . cassandra . concurrent : type = " + threadFactory . id ) ) ; <nl> + mbs . registerMBean ( this , new ObjectName ( mbeanName ) ) ; <nl> } <nl> catch ( Exception e ) <nl> { <nl> @ @ - 84 , 6 + 87 , 33 @ @ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements <nl> } <nl> } <nl> <nl> + private void unregisterMBean ( ) <nl> + { <nl> + try <nl> + { <nl> + ManagementFactory . getPlatformMBeanServer ( ) . unregisterMBean ( new ObjectName ( mbeanName ) ) ; <nl> + } <nl> + catch ( Exception ex ) <nl> + { <nl> + / / don ' t let it get in the way , but notify . <nl> + logger _ . error ( ex . getMessage ( ) , ex ) ; <nl> + } <nl> + } <nl> + <nl> + @ Override <nl> + public void shutdown ( ) <nl> + { <nl> + unregisterMBean ( ) ; <nl> + super . shutdown ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public List < Runnable > shutdownNow ( ) <nl> + { <nl> + unregisterMBean ( ) ; <nl> + return super . shutdownNow ( ) ; <nl> + } <nl> + <nl> / * * <nl> * Get the number of completed tasks <nl> * / <nl> diff - - git a / src / java / org / apache / cassandra / gms / Gossiper . java b / src / java / org / apache / cassandra / gms / Gossiper . java <nl> index 3b70d17 . . f5d8d35 100644 <nl> - - - a / src / java / org / apache / cassandra / gms / Gossiper . java <nl> + + + b / src / java / org / apache / cassandra / gms / Gossiper . java <nl> @ @ - 122 , 7 + 122 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC <nl> return gossiper _ ; <nl> } <nl> <nl> - private Timer gossipTimer _ = new Timer ( false ) ; <nl> + private Timer gossipTimer _ ; <nl> private InetAddress localEndPoint _ ; <nl> private long aVeryLongTime _ ; <nl> private Random random _ = new Random ( ) ; <nl> @ @ - 144 , 6 + 144 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC <nl> <nl> private Gossiper ( ) <nl> { <nl> + gossipTimer _ = new Timer ( false ) ; <nl> aVeryLongTime _ = 259200 * 1000 ; <nl> / * register with the Failure Detector for receiving Failure detector events * / <nl> FailureDetector . instance ( ) . registerFailureDetectionEventListener ( this ) ; <nl> @ @ - 834 , 6 + 835 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC <nl> public void stop ( ) <nl> { <nl> gossipTimer _ . cancel ( ) ; <nl> + gossipTimer _ = new Timer ( false ) ; / / makes the Gossiper reentrant . <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java <nl> index 8ff93f6 . . b1ad5ed 100644 <nl> - - - a / src / java / org / apache / cassandra / net / MessagingService . java <nl> + + + b / src / java / org / apache / cassandra / net / MessagingService . java <nl> @ @ - 69 , 6 + 69 , 9 @ @ public class MessagingService <nl> <nl> / * List of sockets we are listening on * / <nl> private static Map < InetAddress , SelectionKey > listenSockets _ = new HashMap < InetAddress , SelectionKey > ( ) ; <nl> + <nl> + / * List of UdpConnections we are listening on * / <nl> + private static Map < InetAddress , UdpConnection > udpConnections _ = new HashMap < InetAddress , UdpConnection > ( ) ; <nl> <nl> / * Lookup table for registering message handlers based on the verb . * / <nl> private static Map < String , IVerbHandler > verbHandlers _ ; <nl> @ @ - 214 , 7 + 217 , 8 @ @ public class MessagingService <nl> try <nl> { <nl> connection . init ( localEp ) ; <nl> - endPoints _ . add ( localEp ) ; <nl> + endPoints _ . add ( localEp ) ; <nl> + udpConnections _ . put ( localEp , connection ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> @ @ - 497 , 7 + 501 , 7 @ @ public class MessagingService <nl> logger _ . info ( " Shutting down . . . " ) ; <nl> synchronized ( MessagingService . class ) <nl> { <nl> - / * Stop listening on any socket * / <nl> + / * Stop listening on any TCP socket * / <nl> for ( SelectionKey skey : listenSockets _ . values ( ) ) <nl> { <nl> skey . cancel ( ) ; <nl> @ @ - 509 , 6 + 513 , 13 @ @ public class MessagingService <nl> } <nl> listenSockets _ . clear ( ) ; <nl> <nl> + / * Stop listening on any UDP ports . * / <nl> + for ( UdpConnection con : udpConnections _ . values ( ) ) <nl> + { <nl> + con . close ( ) ; <nl> + } <nl> + udpConnections _ . clear ( ) ; <nl> + <nl> / * Shutdown the threads in the EventQueue ' s * / <nl> messageDeserializationExecutor _ . shutdownNow ( ) ; <nl> messageDeserializerExecutor _ . shutdownNow ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / net / SelectorManager . java b / src / java / org / apache / cassandra / net / SelectorManager . java <nl> index 7623a05 . . 16511ee 100644 <nl> - - - a / src / java / org / apache / cassandra / net / SelectorManager . java <nl> + + + b / src / java / org / apache / cassandra / net / SelectorManager . java <nl> @ @ - 35 , 6 + 35 , 9 @ @ public class SelectorManager extends Thread <nl> / / workaround JDK select / register bug <nl> Object gate = new Object ( ) ; <nl> <nl> + / / flag to indicate that shutdown has been requested . <nl> + private boolean shutdownRequested = false ; <nl> + <nl> / / The static selector manager which is used by all applications <nl> private static SelectorManager manager ; <nl> <nl> @ @ - 82 , 7 + 85 , 13 @ @ public class SelectorManager extends Thread <nl> selector . wakeup ( ) ; <nl> return channel . register ( selector , ops , handler ) ; <nl> } <nl> - } <nl> + } <nl> + <nl> + / / requests the thread to shutdown . However , it brings no guarantees . Added for testing . <nl> + private void requestShutdown ( ) <nl> + { <nl> + shutdownRequested = true ; <nl> + } <nl> <nl> / * * <nl> * This method starts the socket manager listening for events . It is <nl> @ @ - 102 , 6 + 111 , 11 @ @ public class SelectorManager extends Thread <nl> { <nl> throw new RuntimeException ( e ) ; <nl> } <nl> + if ( shutdownRequested ) <nl> + { <nl> + shutdownRequested = false ; <nl> + break ; <nl> + } <nl> } <nl> } <nl> <nl> @ @ - 145 , 6 + 159 , 22 @ @ public class SelectorManager extends Thread <nl> } <nl> <nl> / * * <nl> + * Intended to reset the singleton as part of testing . <nl> + * / <nl> + static void reset ( ) <nl> + { <nl> + synchronized ( SelectorManager . class ) <nl> + { <nl> + if ( manager ! = null ) <nl> + manager . requestShutdown ( ) ; <nl> + manager = null ; <nl> + if ( udpManager ! = null ) <nl> + udpManager . requestShutdown ( ) ; <nl> + udpManager = null ; <nl> + } <nl> + } <nl> + <nl> + / * * <nl> * Returns the SelectorManager applications should use . <nl> * <nl> * @ return The SelectorManager which applications should use <nl> diff - - git a / test / unit / org / apache / cassandra / CleanupHelper . java b / test / unit / org / apache / cassandra / CleanupHelper . java <nl> index 969a2cd . . e3cde8d 100644 <nl> - - - a / test / unit / org / apache / cassandra / CleanupHelper . java <nl> + + + b / test / unit / org / apache / cassandra / CleanupHelper . java <nl> @ @ - 19 , 6 + 19 , 7 @ @ <nl> package org . apache . cassandra ; <nl> <nl> import java . io . File ; <nl> + import java . io . IOException ; <nl> <nl> import org . junit . BeforeClass ; <nl> <nl> @ @ - 30 , 6 + 31 , 13 @ @ public class CleanupHelper <nl> private static Logger logger = Logger . getLogger ( CleanupHelper . class ) ; <nl> <nl> @ BeforeClass <nl> + public static void cleanupAndLeaveDirs ( ) <nl> + { <nl> + mkdirs ( ) ; <nl> + cleanup ( ) ; <nl> + mkdirs ( ) ; <nl> + } <nl> + <nl> public static void cleanup ( ) <nl> { <nl> / / we clean the fs twice , once to start with ( so old data files don ' t get stored by anything static if this is the first run ) <nl> @ @ - 38 , 6 + 46 , 10 @ @ public class CleanupHelper <nl> DatabaseDescriptor . getLogFileLocation ( ) , <nl> } ; <nl> <nl> + / / try to delete the directories themselves too . don ' t panic if this fails . it probably means that the process <nl> + / / doesn ' t have permissions to do so , or it contains non - cassandra generated files that were intentionally <nl> + / / put there . <nl> + <nl> for ( String dirName : directoryNames ) <nl> { <nl> File dir = new File ( dirName ) ; <nl> @ @ - 47 , 11 + 59 , 15 @ @ public class CleanupHelper <nl> } <nl> for ( File f : dir . listFiles ( ) ) <nl> { <nl> - if ( ! f . delete ( ) ) { <nl> + if ( ! f . delete ( ) ) <nl> + { <nl> logger . error ( " could not delete " + f ) ; <nl> + } <nl> } <nl> + <nl> + if ( ! dir . delete ( ) ) <nl> + logger . warn ( " could not delete " + dir . getPath ( ) ) ; <nl> } <nl> - } <nl> <nl> / / cleanup data directory which are stored as data directory / table / data files <nl> for ( String dirName : DatabaseDescriptor . getAllDataFileLocations ( ) ) <nl> @ @ - 71 , 8 + 87 , 24 @ @ public class CleanupHelper <nl> } <nl> } <nl> } <nl> + if ( ! tableFile . delete ( ) ) <nl> + logger . warn ( " could not delete " + dir . getPath ( ) ) ; <nl> } <nl> + <nl> + if ( ! dir . delete ( ) ) <nl> + logger . warn ( " could not delete " + dir . getPath ( ) ) ; <nl> } <nl> + } <nl> <nl> + public static void mkdirs ( ) <nl> + { <nl> + try <nl> + { <nl> + DatabaseDescriptor . createAllDirectories ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / net / NetPackageAccessor . java b / test / unit / org / apache / cassandra / net / NetPackageAccessor . java <nl> new file mode 100644 <nl> index 0000000 . . 408bfba <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / net / NetPackageAccessor . java <nl> @ @ - 0 , 0 + 1 , 29 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . net ; <nl> + <nl> + / * * <nl> + For accesing package - level members created for the sole purpose of testing . <nl> + * / <nl> + public class NetPackageAccessor <nl> + { <nl> + public static void resetSelectorManager ( ) <nl> + { <nl> + SelectorManager . reset ( ) ; <nl> + } <nl> + } <nl> diff - - git a / test / unit / org / apache / cassandra / service / StorageServiceTest . java b / test / unit / org / apache / cassandra / service / StorageServiceTest . java <nl> new file mode 100644 <nl> index 0000000 . . 0ec9ffe <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / service / StorageServiceTest . java <nl> @ @ - 0 , 0 + 1 , 68 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + <nl> + package org . apache . cassandra . service ; <nl> + <nl> + import org . apache . cassandra . CleanupHelper ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . net . NetPackageAccessor ; <nl> + import org . junit . Test ; <nl> + import static org . junit . Assert . assertTrue ; <nl> + import static org . junit . Assert . assertFalse ; <nl> + <nl> + import java . io . File ; <nl> + import java . io . IOException ; <nl> + <nl> + public class StorageServiceTest <nl> + { <nl> + @ Test <nl> + public void testClientOnlyMode ( ) throws IOException <nl> + { <nl> + CleanupHelper . mkdirs ( ) ; <nl> + CleanupHelper . cleanup ( ) ; <nl> + StorageService . instance ( ) . initClient ( ) ; <nl> + <nl> + / / verify that no storage directories were created . <nl> + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) <nl> + { <nl> + assertFalse ( new File ( path ) . exists ( ) ) ; <nl> + } <nl> + StorageService . instance ( ) . stopClient ( ) ; <nl> + NetPackageAccessor . resetSelectorManager ( ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testRegularMode ( ) throws IOException , InterruptedException <nl> + { <nl> + CleanupHelper . mkdirs ( ) ; <nl> + CleanupHelper . cleanup ( ) ; <nl> + StorageService . instance ( ) . initServer ( ) ; <nl> + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) <nl> + { <nl> + / / verify that storage directories are there . <nl> + assertTrue ( new File ( path ) . exists ( ) ) ; <nl> + } <nl> + / / a proper test would be to call decommission here , but decommission ( ) mixes both shutdown and datatransfer <nl> + / / calls . This test is only interested in the shutdown - related items which a properly handled by just <nl> + / / stopping the client . <nl> + / / StorageService . instance ( ) . decommission ( ) ; <nl> + StorageService . instance ( ) . stopClient ( ) ; <nl> + NetPackageAccessor . resetSelectorManager ( ) ; <nl> + } <nl> + }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 19cd39c . . 9ec6c95 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 14 
+ + * Expire OutboundTcpConnection messages by a single Thread ( CASSANDRA - 13265 ) 
+ * Fail repair if insufficient responses received ( CASSANDRA - 13397 ) 
+ * Fix SSTableLoader fail when the loaded table contains dropped columns ( CASSANDRA - 13276 ) 
+ * Avoid name clashes in CassandraIndexTest ( CASSANDRA - 13427 ) 
+ diff - - git a / conf / cassandra . yaml b / conf / cassandra . yaml 
+ index 61d3844 . . 22491c6 100644 
+ - - - a / conf / cassandra . yaml 
+ + + + b / conf / cassandra . yaml 
+ @ @ - 989 , 3 + 989 , 12 @ @ windows _ timer _ interval : 1 
+ 
+ # Do not try to coalesce messages if we already got that many messages . This should be more than 2 and less than 128 . 
+ # otc _ coalescing _ enough _ coalesced _ messages : 8 
+ + 
+ + # How many milliseconds to wait between two expiration runs on the backlog ( queue ) of the OutboundTcpConnection . 
+ + # Expiration is done if messages are piling up in the backlog . Droppable messages are expired to free the memory 
+ + # taken by expired messages . The interval should be between 0 and 1000 , and in most installations the default value 
+ + # will be appropriate . A smaller value could potentially expire messages slightly sooner at the expense of more CPU 
+ + # time and queue contention while iterating the backlog of messages . 
+ + # An interval of 0 disables any wait time , which is the behavior of former Cassandra versions . 
+ + # 
+ + # otc _ backlog _ expiration _ interval _ ms : 200 
+ diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java 
+ index 9aaf7ae . . 6a99cd3 100644 
+ - - - a / src / java / org / apache / cassandra / config / Config . java 
+ + + + b / src / java / org / apache / cassandra / config / Config . java 
+ @ @ - 298 , 6 + 298 , 12 @ @ public class Config 
+ public int otc _ coalescing _ window _ us = otc _ coalescing _ window _ us _ default ; 
+ public int otc _ coalescing _ enough _ coalesced _ messages = 8 ; 
+ 
+ + / * * 
+ + * Backlog expiration interval in milliseconds for the OutboundTcpConnection . 
+ + * / 
+ + public static final int otc _ backlog _ expiration _ interval _ ms _ default = 200 ; 
+ + public volatile int otc _ backlog _ expiration _ interval _ ms = otc _ backlog _ expiration _ interval _ ms _ default ; 
+ + 
+ public int windows _ timer _ interval = 0 ; 
+ 
+ public boolean enable _ user _ defined _ functions = false ; 
+ diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ index 602214f . . e9e54c3 100644 
+ - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ @ @ - 1967 , 6 + 1967 , 16 @ @ public class DatabaseDescriptor 
+ conf . otc _ coalescing _ enough _ coalesced _ messages = otc _ coalescing _ enough _ coalesced _ messages ; 
+ } 
+ 
+ + public static int getOtcBacklogExpirationInterval ( ) 
+ + { 
+ + return conf . otc _ backlog _ expiration _ interval _ ms ; 
+ + } 
+ + 
+ + public static void setOtcBacklogExpirationInterval ( int intervalInMillis ) 
+ + { 
+ + conf . otc _ backlog _ expiration _ interval _ ms = intervalInMillis ; 
+ + } 
+ + 
+ public static int getWindowsTimerInterval ( ) 
+ { 
+ return conf . windows _ timer _ interval ; 
+ diff - - git a / src / java / org / apache / cassandra / net / OutboundTcpConnection . java b / src / java / org / apache / cassandra / net / OutboundTcpConnection . java 
+ index 4608399 . . 99ad194 100644 
+ - - - a / src / java / org / apache / cassandra / net / OutboundTcpConnection . java 
+ + + + b / src / java / org / apache / cassandra / net / OutboundTcpConnection . java 
+ @ @ - 31 , 6 + 31 , 7 @ @ import java . util . concurrent . BlockingQueue ; 
+ import java . util . concurrent . CountDownLatch ; 
+ import java . util . concurrent . LinkedBlockingQueue ; 
+ import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . atomic . AtomicBoolean ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ import java . util . concurrent . atomic . AtomicLong ; 
+ import java . util . zip . Checksum ; 
+ @ @ - 62 , 6 + 63 , 7 @ @ import org . xerial . snappy . SnappyOutputStream ; 
+ import org . apache . cassandra . config . Config ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . util . concurrent . Uninterruptibles ; 
+ 
+ public class OutboundTcpConnection extends Thread 
+ @ @ - 116 , 9 + 118 , 14 @ @ public class OutboundTcpConnection extends Thread 
+ if ( coalescingWindow < 0 ) 
+ throw new ExceptionInInitializerError ( 
+ " Value provided for coalescing window must be greather than 0 : " + coalescingWindow ) ; 
+ + 
+ + int otc _ backlog _ expiration _ interval _ in _ ms = DatabaseDescriptor . getOtcBacklogExpirationInterval ( ) ; 
+ + if ( otc _ backlog _ expiration _ interval _ in _ ms ! = Config . otc _ backlog _ expiration _ interval _ ms _ default ) 
+ + logger . info ( " OutboundTcpConnection backlog expiration interval set to to { } ms " , otc _ backlog _ expiration _ interval _ in _ ms ) ; 
+ + 
+ } 
+ 
+ - private static final MessageOut CLOSE _ SENTINEL = new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) ; 
+ + private static final MessageOut < ? > CLOSE _ SENTINEL = new MessageOut < MessagingService . Verb > ( MessagingService . Verb . INTERNAL _ RESPONSE ) ; 
+ private volatile boolean isStopped = false ; 
+ 
+ private static final int OPEN _ RETRY _ DELAY = 100 ; / / ms between retries 
+ @ @ - 128 , 6 + 135 , 11 @ @ public class OutboundTcpConnection extends Thread 
+ static final int LZ4 _ HASH _ SEED = 0x9747b28c ; 
+ 
+ private final BlockingQueue < QueuedMessage > backlog = new LinkedBlockingQueue < > ( ) ; 
+ + private static final String BACKLOG _ PURGE _ SIZE _ PROPERTY = PREFIX + " otc _ backlog _ purge _ size " ; 
+ + @ VisibleForTesting 
+ + static final int BACKLOG _ PURGE _ SIZE = Integer . getInteger ( BACKLOG _ PURGE _ SIZE _ PROPERTY , 1024 ) ; 
+ + private final AtomicBoolean backlogExpirationActive = new AtomicBoolean ( false ) ; 
+ + private volatile long backlogNextExpirationTime ; 
+ 
+ private final OutboundTcpConnectionPool poolReference ; 
+ 
+ @ @ - 164 , 11 + 176 , 11 @ @ public class OutboundTcpConnection extends Thread 
+ 
+ public void enqueue ( MessageOut < ? > message , int id ) 
+ { 
+ - if ( backlog . size ( ) > 1024 ) 
+ - expireMessages ( ) ; 
+ + long nanoTime = System . nanoTime ( ) ; 
+ + expireMessages ( nanoTime ) ; 
+ try 
+ { 
+ - backlog . put ( new QueuedMessage ( message , id ) ) ; 
+ + backlog . put ( new QueuedMessage ( message , id , nanoTime ) ) ; 
+ } 
+ catch ( InterruptedException e ) 
+ { 
+ @ @ - 176 , 6 + 188 , 18 @ @ public class OutboundTcpConnection extends Thread 
+ } 
+ } 
+ 
+ + / * * 
+ + * This is a helper method for unit testing . Disclaimer : Do not use this method outside unit tests , as 
+ + * this method is iterating the queue which can be an expensive operation ( CPU time , queue locking ) . 
+ + * 
+ + * @ return true , if the queue contains at least one expired element 
+ + * / 
+ + @ VisibleForTesting / / ( otherwise = VisibleForTesting . NONE ) 
+ + boolean backlogContainsExpiredMessages ( long nowNanos ) 
+ + { 
+ + return backlog . stream ( ) . anyMatch ( entry - > entry . isTimedOut ( nowNanos ) ) ; 
+ + } 
+ + 
+ void closeSocket ( boolean destroyThread ) 
+ { 
+ isStopped = destroyThread ; / / Exit loop to stop the thread 
+ @ @ - 214 , 9 + 238 , 8 @ @ public class OutboundTcpConnection extends Thread 
+ throw new AssertionError ( e ) ; 
+ } 
+ 
+ - currentMsgBufferCount = drainedMessages . size ( ) ; 
+ + int count = currentMsgBufferCount = drainedMessages . size ( ) ; 
+ 
+ - int count = drainedMessages . size ( ) ; 
+ / / The timestamp of the first message has already been provided to the coalescing strategy 
+ / / so skip logging it . 
+ inner : 
+ @ @ - 233 , 14 + 256 , 16 @ @ public class OutboundTcpConnection extends Thread 
+ continue ; 
+ } 
+ 
+ - if ( qm . isTimedOut ( ) ) 
+ + if ( qm . isTimedOut ( System . nanoTime ( ) ) ) 
+ dropped . incrementAndGet ( ) ; 
+ else if ( socket ! = null | | connect ( ) ) 
+ writeConnected ( qm , count = = 1 & & backlog . isEmpty ( ) ) ; 
+ else 
+ { 
+ - / / clear out the queue , else gossip messages back up . 
+ - drainedMessages . clear ( ) ; 
+ + / / Not connected ! Clear out the queue , else gossip messages back up . Update dropped 
+ + / / statistics accordingly . Hint : The statistics may be slightly too low , if messages 
+ + / / are added between the calls of backlog . size ( ) and backlog . clear ( ) 
+ + dropped . addAndGet ( backlog . size ( ) ) ; 
+ backlog . clear ( ) ; 
+ break inner ; 
+ } 
+ @ @ - 254 , 6 + 279 , 8 @ @ public class OutboundTcpConnection extends Thread 
+ } 
+ currentMsgBufferCount = - - count ; 
+ } 
+ + / / Update dropped statistics by the number of unprocessed drainedMessages 
+ + dropped . addAndGet ( currentMsgBufferCount ) ; 
+ drainedMessages . clear ( ) ; 
+ } 
+ } 
+ @ @ - 343 , 7 + 370 , 7 @ @ public class OutboundTcpConnection extends Thread 
+ } 
+ } 
+ 
+ - private void writeInternal ( MessageOut message , int id , long timestamp ) throws IOException 
+ + private void writeInternal ( MessageOut < ? > message , int id , long timestamp ) throws IOException 
+ { 
+ out . writeInt ( MessagingService . PROTOCOL _ MAGIC ) ; 
+ 
+ @ @ - 563 , 18 + 590 , 53 @ @ public class OutboundTcpConnection extends Thread 
+ return version . get ( ) ; 
+ } 
+ 
+ - private void expireMessages ( ) 
+ + / * * 
+ + * Expire elements from the queue if the queue is pretty full and expiration is not already in progress . 
+ + * This method will only remove droppable expired entries . If no such element exists , nothing is removed from the queue . 
+ + * 
+ + * @ param timestampNanos The current time as from System . nanoTime ( ) 
+ + * / 
+ + @ VisibleForTesting 
+ + void expireMessages ( long timestampNanos ) 
+ { 
+ - Iterator < QueuedMessage > iter = backlog . iterator ( ) ; 
+ - while ( iter . hasNext ( ) ) 
+ + if ( backlog . size ( ) < = BACKLOG _ PURGE _ SIZE ) 
+ + return ; / / Plenty of space 
+ + 
+ + if ( backlogNextExpirationTime - timestampNanos > 0 ) 
+ + return ; / / Expiration is not due . 
+ + 
+ + / * * 
+ + * Expiration is an expensive process . Iterating the queue locks the queue for both writes and 
+ + * reads during iter . next ( ) and iter . remove ( ) . Thus letting only a single Thread do expiration . 
+ + * / 
+ + if ( backlogExpirationActive . compareAndSet ( false , true ) ) 
+ { 
+ - QueuedMessage qm = iter . next ( ) ; 
+ - if ( ! qm . droppable ) 
+ - continue ; 
+ - if ( ! qm . isTimedOut ( ) ) 
+ - return ; 
+ - iter . remove ( ) ; 
+ - dropped . incrementAndGet ( ) ; 
+ + try 
+ + { 
+ + Iterator < QueuedMessage > iter = backlog . iterator ( ) ; 
+ + while ( iter . hasNext ( ) ) 
+ + { 
+ + QueuedMessage qm = iter . next ( ) ; 
+ + if ( ! qm . droppable ) 
+ + continue ; 
+ + if ( ! qm . isTimedOut ( timestampNanos ) ) 
+ + continue ; 
+ + iter . remove ( ) ; 
+ + dropped . incrementAndGet ( ) ; 
+ + } 
+ + 
+ + if ( logger . isTraceEnabled ( ) ) 
+ + { 
+ + long duration = TimeUnit . NANOSECONDS . toMicros ( System . nanoTime ( ) - timestampNanos ) ; 
+ + logger . trace ( " Expiration of { } took { } μ s " , getName ( ) , duration ) ; 
+ + } 
+ + } 
+ + finally 
+ + { 
+ + long backlogExpirationIntervalNanos = TimeUnit . MILLISECONDS . toNanos ( DatabaseDescriptor . getOtcBacklogExpirationInterval ( ) ) ; 
+ + backlogNextExpirationTime = timestampNanos + backlogExpirationIntervalNanos ; 
+ + backlogExpirationActive . set ( false ) ; 
+ + } 
+ } 
+ } 
+ 
+ @ @ - 586 , 18 + 648 , 19 @ @ public class OutboundTcpConnection extends Thread 
+ final long timestampNanos ; 
+ final boolean droppable ; 
+ 
+ - QueuedMessage ( MessageOut < ? > message , int id ) 
+ + QueuedMessage ( MessageOut < ? > message , int id , long timestampNanos ) 
+ { 
+ this . message = message ; 
+ this . id = id ; 
+ - this . timestampNanos = System . nanoTime ( ) ; 
+ + this . timestampNanos = timestampNanos ; 
+ this . droppable = MessagingService . DROPPABLE _ VERBS . contains ( message . verb ) ; 
+ } 
+ 
+ / * * don ' t drop a non - droppable message just because it ' s timestamp is expired * / 
+ - boolean isTimedOut ( ) 
+ + boolean isTimedOut ( long nowNanos ) 
+ { 
+ - return droppable & & timestampNanos < System . nanoTime ( ) - TimeUnit . MILLISECONDS . toNanos ( message . getTimeout ( ) ) ; 
+ + long messageTimeoutNanos = TimeUnit . MILLISECONDS . toNanos ( message . getTimeout ( ) ) ; 
+ + return droppable & & nowNanos - timestampNanos > messageTimeoutNanos ; 
+ } 
+ 
+ boolean shouldRetry ( ) 
+ @ @ - 615 , 7 + 678 , 7 @ @ public class OutboundTcpConnection extends Thread 
+ { 
+ RetriedQueuedMessage ( QueuedMessage msg ) 
+ { 
+ - super ( msg . message , msg . id ) ; 
+ + super ( msg . message , msg . id , msg . timestampNanos ) ; 
+ } 
+ 
+ boolean shouldRetry ( ) 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index cffd63c . . ea082d5 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 72 , 8 + 72 , 6 @ @ import org . apache . cassandra . triggers . TriggerExecutor ; 
+ import org . apache . cassandra . utils . * ; 
+ import org . apache . cassandra . utils . AbstractIterator ; 
+ 
+ - import static com . google . common . collect . Iterables . contains ; 
+ - 
+ public class StorageProxy implements StorageProxyMBean 
+ { 
+ public static final String MBEAN _ NAME = " org . apache . cassandra . db : type = StorageProxy " ; 
+ @ @ - 2683 , 4 + 2681 , 12 @ @ public class StorageProxy implements StorageProxyMBean 
+ public long getReadRepairRepairedBackground ( ) { 
+ return ReadRepairMetrics . repairedBackground . getCount ( ) ; 
+ } 
+ + 
+ + public int getOtcBacklogExpirationInterval ( ) { 
+ + return DatabaseDescriptor . getOtcBacklogExpirationInterval ( ) ; 
+ + } 
+ + 
+ + public void setOtcBacklogExpirationInterval ( int intervalInMillis ) { 
+ + DatabaseDescriptor . setOtcBacklogExpirationInterval ( intervalInMillis ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxyMBean . java b / src / java / org / apache / cassandra / service / StorageProxyMBean . java 
+ index 0db0ca6 . . ee82a5b 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxyMBean . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxyMBean . java 
+ @ @ - 59 , 6 + 59 , 9 @ @ public interface StorageProxyMBean 
+ public long getReadRepairRepairedBlocking ( ) ; 
+ public long getReadRepairRepairedBackground ( ) ; 
+ 
+ + public int getOtcBacklogExpirationInterval ( ) ; 
+ + public void setOtcBacklogExpirationInterval ( int intervalInMillis ) ; 
+ + 
+ / * * Returns each live node ' s schema version * / 
+ public Map < String , List < String > > getSchemaVersions ( ) ; 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / net / OutboundTcpConnectionTest . java b / test / unit / org / apache / cassandra / net / OutboundTcpConnectionTest . java 
+ new file mode 100644 
+ index 0000000 . . c09ae0f 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / net / OutboundTcpConnectionTest . java 
+ @ @ - 0 , 0 + 1 , 170 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . net ; 
+ + 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . net . MessagingService . Verb ; 
+ + import org . junit . BeforeClass ; 
+ + import org . junit . Test ; 
+ + import static org . junit . Assert . assertFalse ; 
+ + import static org . junit . Assert . assertTrue ; 
+ + 
+ + import java . net . InetAddress ; 
+ + import java . net . UnknownHostException ; 
+ + import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . atomic . AtomicInteger ; 
+ + 
+ + / * * 
+ + * The tests check whether Queue expiration in the OutboundTcpConnection behaves properly for droppable and 
+ + * non - droppable messages . 
+ + * / 
+ + public class OutboundTcpConnectionTest 
+ + { 
+ + AtomicInteger messageId = new AtomicInteger ( 0 ) ; 
+ + 
+ + final static Verb VERB _ DROPPABLE = Verb . MUTATION ; / / Droppable , 2s timeout 
+ + final static Verb VERB _ NONDROPPABLE = Verb . GOSSIP _ DIGEST _ ACK ; / / Not droppable 
+ + 
+ + final static long NANOS _ FOR _ TIMEOUT = TimeUnit . MILLISECONDS . toNanos ( DatabaseDescriptor . getTimeout ( VERB _ DROPPABLE ) * 2 ) ; 
+ + 
+ + 
+ + / * * 
+ + * Verifies our assumptions whether a Verb can be dropped or not . The tests make use of droppabilty , and 
+ + * may produce wrong test results if their droppabilty is changed . 
+ + * / 
+ + @ BeforeClass 
+ + public static void assertDroppability ( ) 
+ + { 
+ + if ( ! MessagingService . DROPPABLE _ VERBS . contains ( VERB _ DROPPABLE ) ) 
+ + throw new AssertionError ( " Expected " + VERB _ DROPPABLE + " to be droppable " ) ; 
+ + if ( MessagingService . DROPPABLE _ VERBS . contains ( VERB _ NONDROPPABLE ) ) 
+ + throw new AssertionError ( " Expected " + VERB _ NONDROPPABLE + " not to be droppable " ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Tests that non - droppable messages are never expired 
+ + * / 
+ + @ Test 
+ + public void testNondroppable ( ) throws UnknownHostException 
+ + { 
+ + OutboundTcpConnection otc = getOutboundTcpConnectionForLocalhost ( ) ; 
+ + long nanoTimeBeforeEnqueue = System . nanoTime ( ) ; 
+ + 
+ + assertFalse ( " Fresh OutboundTcpConnection contains expired messages " , 
+ + otc . backlogContainsExpiredMessages ( nanoTimeBeforeEnqueue ) ) ; 
+ + 
+ + fillToPurgeSize ( otc , VERB _ NONDROPPABLE ) ; 
+ + fillToPurgeSize ( otc , VERB _ NONDROPPABLE ) ; 
+ + otc . expireMessages ( expirationTimeNanos ( ) ) ; 
+ + 
+ + assertFalse ( " OutboundTcpConnection with non - droppable verbs should not expire " , 
+ + otc . backlogContainsExpiredMessages ( expirationTimeNanos ( ) ) ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Tests that droppable messages will be dropped after they expire , but not before . 
+ + * 
+ + * @ throws UnknownHostException 
+ + * / 
+ + @ Test 
+ + public void testDroppable ( ) throws UnknownHostException 
+ + { 
+ + OutboundTcpConnection otc = getOutboundTcpConnectionForLocalhost ( ) ; 
+ + long nanoTimeBeforeEnqueue = System . nanoTime ( ) ; 
+ + 
+ + initialFill ( otc , VERB _ DROPPABLE ) ; 
+ + assertFalse ( " OutboundTcpConnection with droppable verbs should not expire immediately " , 
+ + otc . backlogContainsExpiredMessages ( nanoTimeBeforeEnqueue ) ) ; 
+ + 
+ + otc . expireMessages ( nanoTimeBeforeEnqueue ) ; 
+ + assertFalse ( " OutboundTcpConnection with droppable verbs should not expire with enqueue - time expiration " , 
+ + otc . backlogContainsExpiredMessages ( nanoTimeBeforeEnqueue ) ) ; 
+ + 
+ + / / Lets presume , expiration time have passed = > At that time there shall be expired messages in the Queue 
+ + long nanoTimeWhenExpired = expirationTimeNanos ( ) ; 
+ + assertTrue ( " OutboundTcpConnection with droppable verbs should have expired " , 
+ + otc . backlogContainsExpiredMessages ( nanoTimeWhenExpired ) ) ; 
+ + 
+ + / / Using the same timestamp , lets expire them and check whether they have gone 
+ + otc . expireMessages ( nanoTimeWhenExpired ) ; 
+ + assertFalse ( " OutboundTcpConnection should not have expired entries " , 
+ + otc . backlogContainsExpiredMessages ( nanoTimeWhenExpired ) ) ; 
+ + 
+ + / / Actually the previous test can be done in a harder way : As expireMessages ( ) has run , we cannot have 
+ + / / ANY expired values , thus lets test also against nanoTimeBeforeEnqueue 
+ + assertFalse ( " OutboundTcpConnection should not have any expired entries " , 
+ + otc . backlogContainsExpiredMessages ( nanoTimeBeforeEnqueue ) ) ; 
+ + 
+ + } 
+ + 
+ + / * * 
+ + * Fills the given OutboundTcpConnection with ( 1 + BACKLOG _ PURGE _ SIZE ) , elements . The first 
+ + * BACKLOG _ PURGE _ SIZE elements are non - droppable , the last one is a message with the given Verb and can be 
+ + * droppable or non - droppable . 
+ + * / 
+ + private void initialFill ( OutboundTcpConnection otc , Verb verb ) 
+ + { 
+ + assertFalse ( " Fresh OutboundTcpConnection contains expired messages " , 
+ + otc . backlogContainsExpiredMessages ( System . nanoTime ( ) ) ) ; 
+ + 
+ + fillToPurgeSize ( otc , VERB _ NONDROPPABLE ) ; 
+ + MessageOut < ? > messageDroppable10s = new MessageOut < > ( verb ) ; 
+ + otc . enqueue ( messageDroppable10s , nextMessageId ( ) ) ; 
+ + otc . expireMessages ( System . nanoTime ( ) ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Returns a nano timestamp in the far future , when expiration should have been performed for VERB _ DROPPABLE . 
+ + * The offset is chosen as 2 times of the expiration time of VERB _ DROPPABLE . 
+ + * 
+ + * @ return The future nano timestamp 
+ + * / 
+ + private long expirationTimeNanos ( ) 
+ + { 
+ + return System . nanoTime ( ) + NANOS _ FOR _ TIMEOUT ; 
+ + } 
+ + 
+ + private int nextMessageId ( ) 
+ + { 
+ + return messageId . incrementAndGet ( ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Adds BACKLOG _ PURGE _ SIZE messages to the queue . Hint : At BACKLOG _ PURGE _ SIZE expiration starts to work . 
+ + * 
+ + * @ param otc 
+ + * The OutboundTcpConnection 
+ + * @ param verb 
+ + * The verb that defines the message type 
+ + * / 
+ + private void fillToPurgeSize ( OutboundTcpConnection otc , Verb verb ) 
+ + { 
+ + for ( int i = 0 ; i < OutboundTcpConnection . BACKLOG _ PURGE _ SIZE ; i + + ) 
+ + { 
+ + otc . enqueue ( new MessageOut < > ( verb ) , nextMessageId ( ) ) ; 
+ + } 
+ + } 
+ + 
+ + private OutboundTcpConnection getOutboundTcpConnectionForLocalhost ( ) throws UnknownHostException 
+ + { 
+ + InetAddress lo = InetAddress . getByName ( " 127 . 0 . 0 . 1 " ) ; 
+ + OutboundTcpConnectionPool otcPool = new OutboundTcpConnectionPool ( lo ) ; 
+ + OutboundTcpConnection otc = new OutboundTcpConnection ( otcPool ) ; 
+ + return otc ; 
+ + } 
+ + }
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java 
+ index 1f235df . . 25e1072 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java 
+ @ @ - 19 , 6 + 19 , 7 @ @ 
+ package org . apache . cassandra . concurrent ; 
+ 
+ import java . lang . management . ManagementFactory ; 
+ + import java . util . List ; 
+ import java . util . concurrent . * ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . ObjectName ; 
+ @ @ - 34 , 6 + 35 , 7 @ @ import org . apache . log4j . Logger ; 
+ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements DebuggableThreadPoolExecutorMBean 
+ { 
+ private static Logger logger _ = Logger . getLogger ( DebuggableThreadPoolExecutor . class ) ; 
+ + private final String mbeanName ; 
+ 
+ public DebuggableThreadPoolExecutor ( String threadPoolName ) 
+ { 
+ @ @ - 51 , 9 + 53 , 10 @ @ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements 
+ super . prestartAllCoreThreads ( ) ; 
+ 
+ MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; 
+ + mbeanName = " org . apache . cassandra . concurrent : type = " + threadFactory . id ; 
+ try 
+ { 
+ - mbs . registerMBean ( this , new ObjectName ( " org . apache . cassandra . concurrent : type = " + threadFactory . id ) ) ; 
+ + mbs . registerMBean ( this , new ObjectName ( mbeanName ) ) ; 
+ } 
+ catch ( Exception e ) 
+ { 
+ @ @ - 84 , 6 + 87 , 33 @ @ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements 
+ } 
+ } 
+ 
+ + private void unregisterMBean ( ) 
+ + { 
+ + try 
+ + { 
+ + ManagementFactory . getPlatformMBeanServer ( ) . unregisterMBean ( new ObjectName ( mbeanName ) ) ; 
+ + } 
+ + catch ( Exception ex ) 
+ + { 
+ + / / don ' t let it get in the way , but notify . 
+ + logger _ . error ( ex . getMessage ( ) , ex ) ; 
+ + } 
+ + } 
+ + 
+ + @ Override 
+ + public void shutdown ( ) 
+ + { 
+ + unregisterMBean ( ) ; 
+ + super . shutdown ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public List < Runnable > shutdownNow ( ) 
+ + { 
+ + unregisterMBean ( ) ; 
+ + return super . shutdownNow ( ) ; 
+ + } 
+ + 
+ / * * 
+ * Get the number of completed tasks 
+ * / 
+ diff - - git a / src / java / org / apache / cassandra / gms / Gossiper . java b / src / java / org / apache / cassandra / gms / Gossiper . java 
+ index 3b70d17 . . f5d8d35 100644 
+ - - - a / src / java / org / apache / cassandra / gms / Gossiper . java 
+ + + + b / src / java / org / apache / cassandra / gms / Gossiper . java 
+ @ @ - 122 , 7 + 122 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC 
+ return gossiper _ ; 
+ } 
+ 
+ - private Timer gossipTimer _ = new Timer ( false ) ; 
+ + private Timer gossipTimer _ ; 
+ private InetAddress localEndPoint _ ; 
+ private long aVeryLongTime _ ; 
+ private Random random _ = new Random ( ) ; 
+ @ @ - 144 , 6 + 144 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC 
+ 
+ private Gossiper ( ) 
+ { 
+ + gossipTimer _ = new Timer ( false ) ; 
+ aVeryLongTime _ = 259200 * 1000 ; 
+ / * register with the Failure Detector for receiving Failure detector events * / 
+ FailureDetector . instance ( ) . registerFailureDetectionEventListener ( this ) ; 
+ @ @ - 834 , 6 + 835 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC 
+ public void stop ( ) 
+ { 
+ gossipTimer _ . cancel ( ) ; 
+ + gossipTimer _ = new Timer ( false ) ; / / makes the Gossiper reentrant . 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java 
+ index 8ff93f6 . . b1ad5ed 100644 
+ - - - a / src / java / org / apache / cassandra / net / MessagingService . java 
+ + + + b / src / java / org / apache / cassandra / net / MessagingService . java 
+ @ @ - 69 , 6 + 69 , 9 @ @ public class MessagingService 
+ 
+ / * List of sockets we are listening on * / 
+ private static Map < InetAddress , SelectionKey > listenSockets _ = new HashMap < InetAddress , SelectionKey > ( ) ; 
+ + 
+ + / * List of UdpConnections we are listening on * / 
+ + private static Map < InetAddress , UdpConnection > udpConnections _ = new HashMap < InetAddress , UdpConnection > ( ) ; 
+ 
+ / * Lookup table for registering message handlers based on the verb . * / 
+ private static Map < String , IVerbHandler > verbHandlers _ ; 
+ @ @ - 214 , 7 + 217 , 8 @ @ public class MessagingService 
+ try 
+ { 
+ connection . init ( localEp ) ; 
+ - endPoints _ . add ( localEp ) ; 
+ + endPoints _ . add ( localEp ) ; 
+ + udpConnections _ . put ( localEp , connection ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ @ @ - 497 , 7 + 501 , 7 @ @ public class MessagingService 
+ logger _ . info ( " Shutting down . . . " ) ; 
+ synchronized ( MessagingService . class ) 
+ { 
+ - / * Stop listening on any socket * / 
+ + / * Stop listening on any TCP socket * / 
+ for ( SelectionKey skey : listenSockets _ . values ( ) ) 
+ { 
+ skey . cancel ( ) ; 
+ @ @ - 509 , 6 + 513 , 13 @ @ public class MessagingService 
+ } 
+ listenSockets _ . clear ( ) ; 
+ 
+ + / * Stop listening on any UDP ports . * / 
+ + for ( UdpConnection con : udpConnections _ . values ( ) ) 
+ + { 
+ + con . close ( ) ; 
+ + } 
+ + udpConnections _ . clear ( ) ; 
+ + 
+ / * Shutdown the threads in the EventQueue ' s * / 
+ messageDeserializationExecutor _ . shutdownNow ( ) ; 
+ messageDeserializerExecutor _ . shutdownNow ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / net / SelectorManager . java b / src / java / org / apache / cassandra / net / SelectorManager . java 
+ index 7623a05 . . 16511ee 100644 
+ - - - a / src / java / org / apache / cassandra / net / SelectorManager . java 
+ + + + b / src / java / org / apache / cassandra / net / SelectorManager . java 
+ @ @ - 35 , 6 + 35 , 9 @ @ public class SelectorManager extends Thread 
+ / / workaround JDK select / register bug 
+ Object gate = new Object ( ) ; 
+ 
+ + / / flag to indicate that shutdown has been requested . 
+ + private boolean shutdownRequested = false ; 
+ + 
+ / / The static selector manager which is used by all applications 
+ private static SelectorManager manager ; 
+ 
+ @ @ - 82 , 7 + 85 , 13 @ @ public class SelectorManager extends Thread 
+ selector . wakeup ( ) ; 
+ return channel . register ( selector , ops , handler ) ; 
+ } 
+ - } 
+ + } 
+ + 
+ + / / requests the thread to shutdown . However , it brings no guarantees . Added for testing . 
+ + private void requestShutdown ( ) 
+ + { 
+ + shutdownRequested = true ; 
+ + } 
+ 
+ / * * 
+ * This method starts the socket manager listening for events . It is 
+ @ @ - 102 , 6 + 111 , 11 @ @ public class SelectorManager extends Thread 
+ { 
+ throw new RuntimeException ( e ) ; 
+ } 
+ + if ( shutdownRequested ) 
+ + { 
+ + shutdownRequested = false ; 
+ + break ; 
+ + } 
+ } 
+ } 
+ 
+ @ @ - 145 , 6 + 159 , 22 @ @ public class SelectorManager extends Thread 
+ } 
+ 
+ / * * 
+ + * Intended to reset the singleton as part of testing . 
+ + * / 
+ + static void reset ( ) 
+ + { 
+ + synchronized ( SelectorManager . class ) 
+ + { 
+ + if ( manager ! = null ) 
+ + manager . requestShutdown ( ) ; 
+ + manager = null ; 
+ + if ( udpManager ! = null ) 
+ + udpManager . requestShutdown ( ) ; 
+ + udpManager = null ; 
+ + } 
+ + } 
+ + 
+ + / * * 
+ * Returns the SelectorManager applications should use . 
+ * 
+ * @ return The SelectorManager which applications should use 
+ diff - - git a / test / unit / org / apache / cassandra / CleanupHelper . java b / test / unit / org / apache / cassandra / CleanupHelper . java 
+ index 969a2cd . . e3cde8d 100644 
+ - - - a / test / unit / org / apache / cassandra / CleanupHelper . java 
+ + + + b / test / unit / org / apache / cassandra / CleanupHelper . java 
+ @ @ - 19 , 6 + 19 , 7 @ @ 
+ package org . apache . cassandra ; 
+ 
+ import java . io . File ; 
+ + import java . io . IOException ; 
+ 
+ import org . junit . BeforeClass ; 
+ 
+ @ @ - 30 , 6 + 31 , 13 @ @ public class CleanupHelper 
+ private static Logger logger = Logger . getLogger ( CleanupHelper . class ) ; 
+ 
+ @ BeforeClass 
+ + public static void cleanupAndLeaveDirs ( ) 
+ + { 
+ + mkdirs ( ) ; 
+ + cleanup ( ) ; 
+ + mkdirs ( ) ; 
+ + } 
+ + 
+ public static void cleanup ( ) 
+ { 
+ / / we clean the fs twice , once to start with ( so old data files don ' t get stored by anything static if this is the first run ) 
+ @ @ - 38 , 6 + 46 , 10 @ @ public class CleanupHelper 
+ DatabaseDescriptor . getLogFileLocation ( ) , 
+ } ; 
+ 
+ + / / try to delete the directories themselves too . don ' t panic if this fails . it probably means that the process 
+ + / / doesn ' t have permissions to do so , or it contains non - cassandra generated files that were intentionally 
+ + / / put there . 
+ + 
+ for ( String dirName : directoryNames ) 
+ { 
+ File dir = new File ( dirName ) ; 
+ @ @ - 47 , 11 + 59 , 15 @ @ public class CleanupHelper 
+ } 
+ for ( File f : dir . listFiles ( ) ) 
+ { 
+ - if ( ! f . delete ( ) ) { 
+ + if ( ! f . delete ( ) ) 
+ + { 
+ logger . error ( " could not delete " + f ) ; 
+ + } 
+ } 
+ + 
+ + if ( ! dir . delete ( ) ) 
+ + logger . warn ( " could not delete " + dir . getPath ( ) ) ; 
+ } 
+ - } 
+ 
+ / / cleanup data directory which are stored as data directory / table / data files 
+ for ( String dirName : DatabaseDescriptor . getAllDataFileLocations ( ) ) 
+ @ @ - 71 , 8 + 87 , 24 @ @ public class CleanupHelper 
+ } 
+ } 
+ } 
+ + if ( ! tableFile . delete ( ) ) 
+ + logger . warn ( " could not delete " + dir . getPath ( ) ) ; 
+ } 
+ + 
+ + if ( ! dir . delete ( ) ) 
+ + logger . warn ( " could not delete " + dir . getPath ( ) ) ; 
+ } 
+ + } 
+ 
+ + public static void mkdirs ( ) 
+ + { 
+ + try 
+ + { 
+ + DatabaseDescriptor . createAllDirectories ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / net / NetPackageAccessor . java b / test / unit / org / apache / cassandra / net / NetPackageAccessor . java 
+ new file mode 100644 
+ index 0000000 . . 408bfba 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / net / NetPackageAccessor . java 
+ @ @ - 0 , 0 + 1 , 29 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . net ; 
+ + 
+ + / * * 
+ + For accesing package - level members created for the sole purpose of testing . 
+ + * / 
+ + public class NetPackageAccessor 
+ + { 
+ + public static void resetSelectorManager ( ) 
+ + { 
+ + SelectorManager . reset ( ) ; 
+ + } 
+ + } 
+ diff - - git a / test / unit / org / apache / cassandra / service / StorageServiceTest . java b / test / unit / org / apache / cassandra / service / StorageServiceTest . java 
+ new file mode 100644 
+ index 0000000 . . 0ec9ffe 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / service / StorageServiceTest . java 
+ @ @ - 0 , 0 + 1 , 68 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + 
+ + package org . apache . cassandra . service ; 
+ + 
+ + import org . apache . cassandra . CleanupHelper ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . net . NetPackageAccessor ; 
+ + import org . junit . Test ; 
+ + import static org . junit . Assert . assertTrue ; 
+ + import static org . junit . Assert . assertFalse ; 
+ + 
+ + import java . io . File ; 
+ + import java . io . IOException ; 
+ + 
+ + public class StorageServiceTest 
+ + { 
+ + @ Test 
+ + public void testClientOnlyMode ( ) throws IOException 
+ + { 
+ + CleanupHelper . mkdirs ( ) ; 
+ + CleanupHelper . cleanup ( ) ; 
+ + StorageService . instance ( ) . initClient ( ) ; 
+ + 
+ + / / verify that no storage directories were created . 
+ + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) 
+ + { 
+ + assertFalse ( new File ( path ) . exists ( ) ) ; 
+ + } 
+ + StorageService . instance ( ) . stopClient ( ) ; 
+ + NetPackageAccessor . resetSelectorManager ( ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testRegularMode ( ) throws IOException , InterruptedException 
+ + { 
+ + CleanupHelper . mkdirs ( ) ; 
+ + CleanupHelper . cleanup ( ) ; 
+ + StorageService . instance ( ) . initServer ( ) ; 
+ + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) 
+ + { 
+ + / / verify that storage directories are there . 
+ + assertTrue ( new File ( path ) . exists ( ) ) ; 
+ + } 
+ + / / a proper test would be to call decommission here , but decommission ( ) mixes both shutdown and datatransfer 
+ + / / calls . This test is only interested in the shutdown - related items which a properly handled by just 
+ + / / stopping the client . 
+ + / / StorageService . instance ( ) . decommission ( ) ; 
+ + StorageService . instance ( ) . stopClient ( ) ; 
+ + NetPackageAccessor . resetSelectorManager ( ) ; 
+ + } 
+ + }

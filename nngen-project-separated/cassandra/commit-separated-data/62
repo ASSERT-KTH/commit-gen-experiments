@@ -1,0 +1,1320 @@
+BLEU SCORE: 0.02383853510228548
+
+TEST MSG: Startup checker should wait for count rather than percentage
+GENERATED MSG: replace tcp writes w / blocking i / o
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index a7a75c0 . . aaea773 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 4 . 0 <nl> + * Startup checker should wait for count rather than percentage ( CASSANDRA - 14297 ) <nl> * Fix incorrect sorting of replicas in SimpleStrategy . calculateNaturalReplicas ( CASSANDRA - 14862 ) <nl> * Partitioned outbound internode TCP connections can occur when nodes restart ( CASSANDRA - 14358 ) <nl> * Don ' t write to system _ distributed . repair _ history , system _ traces . sessions , system _ traces . events in mixed version 3 . X / 4 . 0 clusters ( CASSANDRA - 14841 ) <nl> diff - - git a / NEWS . txt b / NEWS . txt <nl> index 0d211a3 . . 63c4a47 100644 <nl> - - - a / NEWS . txt <nl> + + + b / NEWS . txt <nl> @ @ - 38 , 6 + 38 , 13 @ @ using the provided ' sstableupgrade ' tool . <nl> <nl> New features <nl> - - - - - - - - - - - - <nl> + - Nodes will now bootstrap all intra - cluster connections at startup by default and wait <nl> + 10 seconds for the all but one node in the local data center to be connected and marked <nl> + UP in gossip . This prevents nodes from coordinating requests and failing because they <nl> + aren ' t able to connect to the cluster fast enough . block _ for _ peers _ timeout _ in _ secs in <nl> + cassandra . yaml can be used to configure how long to wait ( or whether to wait at all ) <nl> + and block _ for _ peers _ in _ remote _ dcs can be used to also block on all but one node in <nl> + each remote DC as well . See CASSANDRA - 14297 and CASSANDRA - 13993 for more information . <nl> - * Experimental * support for Transient Replication and Cheap Quorums introduced by CASSANDRA - 14404 <nl> The intended audience for this functionality is expert users of Cassandra who are prepared <nl> to validate every aspect of the database for their application and deployment practices . Future <nl> diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java <nl> index 1e80108 . . 7371df7 100644 <nl> - - - a / src / java / org / apache / cassandra / config / Config . java <nl> + + + b / src / java / org / apache / cassandra / config / Config . java <nl> @ @ - 388 , 9 + 388 , 28 @ @ public class Config <nl> public RepairCommandPoolFullStrategy repair _ command _ pool _ full _ strategy = RepairCommandPoolFullStrategy . queue ; <nl> public int repair _ command _ pool _ size = concurrent _ validations ; <nl> <nl> - / / parameters to adjust how much to delay startup until a certain amount of the cluster is connect to and marked alive <nl> - public int block _ for _ peers _ percentage = 70 ; <nl> + / * * <nl> + * When a node first starts up it intially considers all other peers as DOWN and is disconnected from all of them . <nl> + * To be useful as a coordinator ( and not introduce latency penalties on restart ) this node must have successfully <nl> + * opened all three internode TCP connections ( gossip , small , and large messages ) before advertising to clients . <nl> + * Due to this , by default , Casssandra will prime these internode TCP connections and wait for all but a single <nl> + * node to be DOWN / disconnected in the local datacenter before offering itself as a coordinator , subject to a <nl> + * timeout . See CASSANDRA - 13993 and CASSANDRA - 14297 for more details . <nl> + * <nl> + * We provide two tunables to control this behavior as some users may want to block until all datacenters are <nl> + * available ( global QUORUM / EACH _ QUORUM ) , some users may not want to block at all ( clients that already work <nl> + * around the problem ) , and some users may want to prime the connections but not delay startup . <nl> + * <nl> + * block _ for _ peers _ timeout _ in _ secs : controls how long this node will wait to connect to peers . To completely disable <nl> + * any startup connectivity checks set this to - 1 . To trigger the internode connections but immediately continue <nl> + * startup , set this to to 0 . The default is 10 seconds . <nl> + * <nl> + * block _ for _ peers _ in _ remote _ dcs : controls if this node will consider remote datacenters to wait for . The default <nl> + * is to _ not _ wait on remote datacenters . <nl> + * / <nl> public int block _ for _ peers _ timeout _ in _ secs = 10 ; <nl> + public boolean block _ for _ peers _ in _ remote _ dcs = false ; <nl> + <nl> public volatile boolean automatic _ sstable _ upgrade = false ; <nl> public volatile int max _ concurrent _ automatic _ sstable _ upgrades = 1 ; <nl> public boolean stream _ entire _ sstables = true ; <nl> diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> index 1b11a91 . . bc1e5a2 100644 <nl> - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> @ @ - 2630 , 9 + 2630 , 9 @ @ public class DatabaseDescriptor <nl> return conf . full _ query _ logging _ options ; <nl> } <nl> <nl> - public static int getBlockForPeersPercentage ( ) <nl> + public static boolean getBlockForPeersInRemoteDatacenters ( ) <nl> { <nl> - return conf . block _ for _ peers _ percentage ; <nl> + return conf . block _ for _ peers _ in _ remote _ dcs ; <nl> } <nl> <nl> public static int getBlockForPeersTimeoutInSeconds ( ) <nl> diff - - git a / src / java / org / apache / cassandra / net / StartupClusterConnectivityChecker . java b / src / java / org / apache / cassandra / net / StartupClusterConnectivityChecker . java <nl> index bab3283 . . 8e37470 100644 <nl> - - - a / src / java / org / apache / cassandra / net / StartupClusterConnectivityChecker . java <nl> + + + b / src / java / org / apache / cassandra / net / StartupClusterConnectivityChecker . java <nl> @ @ - 17 , 6 + 17 , 8 @ @ <nl> * / <nl> package org . apache . cassandra . net ; <nl> <nl> + import java . util . Collections ; <nl> + import java . util . HashMap ; <nl> import java . util . HashSet ; <nl> import java . util . Map ; <nl> import java . util . Set ; <nl> @ @ - 24 , 9 + 26 , 12 @ @ import java . util . concurrent . ConcurrentHashMap ; <nl> import java . util . concurrent . CountDownLatch ; <nl> import java . util . concurrent . TimeUnit ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> + import java . util . function . Function ; <nl> + import java . util . stream . Collectors ; <nl> <nl> import com . google . common . annotations . VisibleForTesting ; <nl> - import com . google . common . collect . Sets ; <nl> + import com . google . common . collect . HashMultimap ; <nl> + import com . google . common . collect . SetMultimap ; <nl> import com . google . common . util . concurrent . Uninterruptibles ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 48 , 73 + 53 , 126 @ @ public class StartupClusterConnectivityChecker <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( StartupClusterConnectivityChecker . class ) ; <nl> <nl> - private final int targetPercent ; <nl> + private final boolean blockForRemoteDcs ; <nl> private final long timeoutNanos ; <nl> <nl> - public static StartupClusterConnectivityChecker create ( int targetPercent , int timeoutSecs ) <nl> + public static StartupClusterConnectivityChecker create ( long timeoutSecs , boolean blockForRemoteDcs ) <nl> { <nl> - timeoutSecs = Math . max ( 1 , timeoutSecs ) ; <nl> if ( timeoutSecs > 100 ) <nl> logger . warn ( " setting the block - for - peers timeout ( in seconds ) to { } might be a bit excessive , but using it nonetheless " , timeoutSecs ) ; <nl> long timeoutNanos = TimeUnit . SECONDS . toNanos ( timeoutSecs ) ; <nl> <nl> - return new StartupClusterConnectivityChecker ( targetPercent , timeoutNanos ) ; <nl> + return new StartupClusterConnectivityChecker ( timeoutNanos , blockForRemoteDcs ) ; <nl> } <nl> <nl> @ VisibleForTesting <nl> - StartupClusterConnectivityChecker ( int targetPercent , long timeoutNanos ) <nl> + StartupClusterConnectivityChecker ( long timeoutNanos , boolean blockForRemoteDcs ) <nl> { <nl> - this . targetPercent = Math . min ( 100 , Math . max ( 0 , targetPercent ) ) ; <nl> + this . blockForRemoteDcs = blockForRemoteDcs ; <nl> this . timeoutNanos = timeoutNanos ; <nl> } <nl> <nl> / * * <nl> * @ param peers The currently known peers in the cluster ; argument is not modified . <nl> + * @ param getDatacenterSource A function for mapping peers to their datacenter . <nl> * @ return true if the requested percentage of peers are marked ALIVE in gossip and have their connections opened ; <nl> * else false . <nl> * / <nl> - public boolean execute ( Set < InetAddressAndPort > peers ) <nl> + public boolean execute ( Set < InetAddressAndPort > peers , Function < InetAddressAndPort , String > getDatacenterSource ) <nl> { <nl> - if ( targetPercent = = 0 | | peers = = null ) <nl> + if ( peers = = null | | this . timeoutNanos < 0 ) <nl> return true ; <nl> <nl> / / make a copy of the set , to avoid mucking with the input ( in case it ' s a sensitive collection ) <nl> peers = new HashSet < > ( peers ) ; <nl> - peers . remove ( FBUtilities . getBroadcastAddressAndPort ( ) ) ; <nl> + InetAddressAndPort localAddress = FBUtilities . getBroadcastAddressAndPort ( ) ; <nl> + String localDc = getDatacenterSource . apply ( localAddress ) ; <nl> <nl> + peers . remove ( localAddress ) ; <nl> if ( peers . isEmpty ( ) ) <nl> return true ; <nl> <nl> - logger . info ( " choosing to block until { } % of the { } known peers are marked alive and connections are established ; max time to wait = { } seconds " , <nl> - targetPercent , peers . size ( ) , TimeUnit . NANOSECONDS . toSeconds ( timeoutNanos ) ) ; <nl> + / / make a copy of the datacenter mapping ( in case gossip updates happen during this method or some such ) <nl> + Map < InetAddressAndPort , String > peerToDatacenter = new HashMap < > ( ) ; <nl> + SetMultimap < String , InetAddressAndPort > datacenterToPeers = HashMultimap . create ( ) ; <nl> <nl> - long startNanos = System . nanoTime ( ) ; <nl> + for ( InetAddressAndPort peer : peers ) <nl> + { <nl> + String datacenter = getDatacenterSource . apply ( peer ) ; <nl> + peerToDatacenter . put ( peer , datacenter ) ; <nl> + datacenterToPeers . put ( datacenter , peer ) ; <nl> + } <nl> + <nl> + / / In the case where we do not want to block startup on remote datacenters ( e . g . because clients only use <nl> + / / LOCAL _ X consistency levels ) , we remove all other datacenter hosts from the mapping and we only wait <nl> + / / on the remaining local datacenter . <nl> + if ( ! blockForRemoteDcs ) <nl> + { <nl> + datacenterToPeers . keySet ( ) . retainAll ( Collections . singleton ( localDc ) ) ; <nl> + logger . info ( " Blocking coordination until only a single peer is DOWN in the local datacenter , timeout = { } s " , <nl> + TimeUnit . NANOSECONDS . toSeconds ( timeoutNanos ) ) ; <nl> + } <nl> + else <nl> + { <nl> + logger . info ( " Blocking coordination until only a single peer is DOWN in each datacenter , timeout = { } s " , <nl> + TimeUnit . NANOSECONDS . toSeconds ( timeoutNanos ) ) ; <nl> + } <nl> <nl> AckMap acks = new AckMap ( 3 ) ; <nl> - int target = ( int ) ( ( targetPercent / 100 . 0 ) * peers . size ( ) ) ; <nl> - CountDownLatch latch = new CountDownLatch ( target ) ; <nl> + Map < String , CountDownLatch > dcToRemainingPeers = new HashMap < > ( datacenterToPeers . size ( ) ) ; <nl> + for ( String datacenter : datacenterToPeers . keys ( ) ) <nl> + { <nl> + dcToRemainingPeers . put ( datacenter , <nl> + new CountDownLatch ( Math . max ( datacenterToPeers . get ( datacenter ) . size ( ) - 1 , 0 ) ) ) ; <nl> + } <nl> + <nl> + long startNanos = System . nanoTime ( ) ; <nl> <nl> / / set up a listener to react to new nodes becoming alive ( in gossip ) , and account for all the nodes that are already alive <nl> - Set < InetAddressAndPort > alivePeers = Sets . newSetFromMap ( new ConcurrentHashMap < > ( ) ) ; <nl> - AliveListener listener = new AliveListener ( alivePeers , latch , acks ) ; <nl> + Set < InetAddressAndPort > alivePeers = Collections . newSetFromMap ( new ConcurrentHashMap < > ( ) ) ; <nl> + AliveListener listener = new AliveListener ( alivePeers , dcToRemainingPeers , acks , peerToDatacenter : : get ) ; <nl> Gossiper . instance . register ( listener ) ; <nl> <nl> - / / send out a ping message to open up the non - gossip connections <nl> - sendPingMessages ( peers , latch , acks ) ; <nl> + / / send out a ping message to open up the non - gossip connections to all peers . Note that this sends the <nl> + / / ping messages to _ all _ peers , not just the ones we block for in dcToRemainingPeers . <nl> + sendPingMessages ( peers , dcToRemainingPeers , acks , peerToDatacenter : : get ) ; <nl> <nl> for ( InetAddressAndPort peer : peers ) <nl> + { <nl> if ( Gossiper . instance . isAlive ( peer ) & & alivePeers . add ( peer ) & & acks . incrementAndCheck ( peer ) ) <nl> - latch . countDown ( ) ; <nl> + { <nl> + String datacenter = peerToDatacenter . get ( peer ) ; <nl> + / / We have to check because we might only have the local DC in the map <nl> + if ( dcToRemainingPeers . containsKey ( datacenter ) ) <nl> + dcToRemainingPeers . get ( datacenter ) . countDown ( ) ; <nl> + } <nl> + } <nl> + <nl> + boolean succeeded = true ; <nl> + for ( String datacenter : dcToRemainingPeers . keySet ( ) ) <nl> + { <nl> + long remainingNanos = Math . max ( 1 , timeoutNanos - ( System . nanoTime ( ) - startNanos ) ) ; <nl> + succeeded & = Uninterruptibles . awaitUninterruptibly ( dcToRemainingPeers . get ( datacenter ) , <nl> + remainingNanos , TimeUnit . NANOSECONDS ) ; <nl> + } <nl> <nl> - boolean succeeded = Uninterruptibles . awaitUninterruptibly ( latch , timeoutNanos , TimeUnit . NANOSECONDS ) ; <nl> Gossiper . instance . unregister ( listener ) ; <nl> <nl> - int connected = peers . size ( ) - ( int ) latch . getCount ( ) ; <nl> - logger . info ( " After waiting / processing for { } milliseconds , { } out of { } peers ( { } % ) have been marked alive and had connections established " , <nl> - TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - startNanos ) , <nl> - connected , <nl> - peers . size ( ) , <nl> - String . format ( " % . 2f " , ( connected / ( float ) peers . size ( ) ) * 100 ) ) ; <nl> + Map < String , Long > numDown = dcToRemainingPeers . entrySet ( ) . stream ( ) <nl> + . collect ( Collectors . toMap ( Map . Entry : : getKey , <nl> + e - > e . getValue ( ) . getCount ( ) ) ) ; <nl> + <nl> + if ( succeeded ) <nl> + { <nl> + logger . info ( " Ensured sufficient healthy connections with { } after { } milliseconds " , <nl> + numDown . keySet ( ) , TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - startNanos ) ) ; <nl> + } <nl> + else <nl> + { <nl> + logger . warn ( " Timed out after { } milliseconds , was waiting for remaining peers to connect : { } " , <nl> + TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - startNanos ) , numDown ) ; <nl> + } <nl> + <nl> return succeeded ; <nl> } <nl> <nl> @ @ - 122 , 7 + 180 , 8 @ @ public class StartupClusterConnectivityChecker <nl> * Sends a " connection warmup " message to each peer in the collection , on every { @ link ConnectionType } <nl> * used for internode messaging ( that is not gossip ) . <nl> * / <nl> - private void sendPingMessages ( Set < InetAddressAndPort > peers , CountDownLatch latch , AckMap acks ) <nl> + private void sendPingMessages ( Set < InetAddressAndPort > peers , Map < String , CountDownLatch > dcToRemainingPeers , <nl> + AckMap acks , Function < InetAddressAndPort , String > getDatacenter ) <nl> { <nl> IAsyncCallback responseHandler = new IAsyncCallback ( ) <nl> { <nl> @ @ - 134 , 7 + 193 , 12 @ @ public class StartupClusterConnectivityChecker <nl> public void response ( MessageIn msg ) <nl> { <nl> if ( acks . incrementAndCheck ( msg . from ) ) <nl> - latch . countDown ( ) ; <nl> + { <nl> + String datacenter = getDatacenter . apply ( msg . from ) ; <nl> + / / We have to check because we might only have the local DC in the map <nl> + if ( dcToRemainingPeers . containsKey ( datacenter ) ) <nl> + dcToRemainingPeers . get ( datacenter ) . countDown ( ) ; <nl> + } <nl> } <nl> } ; <nl> <nl> @ @ - 155 , 15 + 219 , 18 @ @ public class StartupClusterConnectivityChecker <nl> * / <nl> private static final class AliveListener implements IEndpointStateChangeSubscriber <nl> { <nl> - private final CountDownLatch latch ; <nl> + private final Map < String , CountDownLatch > dcToRemainingPeers ; <nl> private final Set < InetAddressAndPort > livePeers ; <nl> + private final Function < InetAddressAndPort , String > getDatacenter ; <nl> private final AckMap acks ; <nl> <nl> - AliveListener ( Set < InetAddressAndPort > livePeers , CountDownLatch latch , AckMap acks ) <nl> + AliveListener ( Set < InetAddressAndPort > livePeers , Map < String , CountDownLatch > dcToRemainingPeers , <nl> + AckMap acks , Function < InetAddressAndPort , String > getDatacenter ) <nl> { <nl> - this . latch = latch ; <nl> this . livePeers = livePeers ; <nl> + this . dcToRemainingPeers = dcToRemainingPeers ; <nl> this . acks = acks ; <nl> + this . getDatacenter = getDatacenter ; <nl> } <nl> <nl> public void onJoin ( InetAddressAndPort endpoint , EndpointState epState ) <nl> @ @ - 181 , 7 + 248 , 11 @ @ public class StartupClusterConnectivityChecker <nl> public void onAlive ( InetAddressAndPort endpoint , EndpointState state ) <nl> { <nl> if ( livePeers . add ( endpoint ) & & acks . incrementAndCheck ( endpoint ) ) <nl> - latch . countDown ( ) ; <nl> + { <nl> + String datacenter = getDatacenter . apply ( endpoint ) ; <nl> + if ( dcToRemainingPeers . containsKey ( datacenter ) ) <nl> + dcToRemainingPeers . get ( datacenter ) . countDown ( ) ; <nl> + } <nl> } <nl> <nl> public void onDead ( InetAddressAndPort endpoint , EndpointState state ) <nl> diff - - git a / src / java / org / apache / cassandra / service / CassandraDaemon . java b / src / java / org / apache / cassandra / service / CassandraDaemon . java <nl> index 815e673 . . f0b2dc1 100644 <nl> - - - a / src / java / org / apache / cassandra / service / CassandraDaemon . java <nl> + + + b / src / java / org / apache / cassandra / service / CassandraDaemon . java <nl> @ @ - 505 , 9 + 505 , 9 @ @ public class CassandraDaemon <nl> * / <nl> public void start ( ) <nl> { <nl> - StartupClusterConnectivityChecker connectivityChecker = StartupClusterConnectivityChecker . create ( DatabaseDescriptor . getBlockForPeersPercentage ( ) , <nl> - DatabaseDescriptor . getBlockForPeersTimeoutInSeconds ( ) ) ; <nl> - connectivityChecker . execute ( Gossiper . instance . getEndpoints ( ) ) ; <nl> + StartupClusterConnectivityChecker connectivityChecker = StartupClusterConnectivityChecker . create ( DatabaseDescriptor . getBlockForPeersTimeoutInSeconds ( ) , <nl> + DatabaseDescriptor . getBlockForPeersInRemoteDatacenters ( ) ) ; <nl> + connectivityChecker . execute ( Gossiper . instance . getEndpoints ( ) , DatabaseDescriptor . getEndpointSnitch ( ) : : getDatacenter ) ; <nl> <nl> String nativeFlag = System . getProperty ( " cassandra . start _ native _ transport " ) ; <nl> if ( ( nativeFlag ! = null & & Boolean . parseBoolean ( nativeFlag ) ) | | ( nativeFlag = = null & & DatabaseDescriptor . startNativeTransport ( ) ) ) <nl> diff - - git a / test / unit / org / apache / cassandra / net / StartupClusterConnectivityCheckerTest . java b / test / unit / org / apache / cassandra / net / StartupClusterConnectivityCheckerTest . java <nl> index 4eeb314 . . 1645d77 100644 <nl> - - - a / test / unit / org / apache / cassandra / net / StartupClusterConnectivityCheckerTest . java <nl> + + + b / test / unit / org / apache / cassandra / net / StartupClusterConnectivityCheckerTest . java <nl> @ @ - 36 , 13 + 36 , 35 @ @ import org . apache . cassandra . gms . EndpointState ; <nl> import org . apache . cassandra . gms . Gossiper ; <nl> import org . apache . cassandra . gms . HeartBeatState ; <nl> import org . apache . cassandra . locator . InetAddressAndPort ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> import static org . apache . cassandra . net . async . OutboundConnectionIdentifier . ConnectionType . SMALL _ MESSAGE ; <nl> <nl> public class StartupClusterConnectivityCheckerTest <nl> { <nl> - private StartupClusterConnectivityChecker connectivityChecker ; <nl> + private StartupClusterConnectivityChecker localQuorumConnectivityChecker ; <nl> + private StartupClusterConnectivityChecker globalQuorumConnectivityChecker ; <nl> + private StartupClusterConnectivityChecker noopChecker ; <nl> + private StartupClusterConnectivityChecker zeroWaitChecker ; <nl> + <nl> + private static final long TIMEOUT _ NANOS = 100 ; <nl> + private static final int NUM _ PER _ DC = 6 ; <nl> private Set < InetAddressAndPort > peers ; <nl> + private Set < InetAddressAndPort > peersA ; <nl> + private Set < InetAddressAndPort > peersAMinusLocal ; <nl> + private Set < InetAddressAndPort > peersB ; <nl> + private Set < InetAddressAndPort > peersC ; <nl> + <nl> + private String getDatacenter ( InetAddressAndPort endpoint ) <nl> + { <nl> + if ( peersA . contains ( endpoint ) ) <nl> + return " datacenterA " ; <nl> + if ( peersB . contains ( endpoint ) ) <nl> + return " datacenterB " ; <nl> + else if ( peersC . contains ( endpoint ) ) <nl> + return " datacenterC " ; <nl> + return null ; <nl> + } <nl> <nl> @ BeforeClass <nl> public static void before ( ) <nl> @ @ - 53 , 11 + 75 , 34 @ @ public class StartupClusterConnectivityCheckerTest <nl> @ Before <nl> public void setUp ( ) throws UnknownHostException <nl> { <nl> - connectivityChecker = new StartupClusterConnectivityChecker ( 70 , 10 ) ; <nl> + localQuorumConnectivityChecker = new StartupClusterConnectivityChecker ( TIMEOUT _ NANOS , false ) ; <nl> + globalQuorumConnectivityChecker = new StartupClusterConnectivityChecker ( TIMEOUT _ NANOS , true ) ; <nl> + noopChecker = new StartupClusterConnectivityChecker ( - 1 , false ) ; <nl> + zeroWaitChecker = new StartupClusterConnectivityChecker ( 0 , false ) ; <nl> + <nl> + peersA = new HashSet < > ( ) ; <nl> + peersAMinusLocal = new HashSet < > ( ) ; <nl> + peersA . add ( FBUtilities . getBroadcastAddressAndPort ( ) ) ; <nl> + <nl> + for ( int i = 0 ; i < NUM _ PER _ DC - 1 ; i + + ) <nl> + { <nl> + peersA . add ( InetAddressAndPort . getByName ( " 127 . 0 . 1 . " + i ) ) ; <nl> + peersAMinusLocal . add ( InetAddressAndPort . getByName ( " 127 . 0 . 1 . " + i ) ) ; <nl> + } <nl> + <nl> + peersB = new HashSet < > ( ) ; <nl> + for ( int i = 0 ; i < NUM _ PER _ DC ; i + + ) <nl> + peersB . add ( InetAddressAndPort . getByName ( " 127 . 0 . 2 . " + i ) ) ; <nl> + <nl> + <nl> + peersC = new HashSet < > ( ) ; <nl> + for ( int i = 0 ; i < NUM _ PER _ DC ; i + + ) <nl> + peersC . add ( InetAddressAndPort . getByName ( " 127 . 0 . 3 . " + i ) ) ; <nl> + <nl> peers = new HashSet < > ( ) ; <nl> - peers . add ( InetAddressAndPort . getByName ( " 127 . 0 . 1 . 0 " ) ) ; <nl> - peers . add ( InetAddressAndPort . getByName ( " 127 . 0 . 1 . 1 " ) ) ; <nl> - peers . add ( InetAddressAndPort . getByName ( " 127 . 0 . 1 . 2 " ) ) ; <nl> + peers . addAll ( peersA ) ; <nl> + peers . addAll ( peersB ) ; <nl> + peers . addAll ( peersC ) ; <nl> } <nl> <nl> @ After <nl> @ @ - 69 , 50 + 114 , 145 @ @ public class StartupClusterConnectivityCheckerTest <nl> @ Test <nl> public void execute _ HappyPath ( ) <nl> { <nl> - Sink sink = new Sink ( true , true ) ; <nl> + Sink sink = new Sink ( true , true , peers ) ; <nl> MessagingService . instance ( ) . addMessageSink ( sink ) ; <nl> - Assert . assertTrue ( connectivityChecker . execute ( peers ) ) ; <nl> - checkAllConnectionTypesSeen ( sink ) ; <nl> + Assert . assertTrue ( localQuorumConnectivityChecker . execute ( peers , this : : getDatacenter ) ) ; <nl> + Assert . assertTrue ( checkAllConnectionTypesSeen ( sink ) ) ; <nl> } <nl> <nl> @ Test <nl> public void execute _ NotAlive ( ) <nl> { <nl> - Sink sink = new Sink ( false , true ) ; <nl> + Sink sink = new Sink ( false , true , peers ) ; <nl> MessagingService . instance ( ) . addMessageSink ( sink ) ; <nl> - Assert . assertFalse ( connectivityChecker . execute ( peers ) ) ; <nl> - checkAllConnectionTypesSeen ( sink ) ; <nl> + Assert . assertFalse ( localQuorumConnectivityChecker . execute ( peers , this : : getDatacenter ) ) ; <nl> + Assert . assertTrue ( checkAllConnectionTypesSeen ( sink ) ) ; <nl> } <nl> <nl> @ Test <nl> public void execute _ NoConnectionsAcks ( ) <nl> { <nl> - Sink sink = new Sink ( true , false ) ; <nl> + Sink sink = new Sink ( true , false , peers ) ; <nl> + MessagingService . instance ( ) . addMessageSink ( sink ) ; <nl> + Assert . assertFalse ( localQuorumConnectivityChecker . execute ( peers , this : : getDatacenter ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void execute _ LocalQuorum ( ) <nl> + { <nl> + / / local peer plus 3 peers from same dc shouldn ' t pass ( 4 / 6 ) <nl> + Set < InetAddressAndPort > available = new HashSet < > ( ) ; <nl> + copyCount ( peersAMinusLocal , available , NUM _ PER _ DC - 3 ) ; <nl> + checkAvailable ( localQuorumConnectivityChecker , available , false , true ) ; <nl> + <nl> + / / local peer plus 4 peers from same dc should pass ( 5 / 6 ) <nl> + available . clear ( ) ; <nl> + copyCount ( peersAMinusLocal , available , NUM _ PER _ DC - 2 ) ; <nl> + checkAvailable ( localQuorumConnectivityChecker , available , true , true ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void execute _ GlobalQuorum ( ) <nl> + { <nl> + / / local dc passing shouldn ' t pass globally with two hosts down in datacenterB <nl> + Set < InetAddressAndPort > available = new HashSet < > ( ) ; <nl> + copyCount ( peersAMinusLocal , available , NUM _ PER _ DC - 2 ) ; <nl> + copyCount ( peersB , available , NUM _ PER _ DC - 2 ) ; <nl> + copyCount ( peersC , available , NUM _ PER _ DC - 1 ) ; <nl> + checkAvailable ( globalQuorumConnectivityChecker , available , false , true ) ; <nl> + <nl> + / / All three datacenters should be able to have a single node down <nl> + available . clear ( ) ; <nl> + copyCount ( peersAMinusLocal , available , NUM _ PER _ DC - 2 ) ; <nl> + copyCount ( peersB , available , NUM _ PER _ DC - 1 ) ; <nl> + copyCount ( peersC , available , NUM _ PER _ DC - 1 ) ; <nl> + checkAvailable ( globalQuorumConnectivityChecker , available , true , true ) ; <nl> + <nl> + / / Everything being up should work of course <nl> + available . clear ( ) ; <nl> + copyCount ( peersAMinusLocal , available , NUM _ PER _ DC - 1 ) ; <nl> + copyCount ( peersB , available , NUM _ PER _ DC ) ; <nl> + copyCount ( peersC , available , NUM _ PER _ DC ) ; <nl> + checkAvailable ( globalQuorumConnectivityChecker , available , true , true ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void execute _ Noop ( ) <nl> + { <nl> + checkAvailable ( noopChecker , new HashSet < > ( ) , true , false ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void execute _ ZeroWaitHasConnections ( ) throws InterruptedException <nl> + { <nl> + Sink sink = new Sink ( true , true , new HashSet < > ( ) ) ; <nl> + MessagingService . instance ( ) . addMessageSink ( sink ) ; <nl> + Assert . assertFalse ( zeroWaitChecker . execute ( peers , this : : getDatacenter ) ) ; <nl> + boolean hasConnections = false ; <nl> + for ( int i = 0 ; i < TIMEOUT _ NANOS ; i + = 10 ) <nl> + { <nl> + hasConnections = checkAllConnectionTypesSeen ( sink ) ; <nl> + if ( hasConnections ) <nl> + break ; <nl> + Thread . sleep ( 0 , 10 ) ; <nl> + } <nl> + MessagingService . instance ( ) . clearMessageSinks ( ) ; <nl> + Assert . assertTrue ( hasConnections ) ; <nl> + } <nl> + <nl> + private void checkAvailable ( StartupClusterConnectivityChecker checker , Set < InetAddressAndPort > available , <nl> + boolean shouldPass , boolean checkConnections ) <nl> + { <nl> + Sink sink = new Sink ( true , true , available ) ; <nl> MessagingService . instance ( ) . addMessageSink ( sink ) ; <nl> - Assert . assertFalse ( connectivityChecker . execute ( peers ) ) ; <nl> + Assert . assertEquals ( shouldPass , checker . execute ( peers , this : : getDatacenter ) ) ; <nl> + if ( checkConnections ) <nl> + Assert . assertTrue ( checkAllConnectionTypesSeen ( sink ) ) ; <nl> + MessagingService . instance ( ) . clearMessageSinks ( ) ; <nl> + } <nl> + <nl> + private void copyCount ( Set < InetAddressAndPort > source , Set < InetAddressAndPort > dest , int count ) <nl> + { <nl> + for ( InetAddressAndPort peer : source ) <nl> + { <nl> + if ( count < = 0 ) <nl> + break ; <nl> + <nl> + dest . add ( peer ) ; <nl> + count - = 1 ; <nl> + } <nl> } <nl> <nl> - private void checkAllConnectionTypesSeen ( Sink sink ) <nl> + private boolean checkAllConnectionTypesSeen ( Sink sink ) <nl> { <nl> + boolean result = true ; <nl> for ( InetAddressAndPort peer : peers ) <nl> { <nl> + if ( peer . equals ( FBUtilities . getBroadcastAddressAndPort ( ) ) ) <nl> + continue ; <nl> ConnectionTypeRecorder recorder = sink . seenConnectionRequests . get ( peer ) ; <nl> - Assert . assertNotNull ( recorder ) ; <nl> - Assert . assertTrue ( recorder . seenSmallMessageRequest ) ; <nl> - Assert . assertTrue ( recorder . seenLargeMessageRequest ) ; <nl> + result = recorder ! = null ; <nl> + if ( ! result ) <nl> + break ; <nl> + <nl> + result = recorder . seenSmallMessageRequest ; <nl> + result & = recorder . seenLargeMessageRequest ; <nl> } <nl> + return result ; <nl> } <nl> <nl> private static class Sink implements IMessageSink <nl> { <nl> private final boolean markAliveInGossip ; <nl> private final boolean processConnectAck ; <nl> + private final Set < InetAddressAndPort > aliveHosts ; <nl> private final Map < InetAddressAndPort , ConnectionTypeRecorder > seenConnectionRequests ; <nl> <nl> - Sink ( boolean markAliveInGossip , boolean processConnectAck ) <nl> + Sink ( boolean markAliveInGossip , boolean processConnectAck , Set < InetAddressAndPort > aliveHosts ) <nl> { <nl> this . markAliveInGossip = markAliveInGossip ; <nl> this . processConnectAck = processConnectAck ; <nl> + this . aliveHosts = aliveHosts ; <nl> seenConnectionRequests = new HashMap < > ( ) ; <nl> } <nl> <nl> @ @ - 131 , 6 + 271 , 9 @ @ public class StartupClusterConnectivityCheckerTest <nl> recorder . seenLargeMessageRequest = true ; <nl> } <nl> <nl> + if ( ! aliveHosts . contains ( to ) ) <nl> + return false ; <nl> + <nl> if ( processConnectAck ) <nl> { <nl> MessageIn msgIn = MessageIn . create ( to , message . payload , Collections . emptyMap ( ) , MessagingService . Verb . REQUEST _ RESPONSE , 1 ) ;
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / net / FileStreamTask . java b / src / java / org / apache / cassandra / net / FileStreamTask . java <nl> index 724e9ae . . 34619da 100644 <nl> - - - a / src / java / org / apache / cassandra / net / FileStreamTask . java <nl> + + + b / src / java / org / apache / cassandra / net / FileStreamTask . java <nl> @ @ - 44 , 6 + 44 , 8 @ @ class FileStreamTask implements Runnable <nl> <nl> public void run ( ) <nl> { <nl> + / * <nl> + TODO <nl> TcpConnection connection = null ; <nl> try <nl> { <nl> @ @ - 61 , 6 + 63 , 6 @ @ class FileStreamTask implements Runnable <nl> } <nl> throw new RuntimeException ( e ) ; <nl> } <nl> + * / <nl> } <nl> - <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java <nl> index 96bad3c . . 11afaae 100644 <nl> - - - a / src / java / org / apache / cassandra / net / MessagingService . java <nl> + + + b / src / java / org / apache / cassandra / net / MessagingService . java <nl> @ @ - 68 , 7 + 68 , 7 @ @ public class MessagingService implements IFailureDetectionEventListener <nl> / * Thread pool to handle messaging write activities * / <nl> private static ExecutorService streamExecutor _ ; <nl> <nl> - private static NonBlockingHashMap < String , TcpConnectionManager > connectionManagers _ = new NonBlockingHashMap < String , TcpConnectionManager > ( ) ; <nl> + private static NonBlockingHashMap < String , OutboundTcpConnectionPool > connectionManagers _ = new NonBlockingHashMap < String , OutboundTcpConnectionPool > ( ) ; <nl> <nl> private static Logger logger _ = Logger . getLogger ( MessagingService . class ) ; <nl> <nl> @ @ - 186 , 19 + 186 , 19 @ @ public class MessagingService implements IFailureDetectionEventListener <nl> } <nl> } <nl> <nl> - public static TcpConnectionManager getConnectionPool ( InetAddress from , InetAddress to ) <nl> + public static OutboundTcpConnectionPool getConnectionPool ( InetAddress from , InetAddress to ) <nl> { <nl> String key = from + " : " + to ; <nl> - TcpConnectionManager cp = connectionManagers _ . get ( key ) ; <nl> + OutboundTcpConnectionPool cp = connectionManagers _ . get ( key ) ; <nl> if ( cp = = null ) <nl> { <nl> - connectionManagers _ . putIfAbsent ( key , new TcpConnectionManager ( from , to ) ) ; <nl> + connectionManagers _ . putIfAbsent ( key , new OutboundTcpConnectionPool ( from , to ) ) ; <nl> cp = connectionManagers _ . get ( key ) ; <nl> } <nl> return cp ; <nl> } <nl> <nl> - public static TcpConnection getConnection ( InetAddress from , InetAddress to , Message msg ) throws IOException <nl> + public static OutboundTcpConnection getConnection ( InetAddress from , InetAddress to , Message msg ) <nl> { <nl> return getConnectionPool ( from , to ) . getConnection ( msg ) ; <nl> } <nl> @ @ - 331 , 20 + 331 , 9 @ @ public class MessagingService implements IFailureDetectionEventListener <nl> assert data . length > 0 ; <nl> ByteBuffer buffer = packIt ( data , false , false ) ; <nl> <nl> - TcpConnection connection = null ; <nl> - try <nl> - { <nl> - connection = MessagingService . getConnection ( processedMessage . getFrom ( ) , to , message ) ; <nl> - connection . write ( buffer ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - if ( connection ! = null ) <nl> - { <nl> - connection . errorClose ( ) ; <nl> - } <nl> - logger _ . error ( " unexpected error writing " + message , e ) ; <nl> - } <nl> + OutboundTcpConnection connection = null ; <nl> + connection = getConnection ( processedMessage . getFrom ( ) , to , message ) ; <nl> + connection . write ( buffer ) ; <nl> } <nl> <nl> public IAsyncResult sendRR ( Message message , InetAddress to ) <nl> diff - - git a / src / java / org / apache / cassandra / net / OutboundTcpConnection . java b / src / java / org / apache / cassandra / net / OutboundTcpConnection . java <nl> new file mode 100644 <nl> index 0000000 . . f2ace82 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / net / OutboundTcpConnection . java <nl> @ @ - 0 , 0 + 1 , 97 @ @ <nl> + package org . apache . cassandra . net ; <nl> + <nl> + import java . io . DataOutputStream ; <nl> + import java . io . IOError ; <nl> + import java . io . IOException ; <nl> + import java . net . InetAddress ; <nl> + import java . net . Socket ; <nl> + import java . nio . ByteBuffer ; <nl> + import java . util . concurrent . BlockingQueue ; <nl> + import java . util . concurrent . LinkedBlockingQueue ; <nl> + <nl> + import org . apache . log4j . Logger ; <nl> + <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> + <nl> + public class OutboundTcpConnection <nl> + { <nl> + private static Logger logger = Logger . getLogger ( OutboundTcpConnection . class ) ; <nl> + <nl> + public BlockingQueue < ByteBuffer > queue = new LinkedBlockingQueue < ByteBuffer > ( ) ; <nl> + public DataOutputStream output ; <nl> + public Socket socket ; <nl> + <nl> + / / TODO localEp is ignored , get rid of it <nl> + public OutboundTcpConnection ( final OutboundTcpConnectionPool pool , InetAddress localEp , final InetAddress remoteEp ) <nl> + { <nl> + try <nl> + { <nl> + socket = new Socket ( remoteEp , DatabaseDescriptor . getStoragePort ( ) ) ; <nl> + socket . setTcpNoDelay ( true ) ; <nl> + output = new DataOutputStream ( socket . getOutputStream ( ) ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + new Thread ( new Runnable ( ) <nl> + { <nl> + public void run ( ) <nl> + { <nl> + while ( socket ! = null ) <nl> + { <nl> + ByteBuffer bb ; <nl> + try <nl> + { <nl> + bb = queue . take ( ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + throw new AssertionError ( e ) ; <nl> + } <nl> + try <nl> + { <nl> + output . write ( bb . array ( ) , 0 , bb . limit ( ) ) ; <nl> + if ( queue . peek ( ) = = null ) <nl> + { <nl> + output . flush ( ) ; <nl> + } <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + logger . info ( " error writing to " + remoteEp ) ; <nl> + pool . reset ( ) ; <nl> + break ; <nl> + } <nl> + } <nl> + } <nl> + } , " WRITE - " + remoteEp ) . start ( ) ; <nl> + } <nl> + <nl> + public void write ( ByteBuffer buffer ) <nl> + { <nl> + try <nl> + { <nl> + queue . put ( buffer ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + throw new AssertionError ( e ) ; <nl> + } <nl> + } <nl> + <nl> + public void closeSocket ( ) <nl> + { <nl> + try <nl> + { <nl> + socket . close ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + if ( logger . isDebugEnabled ( ) ) <nl> + logger . debug ( " error closing socket " , e ) ; <nl> + } <nl> + socket = null ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java b / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java <nl> new file mode 100644 <nl> index 0000000 . . 8ad66ca <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java <nl> @ @ - 0 , 0 + 1 , 72 @ @ <nl> + / * * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + <nl> + package org . apache . cassandra . net ; <nl> + <nl> + import java . io . IOException ; <nl> + import java . net . InetAddress ; <nl> + <nl> + import org . apache . cassandra . concurrent . StageManager ; <nl> + <nl> + class OutboundTcpConnectionPool <nl> + { <nl> + private InetAddress localEp _ ; <nl> + private InetAddress remoteEp _ ; <nl> + private OutboundTcpConnection cmdCon ; <nl> + private OutboundTcpConnection ackCon ; <nl> + <nl> + / / TODO localEp is ignored , get rid of it <nl> + OutboundTcpConnectionPool ( InetAddress localEp , InetAddress remoteEp ) <nl> + { <nl> + localEp _ = localEp ; <nl> + remoteEp _ = remoteEp ; <nl> + } <nl> + <nl> + private OutboundTcpConnection newCon ( ) <nl> + { <nl> + return new OutboundTcpConnection ( this , localEp _ , remoteEp _ ) ; <nl> + } <nl> + <nl> + / * * <nl> + * returns the appropriate connection based on message type . <nl> + * / <nl> + synchronized OutboundTcpConnection getConnection ( Message msg ) <nl> + { <nl> + if ( StageManager . RESPONSE _ STAGE . equals ( msg . getMessageType ( ) ) ) <nl> + { <nl> + if ( ackCon = = null ) <nl> + ackCon = newCon ( ) ; <nl> + return ackCon ; <nl> + } <nl> + else <nl> + { <nl> + if ( cmdCon = = null ) <nl> + cmdCon = newCon ( ) ; <nl> + return cmdCon ; <nl> + } <nl> + } <nl> + <nl> + synchronized void reset ( ) <nl> + { <nl> + for ( OutboundTcpConnection con : new OutboundTcpConnection [ ] { cmdCon , ackCon } ) <nl> + if ( con ! = null ) <nl> + con . closeSocket ( ) ; <nl> + cmdCon = null ; <nl> + ackCon = null ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / net / TcpConnection . java b / src / java / org / apache / cassandra / net / TcpConnection . java <nl> deleted file mode 100644 <nl> index 01003d1 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / net / TcpConnection . java <nl> + + + / dev / null <nl> @ @ - 1 , 378 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . net ; <nl> - <nl> - import java . io . * ; <nl> - import java . nio . ByteBuffer ; <nl> - import java . nio . channels . FileChannel ; <nl> - import java . nio . channels . SelectionKey ; <nl> - import java . nio . channels . SocketChannel ; <nl> - import java . util . * ; <nl> - import java . util . concurrent . TimeUnit ; <nl> - import java . util . concurrent . ConcurrentLinkedQueue ; <nl> - import java . util . concurrent . locks . Condition ; <nl> - import java . util . concurrent . locks . Lock ; <nl> - import java . util . concurrent . locks . ReentrantLock ; <nl> - import java . net . InetAddress ; <nl> - import java . net . InetSocketAddress ; <nl> - <nl> - import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - <nl> - import org . apache . log4j . Logger ; <nl> - <nl> - public class TcpConnection extends SelectionKeyHandler implements Comparable <nl> - { <nl> - / / logging and profiling . <nl> - private static Logger logger _ = Logger . getLogger ( TcpConnection . class ) ; <nl> - private SocketChannel socketChannel _ ; <nl> - private SelectionKey key _ ; <nl> - private TcpConnectionManager pool _ ; <nl> - private boolean isIncoming _ = false ; <nl> - private Queue < ByteBuffer > pendingWrites _ = new ConcurrentLinkedQueue < ByteBuffer > ( ) ; <nl> - private InetAddress localEp _ ; <nl> - private InetAddress remoteEp _ ; <nl> - <nl> - / * <nl> - * Added for streaming support . We need the boolean <nl> - * to indicate that this connection is used for <nl> - * streaming . The Condition and the Lock are used <nl> - * to signal the stream ( ) that it can continue <nl> - * streaming when the socket becomes writable . <nl> - * / <nl> - private boolean bStream _ = false ; <nl> - private Lock lock _ ; <nl> - private Condition condition _ ; <nl> - <nl> - private TcpConnection ( InetAddress from , InetAddress to , TcpConnectionManager pool , boolean streaming ) throws IOException <nl> - { <nl> - socketChannel _ = SocketChannel . open ( ) ; <nl> - socketChannel _ . socket ( ) . bind ( new InetSocketAddress ( from , 0 ) ) ; <nl> - socketChannel _ . configureBlocking ( false ) ; <nl> - <nl> - localEp _ = from ; <nl> - remoteEp _ = to ; <nl> - <nl> - if ( ! socketChannel _ . connect ( new InetSocketAddress ( remoteEp _ , DatabaseDescriptor . getStoragePort ( ) ) ) ) <nl> - { <nl> - key _ = SelectorManager . getSelectorManager ( ) . register ( socketChannel _ , this , SelectionKey . OP _ CONNECT ) ; <nl> - } <nl> - else <nl> - { <nl> - key _ = SelectorManager . getSelectorManager ( ) . register ( socketChannel _ , this , SelectionKey . OP _ READ ) ; <nl> - } <nl> - <nl> - if ( ( pool ! = null & & streaming ) | | ( pool = = null & & ! streaming ) ) <nl> - throw new RuntimeException ( " Invalid configuration . You must either specify a pool or streaming , not both or neither . " ) ; <nl> - <nl> - if ( pool ! = null ) <nl> - pool _ = pool ; <nl> - if ( streaming ) <nl> - { <nl> - bStream _ = true ; <nl> - lock _ = new ReentrantLock ( ) ; <nl> - condition _ = lock _ . newCondition ( ) ; <nl> - } <nl> - } <nl> - <nl> - / / used from getConnection - outgoing <nl> - TcpConnection ( TcpConnectionManager pool , InetAddress from , InetAddress to ) throws IOException <nl> - { <nl> - this ( from , to , pool , false ) ; <nl> - } <nl> - <nl> - / * <nl> - * Used for streaming purposes has no pooling semantics . <nl> - * / <nl> - TcpConnection ( InetAddress from , InetAddress to ) throws IOException <nl> - { <nl> - this ( from , to , null , true ) ; <nl> - } <nl> - <nl> - public InetAddress getEndPoint ( ) <nl> - { <nl> - return remoteEp _ ; <nl> - } <nl> - <nl> - public SocketChannel getSocketChannel ( ) <nl> - { <nl> - return socketChannel _ ; <nl> - } <nl> - <nl> - public synchronized void write ( ByteBuffer buffer ) throws IOException <nl> - { <nl> - if ( ! pendingWrites _ . isEmpty ( ) | | ! socketChannel _ . isConnected ( ) ) <nl> - { <nl> - pendingWrites _ . add ( buffer ) ; <nl> - return ; <nl> - } <nl> - <nl> - socketChannel _ . write ( buffer ) ; <nl> - <nl> - if ( buffer . remaining ( ) > 0 ) <nl> - { <nl> - pendingWrites _ . add ( buffer ) ; <nl> - turnOnInterestOps ( key _ , SelectionKey . OP _ WRITE ) ; <nl> - } <nl> - } <nl> - <nl> - public void stream ( File file , long startPosition , long endPosition ) throws IOException , InterruptedException <nl> - { <nl> - if ( ! bStream _ ) <nl> - throw new IllegalStateException ( " Cannot stream since we are not set up to stream data . " ) ; <nl> - <nl> - lock _ . lock ( ) ; <nl> - try <nl> - { <nl> - / * transfer 64MB in each attempt * / <nl> - int limit = 64 * 1024 * 1024 ; <nl> - long total = endPosition - startPosition ; <nl> - / * keeps track of total number of bytes transferred * / <nl> - long bytesWritten = 0L ; <nl> - RandomAccessFile raf = new RandomAccessFile ( file , " r " ) ; <nl> - FileChannel fc = raf . getChannel ( ) ; <nl> - <nl> - / * <nl> - * If the connection is not yet established then wait for <nl> - * the timeout period of 2 seconds . Attempt to reconnect 3 times and then <nl> - * bail with an IOException . <nl> - * / <nl> - long waitTime = 2 ; <nl> - int retry = 0 ; <nl> - while ( ! socketChannel _ . isConnected ( ) ) <nl> - { <nl> - if ( retry = = 3 ) <nl> - throw new IOException ( " Unable to connect to " + remoteEp _ + " after " + retry + " attempts . " ) ; <nl> - condition _ . await ( waitTime , TimeUnit . SECONDS ) ; <nl> - + + retry ; <nl> - } <nl> - <nl> - while ( bytesWritten < total ) <nl> - { <nl> - if ( startPosition = = 0 ) <nl> - { <nl> - ByteBuffer buffer = MessagingService . constructStreamHeader ( false , true ) ; <nl> - socketChannel _ . write ( buffer ) ; <nl> - if ( buffer . remaining ( ) > 0 ) <nl> - { <nl> - pendingWrites _ . add ( buffer ) ; <nl> - turnOnInterestOps ( key _ , SelectionKey . OP _ WRITE ) ; <nl> - condition _ . await ( ) ; <nl> - } <nl> - } <nl> - <nl> - long bytesTransferred ; <nl> - try <nl> - { <nl> - / * returns the number of bytes transferred from file to the socket * / <nl> - bytesTransferred = fc . transferTo ( startPosition , limit , socketChannel _ ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - / / at least jdk1 . 6 . 0 on Linux seems to throw IOException <nl> - / / when the socket is full . ( Bug fixed for 1 . 7 : http : / / bugs . sun . com / view _ bug . do ? bug _ id = 5103988 ) <nl> - / / For now look for a specific string in for the message for the exception . <nl> - if ( ! e . getMessage ( ) . startsWith ( " Resource temporarily unavailable " ) ) <nl> - throw e ; <nl> - Thread . sleep ( 10 ) ; <nl> - continue ; <nl> - } <nl> - if ( logger _ . isDebugEnabled ( ) ) <nl> - logger _ . debug ( " Bytes transferred " + bytesTransferred ) ; <nl> - bytesWritten + = bytesTransferred ; <nl> - startPosition + = bytesTransferred ; <nl> - / * <nl> - * If the number of bytes transferred is less than intended <nl> - * then we need to wait till socket becomes writeable again . <nl> - * / <nl> - if ( bytesTransferred < limit & & bytesWritten ! = total ) <nl> - { <nl> - turnOnInterestOps ( key _ , SelectionKey . OP _ WRITE ) ; <nl> - condition _ . await ( ) ; <nl> - } <nl> - } <nl> - } <nl> - finally <nl> - { <nl> - lock _ . unlock ( ) ; <nl> - } <nl> - } <nl> - <nl> - private void resumeStreaming ( ) <nl> - { <nl> - / * if not in streaming mode do nothing * / <nl> - if ( ! bStream _ ) <nl> - return ; <nl> - <nl> - lock _ . lock ( ) ; <nl> - try <nl> - { <nl> - condition _ . signal ( ) ; <nl> - } <nl> - finally <nl> - { <nl> - lock _ . unlock ( ) ; <nl> - } <nl> - } <nl> - <nl> - public boolean isConnected ( ) <nl> - { <nl> - return socketChannel _ . isConnected ( ) ; <nl> - } <nl> - <nl> - public boolean equals ( Object o ) <nl> - { <nl> - if ( ! ( o instanceof TcpConnection ) ) <nl> - return false ; <nl> - <nl> - TcpConnection rhs = ( TcpConnection ) o ; <nl> - return localEp _ . equals ( rhs . localEp _ ) & & remoteEp _ . equals ( rhs . remoteEp _ ) ; <nl> - } <nl> - <nl> - public int hashCode ( ) <nl> - { <nl> - return ( localEp _ + " : " + remoteEp _ ) . hashCode ( ) ; <nl> - } <nl> - <nl> - public String toString ( ) <nl> - { <nl> - return socketChannel _ . toString ( ) ; <nl> - } <nl> - <nl> - void closeSocket ( ) <nl> - { <nl> - if ( pendingWrites _ . size ( ) > 0 ) <nl> - logger _ . warn ( " Closing down connection " + socketChannel _ + " with " + pendingWrites _ . size ( ) + " writes remaining . " ) ; <nl> - cancel ( key _ ) ; <nl> - pendingWrites _ . clear ( ) ; <nl> - } <nl> - <nl> - void errorClose ( ) <nl> - { <nl> - logger _ . info ( " Closing errored connection " + socketChannel _ ) ; <nl> - pendingWrites _ . clear ( ) ; <nl> - cancel ( key _ ) ; <nl> - pendingWrites _ . clear ( ) ; <nl> - if ( pool _ ! = null ) <nl> - pool _ . reset ( ) ; <nl> - } <nl> - <nl> - private void cancel ( SelectionKey key ) <nl> - { <nl> - if ( key ! = null ) <nl> - { <nl> - key . cancel ( ) ; <nl> - try <nl> - { <nl> - key . channel ( ) . close ( ) ; <nl> - } <nl> - catch ( IOException e ) { } <nl> - } <nl> - } <nl> - <nl> - / / called in the selector thread <nl> - public void connect ( SelectionKey key ) <nl> - { <nl> - turnOffInterestOps ( key , SelectionKey . OP _ CONNECT ) ; <nl> - try <nl> - { <nl> - if ( socketChannel _ . finishConnect ( ) ) <nl> - { <nl> - turnOnInterestOps ( key , SelectionKey . OP _ READ ) ; <nl> - <nl> - synchronized ( this ) <nl> - { <nl> - / / this will flush the pending <nl> - if ( ! pendingWrites _ . isEmpty ( ) ) <nl> - { <nl> - turnOnInterestOps ( key _ , SelectionKey . OP _ WRITE ) ; <nl> - } <nl> - } <nl> - resumeStreaming ( ) ; <nl> - } <nl> - else <nl> - { <nl> - logger _ . error ( " Closing connection because socket channel could not finishConnect . " ) ; ; <nl> - errorClose ( ) ; <nl> - } <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - logger _ . error ( " Encountered IOException on connection : " + socketChannel _ , e ) ; <nl> - errorClose ( ) ; <nl> - } <nl> - } <nl> - <nl> - / / called in the selector thread <nl> - public void write ( SelectionKey key ) <nl> - { <nl> - turnOffInterestOps ( key , SelectionKey . OP _ WRITE ) ; <nl> - doPendingWrites ( ) ; <nl> - / * <nl> - * This is executed only if we are in streaming mode . <nl> - * Idea is that we read a chunk of data from a source <nl> - * and wait to read the next from the source until we <nl> - * are siganlled to do so from here . <nl> - * / <nl> - resumeStreaming ( ) ; <nl> - } <nl> - <nl> - public void doPendingWrites ( ) <nl> - { <nl> - synchronized ( this ) <nl> - { <nl> - try <nl> - { <nl> - while ( ! pendingWrites _ . isEmpty ( ) ) <nl> - { <nl> - ByteBuffer buffer = pendingWrites _ . peek ( ) ; <nl> - socketChannel _ . write ( buffer ) ; <nl> - if ( buffer . remaining ( ) > 0 ) <nl> - { <nl> - break ; <nl> - } <nl> - pendingWrites _ . remove ( ) ; <nl> - } <nl> - <nl> - } <nl> - catch ( IOException ex ) <nl> - { <nl> - logger _ . error ( ex ) ; <nl> - / / This is to fix the wierd Linux bug with NIO . <nl> - errorClose ( ) ; <nl> - } <nl> - finally <nl> - { <nl> - if ( ! pendingWrites _ . isEmpty ( ) ) <nl> - { <nl> - turnOnInterestOps ( key _ , SelectionKey . OP _ WRITE ) ; <nl> - } <nl> - } <nl> - } <nl> - } <nl> - <nl> - public int compareTo ( Object o ) <nl> - { <nl> - if ( o instanceof TcpConnection ) <nl> - { <nl> - return pendingWrites _ . size ( ) - ( ( TcpConnection ) o ) . pendingWrites _ . size ( ) ; <nl> - } <nl> - <nl> - throw new IllegalArgumentException ( ) ; <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / net / TcpConnectionManager . java b / src / java / org / apache / cassandra / net / TcpConnectionManager . java <nl> deleted file mode 100644 <nl> index 8cdfef2 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / net / TcpConnectionManager . java <nl> + + + / dev / null <nl> @ @ - 1 , 72 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . net ; <nl> - <nl> - import java . io . IOException ; <nl> - import java . net . InetAddress ; <nl> - <nl> - import org . apache . cassandra . concurrent . StageManager ; <nl> - <nl> - class TcpConnectionManager <nl> - { <nl> - private InetAddress localEp _ ; <nl> - private InetAddress remoteEp _ ; <nl> - private TcpConnection cmdCon ; <nl> - private TcpConnection ackCon ; <nl> - <nl> - TcpConnectionManager ( InetAddress localEp , InetAddress remoteEp ) <nl> - { <nl> - localEp _ = localEp ; <nl> - remoteEp _ = remoteEp ; <nl> - } <nl> - <nl> - private TcpConnection newCon ( ) throws IOException <nl> - { <nl> - TcpConnection con = new TcpConnection ( this , localEp _ , remoteEp _ ) ; <nl> - return con ; <nl> - } <nl> - <nl> - / * * <nl> - * returns the appropriate connection based on message type . <nl> - * / <nl> - synchronized TcpConnection getConnection ( Message msg ) throws IOException <nl> - { <nl> - if ( StageManager . RESPONSE _ STAGE . equals ( msg . getMessageType ( ) ) ) <nl> - { <nl> - if ( ackCon = = null ) <nl> - ackCon = newCon ( ) ; <nl> - return ackCon ; <nl> - } <nl> - else <nl> - { <nl> - if ( cmdCon = = null ) <nl> - cmdCon = newCon ( ) ; <nl> - return cmdCon ; <nl> - } <nl> - } <nl> - <nl> - synchronized void reset ( ) <nl> - { <nl> - for ( TcpConnection con : new TcpConnection [ ] { cmdCon , ackCon } ) <nl> - if ( con ! = null ) <nl> - con . closeSocket ( ) ; <nl> - cmdCon = null ; <nl> - ackCon = null ; <nl> - } <nl> - }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index a7a75c0 . . aaea773 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 4 . 0 
+ + * Startup checker should wait for count rather than percentage ( CASSANDRA - 14297 ) 
+ * Fix incorrect sorting of replicas in SimpleStrategy . calculateNaturalReplicas ( CASSANDRA - 14862 ) 
+ * Partitioned outbound internode TCP connections can occur when nodes restart ( CASSANDRA - 14358 ) 
+ * Don ' t write to system _ distributed . repair _ history , system _ traces . sessions , system _ traces . events in mixed version 3 . X / 4 . 0 clusters ( CASSANDRA - 14841 ) 
+ diff - - git a / NEWS . txt b / NEWS . txt 
+ index 0d211a3 . . 63c4a47 100644 
+ - - - a / NEWS . txt 
+ + + + b / NEWS . txt 
+ @ @ - 38 , 6 + 38 , 13 @ @ using the provided ' sstableupgrade ' tool . 
+ 
+ New features 
+ - - - - - - - - - - - - 
+ + - Nodes will now bootstrap all intra - cluster connections at startup by default and wait 
+ + 10 seconds for the all but one node in the local data center to be connected and marked 
+ + UP in gossip . This prevents nodes from coordinating requests and failing because they 
+ + aren ' t able to connect to the cluster fast enough . block _ for _ peers _ timeout _ in _ secs in 
+ + cassandra . yaml can be used to configure how long to wait ( or whether to wait at all ) 
+ + and block _ for _ peers _ in _ remote _ dcs can be used to also block on all but one node in 
+ + each remote DC as well . See CASSANDRA - 14297 and CASSANDRA - 13993 for more information . 
+ - * Experimental * support for Transient Replication and Cheap Quorums introduced by CASSANDRA - 14404 
+ The intended audience for this functionality is expert users of Cassandra who are prepared 
+ to validate every aspect of the database for their application and deployment practices . Future 
+ diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java 
+ index 1e80108 . . 7371df7 100644 
+ - - - a / src / java / org / apache / cassandra / config / Config . java 
+ + + + b / src / java / org / apache / cassandra / config / Config . java 
+ @ @ - 388 , 9 + 388 , 28 @ @ public class Config 
+ public RepairCommandPoolFullStrategy repair _ command _ pool _ full _ strategy = RepairCommandPoolFullStrategy . queue ; 
+ public int repair _ command _ pool _ size = concurrent _ validations ; 
+ 
+ - / / parameters to adjust how much to delay startup until a certain amount of the cluster is connect to and marked alive 
+ - public int block _ for _ peers _ percentage = 70 ; 
+ + / * * 
+ + * When a node first starts up it intially considers all other peers as DOWN and is disconnected from all of them . 
+ + * To be useful as a coordinator ( and not introduce latency penalties on restart ) this node must have successfully 
+ + * opened all three internode TCP connections ( gossip , small , and large messages ) before advertising to clients . 
+ + * Due to this , by default , Casssandra will prime these internode TCP connections and wait for all but a single 
+ + * node to be DOWN / disconnected in the local datacenter before offering itself as a coordinator , subject to a 
+ + * timeout . See CASSANDRA - 13993 and CASSANDRA - 14297 for more details . 
+ + * 
+ + * We provide two tunables to control this behavior as some users may want to block until all datacenters are 
+ + * available ( global QUORUM / EACH _ QUORUM ) , some users may not want to block at all ( clients that already work 
+ + * around the problem ) , and some users may want to prime the connections but not delay startup . 
+ + * 
+ + * block _ for _ peers _ timeout _ in _ secs : controls how long this node will wait to connect to peers . To completely disable 
+ + * any startup connectivity checks set this to - 1 . To trigger the internode connections but immediately continue 
+ + * startup , set this to to 0 . The default is 10 seconds . 
+ + * 
+ + * block _ for _ peers _ in _ remote _ dcs : controls if this node will consider remote datacenters to wait for . The default 
+ + * is to _ not _ wait on remote datacenters . 
+ + * / 
+ public int block _ for _ peers _ timeout _ in _ secs = 10 ; 
+ + public boolean block _ for _ peers _ in _ remote _ dcs = false ; 
+ + 
+ public volatile boolean automatic _ sstable _ upgrade = false ; 
+ public volatile int max _ concurrent _ automatic _ sstable _ upgrades = 1 ; 
+ public boolean stream _ entire _ sstables = true ; 
+ diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ index 1b11a91 . . bc1e5a2 100644 
+ - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ @ @ - 2630 , 9 + 2630 , 9 @ @ public class DatabaseDescriptor 
+ return conf . full _ query _ logging _ options ; 
+ } 
+ 
+ - public static int getBlockForPeersPercentage ( ) 
+ + public static boolean getBlockForPeersInRemoteDatacenters ( ) 
+ { 
+ - return conf . block _ for _ peers _ percentage ; 
+ + return conf . block _ for _ peers _ in _ remote _ dcs ; 
+ } 
+ 
+ public static int getBlockForPeersTimeoutInSeconds ( ) 
+ diff - - git a / src / java / org / apache / cassandra / net / StartupClusterConnectivityChecker . java b / src / java / org / apache / cassandra / net / StartupClusterConnectivityChecker . java 
+ index bab3283 . . 8e37470 100644 
+ - - - a / src / java / org / apache / cassandra / net / StartupClusterConnectivityChecker . java 
+ + + + b / src / java / org / apache / cassandra / net / StartupClusterConnectivityChecker . java 
+ @ @ - 17 , 6 + 17 , 8 @ @ 
+ * / 
+ package org . apache . cassandra . net ; 
+ 
+ + import java . util . Collections ; 
+ + import java . util . HashMap ; 
+ import java . util . HashSet ; 
+ import java . util . Map ; 
+ import java . util . Set ; 
+ @ @ - 24 , 9 + 26 , 12 @ @ import java . util . concurrent . ConcurrentHashMap ; 
+ import java . util . concurrent . CountDownLatch ; 
+ import java . util . concurrent . TimeUnit ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ + import java . util . function . Function ; 
+ + import java . util . stream . Collectors ; 
+ 
+ import com . google . common . annotations . VisibleForTesting ; 
+ - import com . google . common . collect . Sets ; 
+ + import com . google . common . collect . HashMultimap ; 
+ + import com . google . common . collect . SetMultimap ; 
+ import com . google . common . util . concurrent . Uninterruptibles ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 48 , 73 + 53 , 126 @ @ public class StartupClusterConnectivityChecker 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( StartupClusterConnectivityChecker . class ) ; 
+ 
+ - private final int targetPercent ; 
+ + private final boolean blockForRemoteDcs ; 
+ private final long timeoutNanos ; 
+ 
+ - public static StartupClusterConnectivityChecker create ( int targetPercent , int timeoutSecs ) 
+ + public static StartupClusterConnectivityChecker create ( long timeoutSecs , boolean blockForRemoteDcs ) 
+ { 
+ - timeoutSecs = Math . max ( 1 , timeoutSecs ) ; 
+ if ( timeoutSecs > 100 ) 
+ logger . warn ( " setting the block - for - peers timeout ( in seconds ) to { } might be a bit excessive , but using it nonetheless " , timeoutSecs ) ; 
+ long timeoutNanos = TimeUnit . SECONDS . toNanos ( timeoutSecs ) ; 
+ 
+ - return new StartupClusterConnectivityChecker ( targetPercent , timeoutNanos ) ; 
+ + return new StartupClusterConnectivityChecker ( timeoutNanos , blockForRemoteDcs ) ; 
+ } 
+ 
+ @ VisibleForTesting 
+ - StartupClusterConnectivityChecker ( int targetPercent , long timeoutNanos ) 
+ + StartupClusterConnectivityChecker ( long timeoutNanos , boolean blockForRemoteDcs ) 
+ { 
+ - this . targetPercent = Math . min ( 100 , Math . max ( 0 , targetPercent ) ) ; 
+ + this . blockForRemoteDcs = blockForRemoteDcs ; 
+ this . timeoutNanos = timeoutNanos ; 
+ } 
+ 
+ / * * 
+ * @ param peers The currently known peers in the cluster ; argument is not modified . 
+ + * @ param getDatacenterSource A function for mapping peers to their datacenter . 
+ * @ return true if the requested percentage of peers are marked ALIVE in gossip and have their connections opened ; 
+ * else false . 
+ * / 
+ - public boolean execute ( Set < InetAddressAndPort > peers ) 
+ + public boolean execute ( Set < InetAddressAndPort > peers , Function < InetAddressAndPort , String > getDatacenterSource ) 
+ { 
+ - if ( targetPercent = = 0 | | peers = = null ) 
+ + if ( peers = = null | | this . timeoutNanos < 0 ) 
+ return true ; 
+ 
+ / / make a copy of the set , to avoid mucking with the input ( in case it ' s a sensitive collection ) 
+ peers = new HashSet < > ( peers ) ; 
+ - peers . remove ( FBUtilities . getBroadcastAddressAndPort ( ) ) ; 
+ + InetAddressAndPort localAddress = FBUtilities . getBroadcastAddressAndPort ( ) ; 
+ + String localDc = getDatacenterSource . apply ( localAddress ) ; 
+ 
+ + peers . remove ( localAddress ) ; 
+ if ( peers . isEmpty ( ) ) 
+ return true ; 
+ 
+ - logger . info ( " choosing to block until { } % of the { } known peers are marked alive and connections are established ; max time to wait = { } seconds " , 
+ - targetPercent , peers . size ( ) , TimeUnit . NANOSECONDS . toSeconds ( timeoutNanos ) ) ; 
+ + / / make a copy of the datacenter mapping ( in case gossip updates happen during this method or some such ) 
+ + Map < InetAddressAndPort , String > peerToDatacenter = new HashMap < > ( ) ; 
+ + SetMultimap < String , InetAddressAndPort > datacenterToPeers = HashMultimap . create ( ) ; 
+ 
+ - long startNanos = System . nanoTime ( ) ; 
+ + for ( InetAddressAndPort peer : peers ) 
+ + { 
+ + String datacenter = getDatacenterSource . apply ( peer ) ; 
+ + peerToDatacenter . put ( peer , datacenter ) ; 
+ + datacenterToPeers . put ( datacenter , peer ) ; 
+ + } 
+ + 
+ + / / In the case where we do not want to block startup on remote datacenters ( e . g . because clients only use 
+ + / / LOCAL _ X consistency levels ) , we remove all other datacenter hosts from the mapping and we only wait 
+ + / / on the remaining local datacenter . 
+ + if ( ! blockForRemoteDcs ) 
+ + { 
+ + datacenterToPeers . keySet ( ) . retainAll ( Collections . singleton ( localDc ) ) ; 
+ + logger . info ( " Blocking coordination until only a single peer is DOWN in the local datacenter , timeout = { } s " , 
+ + TimeUnit . NANOSECONDS . toSeconds ( timeoutNanos ) ) ; 
+ + } 
+ + else 
+ + { 
+ + logger . info ( " Blocking coordination until only a single peer is DOWN in each datacenter , timeout = { } s " , 
+ + TimeUnit . NANOSECONDS . toSeconds ( timeoutNanos ) ) ; 
+ + } 
+ 
+ AckMap acks = new AckMap ( 3 ) ; 
+ - int target = ( int ) ( ( targetPercent / 100 . 0 ) * peers . size ( ) ) ; 
+ - CountDownLatch latch = new CountDownLatch ( target ) ; 
+ + Map < String , CountDownLatch > dcToRemainingPeers = new HashMap < > ( datacenterToPeers . size ( ) ) ; 
+ + for ( String datacenter : datacenterToPeers . keys ( ) ) 
+ + { 
+ + dcToRemainingPeers . put ( datacenter , 
+ + new CountDownLatch ( Math . max ( datacenterToPeers . get ( datacenter ) . size ( ) - 1 , 0 ) ) ) ; 
+ + } 
+ + 
+ + long startNanos = System . nanoTime ( ) ; 
+ 
+ / / set up a listener to react to new nodes becoming alive ( in gossip ) , and account for all the nodes that are already alive 
+ - Set < InetAddressAndPort > alivePeers = Sets . newSetFromMap ( new ConcurrentHashMap < > ( ) ) ; 
+ - AliveListener listener = new AliveListener ( alivePeers , latch , acks ) ; 
+ + Set < InetAddressAndPort > alivePeers = Collections . newSetFromMap ( new ConcurrentHashMap < > ( ) ) ; 
+ + AliveListener listener = new AliveListener ( alivePeers , dcToRemainingPeers , acks , peerToDatacenter : : get ) ; 
+ Gossiper . instance . register ( listener ) ; 
+ 
+ - / / send out a ping message to open up the non - gossip connections 
+ - sendPingMessages ( peers , latch , acks ) ; 
+ + / / send out a ping message to open up the non - gossip connections to all peers . Note that this sends the 
+ + / / ping messages to _ all _ peers , not just the ones we block for in dcToRemainingPeers . 
+ + sendPingMessages ( peers , dcToRemainingPeers , acks , peerToDatacenter : : get ) ; 
+ 
+ for ( InetAddressAndPort peer : peers ) 
+ + { 
+ if ( Gossiper . instance . isAlive ( peer ) & & alivePeers . add ( peer ) & & acks . incrementAndCheck ( peer ) ) 
+ - latch . countDown ( ) ; 
+ + { 
+ + String datacenter = peerToDatacenter . get ( peer ) ; 
+ + / / We have to check because we might only have the local DC in the map 
+ + if ( dcToRemainingPeers . containsKey ( datacenter ) ) 
+ + dcToRemainingPeers . get ( datacenter ) . countDown ( ) ; 
+ + } 
+ + } 
+ + 
+ + boolean succeeded = true ; 
+ + for ( String datacenter : dcToRemainingPeers . keySet ( ) ) 
+ + { 
+ + long remainingNanos = Math . max ( 1 , timeoutNanos - ( System . nanoTime ( ) - startNanos ) ) ; 
+ + succeeded & = Uninterruptibles . awaitUninterruptibly ( dcToRemainingPeers . get ( datacenter ) , 
+ + remainingNanos , TimeUnit . NANOSECONDS ) ; 
+ + } 
+ 
+ - boolean succeeded = Uninterruptibles . awaitUninterruptibly ( latch , timeoutNanos , TimeUnit . NANOSECONDS ) ; 
+ Gossiper . instance . unregister ( listener ) ; 
+ 
+ - int connected = peers . size ( ) - ( int ) latch . getCount ( ) ; 
+ - logger . info ( " After waiting / processing for { } milliseconds , { } out of { } peers ( { } % ) have been marked alive and had connections established " , 
+ - TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - startNanos ) , 
+ - connected , 
+ - peers . size ( ) , 
+ - String . format ( " % . 2f " , ( connected / ( float ) peers . size ( ) ) * 100 ) ) ; 
+ + Map < String , Long > numDown = dcToRemainingPeers . entrySet ( ) . stream ( ) 
+ + . collect ( Collectors . toMap ( Map . Entry : : getKey , 
+ + e - > e . getValue ( ) . getCount ( ) ) ) ; 
+ + 
+ + if ( succeeded ) 
+ + { 
+ + logger . info ( " Ensured sufficient healthy connections with { } after { } milliseconds " , 
+ + numDown . keySet ( ) , TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - startNanos ) ) ; 
+ + } 
+ + else 
+ + { 
+ + logger . warn ( " Timed out after { } milliseconds , was waiting for remaining peers to connect : { } " , 
+ + TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - startNanos ) , numDown ) ; 
+ + } 
+ + 
+ return succeeded ; 
+ } 
+ 
+ @ @ - 122 , 7 + 180 , 8 @ @ public class StartupClusterConnectivityChecker 
+ * Sends a " connection warmup " message to each peer in the collection , on every { @ link ConnectionType } 
+ * used for internode messaging ( that is not gossip ) . 
+ * / 
+ - private void sendPingMessages ( Set < InetAddressAndPort > peers , CountDownLatch latch , AckMap acks ) 
+ + private void sendPingMessages ( Set < InetAddressAndPort > peers , Map < String , CountDownLatch > dcToRemainingPeers , 
+ + AckMap acks , Function < InetAddressAndPort , String > getDatacenter ) 
+ { 
+ IAsyncCallback responseHandler = new IAsyncCallback ( ) 
+ { 
+ @ @ - 134 , 7 + 193 , 12 @ @ public class StartupClusterConnectivityChecker 
+ public void response ( MessageIn msg ) 
+ { 
+ if ( acks . incrementAndCheck ( msg . from ) ) 
+ - latch . countDown ( ) ; 
+ + { 
+ + String datacenter = getDatacenter . apply ( msg . from ) ; 
+ + / / We have to check because we might only have the local DC in the map 
+ + if ( dcToRemainingPeers . containsKey ( datacenter ) ) 
+ + dcToRemainingPeers . get ( datacenter ) . countDown ( ) ; 
+ + } 
+ } 
+ } ; 
+ 
+ @ @ - 155 , 15 + 219 , 18 @ @ public class StartupClusterConnectivityChecker 
+ * / 
+ private static final class AliveListener implements IEndpointStateChangeSubscriber 
+ { 
+ - private final CountDownLatch latch ; 
+ + private final Map < String , CountDownLatch > dcToRemainingPeers ; 
+ private final Set < InetAddressAndPort > livePeers ; 
+ + private final Function < InetAddressAndPort , String > getDatacenter ; 
+ private final AckMap acks ; 
+ 
+ - AliveListener ( Set < InetAddressAndPort > livePeers , CountDownLatch latch , AckMap acks ) 
+ + AliveListener ( Set < InetAddressAndPort > livePeers , Map < String , CountDownLatch > dcToRemainingPeers , 
+ + AckMap acks , Function < InetAddressAndPort , String > getDatacenter ) 
+ { 
+ - this . latch = latch ; 
+ this . livePeers = livePeers ; 
+ + this . dcToRemainingPeers = dcToRemainingPeers ; 
+ this . acks = acks ; 
+ + this . getDatacenter = getDatacenter ; 
+ } 
+ 
+ public void onJoin ( InetAddressAndPort endpoint , EndpointState epState ) 
+ @ @ - 181 , 7 + 248 , 11 @ @ public class StartupClusterConnectivityChecker 
+ public void onAlive ( InetAddressAndPort endpoint , EndpointState state ) 
+ { 
+ if ( livePeers . add ( endpoint ) & & acks . incrementAndCheck ( endpoint ) ) 
+ - latch . countDown ( ) ; 
+ + { 
+ + String datacenter = getDatacenter . apply ( endpoint ) ; 
+ + if ( dcToRemainingPeers . containsKey ( datacenter ) ) 
+ + dcToRemainingPeers . get ( datacenter ) . countDown ( ) ; 
+ + } 
+ } 
+ 
+ public void onDead ( InetAddressAndPort endpoint , EndpointState state ) 
+ diff - - git a / src / java / org / apache / cassandra / service / CassandraDaemon . java b / src / java / org / apache / cassandra / service / CassandraDaemon . java 
+ index 815e673 . . f0b2dc1 100644 
+ - - - a / src / java / org / apache / cassandra / service / CassandraDaemon . java 
+ + + + b / src / java / org / apache / cassandra / service / CassandraDaemon . java 
+ @ @ - 505 , 9 + 505 , 9 @ @ public class CassandraDaemon 
+ * / 
+ public void start ( ) 
+ { 
+ - StartupClusterConnectivityChecker connectivityChecker = StartupClusterConnectivityChecker . create ( DatabaseDescriptor . getBlockForPeersPercentage ( ) , 
+ - DatabaseDescriptor . getBlockForPeersTimeoutInSeconds ( ) ) ; 
+ - connectivityChecker . execute ( Gossiper . instance . getEndpoints ( ) ) ; 
+ + StartupClusterConnectivityChecker connectivityChecker = StartupClusterConnectivityChecker . create ( DatabaseDescriptor . getBlockForPeersTimeoutInSeconds ( ) , 
+ + DatabaseDescriptor . getBlockForPeersInRemoteDatacenters ( ) ) ; 
+ + connectivityChecker . execute ( Gossiper . instance . getEndpoints ( ) , DatabaseDescriptor . getEndpointSnitch ( ) : : getDatacenter ) ; 
+ 
+ String nativeFlag = System . getProperty ( " cassandra . start _ native _ transport " ) ; 
+ if ( ( nativeFlag ! = null & & Boolean . parseBoolean ( nativeFlag ) ) | | ( nativeFlag = = null & & DatabaseDescriptor . startNativeTransport ( ) ) ) 
+ diff - - git a / test / unit / org / apache / cassandra / net / StartupClusterConnectivityCheckerTest . java b / test / unit / org / apache / cassandra / net / StartupClusterConnectivityCheckerTest . java 
+ index 4eeb314 . . 1645d77 100644 
+ - - - a / test / unit / org / apache / cassandra / net / StartupClusterConnectivityCheckerTest . java 
+ + + + b / test / unit / org / apache / cassandra / net / StartupClusterConnectivityCheckerTest . java 
+ @ @ - 36 , 13 + 36 , 35 @ @ import org . apache . cassandra . gms . EndpointState ; 
+ import org . apache . cassandra . gms . Gossiper ; 
+ import org . apache . cassandra . gms . HeartBeatState ; 
+ import org . apache . cassandra . locator . InetAddressAndPort ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ import static org . apache . cassandra . net . async . OutboundConnectionIdentifier . ConnectionType . SMALL _ MESSAGE ; 
+ 
+ public class StartupClusterConnectivityCheckerTest 
+ { 
+ - private StartupClusterConnectivityChecker connectivityChecker ; 
+ + private StartupClusterConnectivityChecker localQuorumConnectivityChecker ; 
+ + private StartupClusterConnectivityChecker globalQuorumConnectivityChecker ; 
+ + private StartupClusterConnectivityChecker noopChecker ; 
+ + private StartupClusterConnectivityChecker zeroWaitChecker ; 
+ + 
+ + private static final long TIMEOUT _ NANOS = 100 ; 
+ + private static final int NUM _ PER _ DC = 6 ; 
+ private Set < InetAddressAndPort > peers ; 
+ + private Set < InetAddressAndPort > peersA ; 
+ + private Set < InetAddressAndPort > peersAMinusLocal ; 
+ + private Set < InetAddressAndPort > peersB ; 
+ + private Set < InetAddressAndPort > peersC ; 
+ + 
+ + private String getDatacenter ( InetAddressAndPort endpoint ) 
+ + { 
+ + if ( peersA . contains ( endpoint ) ) 
+ + return " datacenterA " ; 
+ + if ( peersB . contains ( endpoint ) ) 
+ + return " datacenterB " ; 
+ + else if ( peersC . contains ( endpoint ) ) 
+ + return " datacenterC " ; 
+ + return null ; 
+ + } 
+ 
+ @ BeforeClass 
+ public static void before ( ) 
+ @ @ - 53 , 11 + 75 , 34 @ @ public class StartupClusterConnectivityCheckerTest 
+ @ Before 
+ public void setUp ( ) throws UnknownHostException 
+ { 
+ - connectivityChecker = new StartupClusterConnectivityChecker ( 70 , 10 ) ; 
+ + localQuorumConnectivityChecker = new StartupClusterConnectivityChecker ( TIMEOUT _ NANOS , false ) ; 
+ + globalQuorumConnectivityChecker = new StartupClusterConnectivityChecker ( TIMEOUT _ NANOS , true ) ; 
+ + noopChecker = new StartupClusterConnectivityChecker ( - 1 , false ) ; 
+ + zeroWaitChecker = new StartupClusterConnectivityChecker ( 0 , false ) ; 
+ + 
+ + peersA = new HashSet < > ( ) ; 
+ + peersAMinusLocal = new HashSet < > ( ) ; 
+ + peersA . add ( FBUtilities . getBroadcastAddressAndPort ( ) ) ; 
+ + 
+ + for ( int i = 0 ; i < NUM _ PER _ DC - 1 ; i + + ) 
+ + { 
+ + peersA . add ( InetAddressAndPort . getByName ( " 127 . 0 . 1 . " + i ) ) ; 
+ + peersAMinusLocal . add ( InetAddressAndPort . getByName ( " 127 . 0 . 1 . " + i ) ) ; 
+ + } 
+ + 
+ + peersB = new HashSet < > ( ) ; 
+ + for ( int i = 0 ; i < NUM _ PER _ DC ; i + + ) 
+ + peersB . add ( InetAddressAndPort . getByName ( " 127 . 0 . 2 . " + i ) ) ; 
+ + 
+ + 
+ + peersC = new HashSet < > ( ) ; 
+ + for ( int i = 0 ; i < NUM _ PER _ DC ; i + + ) 
+ + peersC . add ( InetAddressAndPort . getByName ( " 127 . 0 . 3 . " + i ) ) ; 
+ + 
+ peers = new HashSet < > ( ) ; 
+ - peers . add ( InetAddressAndPort . getByName ( " 127 . 0 . 1 . 0 " ) ) ; 
+ - peers . add ( InetAddressAndPort . getByName ( " 127 . 0 . 1 . 1 " ) ) ; 
+ - peers . add ( InetAddressAndPort . getByName ( " 127 . 0 . 1 . 2 " ) ) ; 
+ + peers . addAll ( peersA ) ; 
+ + peers . addAll ( peersB ) ; 
+ + peers . addAll ( peersC ) ; 
+ } 
+ 
+ @ After 
+ @ @ - 69 , 50 + 114 , 145 @ @ public class StartupClusterConnectivityCheckerTest 
+ @ Test 
+ public void execute _ HappyPath ( ) 
+ { 
+ - Sink sink = new Sink ( true , true ) ; 
+ + Sink sink = new Sink ( true , true , peers ) ; 
+ MessagingService . instance ( ) . addMessageSink ( sink ) ; 
+ - Assert . assertTrue ( connectivityChecker . execute ( peers ) ) ; 
+ - checkAllConnectionTypesSeen ( sink ) ; 
+ + Assert . assertTrue ( localQuorumConnectivityChecker . execute ( peers , this : : getDatacenter ) ) ; 
+ + Assert . assertTrue ( checkAllConnectionTypesSeen ( sink ) ) ; 
+ } 
+ 
+ @ Test 
+ public void execute _ NotAlive ( ) 
+ { 
+ - Sink sink = new Sink ( false , true ) ; 
+ + Sink sink = new Sink ( false , true , peers ) ; 
+ MessagingService . instance ( ) . addMessageSink ( sink ) ; 
+ - Assert . assertFalse ( connectivityChecker . execute ( peers ) ) ; 
+ - checkAllConnectionTypesSeen ( sink ) ; 
+ + Assert . assertFalse ( localQuorumConnectivityChecker . execute ( peers , this : : getDatacenter ) ) ; 
+ + Assert . assertTrue ( checkAllConnectionTypesSeen ( sink ) ) ; 
+ } 
+ 
+ @ Test 
+ public void execute _ NoConnectionsAcks ( ) 
+ { 
+ - Sink sink = new Sink ( true , false ) ; 
+ + Sink sink = new Sink ( true , false , peers ) ; 
+ + MessagingService . instance ( ) . addMessageSink ( sink ) ; 
+ + Assert . assertFalse ( localQuorumConnectivityChecker . execute ( peers , this : : getDatacenter ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void execute _ LocalQuorum ( ) 
+ + { 
+ + / / local peer plus 3 peers from same dc shouldn ' t pass ( 4 / 6 ) 
+ + Set < InetAddressAndPort > available = new HashSet < > ( ) ; 
+ + copyCount ( peersAMinusLocal , available , NUM _ PER _ DC - 3 ) ; 
+ + checkAvailable ( localQuorumConnectivityChecker , available , false , true ) ; 
+ + 
+ + / / local peer plus 4 peers from same dc should pass ( 5 / 6 ) 
+ + available . clear ( ) ; 
+ + copyCount ( peersAMinusLocal , available , NUM _ PER _ DC - 2 ) ; 
+ + checkAvailable ( localQuorumConnectivityChecker , available , true , true ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void execute _ GlobalQuorum ( ) 
+ + { 
+ + / / local dc passing shouldn ' t pass globally with two hosts down in datacenterB 
+ + Set < InetAddressAndPort > available = new HashSet < > ( ) ; 
+ + copyCount ( peersAMinusLocal , available , NUM _ PER _ DC - 2 ) ; 
+ + copyCount ( peersB , available , NUM _ PER _ DC - 2 ) ; 
+ + copyCount ( peersC , available , NUM _ PER _ DC - 1 ) ; 
+ + checkAvailable ( globalQuorumConnectivityChecker , available , false , true ) ; 
+ + 
+ + / / All three datacenters should be able to have a single node down 
+ + available . clear ( ) ; 
+ + copyCount ( peersAMinusLocal , available , NUM _ PER _ DC - 2 ) ; 
+ + copyCount ( peersB , available , NUM _ PER _ DC - 1 ) ; 
+ + copyCount ( peersC , available , NUM _ PER _ DC - 1 ) ; 
+ + checkAvailable ( globalQuorumConnectivityChecker , available , true , true ) ; 
+ + 
+ + / / Everything being up should work of course 
+ + available . clear ( ) ; 
+ + copyCount ( peersAMinusLocal , available , NUM _ PER _ DC - 1 ) ; 
+ + copyCount ( peersB , available , NUM _ PER _ DC ) ; 
+ + copyCount ( peersC , available , NUM _ PER _ DC ) ; 
+ + checkAvailable ( globalQuorumConnectivityChecker , available , true , true ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void execute _ Noop ( ) 
+ + { 
+ + checkAvailable ( noopChecker , new HashSet < > ( ) , true , false ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void execute _ ZeroWaitHasConnections ( ) throws InterruptedException 
+ + { 
+ + Sink sink = new Sink ( true , true , new HashSet < > ( ) ) ; 
+ + MessagingService . instance ( ) . addMessageSink ( sink ) ; 
+ + Assert . assertFalse ( zeroWaitChecker . execute ( peers , this : : getDatacenter ) ) ; 
+ + boolean hasConnections = false ; 
+ + for ( int i = 0 ; i < TIMEOUT _ NANOS ; i + = 10 ) 
+ + { 
+ + hasConnections = checkAllConnectionTypesSeen ( sink ) ; 
+ + if ( hasConnections ) 
+ + break ; 
+ + Thread . sleep ( 0 , 10 ) ; 
+ + } 
+ + MessagingService . instance ( ) . clearMessageSinks ( ) ; 
+ + Assert . assertTrue ( hasConnections ) ; 
+ + } 
+ + 
+ + private void checkAvailable ( StartupClusterConnectivityChecker checker , Set < InetAddressAndPort > available , 
+ + boolean shouldPass , boolean checkConnections ) 
+ + { 
+ + Sink sink = new Sink ( true , true , available ) ; 
+ MessagingService . instance ( ) . addMessageSink ( sink ) ; 
+ - Assert . assertFalse ( connectivityChecker . execute ( peers ) ) ; 
+ + Assert . assertEquals ( shouldPass , checker . execute ( peers , this : : getDatacenter ) ) ; 
+ + if ( checkConnections ) 
+ + Assert . assertTrue ( checkAllConnectionTypesSeen ( sink ) ) ; 
+ + MessagingService . instance ( ) . clearMessageSinks ( ) ; 
+ + } 
+ + 
+ + private void copyCount ( Set < InetAddressAndPort > source , Set < InetAddressAndPort > dest , int count ) 
+ + { 
+ + for ( InetAddressAndPort peer : source ) 
+ + { 
+ + if ( count < = 0 ) 
+ + break ; 
+ + 
+ + dest . add ( peer ) ; 
+ + count - = 1 ; 
+ + } 
+ } 
+ 
+ - private void checkAllConnectionTypesSeen ( Sink sink ) 
+ + private boolean checkAllConnectionTypesSeen ( Sink sink ) 
+ { 
+ + boolean result = true ; 
+ for ( InetAddressAndPort peer : peers ) 
+ { 
+ + if ( peer . equals ( FBUtilities . getBroadcastAddressAndPort ( ) ) ) 
+ + continue ; 
+ ConnectionTypeRecorder recorder = sink . seenConnectionRequests . get ( peer ) ; 
+ - Assert . assertNotNull ( recorder ) ; 
+ - Assert . assertTrue ( recorder . seenSmallMessageRequest ) ; 
+ - Assert . assertTrue ( recorder . seenLargeMessageRequest ) ; 
+ + result = recorder ! = null ; 
+ + if ( ! result ) 
+ + break ; 
+ + 
+ + result = recorder . seenSmallMessageRequest ; 
+ + result & = recorder . seenLargeMessageRequest ; 
+ } 
+ + return result ; 
+ } 
+ 
+ private static class Sink implements IMessageSink 
+ { 
+ private final boolean markAliveInGossip ; 
+ private final boolean processConnectAck ; 
+ + private final Set < InetAddressAndPort > aliveHosts ; 
+ private final Map < InetAddressAndPort , ConnectionTypeRecorder > seenConnectionRequests ; 
+ 
+ - Sink ( boolean markAliveInGossip , boolean processConnectAck ) 
+ + Sink ( boolean markAliveInGossip , boolean processConnectAck , Set < InetAddressAndPort > aliveHosts ) 
+ { 
+ this . markAliveInGossip = markAliveInGossip ; 
+ this . processConnectAck = processConnectAck ; 
+ + this . aliveHosts = aliveHosts ; 
+ seenConnectionRequests = new HashMap < > ( ) ; 
+ } 
+ 
+ @ @ - 131 , 6 + 271 , 9 @ @ public class StartupClusterConnectivityCheckerTest 
+ recorder . seenLargeMessageRequest = true ; 
+ } 
+ 
+ + if ( ! aliveHosts . contains ( to ) ) 
+ + return false ; 
+ + 
+ if ( processConnectAck ) 
+ { 
+ MessageIn msgIn = MessageIn . create ( to , message . payload , Collections . emptyMap ( ) , MessagingService . Verb . REQUEST _ RESPONSE , 1 ) ;
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / net / FileStreamTask . java b / src / java / org / apache / cassandra / net / FileStreamTask . java 
+ index 724e9ae . . 34619da 100644 
+ - - - a / src / java / org / apache / cassandra / net / FileStreamTask . java 
+ + + + b / src / java / org / apache / cassandra / net / FileStreamTask . java 
+ @ @ - 44 , 6 + 44 , 8 @ @ class FileStreamTask implements Runnable 
+ 
+ public void run ( ) 
+ { 
+ + / * 
+ + TODO 
+ TcpConnection connection = null ; 
+ try 
+ { 
+ @ @ - 61 , 6 + 63 , 6 @ @ class FileStreamTask implements Runnable 
+ } 
+ throw new RuntimeException ( e ) ; 
+ } 
+ + * / 
+ } 
+ - 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java 
+ index 96bad3c . . 11afaae 100644 
+ - - - a / src / java / org / apache / cassandra / net / MessagingService . java 
+ + + + b / src / java / org / apache / cassandra / net / MessagingService . java 
+ @ @ - 68 , 7 + 68 , 7 @ @ public class MessagingService implements IFailureDetectionEventListener 
+ / * Thread pool to handle messaging write activities * / 
+ private static ExecutorService streamExecutor _ ; 
+ 
+ - private static NonBlockingHashMap < String , TcpConnectionManager > connectionManagers _ = new NonBlockingHashMap < String , TcpConnectionManager > ( ) ; 
+ + private static NonBlockingHashMap < String , OutboundTcpConnectionPool > connectionManagers _ = new NonBlockingHashMap < String , OutboundTcpConnectionPool > ( ) ; 
+ 
+ private static Logger logger _ = Logger . getLogger ( MessagingService . class ) ; 
+ 
+ @ @ - 186 , 19 + 186 , 19 @ @ public class MessagingService implements IFailureDetectionEventListener 
+ } 
+ } 
+ 
+ - public static TcpConnectionManager getConnectionPool ( InetAddress from , InetAddress to ) 
+ + public static OutboundTcpConnectionPool getConnectionPool ( InetAddress from , InetAddress to ) 
+ { 
+ String key = from + " : " + to ; 
+ - TcpConnectionManager cp = connectionManagers _ . get ( key ) ; 
+ + OutboundTcpConnectionPool cp = connectionManagers _ . get ( key ) ; 
+ if ( cp = = null ) 
+ { 
+ - connectionManagers _ . putIfAbsent ( key , new TcpConnectionManager ( from , to ) ) ; 
+ + connectionManagers _ . putIfAbsent ( key , new OutboundTcpConnectionPool ( from , to ) ) ; 
+ cp = connectionManagers _ . get ( key ) ; 
+ } 
+ return cp ; 
+ } 
+ 
+ - public static TcpConnection getConnection ( InetAddress from , InetAddress to , Message msg ) throws IOException 
+ + public static OutboundTcpConnection getConnection ( InetAddress from , InetAddress to , Message msg ) 
+ { 
+ return getConnectionPool ( from , to ) . getConnection ( msg ) ; 
+ } 
+ @ @ - 331 , 20 + 331 , 9 @ @ public class MessagingService implements IFailureDetectionEventListener 
+ assert data . length > 0 ; 
+ ByteBuffer buffer = packIt ( data , false , false ) ; 
+ 
+ - TcpConnection connection = null ; 
+ - try 
+ - { 
+ - connection = MessagingService . getConnection ( processedMessage . getFrom ( ) , to , message ) ; 
+ - connection . write ( buffer ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - if ( connection ! = null ) 
+ - { 
+ - connection . errorClose ( ) ; 
+ - } 
+ - logger _ . error ( " unexpected error writing " + message , e ) ; 
+ - } 
+ + OutboundTcpConnection connection = null ; 
+ + connection = getConnection ( processedMessage . getFrom ( ) , to , message ) ; 
+ + connection . write ( buffer ) ; 
+ } 
+ 
+ public IAsyncResult sendRR ( Message message , InetAddress to ) 
+ diff - - git a / src / java / org / apache / cassandra / net / OutboundTcpConnection . java b / src / java / org / apache / cassandra / net / OutboundTcpConnection . java 
+ new file mode 100644 
+ index 0000000 . . f2ace82 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / net / OutboundTcpConnection . java 
+ @ @ - 0 , 0 + 1 , 97 @ @ 
+ + package org . apache . cassandra . net ; 
+ + 
+ + import java . io . DataOutputStream ; 
+ + import java . io . IOError ; 
+ + import java . io . IOException ; 
+ + import java . net . InetAddress ; 
+ + import java . net . Socket ; 
+ + import java . nio . ByteBuffer ; 
+ + import java . util . concurrent . BlockingQueue ; 
+ + import java . util . concurrent . LinkedBlockingQueue ; 
+ + 
+ + import org . apache . log4j . Logger ; 
+ + 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ + 
+ + public class OutboundTcpConnection 
+ + { 
+ + private static Logger logger = Logger . getLogger ( OutboundTcpConnection . class ) ; 
+ + 
+ + public BlockingQueue < ByteBuffer > queue = new LinkedBlockingQueue < ByteBuffer > ( ) ; 
+ + public DataOutputStream output ; 
+ + public Socket socket ; 
+ + 
+ + / / TODO localEp is ignored , get rid of it 
+ + public OutboundTcpConnection ( final OutboundTcpConnectionPool pool , InetAddress localEp , final InetAddress remoteEp ) 
+ + { 
+ + try 
+ + { 
+ + socket = new Socket ( remoteEp , DatabaseDescriptor . getStoragePort ( ) ) ; 
+ + socket . setTcpNoDelay ( true ) ; 
+ + output = new DataOutputStream ( socket . getOutputStream ( ) ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + new Thread ( new Runnable ( ) 
+ + { 
+ + public void run ( ) 
+ + { 
+ + while ( socket ! = null ) 
+ + { 
+ + ByteBuffer bb ; 
+ + try 
+ + { 
+ + bb = queue . take ( ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + throw new AssertionError ( e ) ; 
+ + } 
+ + try 
+ + { 
+ + output . write ( bb . array ( ) , 0 , bb . limit ( ) ) ; 
+ + if ( queue . peek ( ) = = null ) 
+ + { 
+ + output . flush ( ) ; 
+ + } 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + logger . info ( " error writing to " + remoteEp ) ; 
+ + pool . reset ( ) ; 
+ + break ; 
+ + } 
+ + } 
+ + } 
+ + } , " WRITE - " + remoteEp ) . start ( ) ; 
+ + } 
+ + 
+ + public void write ( ByteBuffer buffer ) 
+ + { 
+ + try 
+ + { 
+ + queue . put ( buffer ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + throw new AssertionError ( e ) ; 
+ + } 
+ + } 
+ + 
+ + public void closeSocket ( ) 
+ + { 
+ + try 
+ + { 
+ + socket . close ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + if ( logger . isDebugEnabled ( ) ) 
+ + logger . debug ( " error closing socket " , e ) ; 
+ + } 
+ + socket = null ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java b / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java 
+ new file mode 100644 
+ index 0000000 . . 8ad66ca 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java 
+ @ @ - 0 , 0 + 1 , 72 @ @ 
+ + / * * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + 
+ + package org . apache . cassandra . net ; 
+ + 
+ + import java . io . IOException ; 
+ + import java . net . InetAddress ; 
+ + 
+ + import org . apache . cassandra . concurrent . StageManager ; 
+ + 
+ + class OutboundTcpConnectionPool 
+ + { 
+ + private InetAddress localEp _ ; 
+ + private InetAddress remoteEp _ ; 
+ + private OutboundTcpConnection cmdCon ; 
+ + private OutboundTcpConnection ackCon ; 
+ + 
+ + / / TODO localEp is ignored , get rid of it 
+ + OutboundTcpConnectionPool ( InetAddress localEp , InetAddress remoteEp ) 
+ + { 
+ + localEp _ = localEp ; 
+ + remoteEp _ = remoteEp ; 
+ + } 
+ + 
+ + private OutboundTcpConnection newCon ( ) 
+ + { 
+ + return new OutboundTcpConnection ( this , localEp _ , remoteEp _ ) ; 
+ + } 
+ + 
+ + / * * 
+ + * returns the appropriate connection based on message type . 
+ + * / 
+ + synchronized OutboundTcpConnection getConnection ( Message msg ) 
+ + { 
+ + if ( StageManager . RESPONSE _ STAGE . equals ( msg . getMessageType ( ) ) ) 
+ + { 
+ + if ( ackCon = = null ) 
+ + ackCon = newCon ( ) ; 
+ + return ackCon ; 
+ + } 
+ + else 
+ + { 
+ + if ( cmdCon = = null ) 
+ + cmdCon = newCon ( ) ; 
+ + return cmdCon ; 
+ + } 
+ + } 
+ + 
+ + synchronized void reset ( ) 
+ + { 
+ + for ( OutboundTcpConnection con : new OutboundTcpConnection [ ] { cmdCon , ackCon } ) 
+ + if ( con ! = null ) 
+ + con . closeSocket ( ) ; 
+ + cmdCon = null ; 
+ + ackCon = null ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / net / TcpConnection . java b / src / java / org / apache / cassandra / net / TcpConnection . java 
+ deleted file mode 100644 
+ index 01003d1 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / net / TcpConnection . java 
+ + + + / dev / null 
+ @ @ - 1 , 378 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . net ; 
+ - 
+ - import java . io . * ; 
+ - import java . nio . ByteBuffer ; 
+ - import java . nio . channels . FileChannel ; 
+ - import java . nio . channels . SelectionKey ; 
+ - import java . nio . channels . SocketChannel ; 
+ - import java . util . * ; 
+ - import java . util . concurrent . TimeUnit ; 
+ - import java . util . concurrent . ConcurrentLinkedQueue ; 
+ - import java . util . concurrent . locks . Condition ; 
+ - import java . util . concurrent . locks . Lock ; 
+ - import java . util . concurrent . locks . ReentrantLock ; 
+ - import java . net . InetAddress ; 
+ - import java . net . InetSocketAddress ; 
+ - 
+ - import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - 
+ - import org . apache . log4j . Logger ; 
+ - 
+ - public class TcpConnection extends SelectionKeyHandler implements Comparable 
+ - { 
+ - / / logging and profiling . 
+ - private static Logger logger _ = Logger . getLogger ( TcpConnection . class ) ; 
+ - private SocketChannel socketChannel _ ; 
+ - private SelectionKey key _ ; 
+ - private TcpConnectionManager pool _ ; 
+ - private boolean isIncoming _ = false ; 
+ - private Queue < ByteBuffer > pendingWrites _ = new ConcurrentLinkedQueue < ByteBuffer > ( ) ; 
+ - private InetAddress localEp _ ; 
+ - private InetAddress remoteEp _ ; 
+ - 
+ - / * 
+ - * Added for streaming support . We need the boolean 
+ - * to indicate that this connection is used for 
+ - * streaming . The Condition and the Lock are used 
+ - * to signal the stream ( ) that it can continue 
+ - * streaming when the socket becomes writable . 
+ - * / 
+ - private boolean bStream _ = false ; 
+ - private Lock lock _ ; 
+ - private Condition condition _ ; 
+ - 
+ - private TcpConnection ( InetAddress from , InetAddress to , TcpConnectionManager pool , boolean streaming ) throws IOException 
+ - { 
+ - socketChannel _ = SocketChannel . open ( ) ; 
+ - socketChannel _ . socket ( ) . bind ( new InetSocketAddress ( from , 0 ) ) ; 
+ - socketChannel _ . configureBlocking ( false ) ; 
+ - 
+ - localEp _ = from ; 
+ - remoteEp _ = to ; 
+ - 
+ - if ( ! socketChannel _ . connect ( new InetSocketAddress ( remoteEp _ , DatabaseDescriptor . getStoragePort ( ) ) ) ) 
+ - { 
+ - key _ = SelectorManager . getSelectorManager ( ) . register ( socketChannel _ , this , SelectionKey . OP _ CONNECT ) ; 
+ - } 
+ - else 
+ - { 
+ - key _ = SelectorManager . getSelectorManager ( ) . register ( socketChannel _ , this , SelectionKey . OP _ READ ) ; 
+ - } 
+ - 
+ - if ( ( pool ! = null & & streaming ) | | ( pool = = null & & ! streaming ) ) 
+ - throw new RuntimeException ( " Invalid configuration . You must either specify a pool or streaming , not both or neither . " ) ; 
+ - 
+ - if ( pool ! = null ) 
+ - pool _ = pool ; 
+ - if ( streaming ) 
+ - { 
+ - bStream _ = true ; 
+ - lock _ = new ReentrantLock ( ) ; 
+ - condition _ = lock _ . newCondition ( ) ; 
+ - } 
+ - } 
+ - 
+ - / / used from getConnection - outgoing 
+ - TcpConnection ( TcpConnectionManager pool , InetAddress from , InetAddress to ) throws IOException 
+ - { 
+ - this ( from , to , pool , false ) ; 
+ - } 
+ - 
+ - / * 
+ - * Used for streaming purposes has no pooling semantics . 
+ - * / 
+ - TcpConnection ( InetAddress from , InetAddress to ) throws IOException 
+ - { 
+ - this ( from , to , null , true ) ; 
+ - } 
+ - 
+ - public InetAddress getEndPoint ( ) 
+ - { 
+ - return remoteEp _ ; 
+ - } 
+ - 
+ - public SocketChannel getSocketChannel ( ) 
+ - { 
+ - return socketChannel _ ; 
+ - } 
+ - 
+ - public synchronized void write ( ByteBuffer buffer ) throws IOException 
+ - { 
+ - if ( ! pendingWrites _ . isEmpty ( ) | | ! socketChannel _ . isConnected ( ) ) 
+ - { 
+ - pendingWrites _ . add ( buffer ) ; 
+ - return ; 
+ - } 
+ - 
+ - socketChannel _ . write ( buffer ) ; 
+ - 
+ - if ( buffer . remaining ( ) > 0 ) 
+ - { 
+ - pendingWrites _ . add ( buffer ) ; 
+ - turnOnInterestOps ( key _ , SelectionKey . OP _ WRITE ) ; 
+ - } 
+ - } 
+ - 
+ - public void stream ( File file , long startPosition , long endPosition ) throws IOException , InterruptedException 
+ - { 
+ - if ( ! bStream _ ) 
+ - throw new IllegalStateException ( " Cannot stream since we are not set up to stream data . " ) ; 
+ - 
+ - lock _ . lock ( ) ; 
+ - try 
+ - { 
+ - / * transfer 64MB in each attempt * / 
+ - int limit = 64 * 1024 * 1024 ; 
+ - long total = endPosition - startPosition ; 
+ - / * keeps track of total number of bytes transferred * / 
+ - long bytesWritten = 0L ; 
+ - RandomAccessFile raf = new RandomAccessFile ( file , " r " ) ; 
+ - FileChannel fc = raf . getChannel ( ) ; 
+ - 
+ - / * 
+ - * If the connection is not yet established then wait for 
+ - * the timeout period of 2 seconds . Attempt to reconnect 3 times and then 
+ - * bail with an IOException . 
+ - * / 
+ - long waitTime = 2 ; 
+ - int retry = 0 ; 
+ - while ( ! socketChannel _ . isConnected ( ) ) 
+ - { 
+ - if ( retry = = 3 ) 
+ - throw new IOException ( " Unable to connect to " + remoteEp _ + " after " + retry + " attempts . " ) ; 
+ - condition _ . await ( waitTime , TimeUnit . SECONDS ) ; 
+ - + + retry ; 
+ - } 
+ - 
+ - while ( bytesWritten < total ) 
+ - { 
+ - if ( startPosition = = 0 ) 
+ - { 
+ - ByteBuffer buffer = MessagingService . constructStreamHeader ( false , true ) ; 
+ - socketChannel _ . write ( buffer ) ; 
+ - if ( buffer . remaining ( ) > 0 ) 
+ - { 
+ - pendingWrites _ . add ( buffer ) ; 
+ - turnOnInterestOps ( key _ , SelectionKey . OP _ WRITE ) ; 
+ - condition _ . await ( ) ; 
+ - } 
+ - } 
+ - 
+ - long bytesTransferred ; 
+ - try 
+ - { 
+ - / * returns the number of bytes transferred from file to the socket * / 
+ - bytesTransferred = fc . transferTo ( startPosition , limit , socketChannel _ ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - / / at least jdk1 . 6 . 0 on Linux seems to throw IOException 
+ - / / when the socket is full . ( Bug fixed for 1 . 7 : http : / / bugs . sun . com / view _ bug . do ? bug _ id = 5103988 ) 
+ - / / For now look for a specific string in for the message for the exception . 
+ - if ( ! e . getMessage ( ) . startsWith ( " Resource temporarily unavailable " ) ) 
+ - throw e ; 
+ - Thread . sleep ( 10 ) ; 
+ - continue ; 
+ - } 
+ - if ( logger _ . isDebugEnabled ( ) ) 
+ - logger _ . debug ( " Bytes transferred " + bytesTransferred ) ; 
+ - bytesWritten + = bytesTransferred ; 
+ - startPosition + = bytesTransferred ; 
+ - / * 
+ - * If the number of bytes transferred is less than intended 
+ - * then we need to wait till socket becomes writeable again . 
+ - * / 
+ - if ( bytesTransferred < limit & & bytesWritten ! = total ) 
+ - { 
+ - turnOnInterestOps ( key _ , SelectionKey . OP _ WRITE ) ; 
+ - condition _ . await ( ) ; 
+ - } 
+ - } 
+ - } 
+ - finally 
+ - { 
+ - lock _ . unlock ( ) ; 
+ - } 
+ - } 
+ - 
+ - private void resumeStreaming ( ) 
+ - { 
+ - / * if not in streaming mode do nothing * / 
+ - if ( ! bStream _ ) 
+ - return ; 
+ - 
+ - lock _ . lock ( ) ; 
+ - try 
+ - { 
+ - condition _ . signal ( ) ; 
+ - } 
+ - finally 
+ - { 
+ - lock _ . unlock ( ) ; 
+ - } 
+ - } 
+ - 
+ - public boolean isConnected ( ) 
+ - { 
+ - return socketChannel _ . isConnected ( ) ; 
+ - } 
+ - 
+ - public boolean equals ( Object o ) 
+ - { 
+ - if ( ! ( o instanceof TcpConnection ) ) 
+ - return false ; 
+ - 
+ - TcpConnection rhs = ( TcpConnection ) o ; 
+ - return localEp _ . equals ( rhs . localEp _ ) & & remoteEp _ . equals ( rhs . remoteEp _ ) ; 
+ - } 
+ - 
+ - public int hashCode ( ) 
+ - { 
+ - return ( localEp _ + " : " + remoteEp _ ) . hashCode ( ) ; 
+ - } 
+ - 
+ - public String toString ( ) 
+ - { 
+ - return socketChannel _ . toString ( ) ; 
+ - } 
+ - 
+ - void closeSocket ( ) 
+ - { 
+ - if ( pendingWrites _ . size ( ) > 0 ) 
+ - logger _ . warn ( " Closing down connection " + socketChannel _ + " with " + pendingWrites _ . size ( ) + " writes remaining . " ) ; 
+ - cancel ( key _ ) ; 
+ - pendingWrites _ . clear ( ) ; 
+ - } 
+ - 
+ - void errorClose ( ) 
+ - { 
+ - logger _ . info ( " Closing errored connection " + socketChannel _ ) ; 
+ - pendingWrites _ . clear ( ) ; 
+ - cancel ( key _ ) ; 
+ - pendingWrites _ . clear ( ) ; 
+ - if ( pool _ ! = null ) 
+ - pool _ . reset ( ) ; 
+ - } 
+ - 
+ - private void cancel ( SelectionKey key ) 
+ - { 
+ - if ( key ! = null ) 
+ - { 
+ - key . cancel ( ) ; 
+ - try 
+ - { 
+ - key . channel ( ) . close ( ) ; 
+ - } 
+ - catch ( IOException e ) { } 
+ - } 
+ - } 
+ - 
+ - / / called in the selector thread 
+ - public void connect ( SelectionKey key ) 
+ - { 
+ - turnOffInterestOps ( key , SelectionKey . OP _ CONNECT ) ; 
+ - try 
+ - { 
+ - if ( socketChannel _ . finishConnect ( ) ) 
+ - { 
+ - turnOnInterestOps ( key , SelectionKey . OP _ READ ) ; 
+ - 
+ - synchronized ( this ) 
+ - { 
+ - / / this will flush the pending 
+ - if ( ! pendingWrites _ . isEmpty ( ) ) 
+ - { 
+ - turnOnInterestOps ( key _ , SelectionKey . OP _ WRITE ) ; 
+ - } 
+ - } 
+ - resumeStreaming ( ) ; 
+ - } 
+ - else 
+ - { 
+ - logger _ . error ( " Closing connection because socket channel could not finishConnect . " ) ; ; 
+ - errorClose ( ) ; 
+ - } 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - logger _ . error ( " Encountered IOException on connection : " + socketChannel _ , e ) ; 
+ - errorClose ( ) ; 
+ - } 
+ - } 
+ - 
+ - / / called in the selector thread 
+ - public void write ( SelectionKey key ) 
+ - { 
+ - turnOffInterestOps ( key , SelectionKey . OP _ WRITE ) ; 
+ - doPendingWrites ( ) ; 
+ - / * 
+ - * This is executed only if we are in streaming mode . 
+ - * Idea is that we read a chunk of data from a source 
+ - * and wait to read the next from the source until we 
+ - * are siganlled to do so from here . 
+ - * / 
+ - resumeStreaming ( ) ; 
+ - } 
+ - 
+ - public void doPendingWrites ( ) 
+ - { 
+ - synchronized ( this ) 
+ - { 
+ - try 
+ - { 
+ - while ( ! pendingWrites _ . isEmpty ( ) ) 
+ - { 
+ - ByteBuffer buffer = pendingWrites _ . peek ( ) ; 
+ - socketChannel _ . write ( buffer ) ; 
+ - if ( buffer . remaining ( ) > 0 ) 
+ - { 
+ - break ; 
+ - } 
+ - pendingWrites _ . remove ( ) ; 
+ - } 
+ - 
+ - } 
+ - catch ( IOException ex ) 
+ - { 
+ - logger _ . error ( ex ) ; 
+ - / / This is to fix the wierd Linux bug with NIO . 
+ - errorClose ( ) ; 
+ - } 
+ - finally 
+ - { 
+ - if ( ! pendingWrites _ . isEmpty ( ) ) 
+ - { 
+ - turnOnInterestOps ( key _ , SelectionKey . OP _ WRITE ) ; 
+ - } 
+ - } 
+ - } 
+ - } 
+ - 
+ - public int compareTo ( Object o ) 
+ - { 
+ - if ( o instanceof TcpConnection ) 
+ - { 
+ - return pendingWrites _ . size ( ) - ( ( TcpConnection ) o ) . pendingWrites _ . size ( ) ; 
+ - } 
+ - 
+ - throw new IllegalArgumentException ( ) ; 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / net / TcpConnectionManager . java b / src / java / org / apache / cassandra / net / TcpConnectionManager . java 
+ deleted file mode 100644 
+ index 8cdfef2 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / net / TcpConnectionManager . java 
+ + + + / dev / null 
+ @ @ - 1 , 72 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . net ; 
+ - 
+ - import java . io . IOException ; 
+ - import java . net . InetAddress ; 
+ - 
+ - import org . apache . cassandra . concurrent . StageManager ; 
+ - 
+ - class TcpConnectionManager 
+ - { 
+ - private InetAddress localEp _ ; 
+ - private InetAddress remoteEp _ ; 
+ - private TcpConnection cmdCon ; 
+ - private TcpConnection ackCon ; 
+ - 
+ - TcpConnectionManager ( InetAddress localEp , InetAddress remoteEp ) 
+ - { 
+ - localEp _ = localEp ; 
+ - remoteEp _ = remoteEp ; 
+ - } 
+ - 
+ - private TcpConnection newCon ( ) throws IOException 
+ - { 
+ - TcpConnection con = new TcpConnection ( this , localEp _ , remoteEp _ ) ; 
+ - return con ; 
+ - } 
+ - 
+ - / * * 
+ - * returns the appropriate connection based on message type . 
+ - * / 
+ - synchronized TcpConnection getConnection ( Message msg ) throws IOException 
+ - { 
+ - if ( StageManager . RESPONSE _ STAGE . equals ( msg . getMessageType ( ) ) ) 
+ - { 
+ - if ( ackCon = = null ) 
+ - ackCon = newCon ( ) ; 
+ - return ackCon ; 
+ - } 
+ - else 
+ - { 
+ - if ( cmdCon = = null ) 
+ - cmdCon = newCon ( ) ; 
+ - return cmdCon ; 
+ - } 
+ - } 
+ - 
+ - synchronized void reset ( ) 
+ - { 
+ - for ( TcpConnection con : new TcpConnection [ ] { cmdCon , ackCon } ) 
+ - if ( con ! = null ) 
+ - con . closeSocket ( ) ; 
+ - cmdCon = null ; 
+ - ackCon = null ; 
+ - } 
+ - }

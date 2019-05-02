@@ -1,0 +1,372 @@
+BLEU SCORE: 0.04767707020457096
+
+TEST MSG: Revert refactor of doValidationCompaction which caused breaks from 9431
+GENERATED MSG: Exclude gcable tombstones from merkle - tree computation
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> index ffed554 . . 26dab7c 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> @ @ - 1013 , 6 + 1013 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> * Performs a readonly " compaction " of all sstables in order to validate complete rows , <nl> * but without writing the merge result <nl> * / <nl> + @ SuppressWarnings ( " resource " ) <nl> private void doValidationCompaction ( ColumnFamilyStore cfs , Validator validator ) throws IOException <nl> { <nl> / / this isn ' t meant to be race - proof , because it ' s not - - it won ' t cause bugs for a CFS to be dropped <nl> @ @ - 1023 , 40 + 1024 , 35 @ @ public class CompactionManager implements CompactionManagerMBean <nl> if ( ! cfs . isValid ( ) ) <nl> return ; <nl> <nl> - String snapshotName = validator . desc . sessionId . toString ( ) ; <nl> - boolean isSnapshotValidation = cfs . snapshotExists ( snapshotName ) ; <nl> - <nl> - int gcBefore ; <nl> - <nl> - if ( isSnapshotValidation ) <nl> + Refs < SSTableReader > sstables = null ; <nl> + try <nl> { <nl> - / / If there is a snapshot created for the session then read from there . <nl> - / / note that we populate the parent repair session when creating the snapshot , meaning the sstables in the snapshot are the ones we <nl> - / / are supposed to validate . <nl> <nl> - try ( Refs < SSTableReader > sstables = cfs . getSnapshotSSTableReader ( snapshotName ) ) <nl> + String snapshotName = validator . desc . sessionId . toString ( ) ; <nl> + int gcBefore ; <nl> + boolean isSnapshotValidation = cfs . snapshotExists ( snapshotName ) ; <nl> + if ( isSnapshotValidation ) <nl> { <nl> + / / If there is a snapshot created for the session then read from there . <nl> + / / note that we populate the parent repair session when creating the snapshot , meaning the sstables in the snapshot are the ones we <nl> + / / are supposed to validate . <nl> + sstables = cfs . getSnapshotSSTableReader ( snapshotName ) ; <nl> + <nl> + <nl> / / Computing gcbefore based on the current time wouldn ' t be very good because we know each replica will execute <nl> / / this at a different time ( that ' s the whole purpose of repair with snaphsot ) . So instead we take the creation <nl> / / time of the snapshot , which should give us roughtly the same time on each replica ( roughtly being in that case <nl> / / ' as good as in the non - snapshot ' case ) <nl> gcBefore = cfs . gcBefore ( cfs . getSnapshotCreationTime ( snapshotName ) ) ; <nl> - <nl> - buildMerkleTree ( cfs , sstables , validator , gcBefore ) ; <nl> - <nl> - / / review comment : should this be in a try / finally ? it was previously <nl> - cfs . clearSnapshot ( snapshotName ) ; <nl> } <nl> - } <nl> - else <nl> - { <nl> - / / flush first so everyone is validating data that is as similar as possible <nl> - StorageService . instance . forceKeyspaceFlush ( cfs . keyspace . getName ( ) , cfs . name ) ; <nl> - ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( validator . desc . parentSessionId ) ; <nl> - try ( ColumnFamilyStore . RefViewFragment sstableCandidates = cfs . selectAndReference ( prs . isIncremental ? ColumnFamilyStore . UNREPAIRED _ SSTABLES : ColumnFamilyStore . CANONICAL _ SSTABLES ) ) <nl> + else <nl> { <nl> - Refs < SSTableReader > refs = sstableCandidates . refs ; <nl> + / / flush first so everyone is validating data that is as similar as possible <nl> + StorageService . instance . forceKeyspaceFlush ( cfs . keyspace . getName ( ) , cfs . name ) ; <nl> + ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( validator . desc . parentSessionId ) ; <nl> + ColumnFamilyStore . RefViewFragment sstableCandidates = cfs . selectAndReference ( prs . isIncremental ? ColumnFamilyStore . UNREPAIRED _ SSTABLES : ColumnFamilyStore . CANONICAL _ SSTABLES ) ; <nl> Set < SSTableReader > sstablesToValidate = new HashSet < > ( ) ; <nl> + <nl> for ( SSTableReader sstable : sstableCandidates . sstables ) <nl> { <nl> if ( new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Collections . singletonList ( validator . desc . range ) ) ) <nl> @ @ - 1073 , 72 + 1069 , 78 @ @ public class CompactionManager implements CompactionManagerMBean <nl> throw new RuntimeException ( " Cannot start multiple repair sessions over the same sstables " ) ; <nl> } <nl> <nl> - refs . relaseAllExcept ( sstablesToValidate ) ; <nl> + sstables = Refs . tryRef ( sstablesToValidate ) ; <nl> + if ( sstables = = null ) <nl> + { <nl> + logger . error ( " Could not reference sstables " ) ; <nl> + throw new RuntimeException ( " Could not reference sstables " ) ; <nl> + } <nl> + sstableCandidates . release ( ) ; <nl> prs . addSSTables ( cfs . metadata . cfId , sstablesToValidate ) ; <nl> <nl> if ( validator . gcBefore > 0 ) <nl> gcBefore = validator . gcBefore ; <nl> else <nl> gcBefore = getDefaultGcBefore ( cfs ) ; <nl> - <nl> - <nl> - buildMerkleTree ( cfs , refs , validator , gcBefore ) ; <nl> } <nl> - } <nl> - } <nl> <nl> - private void buildMerkleTree ( ColumnFamilyStore cfs , Refs < SSTableReader > sstables , Validator validator , int gcBefore ) <nl> - { <nl> - / / Create Merkle tree suitable to hold estimated partitions for given range . <nl> - / / We blindly assume that partition is evenly distributed on all sstables for now . <nl> - long numPartitions = 0 ; <nl> - for ( SSTableReader sstable : sstables ) <nl> - { <nl> - numPartitions + = sstable . estimatedKeysForRanges ( Collections . singleton ( validator . desc . range ) ) ; <nl> - } <nl> - / / determine tree depth from number of partitions , but cap at 20 to prevent large tree . <nl> - int depth = numPartitions > 0 ? ( int ) Math . min ( Math . floor ( Math . log ( numPartitions ) ) , 20 ) : 0 ; <nl> - MerkleTree tree = new MerkleTree ( cfs . partitioner , validator . desc . range , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , depth ) ) ; <nl> + / / Create Merkle tree suitable to hold estimated partitions for given range . <nl> + / / We blindly assume that partition is evenly distributed on all sstables for now . <nl> + long numPartitions = 0 ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + { <nl> + numPartitions + = sstable . estimatedKeysForRanges ( singleton ( validator . desc . range ) ) ; <nl> + } <nl> + / / determine tree depth from number of partitions , but cap at 20 to prevent large tree . <nl> + int depth = numPartitions > 0 ? ( int ) Math . min ( Math . floor ( Math . log ( numPartitions ) ) , 20 ) : 0 ; <nl> + MerkleTree tree = new MerkleTree ( cfs . partitioner , validator . desc . range , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , depth ) ) ; <nl> <nl> - long start = System . nanoTime ( ) ; <nl> - try ( AbstractCompactionStrategy . ScannerList scanners = cfs . getCompactionStrategy ( ) . getScanners ( sstables , validator . desc . range ) ) <nl> - { <nl> - CompactionIterable ci = new ValidationCompactionIterable ( cfs , scanners . scanners , gcBefore ) ; <nl> - metrics . beginCompaction ( ci ) ; <nl> - try ( CloseableIterator < AbstractCompactedRow > iter = ci . iterator ( ) ; ) <nl> + long start = System . nanoTime ( ) ; <nl> + try ( AbstractCompactionStrategy . ScannerList scanners = cfs . getCompactionStrategy ( ) . getScanners ( sstables , validator . desc . range ) ) <nl> { <nl> - / / validate the CF as we iterate over it <nl> - validator . prepare ( cfs , tree ) ; <nl> - while ( iter . hasNext ( ) ) <nl> + CompactionIterable ci = new ValidationCompactionIterable ( cfs , scanners . scanners , gcBefore ) ; <nl> + Iterator < AbstractCompactedRow > iter = ci . iterator ( ) ; <nl> + metrics . beginCompaction ( ci ) ; <nl> + try <nl> { <nl> - if ( ci . isStopRequested ( ) ) <nl> - throw new CompactionInterruptedException ( ci . getCompactionInfo ( ) ) ; <nl> - @ SuppressWarnings ( " resource " ) <nl> - AbstractCompactedRow row = iter . next ( ) ; <nl> - validator . add ( row ) ; <nl> + / / validate the CF as we iterate over it <nl> + validator . prepare ( cfs , tree ) ; <nl> + while ( iter . hasNext ( ) ) <nl> + { <nl> + if ( ci . isStopRequested ( ) ) <nl> + throw new CompactionInterruptedException ( ci . getCompactionInfo ( ) ) ; <nl> + AbstractCompactedRow row = iter . next ( ) ; <nl> + validator . add ( row ) ; <nl> + } <nl> + validator . complete ( ) ; <nl> + } <nl> + finally <nl> + { <nl> + if ( isSnapshotValidation ) <nl> + { <nl> + cfs . clearSnapshot ( snapshotName ) ; <nl> + } <nl> + <nl> + metrics . finishCompaction ( ci ) ; <nl> } <nl> - validator . complete ( ) ; <nl> - } <nl> - catch ( Exception e ) <nl> - { <nl> - Throwables . propagate ( e ) ; <nl> } <nl> - finally <nl> + <nl> + if ( logger . isDebugEnabled ( ) ) <nl> { <nl> - metrics . finishCompaction ( ci ) ; <nl> + / / MT serialize may take time <nl> + long duration = TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) ; <nl> + logger . debug ( " Validation finished in { } msec , depth { } for { } keys , serialized size { } bytes for { } " , <nl> + duration , <nl> + depth , <nl> + numPartitions , <nl> + MerkleTree . serializer . serializedSize ( tree , 0 ) , <nl> + validator . desc ) ; <nl> } <nl> } <nl> - <nl> - if ( logger . isDebugEnabled ( ) ) <nl> + finally <nl> { <nl> - / / MT serialize may take time <nl> - long duration = TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) ; <nl> - logger . debug ( " Validation finished in { } msec , depth { } for { } keys , serialized size { } bytes for { } " , <nl> - duration , <nl> - depth , <nl> - numPartitions , <nl> - MerkleTree . serializer . serializedSize ( tree , 0 ) , <nl> - validator . desc ) ; <nl> + if ( sstables ! = null ) <nl> + sstables . release ( ) ; <nl> } <nl> } <nl>
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 9bc4478 . . ba9e134 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 2 , 6 + 2 , 7 @ @ <nl> * Don ' t share slice query filter in CQL3 SelectStatement ( CASSANDRA - 4928 ) <nl> * Separate tracing from Log4J ( CASSANDRA - 4861 ) <nl> * Exclude gcable tombstones from merkle - tree computation ( CASSANDRA - 4905 ) <nl> + * Better printing of AbstractBounds for tracing ( CASSANDRA - 4931 ) <nl> <nl> 1 . 2 - beta2 <nl> * fp rate of 1 . 0 disables BF entirely ; LCS defaults to 1 . 0 ( CASSANDRA - 4876 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 199d07a . . 882a322 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1387 , 7 + 1387 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> QueryFilter filter = new QueryFilter ( null , new QueryPath ( columnFamily , superColumn , null ) , columnFilter ) ; <nl> <nl> final ViewFragment view = markReferenced ( startWith , stopAt ) ; <nl> - Tracing . trace ( " Executing seq scan across { } sstables for { } . . { } " , new Object [ ] { view . sstables . size ( ) , startWith , stopAt } ) ; <nl> + Tracing . trace ( " Executing seq scan across { } sstables for { } " , view . sstables . size ( ) , range . getString ( metadata . getKeyValidator ( ) ) ) ; <nl> <nl> try <nl> { <nl> @ @ - 1453 , 7 + 1453 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> <nl> public List < Row > search ( List < IndexExpression > clause , AbstractBounds < RowPosition > range , int maxResults , IDiskAtomFilter dataFilter , boolean maxIsColumns ) <nl> { <nl> - Tracing . trace ( " Executing indexed scan for { } . . { } " , range . left , range . right ) ; <nl> + Tracing . trace ( " Executing indexed scan for { } " , range . getString ( metadata . getKeyValidator ( ) ) ) ; <nl> return indexManager . search ( clause , range , maxResults , dataFilter , maxIsColumns ) ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / dht / AbstractBounds . java b / src / java / org / apache / cassandra / dht / AbstractBounds . java <nl> index f2ae5c3 . . b5ce85d 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / AbstractBounds . java <nl> + + + b / src / java / org / apache / cassandra / dht / AbstractBounds . java <nl> @ @ - 23 , 8 + 23 , 10 @ @ import java . io . IOException ; <nl> import java . io . Serializable ; <nl> import java . util . * ; <nl> <nl> + import org . apache . cassandra . db . DecoratedKey ; <nl> import org . apache . cassandra . db . TypeSizes ; <nl> import org . apache . cassandra . db . RowPosition ; <nl> + import org . apache . cassandra . db . marshal . AbstractType ; <nl> import org . apache . cassandra . io . IVersionedSerializer ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> import org . apache . cassandra . utils . Pair ; <nl> @ @ - 89 , 6 + 91 , 26 @ @ public abstract class AbstractBounds < T extends RingPosition > implements Serializ <nl> <nl> public abstract List < ? extends AbstractBounds < T > > unwrap ( ) ; <nl> <nl> + public String getString ( AbstractType < ? > keyValidator ) <nl> + { <nl> + return getOpeningString ( ) + format ( left , keyValidator ) + " , " + format ( right , keyValidator ) + getClosingString ( ) ; <nl> + } <nl> + <nl> + private String format ( T value , AbstractType < ? > keyValidator ) <nl> + { <nl> + if ( value instanceof DecoratedKey ) <nl> + { <nl> + return keyValidator . getString ( ( ( DecoratedKey ) value ) . key ) ; <nl> + } <nl> + else <nl> + { <nl> + return value . toString ( ) ; <nl> + } <nl> + } <nl> + <nl> + protected abstract String getOpeningString ( ) ; <nl> + protected abstract String getClosingString ( ) ; <nl> + <nl> / * * <nl> * Transform this abstract bounds to equivalent covering bounds of row positions . <nl> * If this abstract bounds was already an abstractBounds of row positions , this is a noop . <nl> diff - - git a / src / java / org / apache / cassandra / dht / Bounds . java b / src / java / org / apache / cassandra / dht / Bounds . java <nl> index 7da30bc . . bf579ae 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / Bounds . java <nl> + + + b / src / java / org / apache / cassandra / dht / Bounds . java <nl> @ @ - 88 , 6 + 88 , 16 @ @ public class Bounds < T extends RingPosition > extends AbstractBounds < T > <nl> return " [ " + left + " , " + right + " ] " ; <nl> } <nl> <nl> + protected String getOpeningString ( ) <nl> + { <nl> + return " [ " ; <nl> + } <nl> + <nl> + protected String getClosingString ( ) <nl> + { <nl> + return " ] " ; <nl> + } <nl> + <nl> / * * <nl> * Compute a bounds of keys corresponding to a given bounds of token . <nl> * / <nl> diff - - git a / src / java / org / apache / cassandra / dht / ExcludingBounds . java b / src / java / org / apache / cassandra / dht / ExcludingBounds . java <nl> index 0bde8f1 . . 7823023 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / ExcludingBounds . java <nl> + + + b / src / java / org / apache / cassandra / dht / ExcludingBounds . java <nl> @ @ - 77 , 6 + 77 , 16 @ @ public class ExcludingBounds < T extends RingPosition > extends AbstractBounds < T > <nl> return " ( " + left + " , " + right + " ) " ; <nl> } <nl> <nl> + protected String getOpeningString ( ) <nl> + { <nl> + return " ( " ; <nl> + } <nl> + <nl> + protected String getClosingString ( ) <nl> + { <nl> + return " ) " ; <nl> + } <nl> + <nl> / * * <nl> * Compute a bounds of keys corresponding to a given bounds of token . <nl> * / <nl> diff - - git a / src / java / org / apache / cassandra / dht / IncludingExcludingBounds . java b / src / java / org / apache / cassandra / dht / IncludingExcludingBounds . java <nl> index 9c0f6dd . . 0b1cb0b 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / IncludingExcludingBounds . java <nl> + + + b / src / java / org / apache / cassandra / dht / IncludingExcludingBounds . java <nl> @ @ - 73 , 7 + 73 , 17 @ @ public class IncludingExcludingBounds < T extends RingPosition > extends AbstractBo <nl> @ Override <nl> public String toString ( ) <nl> { <nl> - return " ( " + left + " , " + right + " ) " ; <nl> + return " [ " + left + " , " + right + " ) " ; <nl> + } <nl> + <nl> + protected String getOpeningString ( ) <nl> + { <nl> + return " [ " ; <nl> + } <nl> + <nl> + protected String getClosingString ( ) <nl> + { <nl> + return " ) " ; <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / dht / Range . java b / src / java / org / apache / cassandra / dht / Range . java <nl> index f32c938 . . a750ae2 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / Range . java <nl> + + + b / src / java / org / apache / cassandra / dht / Range . java <nl> @ @ - 355 , 6 + 355 , 16 @ @ public class Range < T extends RingPosition > extends AbstractBounds < T > implements <nl> return " ( " + left + " , " + right + " ] " ; <nl> } <nl> <nl> + protected String getOpeningString ( ) <nl> + { <nl> + return " ( " ; <nl> + } <nl> + <nl> + protected String getClosingString ( ) <nl> + { <nl> + return " ] " ; <nl> + } <nl> + <nl> public List < String > asList ( ) <nl> { <nl> ArrayList < String > ret = new ArrayList < String > ( 2 ) ;
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ index ffed554 . . 26dab7c 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ @ @ - 1013 , 6 + 1013 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ * Performs a readonly " compaction " of all sstables in order to validate complete rows , 
+ * but without writing the merge result 
+ * / 
+ + @ SuppressWarnings ( " resource " ) 
+ private void doValidationCompaction ( ColumnFamilyStore cfs , Validator validator ) throws IOException 
+ { 
+ / / this isn ' t meant to be race - proof , because it ' s not - - it won ' t cause bugs for a CFS to be dropped 
+ @ @ - 1023 , 40 + 1024 , 35 @ @ public class CompactionManager implements CompactionManagerMBean 
+ if ( ! cfs . isValid ( ) ) 
+ return ; 
+ 
+ - String snapshotName = validator . desc . sessionId . toString ( ) ; 
+ - boolean isSnapshotValidation = cfs . snapshotExists ( snapshotName ) ; 
+ - 
+ - int gcBefore ; 
+ - 
+ - if ( isSnapshotValidation ) 
+ + Refs < SSTableReader > sstables = null ; 
+ + try 
+ { 
+ - / / If there is a snapshot created for the session then read from there . 
+ - / / note that we populate the parent repair session when creating the snapshot , meaning the sstables in the snapshot are the ones we 
+ - / / are supposed to validate . 
+ 
+ - try ( Refs < SSTableReader > sstables = cfs . getSnapshotSSTableReader ( snapshotName ) ) 
+ + String snapshotName = validator . desc . sessionId . toString ( ) ; 
+ + int gcBefore ; 
+ + boolean isSnapshotValidation = cfs . snapshotExists ( snapshotName ) ; 
+ + if ( isSnapshotValidation ) 
+ { 
+ + / / If there is a snapshot created for the session then read from there . 
+ + / / note that we populate the parent repair session when creating the snapshot , meaning the sstables in the snapshot are the ones we 
+ + / / are supposed to validate . 
+ + sstables = cfs . getSnapshotSSTableReader ( snapshotName ) ; 
+ + 
+ + 
+ / / Computing gcbefore based on the current time wouldn ' t be very good because we know each replica will execute 
+ / / this at a different time ( that ' s the whole purpose of repair with snaphsot ) . So instead we take the creation 
+ / / time of the snapshot , which should give us roughtly the same time on each replica ( roughtly being in that case 
+ / / ' as good as in the non - snapshot ' case ) 
+ gcBefore = cfs . gcBefore ( cfs . getSnapshotCreationTime ( snapshotName ) ) ; 
+ - 
+ - buildMerkleTree ( cfs , sstables , validator , gcBefore ) ; 
+ - 
+ - / / review comment : should this be in a try / finally ? it was previously 
+ - cfs . clearSnapshot ( snapshotName ) ; 
+ } 
+ - } 
+ - else 
+ - { 
+ - / / flush first so everyone is validating data that is as similar as possible 
+ - StorageService . instance . forceKeyspaceFlush ( cfs . keyspace . getName ( ) , cfs . name ) ; 
+ - ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( validator . desc . parentSessionId ) ; 
+ - try ( ColumnFamilyStore . RefViewFragment sstableCandidates = cfs . selectAndReference ( prs . isIncremental ? ColumnFamilyStore . UNREPAIRED _ SSTABLES : ColumnFamilyStore . CANONICAL _ SSTABLES ) ) 
+ + else 
+ { 
+ - Refs < SSTableReader > refs = sstableCandidates . refs ; 
+ + / / flush first so everyone is validating data that is as similar as possible 
+ + StorageService . instance . forceKeyspaceFlush ( cfs . keyspace . getName ( ) , cfs . name ) ; 
+ + ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( validator . desc . parentSessionId ) ; 
+ + ColumnFamilyStore . RefViewFragment sstableCandidates = cfs . selectAndReference ( prs . isIncremental ? ColumnFamilyStore . UNREPAIRED _ SSTABLES : ColumnFamilyStore . CANONICAL _ SSTABLES ) ; 
+ Set < SSTableReader > sstablesToValidate = new HashSet < > ( ) ; 
+ + 
+ for ( SSTableReader sstable : sstableCandidates . sstables ) 
+ { 
+ if ( new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Collections . singletonList ( validator . desc . range ) ) ) 
+ @ @ - 1073 , 72 + 1069 , 78 @ @ public class CompactionManager implements CompactionManagerMBean 
+ throw new RuntimeException ( " Cannot start multiple repair sessions over the same sstables " ) ; 
+ } 
+ 
+ - refs . relaseAllExcept ( sstablesToValidate ) ; 
+ + sstables = Refs . tryRef ( sstablesToValidate ) ; 
+ + if ( sstables = = null ) 
+ + { 
+ + logger . error ( " Could not reference sstables " ) ; 
+ + throw new RuntimeException ( " Could not reference sstables " ) ; 
+ + } 
+ + sstableCandidates . release ( ) ; 
+ prs . addSSTables ( cfs . metadata . cfId , sstablesToValidate ) ; 
+ 
+ if ( validator . gcBefore > 0 ) 
+ gcBefore = validator . gcBefore ; 
+ else 
+ gcBefore = getDefaultGcBefore ( cfs ) ; 
+ - 
+ - 
+ - buildMerkleTree ( cfs , refs , validator , gcBefore ) ; 
+ } 
+ - } 
+ - } 
+ 
+ - private void buildMerkleTree ( ColumnFamilyStore cfs , Refs < SSTableReader > sstables , Validator validator , int gcBefore ) 
+ - { 
+ - / / Create Merkle tree suitable to hold estimated partitions for given range . 
+ - / / We blindly assume that partition is evenly distributed on all sstables for now . 
+ - long numPartitions = 0 ; 
+ - for ( SSTableReader sstable : sstables ) 
+ - { 
+ - numPartitions + = sstable . estimatedKeysForRanges ( Collections . singleton ( validator . desc . range ) ) ; 
+ - } 
+ - / / determine tree depth from number of partitions , but cap at 20 to prevent large tree . 
+ - int depth = numPartitions > 0 ? ( int ) Math . min ( Math . floor ( Math . log ( numPartitions ) ) , 20 ) : 0 ; 
+ - MerkleTree tree = new MerkleTree ( cfs . partitioner , validator . desc . range , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , depth ) ) ; 
+ + / / Create Merkle tree suitable to hold estimated partitions for given range . 
+ + / / We blindly assume that partition is evenly distributed on all sstables for now . 
+ + long numPartitions = 0 ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + { 
+ + numPartitions + = sstable . estimatedKeysForRanges ( singleton ( validator . desc . range ) ) ; 
+ + } 
+ + / / determine tree depth from number of partitions , but cap at 20 to prevent large tree . 
+ + int depth = numPartitions > 0 ? ( int ) Math . min ( Math . floor ( Math . log ( numPartitions ) ) , 20 ) : 0 ; 
+ + MerkleTree tree = new MerkleTree ( cfs . partitioner , validator . desc . range , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , depth ) ) ; 
+ 
+ - long start = System . nanoTime ( ) ; 
+ - try ( AbstractCompactionStrategy . ScannerList scanners = cfs . getCompactionStrategy ( ) . getScanners ( sstables , validator . desc . range ) ) 
+ - { 
+ - CompactionIterable ci = new ValidationCompactionIterable ( cfs , scanners . scanners , gcBefore ) ; 
+ - metrics . beginCompaction ( ci ) ; 
+ - try ( CloseableIterator < AbstractCompactedRow > iter = ci . iterator ( ) ; ) 
+ + long start = System . nanoTime ( ) ; 
+ + try ( AbstractCompactionStrategy . ScannerList scanners = cfs . getCompactionStrategy ( ) . getScanners ( sstables , validator . desc . range ) ) 
+ { 
+ - / / validate the CF as we iterate over it 
+ - validator . prepare ( cfs , tree ) ; 
+ - while ( iter . hasNext ( ) ) 
+ + CompactionIterable ci = new ValidationCompactionIterable ( cfs , scanners . scanners , gcBefore ) ; 
+ + Iterator < AbstractCompactedRow > iter = ci . iterator ( ) ; 
+ + metrics . beginCompaction ( ci ) ; 
+ + try 
+ { 
+ - if ( ci . isStopRequested ( ) ) 
+ - throw new CompactionInterruptedException ( ci . getCompactionInfo ( ) ) ; 
+ - @ SuppressWarnings ( " resource " ) 
+ - AbstractCompactedRow row = iter . next ( ) ; 
+ - validator . add ( row ) ; 
+ + / / validate the CF as we iterate over it 
+ + validator . prepare ( cfs , tree ) ; 
+ + while ( iter . hasNext ( ) ) 
+ + { 
+ + if ( ci . isStopRequested ( ) ) 
+ + throw new CompactionInterruptedException ( ci . getCompactionInfo ( ) ) ; 
+ + AbstractCompactedRow row = iter . next ( ) ; 
+ + validator . add ( row ) ; 
+ + } 
+ + validator . complete ( ) ; 
+ + } 
+ + finally 
+ + { 
+ + if ( isSnapshotValidation ) 
+ + { 
+ + cfs . clearSnapshot ( snapshotName ) ; 
+ + } 
+ + 
+ + metrics . finishCompaction ( ci ) ; 
+ } 
+ - validator . complete ( ) ; 
+ - } 
+ - catch ( Exception e ) 
+ - { 
+ - Throwables . propagate ( e ) ; 
+ } 
+ - finally 
+ + 
+ + if ( logger . isDebugEnabled ( ) ) 
+ { 
+ - metrics . finishCompaction ( ci ) ; 
+ + / / MT serialize may take time 
+ + long duration = TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) ; 
+ + logger . debug ( " Validation finished in { } msec , depth { } for { } keys , serialized size { } bytes for { } " , 
+ + duration , 
+ + depth , 
+ + numPartitions , 
+ + MerkleTree . serializer . serializedSize ( tree , 0 ) , 
+ + validator . desc ) ; 
+ } 
+ } 
+ - 
+ - if ( logger . isDebugEnabled ( ) ) 
+ + finally 
+ { 
+ - / / MT serialize may take time 
+ - long duration = TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) ; 
+ - logger . debug ( " Validation finished in { } msec , depth { } for { } keys , serialized size { } bytes for { } " , 
+ - duration , 
+ - depth , 
+ - numPartitions , 
+ - MerkleTree . serializer . serializedSize ( tree , 0 ) , 
+ - validator . desc ) ; 
+ + if ( sstables ! = null ) 
+ + sstables . release ( ) ; 
+ } 
+ } 
+
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 9bc4478 . . ba9e134 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 2 , 6 + 2 , 7 @ @ 
+ * Don ' t share slice query filter in CQL3 SelectStatement ( CASSANDRA - 4928 ) 
+ * Separate tracing from Log4J ( CASSANDRA - 4861 ) 
+ * Exclude gcable tombstones from merkle - tree computation ( CASSANDRA - 4905 ) 
+ + * Better printing of AbstractBounds for tracing ( CASSANDRA - 4931 ) 
+ 
+ 1 . 2 - beta2 
+ * fp rate of 1 . 0 disables BF entirely ; LCS defaults to 1 . 0 ( CASSANDRA - 4876 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 199d07a . . 882a322 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1387 , 7 + 1387 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ QueryFilter filter = new QueryFilter ( null , new QueryPath ( columnFamily , superColumn , null ) , columnFilter ) ; 
+ 
+ final ViewFragment view = markReferenced ( startWith , stopAt ) ; 
+ - Tracing . trace ( " Executing seq scan across { } sstables for { } . . { } " , new Object [ ] { view . sstables . size ( ) , startWith , stopAt } ) ; 
+ + Tracing . trace ( " Executing seq scan across { } sstables for { } " , view . sstables . size ( ) , range . getString ( metadata . getKeyValidator ( ) ) ) ; 
+ 
+ try 
+ { 
+ @ @ - 1453 , 7 + 1453 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ 
+ public List < Row > search ( List < IndexExpression > clause , AbstractBounds < RowPosition > range , int maxResults , IDiskAtomFilter dataFilter , boolean maxIsColumns ) 
+ { 
+ - Tracing . trace ( " Executing indexed scan for { } . . { } " , range . left , range . right ) ; 
+ + Tracing . trace ( " Executing indexed scan for { } " , range . getString ( metadata . getKeyValidator ( ) ) ) ; 
+ return indexManager . search ( clause , range , maxResults , dataFilter , maxIsColumns ) ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / dht / AbstractBounds . java b / src / java / org / apache / cassandra / dht / AbstractBounds . java 
+ index f2ae5c3 . . b5ce85d 100644 
+ - - - a / src / java / org / apache / cassandra / dht / AbstractBounds . java 
+ + + + b / src / java / org / apache / cassandra / dht / AbstractBounds . java 
+ @ @ - 23 , 8 + 23 , 10 @ @ import java . io . IOException ; 
+ import java . io . Serializable ; 
+ import java . util . * ; 
+ 
+ + import org . apache . cassandra . db . DecoratedKey ; 
+ import org . apache . cassandra . db . TypeSizes ; 
+ import org . apache . cassandra . db . RowPosition ; 
+ + import org . apache . cassandra . db . marshal . AbstractType ; 
+ import org . apache . cassandra . io . IVersionedSerializer ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ import org . apache . cassandra . utils . Pair ; 
+ @ @ - 89 , 6 + 91 , 26 @ @ public abstract class AbstractBounds < T extends RingPosition > implements Serializ 
+ 
+ public abstract List < ? extends AbstractBounds < T > > unwrap ( ) ; 
+ 
+ + public String getString ( AbstractType < ? > keyValidator ) 
+ + { 
+ + return getOpeningString ( ) + format ( left , keyValidator ) + " , " + format ( right , keyValidator ) + getClosingString ( ) ; 
+ + } 
+ + 
+ + private String format ( T value , AbstractType < ? > keyValidator ) 
+ + { 
+ + if ( value instanceof DecoratedKey ) 
+ + { 
+ + return keyValidator . getString ( ( ( DecoratedKey ) value ) . key ) ; 
+ + } 
+ + else 
+ + { 
+ + return value . toString ( ) ; 
+ + } 
+ + } 
+ + 
+ + protected abstract String getOpeningString ( ) ; 
+ + protected abstract String getClosingString ( ) ; 
+ + 
+ / * * 
+ * Transform this abstract bounds to equivalent covering bounds of row positions . 
+ * If this abstract bounds was already an abstractBounds of row positions , this is a noop . 
+ diff - - git a / src / java / org / apache / cassandra / dht / Bounds . java b / src / java / org / apache / cassandra / dht / Bounds . java 
+ index 7da30bc . . bf579ae 100644 
+ - - - a / src / java / org / apache / cassandra / dht / Bounds . java 
+ + + + b / src / java / org / apache / cassandra / dht / Bounds . java 
+ @ @ - 88 , 6 + 88 , 16 @ @ public class Bounds < T extends RingPosition > extends AbstractBounds < T > 
+ return " [ " + left + " , " + right + " ] " ; 
+ } 
+ 
+ + protected String getOpeningString ( ) 
+ + { 
+ + return " [ " ; 
+ + } 
+ + 
+ + protected String getClosingString ( ) 
+ + { 
+ + return " ] " ; 
+ + } 
+ + 
+ / * * 
+ * Compute a bounds of keys corresponding to a given bounds of token . 
+ * / 
+ diff - - git a / src / java / org / apache / cassandra / dht / ExcludingBounds . java b / src / java / org / apache / cassandra / dht / ExcludingBounds . java 
+ index 0bde8f1 . . 7823023 100644 
+ - - - a / src / java / org / apache / cassandra / dht / ExcludingBounds . java 
+ + + + b / src / java / org / apache / cassandra / dht / ExcludingBounds . java 
+ @ @ - 77 , 6 + 77 , 16 @ @ public class ExcludingBounds < T extends RingPosition > extends AbstractBounds < T > 
+ return " ( " + left + " , " + right + " ) " ; 
+ } 
+ 
+ + protected String getOpeningString ( ) 
+ + { 
+ + return " ( " ; 
+ + } 
+ + 
+ + protected String getClosingString ( ) 
+ + { 
+ + return " ) " ; 
+ + } 
+ + 
+ / * * 
+ * Compute a bounds of keys corresponding to a given bounds of token . 
+ * / 
+ diff - - git a / src / java / org / apache / cassandra / dht / IncludingExcludingBounds . java b / src / java / org / apache / cassandra / dht / IncludingExcludingBounds . java 
+ index 9c0f6dd . . 0b1cb0b 100644 
+ - - - a / src / java / org / apache / cassandra / dht / IncludingExcludingBounds . java 
+ + + + b / src / java / org / apache / cassandra / dht / IncludingExcludingBounds . java 
+ @ @ - 73 , 7 + 73 , 17 @ @ public class IncludingExcludingBounds < T extends RingPosition > extends AbstractBo 
+ @ Override 
+ public String toString ( ) 
+ { 
+ - return " ( " + left + " , " + right + " ) " ; 
+ + return " [ " + left + " , " + right + " ) " ; 
+ + } 
+ + 
+ + protected String getOpeningString ( ) 
+ + { 
+ + return " [ " ; 
+ + } 
+ + 
+ + protected String getClosingString ( ) 
+ + { 
+ + return " ) " ; 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / dht / Range . java b / src / java / org / apache / cassandra / dht / Range . java 
+ index f32c938 . . a750ae2 100644 
+ - - - a / src / java / org / apache / cassandra / dht / Range . java 
+ + + + b / src / java / org / apache / cassandra / dht / Range . java 
+ @ @ - 355 , 6 + 355 , 16 @ @ public class Range < T extends RingPosition > extends AbstractBounds < T > implements 
+ return " ( " + left + " , " + right + " ] " ; 
+ } 
+ 
+ + protected String getOpeningString ( ) 
+ + { 
+ + return " ( " ; 
+ + } 
+ + 
+ + protected String getClosingString ( ) 
+ + { 
+ + return " ] " ; 
+ + } 
+ + 
+ public List < String > asList ( ) 
+ { 
+ ArrayList < String > ret = new ArrayList < String > ( 2 ) ;

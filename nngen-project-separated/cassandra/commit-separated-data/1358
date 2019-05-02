@@ -1,0 +1,1960 @@
+BLEU SCORE: 0.018738883683389617
+
+TEST MSG: Don ' t deadlock when flushing CFS backed , custom indexes
+GENERATED MSG: ( mostly ) working SELECT ; ( barely ) working UPDATE
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 4a3dc02 . . 2643bfc 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 0 - beta2 <nl> + * Don ' t deadlock when flushing CFS backed custom indexes ( CASSANDRA - 10181 ) <nl> * Fix double flushing of secondary index tables ( CASSANDRA - 10180 ) <nl> * Fix incorrect handling of range tombstones in thrift ( CASSANDRA - 10046 ) <nl> * Only use batchlog when paired materialized view replica is remote ( CASSANDRA - 10061 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index b177c23 . . efac287 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 953 , 7 + 953 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> * / <nl> <nl> if ( flushSecondaryIndexes ) <nl> - indexManager . flushAllCustomIndexesBlocking ( ) ; <nl> + indexManager . flushAllNonCFSBackedIndexesBlocking ( ) ; <nl> <nl> try <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java <nl> index 6bff916 . . 233a0f2 100644 <nl> - - - a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java <nl> + + + b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java <nl> @ @ - 94 , 7 + 94 , 6 @ @ public class SecondaryIndexManager implements IndexRegistry <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( SecondaryIndexManager . class ) ; <nl> <nl> - <nl> private Map < String , Index > indexes = Maps . newConcurrentMap ( ) ; <nl> <nl> / / executes tasks returned by Indexer # addIndexColumn which may require index ( es ) to be ( re ) built <nl> @ @ - 343 , 6 + 342 , 7 @ @ public class SecondaryIndexManager implements IndexRegistry <nl> . map ( cfs - > wait . add ( cfs . forceFlush ( ) ) ) <nl> . orElseGet ( ( ) - > nonCfsIndexes . add ( index ) ) ) ; <nl> } <nl> + <nl> executeAllBlocking ( nonCfsIndexes . stream ( ) , Index : : getBlockingFlushTask ) ; <nl> FBUtilities . waitOnFutures ( wait ) ; <nl> } <nl> @ @ - 350 , 11 + 350 , 11 @ @ public class SecondaryIndexManager implements IndexRegistry <nl> / * * <nl> * Performs a blocking flush of all custom indexes <nl> * / <nl> - public void flushAllCustomIndexesBlocking ( ) <nl> + public void flushAllNonCFSBackedIndexesBlocking ( ) <nl> { <nl> Set < Index > customIndexers = indexes . values ( ) . stream ( ) <nl> - . filter ( index - > ! ( index instanceof CassandraIndex ) ) <nl> - . collect ( Collectors . toSet ( ) ) ; <nl> + . filter ( index - > ! ( index . getBackingTable ( ) . isPresent ( ) ) ) <nl> + . collect ( Collectors . toSet ( ) ) ; <nl> flushIndexesBlocking ( customIndexers ) ; <nl> } <nl> <nl> diff - - git a / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java b / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java <nl> new file mode 100644 <nl> index 0000000 . . 3326b3f <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java <nl> @ @ - 0 , 0 + 1 , 738 @ @ <nl> + package org . apache . cassandra . index . internal ; <nl> + <nl> + import java . nio . ByteBuffer ; <nl> + import java . util . * ; <nl> + import java . util . concurrent . Callable ; <nl> + import java . util . concurrent . Future ; <nl> + import java . util . function . BiFunction ; <nl> + import java . util . stream . Collectors ; <nl> + import java . util . stream . StreamSupport ; <nl> + <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> + <nl> + import org . apache . cassandra . config . CFMetaData ; <nl> + import org . apache . cassandra . config . ColumnDefinition ; <nl> + import org . apache . cassandra . cql3 . Operator ; <nl> + import org . apache . cassandra . cql3 . statements . IndexTarget ; <nl> + import org . apache . cassandra . db . * ; <nl> + import org . apache . cassandra . db . compaction . CompactionManager ; <nl> + import org . apache . cassandra . db . filter . RowFilter ; <nl> + import org . apache . cassandra . db . lifecycle . SSTableSet ; <nl> + import org . apache . cassandra . db . lifecycle . View ; <nl> + import org . apache . cassandra . db . marshal . AbstractType ; <nl> + import org . apache . cassandra . db . marshal . CollectionType ; <nl> + import org . apache . cassandra . db . partitions . PartitionIterator ; <nl> + import org . apache . cassandra . db . partitions . PartitionUpdate ; <nl> + import org . apache . cassandra . db . rows . * ; <nl> + import org . apache . cassandra . dht . LocalPartitioner ; <nl> + import org . apache . cassandra . exceptions . InvalidRequestException ; <nl> + import org . apache . cassandra . index . Index ; <nl> + import org . apache . cassandra . index . IndexRegistry ; <nl> + import org . apache . cassandra . index . SecondaryIndexBuilder ; <nl> + import org . apache . cassandra . index . internal . composites . CompositesSearcher ; <nl> + import org . apache . cassandra . index . internal . keys . KeysSearcher ; <nl> + import org . apache . cassandra . index . transactions . IndexTransaction ; <nl> + import org . apache . cassandra . index . transactions . UpdateTransaction ; <nl> + import org . apache . cassandra . io . sstable . ReducingKeyIterator ; <nl> + import org . apache . cassandra . io . sstable . format . SSTableReader ; <nl> + import org . apache . cassandra . schema . IndexMetadata ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . apache . cassandra . utils . concurrent . OpOrder ; <nl> + import org . apache . cassandra . utils . concurrent . Refs ; <nl> + <nl> + / * * <nl> + * Clone of KeysIndex used in CassandraIndexTest # testCustomIndexWithCFS to verify <nl> + * behaviour of flushing CFS backed CUSTOM indexes <nl> + * / <nl> + public class CustomCassandraIndex implements Index <nl> + { <nl> + private static final Logger logger = LoggerFactory . getLogger ( CassandraIndex . class ) ; <nl> + <nl> + public final ColumnFamilyStore baseCfs ; <nl> + protected IndexMetadata metadata ; <nl> + protected ColumnFamilyStore indexCfs ; <nl> + protected ColumnDefinition indexedColumn ; <nl> + protected CassandraIndexFunctions functions ; <nl> + <nl> + public CustomCassandraIndex ( ColumnFamilyStore baseCfs , IndexMetadata indexDef ) <nl> + { <nl> + this . baseCfs = baseCfs ; <nl> + setMetadata ( indexDef ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Returns true if an index of this type can support search predicates of the form [ column ] OPERATOR [ value ] <nl> + * @ param indexedColumn <nl> + * @ param operator <nl> + * @ return <nl> + * / <nl> + protected boolean supportsOperator ( ColumnDefinition indexedColumn , Operator operator ) <nl> + { <nl> + return operator . equals ( Operator . EQ ) ; <nl> + } <nl> + <nl> + public ColumnDefinition getIndexedColumn ( ) <nl> + { <nl> + return indexedColumn ; <nl> + } <nl> + <nl> + public ClusteringComparator getIndexComparator ( ) <nl> + { <nl> + return indexCfs . metadata . comparator ; <nl> + } <nl> + <nl> + public ColumnFamilyStore getIndexCfs ( ) <nl> + { <nl> + return indexCfs ; <nl> + } <nl> + <nl> + public void register ( IndexRegistry registry ) <nl> + { <nl> + registry . registerIndex ( this ) ; <nl> + } <nl> + <nl> + public Callable < ? > getInitializationTask ( ) <nl> + { <nl> + / / if we ' re just linking in the index on an already - built index post - restart <nl> + / / we ' ve nothing to do . Otherwise , submit for building via SecondaryIndexBuilder <nl> + return isBuilt ( ) ? null : getBuildIndexTask ( ) ; <nl> + } <nl> + <nl> + public IndexMetadata getIndexMetadata ( ) <nl> + { <nl> + return metadata ; <nl> + } <nl> + <nl> + public String getIndexName ( ) <nl> + { <nl> + / / should return metadata . name , see CASSANDRA - 10127 <nl> + return indexCfs . name ; <nl> + } <nl> + <nl> + public Optional < ColumnFamilyStore > getBackingTable ( ) <nl> + { <nl> + return indexCfs = = null ? Optional . empty ( ) : Optional . of ( indexCfs ) ; <nl> + } <nl> + <nl> + public Callable < Void > getBlockingFlushTask ( ) <nl> + { <nl> + return ( ) - > { <nl> + indexCfs . forceBlockingFlush ( ) ; <nl> + return null ; <nl> + } ; <nl> + } <nl> + <nl> + public Callable < ? > getInvalidateTask ( ) <nl> + { <nl> + return ( ) - > { <nl> + markRemoved ( ) ; <nl> + invalidate ( ) ; <nl> + return null ; <nl> + } ; <nl> + } <nl> + <nl> + public Callable < ? > getMetadataReloadTask ( IndexMetadata indexDef ) <nl> + { <nl> + setMetadata ( indexDef ) ; <nl> + return ( ) - > { <nl> + indexCfs . metadata . reloadIndexMetadataProperties ( baseCfs . metadata ) ; <nl> + indexCfs . reload ( ) ; <nl> + return null ; <nl> + } ; <nl> + } <nl> + <nl> + private void setMetadata ( IndexMetadata indexDef ) <nl> + { <nl> + metadata = indexDef ; <nl> + functions = getFunctions ( baseCfs . metadata , indexDef ) ; <nl> + CFMetaData cfm = indexCfsMetadata ( baseCfs . metadata , indexDef ) ; <nl> + indexCfs = ColumnFamilyStore . createColumnFamilyStore ( baseCfs . keyspace , <nl> + cfm . cfName , <nl> + cfm , <nl> + baseCfs . getTracker ( ) . loadsstables ) ; <nl> + assert indexDef . columns . size ( ) = = 1 : " Build in indexes on multiple target columns are not supported " ; <nl> + indexedColumn = indexDef . indexedColumn ( baseCfs . metadata ) ; <nl> + } <nl> + <nl> + public Callable < ? > getTruncateTask ( final long truncatedAt ) <nl> + { <nl> + return ( ) - > { <nl> + indexCfs . discardSSTables ( truncatedAt ) ; <nl> + return null ; <nl> + } ; <nl> + } <nl> + <nl> + public boolean indexes ( PartitionColumns columns ) <nl> + { <nl> + / / if we have indexes on the partition key or clustering columns , return true <nl> + return isPrimaryKeyIndex ( ) | | columns . contains ( indexedColumn ) ; <nl> + } <nl> + <nl> + public boolean supportsExpression ( ColumnDefinition column , Operator operator ) <nl> + { <nl> + return indexedColumn . name . equals ( column . name ) <nl> + & & supportsOperator ( indexedColumn , operator ) ; <nl> + } <nl> + <nl> + private boolean supportsExpression ( RowFilter . Expression expression ) <nl> + { <nl> + return supportsExpression ( expression . column ( ) , expression . operator ( ) ) ; <nl> + } <nl> + <nl> + public long getEstimatedResultRows ( ) <nl> + { <nl> + return indexCfs . getMeanColumns ( ) ; <nl> + } <nl> + <nl> + / * * <nl> + * No post processing of query results , just return them unchanged <nl> + * / <nl> + public BiFunction < PartitionIterator , ReadCommand , PartitionIterator > postProcessorFor ( ReadCommand command ) <nl> + { <nl> + return ( partitionIterator , readCommand ) - > partitionIterator ; <nl> + } <nl> + <nl> + public RowFilter getPostIndexQueryFilter ( RowFilter filter ) <nl> + { <nl> + return getTargetExpression ( filter . getExpressions ( ) ) . map ( filter : : without ) <nl> + . orElse ( filter ) ; <nl> + } <nl> + <nl> + private Optional < RowFilter . Expression > getTargetExpression ( List < RowFilter . Expression > expressions ) <nl> + { <nl> + return expressions . stream ( ) . filter ( this : : supportsExpression ) . findFirst ( ) ; <nl> + } <nl> + <nl> + public Index . Searcher searcherFor ( ReadCommand command ) <nl> + { <nl> + return null ; <nl> + / * <nl> + Optional < RowFilter . Expression > target = getTargetExpression ( command . rowFilter ( ) . getExpressions ( ) ) ; <nl> + <nl> + if ( target . isPresent ( ) ) <nl> + { <nl> + target . get ( ) . validateForIndexing ( ) ; <nl> + switch ( getIndexMetadata ( ) . indexType ) <nl> + { <nl> + case COMPOSITES : <nl> + return new CompositesSearcher ( command , target . get ( ) , this ) ; <nl> + case KEYS : <nl> + return new KeysSearcher ( command , target . get ( ) , this ) ; <nl> + default : <nl> + throw new IllegalStateException ( String . format ( " Unsupported index type % s for index % s on % s " , <nl> + metadata . indexType , <nl> + metadata . name , <nl> + indexedColumn . name . toString ( ) ) ) ; <nl> + } <nl> + } <nl> + <nl> + return null ; <nl> + <nl> + * / <nl> + } <nl> + <nl> + public void validate ( PartitionUpdate update ) throws InvalidRequestException <nl> + { <nl> + switch ( indexedColumn . kind ) <nl> + { <nl> + case PARTITION _ KEY : <nl> + validatePartitionKey ( update . partitionKey ( ) ) ; <nl> + break ; <nl> + case CLUSTERING : <nl> + validateClusterings ( update ) ; <nl> + break ; <nl> + case REGULAR : <nl> + validateRows ( update ) ; <nl> + break ; <nl> + case STATIC : <nl> + validateRows ( Collections . singleton ( update . staticRow ( ) ) ) ; <nl> + break ; <nl> + } <nl> + } <nl> + <nl> + protected CBuilder buildIndexClusteringPrefix ( ByteBuffer partitionKey , <nl> + ClusteringPrefix prefix , <nl> + CellPath path ) <nl> + { <nl> + CBuilder builder = CBuilder . create ( getIndexComparator ( ) ) ; <nl> + builder . add ( partitionKey ) ; <nl> + return builder ; <nl> + } <nl> + <nl> + protected ByteBuffer getIndexedValue ( ByteBuffer partitionKey , <nl> + Clustering clustering , <nl> + CellPath path , ByteBuffer cellValue ) <nl> + { <nl> + return cellValue ; <nl> + } <nl> + <nl> + public IndexEntry decodeEntry ( DecoratedKey indexedValue , Row indexEntry ) <nl> + { <nl> + throw new UnsupportedOperationException ( " KEYS indexes do not use a specialized index entry format " ) ; <nl> + } <nl> + <nl> + public boolean isStale ( Row row , ByteBuffer indexValue , int nowInSec ) <nl> + { <nl> + if ( row = = null ) <nl> + return true ; <nl> + <nl> + Cell cell = row . getCell ( indexedColumn ) ; <nl> + <nl> + return ( cell = = null <nl> + | | ! cell . isLive ( nowInSec ) <nl> + | | indexedColumn . type . compare ( indexValue , cell . value ( ) ) ! = 0 ) ; <nl> + } <nl> + <nl> + public Indexer indexerFor ( final DecoratedKey key , <nl> + final int nowInSec , <nl> + final OpOrder . Group opGroup , <nl> + final IndexTransaction . Type transactionType ) <nl> + { <nl> + return new Indexer ( ) <nl> + { <nl> + public void begin ( ) <nl> + { <nl> + } <nl> + <nl> + public void partitionDelete ( DeletionTime deletionTime ) <nl> + { <nl> + } <nl> + <nl> + public void rangeTombstone ( RangeTombstone tombstone ) <nl> + { <nl> + } <nl> + <nl> + public void insertRow ( Row row ) <nl> + { <nl> + if ( isPrimaryKeyIndex ( ) ) <nl> + { <nl> + indexPrimaryKey ( row . clustering ( ) , <nl> + getPrimaryKeyIndexLiveness ( row ) , <nl> + row . deletion ( ) ) ; <nl> + } <nl> + else <nl> + { <nl> + if ( indexedColumn . isComplex ( ) ) <nl> + indexCells ( row . clustering ( ) , row . getComplexColumnData ( indexedColumn ) ) ; <nl> + else <nl> + indexCell ( row . clustering ( ) , row . getCell ( indexedColumn ) ) ; <nl> + } <nl> + } <nl> + <nl> + public void removeRow ( Row row ) <nl> + { <nl> + if ( isPrimaryKeyIndex ( ) ) <nl> + indexPrimaryKey ( row . clustering ( ) , row . primaryKeyLivenessInfo ( ) , row . deletion ( ) ) ; <nl> + <nl> + if ( indexedColumn . isComplex ( ) ) <nl> + removeCells ( row . clustering ( ) , row . getComplexColumnData ( indexedColumn ) ) ; <nl> + else <nl> + removeCell ( row . clustering ( ) , row . getCell ( indexedColumn ) ) ; <nl> + } <nl> + <nl> + <nl> + public void updateRow ( Row oldRow , Row newRow ) <nl> + { <nl> + if ( isPrimaryKeyIndex ( ) ) <nl> + indexPrimaryKey ( newRow . clustering ( ) , <nl> + newRow . primaryKeyLivenessInfo ( ) , <nl> + newRow . deletion ( ) ) ; <nl> + <nl> + if ( indexedColumn . isComplex ( ) ) <nl> + { <nl> + indexCells ( newRow . clustering ( ) , newRow . getComplexColumnData ( indexedColumn ) ) ; <nl> + removeCells ( oldRow . clustering ( ) , oldRow . getComplexColumnData ( indexedColumn ) ) ; <nl> + } <nl> + else <nl> + { <nl> + indexCell ( newRow . clustering ( ) , newRow . getCell ( indexedColumn ) ) ; <nl> + removeCell ( oldRow . clustering ( ) , oldRow . getCell ( indexedColumn ) ) ; <nl> + } <nl> + } <nl> + <nl> + public void finish ( ) <nl> + { <nl> + } <nl> + <nl> + private void indexCells ( Clustering clustering , Iterable < Cell > cells ) <nl> + { <nl> + if ( cells = = null ) <nl> + return ; <nl> + <nl> + for ( Cell cell : cells ) <nl> + indexCell ( clustering , cell ) ; <nl> + } <nl> + <nl> + private void indexCell ( Clustering clustering , Cell cell ) <nl> + { <nl> + if ( cell = = null | | ! cell . isLive ( nowInSec ) ) <nl> + return ; <nl> + <nl> + insert ( key . getKey ( ) , <nl> + clustering , <nl> + cell , <nl> + LivenessInfo . create ( cell . timestamp ( ) , cell . ttl ( ) , cell . localDeletionTime ( ) ) , <nl> + opGroup ) ; <nl> + } <nl> + <nl> + private void removeCells ( Clustering clustering , Iterable < Cell > cells ) <nl> + { <nl> + if ( cells = = null ) <nl> + return ; <nl> + <nl> + for ( Cell cell : cells ) <nl> + removeCell ( clustering , cell ) ; <nl> + } <nl> + <nl> + private void removeCell ( Clustering clustering , Cell cell ) <nl> + { <nl> + if ( cell = = null | | ! cell . isLive ( nowInSec ) ) <nl> + return ; <nl> + <nl> + delete ( key . getKey ( ) , clustering , cell , opGroup , nowInSec ) ; <nl> + } <nl> + <nl> + private void indexPrimaryKey ( final Clustering clustering , <nl> + final LivenessInfo liveness , <nl> + final DeletionTime deletion ) <nl> + { <nl> + if ( liveness . timestamp ( ) ! = LivenessInfo . NO _ TIMESTAMP ) <nl> + insert ( key . getKey ( ) , clustering , null , liveness , opGroup ) ; <nl> + <nl> + if ( ! deletion . isLive ( ) ) <nl> + delete ( key . getKey ( ) , clustering , deletion , opGroup ) ; <nl> + } <nl> + <nl> + private LivenessInfo getPrimaryKeyIndexLiveness ( Row row ) <nl> + { <nl> + long timestamp = row . primaryKeyLivenessInfo ( ) . timestamp ( ) ; <nl> + int ttl = row . primaryKeyLivenessInfo ( ) . ttl ( ) ; <nl> + for ( Cell cell : row . cells ( ) ) <nl> + { <nl> + long cellTimestamp = cell . timestamp ( ) ; <nl> + if ( cell . isLive ( nowInSec ) ) <nl> + { <nl> + if ( cellTimestamp > timestamp ) <nl> + { <nl> + timestamp = cellTimestamp ; <nl> + ttl = cell . ttl ( ) ; <nl> + } <nl> + } <nl> + } <nl> + return LivenessInfo . create ( baseCfs . metadata , timestamp , ttl , nowInSec ) ; <nl> + } <nl> + } ; <nl> + } <nl> + <nl> + / * * <nl> + * Specific to internal indexes , this is called by a <nl> + * searcher when it encounters a stale entry in the index <nl> + * @ param indexKey the partition key in the index table <nl> + * @ param indexClustering the clustering in the index table <nl> + * @ param deletion deletion timestamp etc <nl> + * @ param opGroup the operation under which to perform the deletion <nl> + * / <nl> + public void deleteStaleEntry ( DecoratedKey indexKey , <nl> + Clustering indexClustering , <nl> + DeletionTime deletion , <nl> + OpOrder . Group opGroup ) <nl> + { <nl> + doDelete ( indexKey , indexClustering , deletion , opGroup ) ; <nl> + logger . debug ( " Removed index entry for stale value { } " , indexKey ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Called when adding a new entry to the index <nl> + * / <nl> + private void insert ( ByteBuffer rowKey , <nl> + Clustering clustering , <nl> + Cell cell , <nl> + LivenessInfo info , <nl> + OpOrder . Group opGroup ) <nl> + { <nl> + DecoratedKey valueKey = getIndexKeyFor ( getIndexedValue ( rowKey , <nl> + clustering , <nl> + cell ) ) ; <nl> + Row row = BTreeRow . noCellLiveRow ( buildIndexClustering ( rowKey , clustering , cell ) , info ) ; <nl> + PartitionUpdate upd = partitionUpdate ( valueKey , row ) ; <nl> + indexCfs . apply ( upd , UpdateTransaction . NO _ OP , opGroup , null ) ; <nl> + logger . debug ( " Inserted entry into index for value { } " , valueKey ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Called when deleting entries on non - primary key columns <nl> + * / <nl> + private void delete ( ByteBuffer rowKey , <nl> + Clustering clustering , <nl> + Cell cell , <nl> + OpOrder . Group opGroup , <nl> + int nowInSec ) <nl> + { <nl> + DecoratedKey valueKey = getIndexKeyFor ( getIndexedValue ( rowKey , <nl> + clustering , <nl> + cell ) ) ; <nl> + doDelete ( valueKey , <nl> + buildIndexClustering ( rowKey , clustering , cell ) , <nl> + new DeletionTime ( cell . timestamp ( ) , nowInSec ) , <nl> + opGroup ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Called when deleting entries from indexes on primary key columns <nl> + * / <nl> + private void delete ( ByteBuffer rowKey , <nl> + Clustering clustering , <nl> + DeletionTime deletion , <nl> + OpOrder . Group opGroup ) <nl> + { <nl> + DecoratedKey valueKey = getIndexKeyFor ( getIndexedValue ( rowKey , <nl> + clustering , <nl> + null ) ) ; <nl> + doDelete ( valueKey , <nl> + buildIndexClustering ( rowKey , clustering , null ) , <nl> + deletion , <nl> + opGroup ) ; <nl> + } <nl> + <nl> + private void doDelete ( DecoratedKey indexKey , <nl> + Clustering indexClustering , <nl> + DeletionTime deletion , <nl> + OpOrder . Group opGroup ) <nl> + { <nl> + Row row = BTreeRow . emptyDeletedRow ( indexClustering , deletion ) ; <nl> + PartitionUpdate upd = partitionUpdate ( indexKey , row ) ; <nl> + indexCfs . apply ( upd , UpdateTransaction . NO _ OP , opGroup , null ) ; <nl> + logger . debug ( " Removed index entry for value { } " , indexKey ) ; <nl> + } <nl> + <nl> + private void validatePartitionKey ( DecoratedKey partitionKey ) throws InvalidRequestException <nl> + { <nl> + assert indexedColumn . isPartitionKey ( ) ; <nl> + validateIndexedValue ( getIndexedValue ( partitionKey . getKey ( ) , null , null ) ) ; <nl> + } <nl> + <nl> + private void validateClusterings ( PartitionUpdate update ) throws InvalidRequestException <nl> + { <nl> + assert indexedColumn . isClusteringColumn ( ) ; <nl> + for ( Row row : update ) <nl> + validateIndexedValue ( getIndexedValue ( null , row . clustering ( ) , null ) ) ; <nl> + } <nl> + <nl> + private void validateRows ( Iterable < Row > rows ) <nl> + { <nl> + assert ! indexedColumn . isPrimaryKeyColumn ( ) ; <nl> + for ( Row row : rows ) <nl> + { <nl> + if ( indexedColumn . isComplex ( ) ) <nl> + { <nl> + ComplexColumnData data = row . getComplexColumnData ( indexedColumn ) ; <nl> + if ( data ! = null ) <nl> + { <nl> + for ( Cell cell : data ) <nl> + { <nl> + validateIndexedValue ( getIndexedValue ( null , null , cell . path ( ) , cell . value ( ) ) ) ; <nl> + } <nl> + } <nl> + } <nl> + else <nl> + { <nl> + validateIndexedValue ( getIndexedValue ( null , null , row . getCell ( indexedColumn ) ) ) ; <nl> + } <nl> + } <nl> + } <nl> + <nl> + private void validateIndexedValue ( ByteBuffer value ) <nl> + { <nl> + if ( value ! = null & & value . remaining ( ) > = FBUtilities . MAX _ UNSIGNED _ SHORT ) <nl> + throw new InvalidRequestException ( String . format ( <nl> + " Cannot index value of size % d for index % s on % s . % s ( % s ) ( maximum allowed size = % d ) " , <nl> + value . remaining ( ) , <nl> + getIndexName ( ) , <nl> + baseCfs . metadata . ksName , <nl> + baseCfs . metadata . cfName , <nl> + indexedColumn . name . toString ( ) , <nl> + FBUtilities . MAX _ UNSIGNED _ SHORT ) ) ; <nl> + } <nl> + <nl> + private ByteBuffer getIndexedValue ( ByteBuffer rowKey , <nl> + Clustering clustering , <nl> + Cell cell ) <nl> + { <nl> + return getIndexedValue ( rowKey , <nl> + clustering , <nl> + cell = = null ? null : cell . path ( ) , <nl> + cell = = null ? null : cell . value ( ) <nl> + ) ; <nl> + } <nl> + <nl> + private Clustering buildIndexClustering ( ByteBuffer rowKey , <nl> + Clustering clustering , <nl> + Cell cell ) <nl> + { <nl> + return buildIndexClusteringPrefix ( rowKey , <nl> + clustering , <nl> + cell = = null ? null : cell . path ( ) ) . build ( ) ; <nl> + } <nl> + <nl> + private DecoratedKey getIndexKeyFor ( ByteBuffer value ) <nl> + { <nl> + return indexCfs . decorateKey ( value ) ; <nl> + } <nl> + <nl> + private PartitionUpdate partitionUpdate ( DecoratedKey valueKey , Row row ) <nl> + { <nl> + return PartitionUpdate . singleRowUpdate ( indexCfs . metadata , valueKey , row ) ; <nl> + } <nl> + <nl> + private void invalidate ( ) <nl> + { <nl> + / / interrupt in - progress compactions <nl> + Collection < ColumnFamilyStore > cfss = Collections . singleton ( indexCfs ) ; <nl> + CompactionManager . instance . interruptCompactionForCFs ( cfss , true ) ; <nl> + CompactionManager . instance . waitForCessation ( cfss ) ; <nl> + indexCfs . keyspace . writeOrder . awaitNewBarrier ( ) ; <nl> + indexCfs . forceBlockingFlush ( ) ; <nl> + indexCfs . readOrdering . awaitNewBarrier ( ) ; <nl> + indexCfs . invalidate ( ) ; <nl> + } <nl> + <nl> + private boolean isBuilt ( ) <nl> + { <nl> + return SystemKeyspace . isIndexBuilt ( baseCfs . keyspace . getName ( ) , getIndexName ( ) ) ; <nl> + } <nl> + <nl> + private void markBuilt ( ) <nl> + { <nl> + SystemKeyspace . setIndexBuilt ( baseCfs . keyspace . getName ( ) , getIndexName ( ) ) ; <nl> + } <nl> + <nl> + private void markRemoved ( ) <nl> + { <nl> + SystemKeyspace . setIndexRemoved ( baseCfs . keyspace . getName ( ) , getIndexName ( ) ) ; <nl> + } <nl> + <nl> + private boolean isPrimaryKeyIndex ( ) <nl> + { <nl> + return indexedColumn . isPrimaryKeyColumn ( ) ; <nl> + } <nl> + <nl> + private Callable < ? > getBuildIndexTask ( ) <nl> + { <nl> + return ( ) - > { <nl> + buildBlocking ( ) ; <nl> + return null ; <nl> + } ; <nl> + } <nl> + <nl> + private void buildBlocking ( ) <nl> + { <nl> + baseCfs . forceBlockingFlush ( ) ; <nl> + <nl> + try ( ColumnFamilyStore . RefViewFragment viewFragment = baseCfs . selectAndReference ( View . select ( SSTableSet . CANONICAL ) ) ; <nl> + Refs < SSTableReader > sstables = viewFragment . refs ) <nl> + { <nl> + if ( sstables . isEmpty ( ) ) <nl> + { <nl> + logger . info ( " No SSTable data for { } . { } to build index { } from , marking empty index as built " , <nl> + baseCfs . metadata . ksName , <nl> + baseCfs . metadata . cfName , <nl> + getIndexName ( ) ) ; <nl> + markBuilt ( ) ; <nl> + return ; <nl> + } <nl> + <nl> + logger . info ( " Submitting index build of { } for data in { } " , <nl> + getIndexName ( ) , <nl> + getSSTableNames ( sstables ) ) ; <nl> + <nl> + SecondaryIndexBuilder builder = new SecondaryIndexBuilder ( baseCfs , <nl> + Collections . singleton ( this ) , <nl> + new ReducingKeyIterator ( sstables ) ) ; <nl> + Future < ? > future = CompactionManager . instance . submitIndexBuild ( builder ) ; <nl> + FBUtilities . waitOnFuture ( future ) ; <nl> + indexCfs . forceBlockingFlush ( ) ; <nl> + markBuilt ( ) ; <nl> + } <nl> + logger . info ( " Index build of { } complete " , getIndexName ( ) ) ; <nl> + } <nl> + <nl> + private static String getSSTableNames ( Collection < SSTableReader > sstables ) <nl> + { <nl> + return StreamSupport . stream ( sstables . spliterator ( ) , false ) <nl> + . map ( SSTableReader : : toString ) <nl> + . collect ( Collectors . joining ( " , " ) ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Construct the CFMetadata for an index table , the clustering columns in the index table <nl> + * vary dependent on the kind of the indexed value . <nl> + * @ param baseCfsMetadata <nl> + * @ param indexMetadata <nl> + * @ return <nl> + * / <nl> + public static final CFMetaData indexCfsMetadata ( CFMetaData baseCfsMetadata , IndexMetadata indexMetadata ) <nl> + { <nl> + CassandraIndexFunctions utils = getFunctions ( baseCfsMetadata , indexMetadata ) ; <nl> + ColumnDefinition indexedColumn = indexMetadata . indexedColumn ( baseCfsMetadata ) ; <nl> + AbstractType < ? > indexedValueType = utils . getIndexedValueType ( indexedColumn ) ; <nl> + CFMetaData . Builder builder = CFMetaData . Builder . create ( baseCfsMetadata . ksName , <nl> + baseCfsMetadata . indexColumnFamilyName ( indexMetadata ) ) <nl> + . withId ( baseCfsMetadata . cfId ) <nl> + . withPartitioner ( new LocalPartitioner ( indexedValueType ) ) <nl> + . addPartitionKey ( indexedColumn . name , indexedColumn . type ) ; <nl> + <nl> + builder . addClusteringColumn ( " partition _ key " , baseCfsMetadata . partitioner . partitionOrdering ( ) ) ; <nl> + builder = utils . addIndexClusteringColumns ( builder , baseCfsMetadata , indexedColumn ) ; <nl> + return builder . build ( ) . reloadIndexMetadataProperties ( baseCfsMetadata ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Factory method for new CassandraIndex instances <nl> + * @ param baseCfs <nl> + * @ param indexMetadata <nl> + * @ return <nl> + * / <nl> + public static final CassandraIndex newIndex ( ColumnFamilyStore baseCfs , IndexMetadata indexMetadata ) <nl> + { <nl> + return getFunctions ( baseCfs . metadata , indexMetadata ) . newIndexInstance ( baseCfs , indexMetadata ) ; <nl> + } <nl> + <nl> + private static CassandraIndexFunctions getFunctions ( CFMetaData baseCfMetadata , IndexMetadata indexDef ) <nl> + { <nl> + if ( indexDef . isKeys ( ) ) <nl> + return CassandraIndexFunctions . KEYS _ INDEX _ FUNCTIONS ; <nl> + <nl> + ColumnDefinition indexedColumn = indexDef . indexedColumn ( baseCfMetadata ) ; <nl> + if ( indexedColumn . type . isCollection ( ) & & indexedColumn . type . isMultiCell ( ) ) <nl> + { <nl> + switch ( ( ( CollectionType ) indexedColumn . type ) . kind ) <nl> + { <nl> + case LIST : <nl> + return CassandraIndexFunctions . COLLECTION _ VALUE _ INDEX _ FUNCTIONS ; <nl> + case SET : <nl> + return CassandraIndexFunctions . COLLECTION _ KEY _ INDEX _ FUNCTIONS ; <nl> + case MAP : <nl> + if ( indexDef . options . containsKey ( IndexTarget . INDEX _ KEYS _ OPTION _ NAME ) ) <nl> + return CassandraIndexFunctions . COLLECTION _ KEY _ INDEX _ FUNCTIONS ; <nl> + else if ( indexDef . options . containsKey ( IndexTarget . INDEX _ ENTRIES _ OPTION _ NAME ) ) <nl> + return CassandraIndexFunctions . COLLECTION _ ENTRY _ INDEX _ FUNCTIONS ; <nl> + else <nl> + return CassandraIndexFunctions . COLLECTION _ VALUE _ INDEX _ FUNCTIONS ; <nl> + } <nl> + } <nl> + <nl> + switch ( indexedColumn . kind ) <nl> + { <nl> + case CLUSTERING : <nl> + return CassandraIndexFunctions . CLUSTERING _ COLUMN _ INDEX _ FUNCTIONS ; <nl> + case REGULAR : <nl> + return CassandraIndexFunctions . REGULAR _ COLUMN _ INDEX _ FUNCTIONS ; <nl> + case PARTITION _ KEY : <nl> + return CassandraIndexFunctions . PARTITION _ KEY _ INDEX _ FUNCTIONS ; <nl> + / / case COMPACT _ VALUE : <nl> + / / return new CompositesIndexOnCompactValue ( ) ; <nl> + } <nl> + throw new AssertionError ( ) ; <nl> + } <nl> + } <nl> diff - - git a / test / unit / org / apache / cassandra / index / internal / CustomIndexTest . java b / test / unit / org / apache / cassandra / index / internal / CustomIndexTest . java <nl> new file mode 100644 <nl> index 0000000 . . 3cc7987 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / index / internal / CustomIndexTest . java <nl> @ @ - 0 , 0 + 1 , 20 @ @ <nl> + package org . apache . cassandra . index . internal ; <nl> + <nl> + import org . apache . cassandra . cql3 . CQLTester ; <nl> + import org . junit . Test ; <nl> + <nl> + public class CustomIndexTest extends CQLTester <nl> + { <nl> + @ Test <nl> + public void testInserts ( ) throws Throwable <nl> + { <nl> + / / test to ensure that we don ' t deadlock when flushing CFS backed custom indexers <nl> + / / see CASSANDRA - 10181 <nl> + createTable ( " CREATE TABLE % s ( a int , b int , c int , d int , PRIMARY KEY ( a , b ) ) " ) ; <nl> + createIndex ( " CREATE CUSTOM INDEX myindex ON % s ( c ) USING ' org . apache . cassandra . index . internal . CustomCassandraIndex ' " ) ; <nl> + <nl> + execute ( " INSERT INTO % s ( a , b , c , d ) VALUES ( ? , ? , ? , ? ) " , 0 , 0 , 0 , 2 ) ; <nl> + execute ( " INSERT INTO % s ( a , b , c , d ) VALUES ( ? , ? , ? , ? ) " , 0 , 1 , 0 , 1 ) ; <nl> + execute ( " INSERT INTO % s ( a , b , c , d ) VALUES ( ? , ? , ? , ? ) " , 0 , 2 , 0 , 0 ) ; <nl> + } <nl> + }
+NEAREST DIFF (one line): diff - - git a / interface / cassandra . genavro b / interface / cassandra . genavro <nl> index a53ec1f . . 4ee8c8f 100644 <nl> - - - a / interface / cassandra . genavro <nl> + + + b / interface / cassandra . genavro <nl> @ @ - 375 , 4 + 375 , 29 @ @ protocol Cassandra { <nl> KeyRange range , <nl> ConsistencyLevel consistency _ level ) <nl> throws InvalidRequestException , UnavailableException , TimedOutException ; <nl> + <nl> + enum Compression { <nl> + GZIP <nl> + } <nl> + <nl> + enum CqlResultType { <nl> + ROWS , VOID <nl> + } <nl> + <nl> + record CqlRow { <nl> + bytes key ; <nl> + array < Column > columns ; <nl> + } <nl> + <nl> + record CqlResult { <nl> + CqlResultType type ; <nl> + union { array < CqlRow > , null } rows ; <nl> + } <nl> + <nl> + / * * <nl> + * Executes a CQL ( Cassandra Query Language ) statement and returns a <nl> + * CqlResult containing the results . <nl> + * / <nl> + CqlResult execute _ cql _ query ( bytes query , Compression compression ) <nl> + throws InvalidRequestException , UnavailableException , TimedOutException ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / avro / AvroValidation . java b / src / java / org / apache / cassandra / avro / AvroValidation . java <nl> index 078a6ee . . ad46bfe 100644 <nl> - - - a / src / java / org / apache / cassandra / avro / AvroValidation . java <nl> + + + b / src / java / org / apache / cassandra / avro / AvroValidation . java <nl> @ @ - 48 , 7 + 48 , 7 @ @ import static org . apache . cassandra . avro . AvroRecordFactory . newColumnPath ; <nl> * / <nl> public class AvroValidation <nl> { <nl> - static void validateKey ( ByteBuffer key ) throws InvalidRequestException <nl> + public static void validateKey ( ByteBuffer key ) throws InvalidRequestException <nl> { <nl> if ( key = = null | | key . remaining ( ) = = 0 ) <nl> throw newInvalidRequestException ( " Key may not be empty " ) ; <nl> diff - - git a / src / java / org / apache / cassandra / avro / CassandraServer . java b / src / java / org / apache / cassandra / avro / CassandraServer . java <nl> index 325d3aa . . 68aeda1 100644 <nl> - - - a / src / java / org / apache / cassandra / avro / CassandraServer . java <nl> + + + b / src / java / org / apache / cassandra / avro / CassandraServer . java <nl> @ @ - 21 , 6 + 21 , 7 @ @ package org . apache . cassandra . avro ; <nl> * / <nl> <nl> import java . io . IOException ; <nl> + import java . io . UnsupportedEncodingException ; <nl> import java . nio . ByteBuffer ; <nl> import java . util . ArrayList ; <nl> import java . util . Arrays ; <nl> @ @ - 34 , 7 + 35 , 10 @ @ import java . util . concurrent . Callable ; <nl> import java . util . concurrent . ExecutionException ; <nl> import java . util . concurrent . Future ; <nl> import java . util . concurrent . TimeoutException ; <nl> + import java . util . zip . DataFormatException ; <nl> + import java . util . zip . Inflater ; <nl> <nl> + import org . antlr . runtime . RecognitionException ; <nl> import org . apache . avro . Schema ; <nl> import org . apache . avro . generic . GenericArray ; <nl> import org . apache . avro . generic . GenericData ; <nl> @ @ - 59 , 6 + 63 , 7 @ @ import org . apache . cassandra . config . ColumnDefinition ; <nl> import org . apache . cassandra . config . ConfigurationException ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . config . KSMetaData ; <nl> + import org . apache . cassandra . cql . QueryProcessor ; <nl> import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . db . filter . QueryPath ; <nl> import org . apache . cassandra . db . marshal . MarshalException ; <nl> @ @ - 1161 , 4 + 1166 , 47 @ @ public class CassandraServer implements Cassandra { <nl> } <nl> return null ; <nl> } <nl> + <nl> + @ Override <nl> + public CqlResult execute _ cql _ query ( ByteBuffer query , Compression compression ) <nl> + throws UnavailableException , InvalidRequestException , TimedOutException <nl> + { <nl> + String queryString = null ; <nl> + <nl> + / / Decompress the query string . <nl> + try <nl> + { <nl> + switch ( compression ) <nl> + { <nl> + case GZIP : <nl> + Inflater decompressor = new Inflater ( ) ; <nl> + decompressor . setInput ( query . array ( ) , 0 , query . array ( ) . length ) ; <nl> + <nl> + byte [ ] decompressedBytes = new byte [ 100 ] ; <nl> + int length = decompressor . inflate ( decompressedBytes ) ; <nl> + decompressor . end ( ) ; <nl> + <nl> + queryString = new String ( decompressedBytes , 0 , length , " UTF - 8 " ) ; <nl> + } <nl> + } <nl> + catch ( DataFormatException e ) <nl> + { <nl> + throw newInvalidRequestException ( " Error deflating query string . " ) ; <nl> + } <nl> + catch ( UnsupportedEncodingException e ) <nl> + { <nl> + throw newInvalidRequestException ( " Unknown query string encoding . " ) ; <nl> + } <nl> + <nl> + try <nl> + { <nl> + return QueryProcessor . process ( queryString , state ( ) . getKeyspace ( ) ) ; <nl> + } <nl> + catch ( RecognitionException e ) <nl> + { <nl> + InvalidRequestException badQuery = newInvalidRequestException ( " Invalid or malformed CQL query string " ) ; <nl> + badQuery . initCause ( e ) ; <nl> + throw badQuery ; <nl> + } <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / cql / CQLStatement . java b / src / java / org / apache / cassandra / cql / CQLStatement . java <nl> new file mode 100644 <nl> index 0000000 . . 3040ddd <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / CQLStatement . java <nl> @ @ - 0 , 0 + 1 , 13 @ @ <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + public class CQLStatement <nl> + { <nl> + public StatementType type ; <nl> + public Object statement ; <nl> + <nl> + public CQLStatement ( StatementType type , Object statement ) <nl> + { <nl> + this . type = type ; <nl> + this . statement = statement ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / cql / Client . java b / src / java / org / apache / cassandra / cql / Client . java <nl> new file mode 100644 <nl> index 0000000 . . 03ace7b <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / Client . java <nl> @ @ - 0 , 0 + 1 , 50 @ @ <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + import java . io . IOException ; <nl> + import java . net . URL ; <nl> + import java . nio . ByteBuffer ; <nl> + import java . util . zip . Deflater ; <nl> + <nl> + import org . apache . avro . ipc . HttpTransceiver ; <nl> + import org . apache . avro . specific . SpecificRequestor ; <nl> + import org . apache . cassandra . avro . Cassandra ; <nl> + import org . apache . cassandra . avro . Column ; <nl> + import org . apache . cassandra . avro . Compression ; <nl> + import org . apache . cassandra . avro . CqlResult ; <nl> + import org . apache . cassandra . avro . CqlRow ; <nl> + <nl> + public class Client <nl> + { <nl> + public static void main ( String [ ] args ) throws IOException <nl> + { <nl> + / / Remote setup <nl> + String host = " localhost " , keyspace = " Keyspace1 " ; <nl> + int port = 9160 ; <nl> + <nl> + HttpTransceiver tr = new HttpTransceiver ( new URL ( " http " , host , port , " " ) ) ; <nl> + Cassandra client = ( Cassandra ) SpecificRequestor . getClient ( Cassandra . class , tr ) ; <nl> + client . set _ keyspace ( keyspace ) ; <nl> + <nl> + / / Query compression <nl> + String query = " SELECT FROM Standard2 USING CONSISTENCY . ONE WHERE KEY = \ " eevans \ " AND COL < \ " age \ " COLLIMIT 2 ASC ; " ; <nl> + Deflater compressor = new Deflater ( ) ; <nl> + compressor . setInput ( query . getBytes ( ) ) ; <nl> + compressor . finish ( ) ; <nl> + byte [ ] output = new byte [ 100 ] ; <nl> + System . out . println ( " Query compressed from " + query . length ( ) + " bytes , to " + compressor . deflate ( output ) + " bytes " ) ; <nl> + <nl> + CqlResult res = client . execute _ cql _ query ( ByteBuffer . wrap ( output ) , Compression . GZIP ) ; <nl> + <nl> + switch ( res . type ) <nl> + { <nl> + case ROWS : <nl> + for ( CqlRow row : res . rows ) <nl> + { <nl> + System . out . println ( " Key = " + new String ( row . key . array ( ) ) ) ; <nl> + for ( Column col : row . columns ) <nl> + System . out . println ( " Col = " + new String ( col . name . array ( ) ) + " / " + new String ( col . value . array ( ) ) ) ; <nl> + } <nl> + } <nl> + <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / cql / Column . java b / src / java / org / apache / cassandra / cql / Column . java <nl> new file mode 100644 <nl> index 0000000 . . a94942b <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / Column . java <nl> @ @ - 0 , 0 + 1 , 23 @ @ <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + public class Column <nl> + { <nl> + private final Term name ; <nl> + private final Term value ; <nl> + <nl> + public Column ( Term name , Term value ) <nl> + { <nl> + this . name = name ; <nl> + this . value = value ; <nl> + } <nl> + <nl> + public Term getName ( ) <nl> + { <nl> + return name ; <nl> + } <nl> + <nl> + public Term getValue ( ) <nl> + { <nl> + return value ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / cql / Cql . g b / src / java / org / apache / cassandra / cql / Cql . g <nl> new file mode 100644 <nl> index 0000000 . . 7911b07 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / Cql . g <nl> @ @ - 0 , 0 + 1 , 199 @ @ <nl> + grammar Cql ; <nl> + <nl> + options { <nl> + language = Java ; <nl> + } <nl> + <nl> + @ header { <nl> + package org . apache . cassandra . cql ; <nl> + import org . apache . cassandra . thrift . ConsistencyLevel ; <nl> + } <nl> + <nl> + @ lexer : : header { <nl> + package org . apache . cassandra . cql ; <nl> + } <nl> + <nl> + query returns [ CQLStatement stmnt ] <nl> + : selectStatement { $ stmnt = new CQLStatement ( StatementType . SELECT , $ selectStatement . expr ) ; } <nl> + | updateStatement { $ stmnt = new CQLStatement ( StatementType . UPDATE , $ updateStatement . expr ) ; } <nl> + ; <nl> + <nl> + / * * <nl> + * SELECT FROM <nl> + * < CF > <nl> + * USING <nl> + * CONSISTENCY . ONE <nl> + * WHERE <nl> + * KEY = " key1 " AND KEY = " key2 " AND <nl> + * COL > 1 AND COL < 100 <nl> + * COLLIMIT 10 DESC ; <nl> + * / <nl> + selectStatement returns [ SelectStatement expr ] <nl> + : { <nl> + int numRecords = Integer . MAX _ VALUE ; <nl> + int numColumns = Integer . MAX _ VALUE ; <nl> + boolean reversed = false ; <nl> + ConsistencyLevel cLevel = ConsistencyLevel . ONE ; <nl> + } <nl> + K _ SELECT K _ FROM ? IDENT <nl> + ( K _ USING K _ CONSISTENCY ' . ' K _ LEVEL { cLevel = ConsistencyLevel . valueOf ( $ K _ LEVEL . text ) ; } ) ? <nl> + K _ WHERE selectExpression <nl> + ( limit = ( K _ ROWLIMIT | K _ COLLIMIT ) value = INTEGER <nl> + { <nl> + int count = Integer . parseInt ( $ value . text ) ; <nl> + if ( $ limit . type = = K _ ROWLIMIT ) <nl> + numRecords = count ; <nl> + else <nl> + numColumns = count ; <nl> + } <nl> + ) * <nl> + order = ( K _ ASC | K _ DESC { reversed = true ; } ) ? ' ; ' <nl> + { <nl> + return new SelectStatement ( $ IDENT . text , <nl> + cLevel , <nl> + $ selectExpression . expr , <nl> + numRecords , <nl> + numColumns , <nl> + reversed ) ; <nl> + } <nl> + ; <nl> + <nl> + / * * <nl> + * UPDATE <nl> + * < CF > <nl> + * USING <nl> + * CONSISTENCY . ONE <nl> + * WITH <nl> + * ROW ( " key1 " , COL ( " col1 " , " val1 " ) , . . . ) AND <nl> + * ROW ( " key2 " , COL ( " col1 " , " val1 " ) , . . . ) AND <nl> + * ROW ( " key3 " , COLUMN ( " col1 " , " val1 " ) , . . . ) <nl> + * / <nl> + updateStatement returns [ UpdateStatement expr ] <nl> + : { ConsistencyLevel cLevel = ConsistencyLevel . ONE ; } <nl> + K _ UPDATE IDENT <nl> + ( K _ USING K _ CONSISTENCY ' . ' K _ LEVEL { cLevel = ConsistencyLevel . valueOf ( $ K _ LEVEL . text ) ; } ) ? <nl> + K _ WITH first = rowDef { $ expr = new UpdateStatement ( $ IDENT . text , first , cLevel ) ; } <nl> + ( K _ AND next = rowDef { $ expr . and ( next ) ; } ) * ' ; ' <nl> + ; <nl> + <nl> + / / TODO : date / time , utf8 <nl> + term returns [ Term item ] <nl> + : ( t = STRING _ LITERAL | t = LONG ) <nl> + { $ item = new Term ( $ t . text , $ t . type ) ; } <nl> + ; <nl> + <nl> + / / Note : slices are inclusive so > = and > , and < and < = all have the same semantics . <nl> + relation returns [ Relation rel ] <nl> + : kind = ( K _ KEY | K _ COLUMN ) type = ( ' = ' | ' < ' | ' < = ' | ' > = ' | ' > ' ) t = term <nl> + { return new Relation ( $ kind . text , $ type . text , $ t . item ) ; } <nl> + ; <nl> + <nl> + / / relation [ [ AND relation ] . . . ] <nl> + selectExpression returns [ SelectExpression expr ] <nl> + : first = relation { $ expr = new SelectExpression ( first ) ; } <nl> + ( K _ AND next = relation { $ expr . and ( next ) ; } ) * <nl> + ; <nl> + <nl> + columnDef returns [ Column column ] <nl> + : K _ COLUMN ' ( ' n = term ' , ' v = term ' ) ' { $ column = new Column ( $ n . item , $ v . item ) ; } <nl> + ; <nl> + <nl> + rowDef returns [ Row row ] <nl> + : K _ ROW ' ( ' key = term ' , ' first = columnDef { $ row = new Row ( $ key . item , first ) ; } <nl> + ( ' , ' next = columnDef { $ row . and ( next ) ; } ) * ' ) ' <nl> + ; <nl> + <nl> + / / Case - insensitive keywords <nl> + K _ SELECT : S E L E C T ; <nl> + K _ FROM : F R O M ; <nl> + K _ WHERE : W H E R E ; <nl> + K _ AND : A N D ; <nl> + K _ KEY : K E Y ; <nl> + K _ COLUMN : C O L ( U M N ) ? ; <nl> + K _ UPDATE : U P D A T E ; <nl> + K _ WITH : W I T H ; <nl> + K _ ROW : R O W ; <nl> + K _ ROWLIMIT : R O W L I M I T ; <nl> + K _ COLLIMIT : C O L L I M I T ; <nl> + K _ ASC : A S C ( E N D I N G ) ? ; <nl> + K _ DESC : D E S C ( E N D I N G ) ? ; <nl> + K _ USING : U S I N G ; <nl> + K _ CONSISTENCY : C O N S I S T E N C Y ; <nl> + K _ LEVEL : ( Z E R O <nl> + | O N E <nl> + | Q U O R U M <nl> + | A L L <nl> + | D C Q U O R U M <nl> + | D C Q U O R U M S Y N C <nl> + ) <nl> + ; <nl> + <nl> + / / Case - insensitive alpha characters <nl> + fragment A : ( ' a ' | ' A ' ) ; <nl> + fragment B : ( ' b ' | ' B ' ) ; <nl> + fragment C : ( ' c ' | ' C ' ) ; <nl> + fragment D : ( ' d ' | ' D ' ) ; <nl> + fragment E : ( ' e ' | ' E ' ) ; <nl> + fragment F : ( ' f ' | ' F ' ) ; <nl> + fragment G : ( ' g ' | ' G ' ) ; <nl> + fragment H : ( ' h ' | ' H ' ) ; <nl> + fragment I : ( ' i ' | ' I ' ) ; <nl> + fragment J : ( ' j ' | ' J ' ) ; <nl> + fragment K : ( ' k ' | ' K ' ) ; <nl> + fragment L : ( ' l ' | ' L ' ) ; <nl> + fragment M : ( ' m ' | ' M ' ) ; <nl> + fragment N : ( ' n ' | ' N ' ) ; <nl> + fragment O : ( ' o ' | ' O ' ) ; <nl> + fragment P : ( ' p ' | ' P ' ) ; <nl> + fragment Q : ( ' q ' | ' Q ' ) ; <nl> + fragment R : ( ' r ' | ' R ' ) ; <nl> + fragment S : ( ' s ' | ' S ' ) ; <nl> + fragment T : ( ' t ' | ' T ' ) ; <nl> + fragment U : ( ' u ' | ' U ' ) ; <nl> + fragment V : ( ' v ' | ' V ' ) ; <nl> + fragment W : ( ' w ' | ' W ' ) ; <nl> + fragment X : ( ' x ' | ' X ' ) ; <nl> + fragment Y : ( ' y ' | ' Y ' ) ; <nl> + fragment Z : ( ' z ' | ' Z ' ) ; <nl> + <nl> + STRING _ LITERAL <nl> + : ' " ' <nl> + { StringBuilder b = new StringBuilder ( ) ; } <nl> + ( c = ~ ( ' " ' | ' \ r ' | ' \ n ' ) { b . appendCodePoint ( c ) ; } <nl> + | ' " ' ' " ' { b . appendCodePoint ( ' " ' ) ; } <nl> + ) * <nl> + ' " ' <nl> + { setText ( b . toString ( ) ) ; } <nl> + ; <nl> + <nl> + fragment DIGIT <nl> + : ' 0 ' . . ' 9 ' <nl> + ; <nl> + <nl> + fragment LETTER <nl> + : ( ' A ' . . ' Z ' | ' a ' . . ' z ' ) <nl> + ; <nl> + <nl> + INTEGER <nl> + : DIGIT + <nl> + ; <nl> + <nl> + LONG <nl> + : INTEGER ' L ' { setText ( $ INTEGER . text ) ; } <nl> + ; <nl> + <nl> + IDENT <nl> + : LETTER ( LETTER | DIGIT ) * <nl> + ; <nl> + <nl> + WS <nl> + : ( ' ' | ' \ t ' | ' \ n ' | ' \ r ' ) + { $ channel = HIDDEN ; } <nl> + ; <nl> + <nl> + COMMENT <nl> + : ( ' - - ' | ' / / ' ) . * ( ' \ n ' | ' \ r ' ) { $ channel = HIDDEN ; } <nl> + ; <nl> + <nl> + MULTILINE _ COMMENT <nl> + : ' / * ' . * ' * / ' { $ channel = HIDDEN ; } <nl> + ; <nl> diff - - git a / src / java / org / apache / cassandra / cql / QueryProcessor . java b / src / java / org / apache / cassandra / cql / QueryProcessor . java <nl> new file mode 100644 <nl> index 0000000 . . 8f028f4 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / QueryProcessor . java <nl> @ @ - 0 , 0 + 1 , 222 @ @ <nl> + <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + import java . io . IOException ; <nl> + import java . nio . ByteBuffer ; <nl> + import java . util . ArrayList ; <nl> + import java . util . Collection ; <nl> + import java . util . HashMap ; <nl> + import java . util . List ; <nl> + import java . util . Map ; <nl> + import java . util . concurrent . TimeoutException ; <nl> + <nl> + import org . antlr . runtime . ANTLRStringStream ; <nl> + import org . antlr . runtime . CharStream ; <nl> + import org . antlr . runtime . CommonTokenStream ; <nl> + import org . antlr . runtime . RecognitionException ; <nl> + import org . antlr . runtime . TokenStream ; <nl> + import org . apache . cassandra . avro . Column ; <nl> + import org . apache . cassandra . avro . CqlResult ; <nl> + import org . apache . cassandra . avro . CqlResultType ; <nl> + import org . apache . cassandra . avro . CqlRow ; <nl> + import org . apache . cassandra . avro . InvalidRequestException ; <nl> + import org . apache . cassandra . avro . TimedOutException ; <nl> + import org . apache . cassandra . avro . UnavailableException ; <nl> + import org . apache . cassandra . db . ColumnFamily ; <nl> + import org . apache . cassandra . db . DecoratedKey ; <nl> + import org . apache . cassandra . db . IColumn ; <nl> + import org . apache . cassandra . db . ReadCommand ; <nl> + import org . apache . cassandra . db . RowMutation ; <nl> + import org . apache . cassandra . db . SliceByNamesReadCommand ; <nl> + import org . apache . cassandra . db . SliceFromReadCommand ; <nl> + import org . apache . cassandra . db . filter . QueryPath ; <nl> + import org . apache . cassandra . service . StorageProxy ; <nl> + import org . apache . cassandra . service . StorageService ; <nl> + import org . apache . cassandra . thrift . ConsistencyLevel ; <nl> + <nl> + import static org . apache . cassandra . avro . AvroValidation . validateKey ; <nl> + <nl> + public class QueryProcessor <nl> + { <nl> + <nl> + public static Map < DecoratedKey < ? > , ColumnFamily > readColumnFamily ( List < ReadCommand > commands , ConsistencyLevel cLevel ) <nl> + throws UnavailableException , InvalidRequestException , TimedOutException <nl> + { <nl> + Map < DecoratedKey < ? > , ColumnFamily > columnFamilyKeyMap = new HashMap < DecoratedKey < ? > , ColumnFamily > ( ) ; <nl> + List < org . apache . cassandra . db . Row > rows ; <nl> + <nl> + try <nl> + { <nl> + rows = StorageProxy . readProtocol ( commands , cLevel ) ; <nl> + } <nl> + catch ( TimeoutException e ) <nl> + { <nl> + throw new TimedOutException ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + catch ( org . apache . cassandra . thrift . UnavailableException e ) <nl> + { <nl> + UnavailableException error = new UnavailableException ( ) ; <nl> + error . initCause ( e ) ; <nl> + throw error ; <nl> + } <nl> + catch ( org . apache . cassandra . thrift . InvalidRequestException e ) <nl> + { <nl> + InvalidRequestException error = new InvalidRequestException ( ) ; <nl> + error . initCause ( e ) ; <nl> + throw error ; <nl> + } <nl> + <nl> + for ( org . apache . cassandra . db . Row row : rows ) <nl> + columnFamilyKeyMap . put ( row . key , row . cf ) ; <nl> + <nl> + return columnFamilyKeyMap ; <nl> + } <nl> + <nl> + public static CqlResult process ( String queryString , String keyspace ) <nl> + throws RecognitionException , UnavailableException , InvalidRequestException , TimedOutException <nl> + { <nl> + CqlParser parser = getParser ( queryString ) ; <nl> + CQLStatement statement = parser . query ( ) ; <nl> + <nl> + CqlResult avroResult = new CqlResult ( ) ; <nl> + <nl> + switch ( statement . type ) <nl> + { <nl> + case SELECT : <nl> + SelectStatement select = ( SelectStatement ) statement . statement ; <nl> + <nl> + QueryPath queryPath = new QueryPath ( select . getColumnFamily ( ) ) ; <nl> + List < ReadCommand > commands = new ArrayList < ReadCommand > ( ) ; <nl> + <nl> + List < CqlRow > avroRows = new ArrayList < CqlRow > ( ) ; <nl> + avroResult . type = CqlResultType . ROWS ; <nl> + <nl> + / / It ' s a multiget . . . <nl> + if ( ! select . getKeyPredicates ( ) . isRange ( ) ) <nl> + { <nl> + <nl> + for ( Term keyName : select . getKeyPredicates ( ) . getTerms ( ) ) <nl> + { <nl> + byte [ ] key = keyName . getBytes ( ) ; / / FIXME : surely not good enough <nl> + validateKey ( key ) ; <nl> + <nl> + / / . . . of a list of column names <nl> + if ( ! select . getColumnPredicates ( ) . isRange ( ) ) <nl> + { <nl> + Collection < byte [ ] > columnNames = new ArrayList < byte [ ] > ( ) ; <nl> + for ( Term column : select . getColumnPredicates ( ) . getTerms ( ) ) <nl> + columnNames . add ( column . getBytes ( ) ) ; / / FIXME : surely not good enough <nl> + <nl> + commands . add ( new SliceByNamesReadCommand ( keyspace , key , queryPath , columnNames ) ) ; <nl> + } <nl> + / / . . . a range ( slice ) of column names <nl> + else <nl> + { <nl> + commands . add ( new SliceFromReadCommand ( keyspace , <nl> + key , <nl> + queryPath , <nl> + select . getColumnPredicates ( ) . getStart ( ) . getBytes ( ) , <nl> + select . getColumnPredicates ( ) . getFinish ( ) . getBytes ( ) , <nl> + select . reversed ( ) , <nl> + select . getNumColumns ( ) ) ) ; <nl> + } <nl> + <nl> + Map < DecoratedKey < ? > , ColumnFamily > columnFamilies = readColumnFamily ( commands , <nl> + select . getConsistencyLevel ( ) ) ; <nl> + List < Column > avroColumns = new ArrayList < Column > ( ) ; <nl> + <nl> + for ( ReadCommand cmd : commands ) <nl> + { <nl> + ColumnFamily cf = columnFamilies . get ( StorageService . getPartitioner ( ) . decorateKey ( cmd . key ) ) ; <nl> + / / TODO : handle reversing order <nl> + for ( IColumn column : cf . getSortedColumns ( ) ) <nl> + { <nl> + Column avroColumn = new Column ( ) ; <nl> + avroColumn . name = ByteBuffer . wrap ( column . name ( ) ) ; <nl> + avroColumn . value = ByteBuffer . wrap ( column . value ( ) ) ; <nl> + avroColumns . add ( avroColumn ) ; <nl> + } <nl> + } <nl> + <nl> + / / Create a new row , add the columns to it , and then add it to the list of rows <nl> + CqlRow avroRow = new CqlRow ( ) ; <nl> + avroRow . key = ByteBuffer . wrap ( key ) ; <nl> + avroRow . columns = avroColumns ; <nl> + avroRows . add ( avroRow ) ; <nl> + } <nl> + } <nl> + else / / It is a range query ( range of keys ) . <nl> + { <nl> + <nl> + } <nl> + <nl> + avroResult . rows = avroRows ; <nl> + return avroResult ; <nl> + <nl> + case UPDATE : <nl> + UpdateStatement update = ( UpdateStatement ) statement . statement ; <nl> + avroResult . type = CqlResultType . VOID ; <nl> + <nl> + List < RowMutation > rowMutations = new ArrayList < RowMutation > ( ) ; <nl> + <nl> + for ( Row row : update . getRows ( ) ) <nl> + { <nl> + RowMutation rm = new RowMutation ( keyspace , row . getKey ( ) . getBytes ( ) ) ; <nl> + <nl> + for ( org . apache . cassandra . cql . Column col : row . getColumns ( ) ) <nl> + { <nl> + rm . add ( new QueryPath ( update . getColumnFamily ( ) , null , col . getName ( ) . getBytes ( ) ) , <nl> + col . getValue ( ) . getBytes ( ) , <nl> + System . currentTimeMillis ( ) ) ; <nl> + rowMutations . add ( rm ) ; <nl> + } <nl> + } <nl> + <nl> + try <nl> + { <nl> + StorageProxy . mutate ( rowMutations , update . getConsistencyLevel ( ) ) ; <nl> + } <nl> + catch ( org . apache . cassandra . thrift . UnavailableException e ) <nl> + { <nl> + throw new UnavailableException ( ) ; <nl> + } <nl> + catch ( TimeoutException e ) <nl> + { <nl> + throw new TimedOutException ( ) ; <nl> + } <nl> + <nl> + return avroResult ; <nl> + } <nl> + <nl> + return null ; / / We should never get here . <nl> + } <nl> + <nl> + private static CqlParser getParser ( String queryStr ) <nl> + { <nl> + CharStream stream = new ANTLRStringStream ( queryStr ) ; <nl> + CqlLexer lexer = new CqlLexer ( stream ) ; <nl> + TokenStream tokenStream = new CommonTokenStream ( lexer ) ; <nl> + return new CqlParser ( tokenStream ) ; <nl> + } <nl> + <nl> + public static void main ( String [ ] args ) throws RecognitionException <nl> + { <nl> + CqlParser parser = getParser ( " SElecT FRoM Standard1 where KEY > \ " foo \ " and key < \ " fnord \ " and COLUMN = \ " bar \ " ; " ) ; <nl> + CQLStatement statement = parser . query ( ) ; <nl> + <nl> + switch ( statement . type ) <nl> + { <nl> + case SELECT : <nl> + SelectStatement st = ( SelectStatement ) statement . statement ; <nl> + System . out . println ( st . getColumnFamily ( ) + " " + st . getKeyPredicates ( ) . getStart ( ) . getText ( ) + <nl> + " " + st . getColumnPredicates ( ) . getTerms ( ) + " " + st . getKeyPredicates ( ) . isRange ( ) ) ; <nl> + case UPDATE : <nl> + return ; <nl> + } <nl> + } <nl> + <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / cql / Relation . java b / src / java / org / apache / cassandra / cql / Relation . java <nl> new file mode 100644 <nl> index 0000000 . . 38ebf25 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / Relation . java <nl> @ @ - 0 , 0 + 1 , 67 @ @ <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + / * * <nl> + * Relations encapsulate the relationship between an entity and a value . For <nl> + * example , KEY > ' start ' or COLUMN = ' somecolumn ' . <nl> + * <nl> + * @ author eevans <nl> + * <nl> + * / <nl> + public class Relation <nl> + { <nl> + public Entity entity = Entity . COLUMN ; <nl> + public RelationType type ; <nl> + public Term value ; <nl> + <nl> + / * * <nl> + * Creates a new relation . <nl> + * <nl> + * @ param entity the kind of relation this is ; what the value is compared to . <nl> + * @ param type the type of relation ; how how this entity relates to the value . <nl> + * @ param value the value being compared to the entity . <nl> + * / <nl> + public Relation ( String entity , String type , Term value ) <nl> + { <nl> + if ( entity . toUpperCase ( ) . equals ( " KEY " ) ) <nl> + this . entity = Entity . KEY ; <nl> + <nl> + this . type = RelationType . forString ( type ) ; <nl> + this . value = value ; <nl> + } <nl> + <nl> + public boolean isKey ( ) <nl> + { <nl> + return entity . equals ( Entity . KEY ) ; <nl> + } <nl> + <nl> + public boolean isColumn ( ) <nl> + { <nl> + return entity . equals ( Entity . COLUMN ) ; <nl> + } <nl> + } <nl> + <nl> + enum Entity <nl> + { <nl> + KEY , COLUMN ; <nl> + } <nl> + <nl> + enum RelationType <nl> + { <nl> + EQ , LT , LTE , GTE , GT ; <nl> + <nl> + public static RelationType forString ( String s ) <nl> + { <nl> + if ( s . equals ( " = " ) ) <nl> + return EQ ; <nl> + else if ( s . equals ( " < " ) ) <nl> + return LT ; <nl> + else if ( s . equals ( " < = " ) ) <nl> + return LTE ; <nl> + else if ( s . equals ( " > = " ) ) <nl> + return GTE ; <nl> + else if ( s . equals ( " > " ) ) <nl> + return GT ; <nl> + <nl> + return null ; <nl> + } <nl> + } <nl> \ No newline at end of file <nl> diff - - git a / src / java / org / apache / cassandra / cql / Row . java b / src / java / org / apache / cassandra / cql / Row . java <nl> new file mode 100644 <nl> index 0000000 . . c9376c8 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / Row . java <nl> @ @ - 0 , 0 + 1 , 31 @ @ <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + import java . util . ArrayList ; <nl> + import java . util . List ; <nl> + <nl> + public class Row <nl> + { <nl> + private final Term key ; <nl> + private List < Column > columns = new ArrayList < Column > ( ) ; <nl> + <nl> + public Row ( Term key , Column firstColumn ) <nl> + { <nl> + this . key = key ; <nl> + columns . add ( firstColumn ) ; <nl> + } <nl> + <nl> + public void and ( Column col ) <nl> + { <nl> + columns . add ( col ) ; <nl> + } <nl> + <nl> + public Term getKey ( ) <nl> + { <nl> + return key ; <nl> + } <nl> + <nl> + public List < Column > getColumns ( ) <nl> + { <nl> + return columns ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / cql / SelectExpression . java b / src / java / org / apache / cassandra / cql / SelectExpression . java <nl> new file mode 100644 <nl> index 0000000 . . e8e0afa <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / SelectExpression . java <nl> @ @ - 0 , 0 + 1 , 114 @ @ <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + import java . util . ArrayList ; <nl> + import java . util . List ; <nl> + <nl> + / * * <nl> + * SelectExpressions encapsulate all of the predicates of a SELECT query . <nl> + * <nl> + * @ author eevans <nl> + * <nl> + * / <nl> + public class SelectExpression <nl> + { <nl> + private Predicates keys = new Predicates ( ) ; <nl> + private Predicates columns = new Predicates ( ) ; <nl> + <nl> + public SelectExpression ( Relation firstRelation ) <nl> + { <nl> + and ( firstRelation ) ; <nl> + } <nl> + <nl> + public void and ( Relation relation ) <nl> + { <nl> + if ( relation . isKey ( ) ) <nl> + { <nl> + if ( relation . type . equals ( RelationType . EQ ) ) <nl> + keys . addTerm ( relation . value ) ; <nl> + else if ( ( relation . type . equals ( RelationType . GT ) | | relation . type . equals ( RelationType . GTE ) ) ) <nl> + keys . setStart ( relation . value ) ; <nl> + else if ( ( relation . type . equals ( RelationType . LT ) | | relation . type . equals ( RelationType . LTE ) ) ) <nl> + keys . setFinish ( relation . value ) ; <nl> + } <nl> + else / / It ' s a column <nl> + { <nl> + if ( relation . type . equals ( RelationType . EQ ) ) <nl> + columns . addTerm ( relation . value ) ; <nl> + else if ( ( relation . type . equals ( RelationType . GT ) | | relation . type . equals ( RelationType . GTE ) ) ) <nl> + columns . setStart ( relation . value ) ; <nl> + else if ( ( relation . type . equals ( RelationType . LT ) | | relation . type . equals ( RelationType . LTE ) ) ) <nl> + columns . setFinish ( relation . value ) ; <nl> + } <nl> + } <nl> + <nl> + public Predicates getKeyPredicates ( ) <nl> + { <nl> + return keys ; <nl> + } <nl> + <nl> + public Predicates getColumnPredicates ( ) <nl> + { <nl> + return columns ; <nl> + } <nl> + } <nl> + <nl> + class Predicates <nl> + { <nl> + private boolean initialized = false ; <nl> + private List < Term > names = new ArrayList < Term > ( ) ; <nl> + private Term start , finish ; <nl> + private boolean isRange = false ; <nl> + <nl> + Term getStart ( ) <nl> + { <nl> + return start = = null ? new Term ( ) : start ; <nl> + } <nl> + <nl> + void setStart ( Term start ) <nl> + { <nl> + / / FIXME : propagate a proper exception <nl> + if ( initialized & & ( ! isRange ( ) ) ) <nl> + throw new RuntimeException ( " You cannot combine discreet names and range operators . " ) ; <nl> + <nl> + initialized = true ; <nl> + isRange = true ; <nl> + this . start = start ; <nl> + } <nl> + <nl> + Term getFinish ( ) <nl> + { <nl> + return finish = = null ? new Term ( ) : finish ; <nl> + } <nl> + <nl> + void setFinish ( Term finish ) <nl> + { <nl> + / / FIXME : propagate a proper exception <nl> + if ( initialized & & ( ! isRange ( ) ) ) <nl> + throw new RuntimeException ( " You cannot combine discreet names and range operators . " ) ; <nl> + <nl> + initialized = true ; <nl> + isRange = true ; <nl> + this . finish = finish ; <nl> + } <nl> + <nl> + List < Term > getTerms ( ) <nl> + { <nl> + return names ; <nl> + } <nl> + <nl> + void addTerm ( Term name ) <nl> + { <nl> + / / FIXME : propagate a proper exception <nl> + if ( initialized & & ( isRange ( ) ) ) <nl> + throw new RuntimeException ( " You cannot combine discreet names and range operators . " ) ; <nl> + <nl> + initialized = true ; <nl> + isRange = false ; <nl> + names . add ( name ) ; <nl> + } <nl> + <nl> + boolean isRange ( ) <nl> + { <nl> + return isRange ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / cql / SelectStatement . java b / src / java / org / apache / cassandra / cql / SelectStatement . java <nl> new file mode 100644 <nl> index 0000000 . . 01695c9 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / SelectStatement . java <nl> @ @ - 0 , 0 + 1 , 66 @ @ <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + import org . apache . cassandra . thrift . ConsistencyLevel ; <nl> + <nl> + / * * <nl> + * Encapsulates a completely parsed SELECT query , including the target <nl> + * column family , expression , result count , and ordering clause . <nl> + * <nl> + * @ author eevans <nl> + * <nl> + * / <nl> + public class SelectStatement <nl> + { <nl> + private final String columnFamily ; <nl> + private final ConsistencyLevel cLevel ; <nl> + private final SelectExpression expression ; <nl> + private final int numRecords ; <nl> + private final int numColumns ; <nl> + private final boolean reverse ; <nl> + <nl> + public SelectStatement ( String columnFamily , ConsistencyLevel cLevel , SelectExpression expression , <nl> + int numRecords , int numColumns , boolean reverse ) <nl> + { <nl> + this . columnFamily = columnFamily ; <nl> + this . cLevel = cLevel ; <nl> + this . expression = expression ; <nl> + this . numRecords = numRecords ; <nl> + this . numColumns = numColumns ; <nl> + this . reverse = reverse ; <nl> + } <nl> + <nl> + public Predicates getKeyPredicates ( ) <nl> + { <nl> + return expression . getKeyPredicates ( ) ; <nl> + } <nl> + <nl> + public Predicates getColumnPredicates ( ) <nl> + { <nl> + return expression . getColumnPredicates ( ) ; <nl> + } <nl> + <nl> + public String getColumnFamily ( ) <nl> + { <nl> + return columnFamily ; <nl> + } <nl> + <nl> + public boolean reversed ( ) <nl> + { <nl> + return reverse ; <nl> + } <nl> + <nl> + public ConsistencyLevel getConsistencyLevel ( ) <nl> + { <nl> + return cLevel ; <nl> + } <nl> + <nl> + public int getNumRecords ( ) <nl> + { <nl> + return numRecords ; <nl> + } <nl> + <nl> + public int getNumColumns ( ) <nl> + { <nl> + return numColumns ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / cql / StatementType . java b / src / java / org / apache / cassandra / cql / StatementType . java <nl> new file mode 100644 <nl> index 0000000 . . e364267 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / StatementType . java <nl> @ @ - 0 , 0 + 1 , 6 @ @ <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + public enum StatementType <nl> + { <nl> + SELECT , UPDATE ; <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / cql / Term . java b / src / java / org / apache / cassandra / cql / Term . java <nl> new file mode 100644 <nl> index 0000000 . . 1ff4e57 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / Term . java <nl> @ @ - 0 , 0 + 1 , 91 @ @ <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> + <nl> + / * * <nl> + * Represents a term processed from a CQL query statement . Terms are things <nl> + * like strings , numbers , UUIDs , etc . <nl> + * <nl> + * @ author eevans <nl> + * <nl> + * / <nl> + public class Term <nl> + { <nl> + private final String text ; <nl> + private final TermType type ; <nl> + <nl> + / * * <nl> + * Create new Term instance from a string , and an integer that corresponds <nl> + * with the token ID from CQLParser . <nl> + * <nl> + * @ param text the text representation of the term . <nl> + * @ param type the term ' s type as an integer token ID . <nl> + * / <nl> + public Term ( String text , int type ) <nl> + { <nl> + this . text = text ; <nl> + this . type = TermType . forInt ( type ) ; <nl> + } <nl> + <nl> + protected Term ( ) <nl> + { <nl> + this . text = " " ; <nl> + this . type = TermType . STRING ; <nl> + } <nl> + <nl> + / * * <nl> + * Get the text that was parsed to create this term . <nl> + * <nl> + * @ return the string term as parsed from a CQL statement . <nl> + * / <nl> + public String getText ( ) <nl> + { <nl> + return text ; <nl> + } <nl> + <nl> + / * * <nl> + * Get the typed value , serialized to a byte [ ] . <nl> + * <nl> + * @ return <nl> + * / <nl> + public byte [ ] getBytes ( ) <nl> + { <nl> + switch ( type ) <nl> + { <nl> + case STRING : <nl> + return text . getBytes ( ) ; <nl> + case LONG : <nl> + return FBUtilities . toByteArray ( Long . parseLong ( text ) ) ; <nl> + } <nl> + <nl> + / / FIXME : handle scenario that should never happen <nl> + return null ; <nl> + } <nl> + <nl> + / * * <nl> + * Get the term ' s type . <nl> + * <nl> + * @ return the type <nl> + * / <nl> + public TermType getType ( ) <nl> + { <nl> + return type ; <nl> + } <nl> + <nl> + } <nl> + <nl> + enum TermType <nl> + { <nl> + STRING , LONG ; <nl> + <nl> + static TermType forInt ( int type ) <nl> + { <nl> + if ( type = = CqlParser . STRING _ LITERAL ) <nl> + return STRING ; <nl> + else if ( type = = CqlParser . LONG ) <nl> + return LONG ; <nl> + <nl> + / / FIXME : handled scenario that should never occur . <nl> + return null ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / cql / UpdateStatement . java b / src / java / org / apache / cassandra / cql / UpdateStatement . java <nl> new file mode 100644 <nl> index 0000000 . . ae5b752 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / cql / UpdateStatement . java <nl> @ @ - 0 , 0 + 1 , 40 @ @ <nl> + package org . apache . cassandra . cql ; <nl> + <nl> + import java . util . ArrayList ; <nl> + import java . util . List ; <nl> + <nl> + import org . apache . cassandra . thrift . ConsistencyLevel ; <nl> + <nl> + public class UpdateStatement <nl> + { <nl> + private String columnFamily ; <nl> + private List < Row > rows = new ArrayList < Row > ( ) ; <nl> + private ConsistencyLevel cLevel ; <nl> + <nl> + public UpdateStatement ( String columnFamily , Row first , ConsistencyLevel cLevel ) <nl> + { <nl> + this . columnFamily = columnFamily ; <nl> + this . cLevel = cLevel ; <nl> + and ( first ) ; <nl> + } <nl> + <nl> + public void and ( Row row ) <nl> + { <nl> + rows . add ( row ) ; <nl> + } <nl> + <nl> + public List < Row > getRows ( ) <nl> + { <nl> + return rows ; <nl> + } <nl> + <nl> + public ConsistencyLevel getConsistencyLevel ( ) <nl> + { <nl> + return cLevel ; <nl> + } <nl> + <nl> + public String getColumnFamily ( ) <nl> + { <nl> + return columnFamily ; <nl> + } <nl> + }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 4a3dc02 . . 2643bfc 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 0 - beta2 
+ + * Don ' t deadlock when flushing CFS backed custom indexes ( CASSANDRA - 10181 ) 
+ * Fix double flushing of secondary index tables ( CASSANDRA - 10180 ) 
+ * Fix incorrect handling of range tombstones in thrift ( CASSANDRA - 10046 ) 
+ * Only use batchlog when paired materialized view replica is remote ( CASSANDRA - 10061 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index b177c23 . . efac287 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 953 , 7 + 953 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ * / 
+ 
+ if ( flushSecondaryIndexes ) 
+ - indexManager . flushAllCustomIndexesBlocking ( ) ; 
+ + indexManager . flushAllNonCFSBackedIndexesBlocking ( ) ; 
+ 
+ try 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java 
+ index 6bff916 . . 233a0f2 100644 
+ - - - a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java 
+ + + + b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java 
+ @ @ - 94 , 7 + 94 , 6 @ @ public class SecondaryIndexManager implements IndexRegistry 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( SecondaryIndexManager . class ) ; 
+ 
+ - 
+ private Map < String , Index > indexes = Maps . newConcurrentMap ( ) ; 
+ 
+ / / executes tasks returned by Indexer # addIndexColumn which may require index ( es ) to be ( re ) built 
+ @ @ - 343 , 6 + 342 , 7 @ @ public class SecondaryIndexManager implements IndexRegistry 
+ . map ( cfs - > wait . add ( cfs . forceFlush ( ) ) ) 
+ . orElseGet ( ( ) - > nonCfsIndexes . add ( index ) ) ) ; 
+ } 
+ + 
+ executeAllBlocking ( nonCfsIndexes . stream ( ) , Index : : getBlockingFlushTask ) ; 
+ FBUtilities . waitOnFutures ( wait ) ; 
+ } 
+ @ @ - 350 , 11 + 350 , 11 @ @ public class SecondaryIndexManager implements IndexRegistry 
+ / * * 
+ * Performs a blocking flush of all custom indexes 
+ * / 
+ - public void flushAllCustomIndexesBlocking ( ) 
+ + public void flushAllNonCFSBackedIndexesBlocking ( ) 
+ { 
+ Set < Index > customIndexers = indexes . values ( ) . stream ( ) 
+ - . filter ( index - > ! ( index instanceof CassandraIndex ) ) 
+ - . collect ( Collectors . toSet ( ) ) ; 
+ + . filter ( index - > ! ( index . getBackingTable ( ) . isPresent ( ) ) ) 
+ + . collect ( Collectors . toSet ( ) ) ; 
+ flushIndexesBlocking ( customIndexers ) ; 
+ } 
+ 
+ diff - - git a / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java b / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java 
+ new file mode 100644 
+ index 0000000 . . 3326b3f 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / index / internal / CustomCassandraIndex . java 
+ @ @ - 0 , 0 + 1 , 738 @ @ 
+ + package org . apache . cassandra . index . internal ; 
+ + 
+ + import java . nio . ByteBuffer ; 
+ + import java . util . * ; 
+ + import java . util . concurrent . Callable ; 
+ + import java . util . concurrent . Future ; 
+ + import java . util . function . BiFunction ; 
+ + import java . util . stream . Collectors ; 
+ + import java . util . stream . StreamSupport ; 
+ + 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ + 
+ + import org . apache . cassandra . config . CFMetaData ; 
+ + import org . apache . cassandra . config . ColumnDefinition ; 
+ + import org . apache . cassandra . cql3 . Operator ; 
+ + import org . apache . cassandra . cql3 . statements . IndexTarget ; 
+ + import org . apache . cassandra . db . * ; 
+ + import org . apache . cassandra . db . compaction . CompactionManager ; 
+ + import org . apache . cassandra . db . filter . RowFilter ; 
+ + import org . apache . cassandra . db . lifecycle . SSTableSet ; 
+ + import org . apache . cassandra . db . lifecycle . View ; 
+ + import org . apache . cassandra . db . marshal . AbstractType ; 
+ + import org . apache . cassandra . db . marshal . CollectionType ; 
+ + import org . apache . cassandra . db . partitions . PartitionIterator ; 
+ + import org . apache . cassandra . db . partitions . PartitionUpdate ; 
+ + import org . apache . cassandra . db . rows . * ; 
+ + import org . apache . cassandra . dht . LocalPartitioner ; 
+ + import org . apache . cassandra . exceptions . InvalidRequestException ; 
+ + import org . apache . cassandra . index . Index ; 
+ + import org . apache . cassandra . index . IndexRegistry ; 
+ + import org . apache . cassandra . index . SecondaryIndexBuilder ; 
+ + import org . apache . cassandra . index . internal . composites . CompositesSearcher ; 
+ + import org . apache . cassandra . index . internal . keys . KeysSearcher ; 
+ + import org . apache . cassandra . index . transactions . IndexTransaction ; 
+ + import org . apache . cassandra . index . transactions . UpdateTransaction ; 
+ + import org . apache . cassandra . io . sstable . ReducingKeyIterator ; 
+ + import org . apache . cassandra . io . sstable . format . SSTableReader ; 
+ + import org . apache . cassandra . schema . IndexMetadata ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . apache . cassandra . utils . concurrent . OpOrder ; 
+ + import org . apache . cassandra . utils . concurrent . Refs ; 
+ + 
+ + / * * 
+ + * Clone of KeysIndex used in CassandraIndexTest # testCustomIndexWithCFS to verify 
+ + * behaviour of flushing CFS backed CUSTOM indexes 
+ + * / 
+ + public class CustomCassandraIndex implements Index 
+ + { 
+ + private static final Logger logger = LoggerFactory . getLogger ( CassandraIndex . class ) ; 
+ + 
+ + public final ColumnFamilyStore baseCfs ; 
+ + protected IndexMetadata metadata ; 
+ + protected ColumnFamilyStore indexCfs ; 
+ + protected ColumnDefinition indexedColumn ; 
+ + protected CassandraIndexFunctions functions ; 
+ + 
+ + public CustomCassandraIndex ( ColumnFamilyStore baseCfs , IndexMetadata indexDef ) 
+ + { 
+ + this . baseCfs = baseCfs ; 
+ + setMetadata ( indexDef ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Returns true if an index of this type can support search predicates of the form [ column ] OPERATOR [ value ] 
+ + * @ param indexedColumn 
+ + * @ param operator 
+ + * @ return 
+ + * / 
+ + protected boolean supportsOperator ( ColumnDefinition indexedColumn , Operator operator ) 
+ + { 
+ + return operator . equals ( Operator . EQ ) ; 
+ + } 
+ + 
+ + public ColumnDefinition getIndexedColumn ( ) 
+ + { 
+ + return indexedColumn ; 
+ + } 
+ + 
+ + public ClusteringComparator getIndexComparator ( ) 
+ + { 
+ + return indexCfs . metadata . comparator ; 
+ + } 
+ + 
+ + public ColumnFamilyStore getIndexCfs ( ) 
+ + { 
+ + return indexCfs ; 
+ + } 
+ + 
+ + public void register ( IndexRegistry registry ) 
+ + { 
+ + registry . registerIndex ( this ) ; 
+ + } 
+ + 
+ + public Callable < ? > getInitializationTask ( ) 
+ + { 
+ + / / if we ' re just linking in the index on an already - built index post - restart 
+ + / / we ' ve nothing to do . Otherwise , submit for building via SecondaryIndexBuilder 
+ + return isBuilt ( ) ? null : getBuildIndexTask ( ) ; 
+ + } 
+ + 
+ + public IndexMetadata getIndexMetadata ( ) 
+ + { 
+ + return metadata ; 
+ + } 
+ + 
+ + public String getIndexName ( ) 
+ + { 
+ + / / should return metadata . name , see CASSANDRA - 10127 
+ + return indexCfs . name ; 
+ + } 
+ + 
+ + public Optional < ColumnFamilyStore > getBackingTable ( ) 
+ + { 
+ + return indexCfs = = null ? Optional . empty ( ) : Optional . of ( indexCfs ) ; 
+ + } 
+ + 
+ + public Callable < Void > getBlockingFlushTask ( ) 
+ + { 
+ + return ( ) - > { 
+ + indexCfs . forceBlockingFlush ( ) ; 
+ + return null ; 
+ + } ; 
+ + } 
+ + 
+ + public Callable < ? > getInvalidateTask ( ) 
+ + { 
+ + return ( ) - > { 
+ + markRemoved ( ) ; 
+ + invalidate ( ) ; 
+ + return null ; 
+ + } ; 
+ + } 
+ + 
+ + public Callable < ? > getMetadataReloadTask ( IndexMetadata indexDef ) 
+ + { 
+ + setMetadata ( indexDef ) ; 
+ + return ( ) - > { 
+ + indexCfs . metadata . reloadIndexMetadataProperties ( baseCfs . metadata ) ; 
+ + indexCfs . reload ( ) ; 
+ + return null ; 
+ + } ; 
+ + } 
+ + 
+ + private void setMetadata ( IndexMetadata indexDef ) 
+ + { 
+ + metadata = indexDef ; 
+ + functions = getFunctions ( baseCfs . metadata , indexDef ) ; 
+ + CFMetaData cfm = indexCfsMetadata ( baseCfs . metadata , indexDef ) ; 
+ + indexCfs = ColumnFamilyStore . createColumnFamilyStore ( baseCfs . keyspace , 
+ + cfm . cfName , 
+ + cfm , 
+ + baseCfs . getTracker ( ) . loadsstables ) ; 
+ + assert indexDef . columns . size ( ) = = 1 : " Build in indexes on multiple target columns are not supported " ; 
+ + indexedColumn = indexDef . indexedColumn ( baseCfs . metadata ) ; 
+ + } 
+ + 
+ + public Callable < ? > getTruncateTask ( final long truncatedAt ) 
+ + { 
+ + return ( ) - > { 
+ + indexCfs . discardSSTables ( truncatedAt ) ; 
+ + return null ; 
+ + } ; 
+ + } 
+ + 
+ + public boolean indexes ( PartitionColumns columns ) 
+ + { 
+ + / / if we have indexes on the partition key or clustering columns , return true 
+ + return isPrimaryKeyIndex ( ) | | columns . contains ( indexedColumn ) ; 
+ + } 
+ + 
+ + public boolean supportsExpression ( ColumnDefinition column , Operator operator ) 
+ + { 
+ + return indexedColumn . name . equals ( column . name ) 
+ + & & supportsOperator ( indexedColumn , operator ) ; 
+ + } 
+ + 
+ + private boolean supportsExpression ( RowFilter . Expression expression ) 
+ + { 
+ + return supportsExpression ( expression . column ( ) , expression . operator ( ) ) ; 
+ + } 
+ + 
+ + public long getEstimatedResultRows ( ) 
+ + { 
+ + return indexCfs . getMeanColumns ( ) ; 
+ + } 
+ + 
+ + / * * 
+ + * No post processing of query results , just return them unchanged 
+ + * / 
+ + public BiFunction < PartitionIterator , ReadCommand , PartitionIterator > postProcessorFor ( ReadCommand command ) 
+ + { 
+ + return ( partitionIterator , readCommand ) - > partitionIterator ; 
+ + } 
+ + 
+ + public RowFilter getPostIndexQueryFilter ( RowFilter filter ) 
+ + { 
+ + return getTargetExpression ( filter . getExpressions ( ) ) . map ( filter : : without ) 
+ + . orElse ( filter ) ; 
+ + } 
+ + 
+ + private Optional < RowFilter . Expression > getTargetExpression ( List < RowFilter . Expression > expressions ) 
+ + { 
+ + return expressions . stream ( ) . filter ( this : : supportsExpression ) . findFirst ( ) ; 
+ + } 
+ + 
+ + public Index . Searcher searcherFor ( ReadCommand command ) 
+ + { 
+ + return null ; 
+ + / * 
+ + Optional < RowFilter . Expression > target = getTargetExpression ( command . rowFilter ( ) . getExpressions ( ) ) ; 
+ + 
+ + if ( target . isPresent ( ) ) 
+ + { 
+ + target . get ( ) . validateForIndexing ( ) ; 
+ + switch ( getIndexMetadata ( ) . indexType ) 
+ + { 
+ + case COMPOSITES : 
+ + return new CompositesSearcher ( command , target . get ( ) , this ) ; 
+ + case KEYS : 
+ + return new KeysSearcher ( command , target . get ( ) , this ) ; 
+ + default : 
+ + throw new IllegalStateException ( String . format ( " Unsupported index type % s for index % s on % s " , 
+ + metadata . indexType , 
+ + metadata . name , 
+ + indexedColumn . name . toString ( ) ) ) ; 
+ + } 
+ + } 
+ + 
+ + return null ; 
+ + 
+ + * / 
+ + } 
+ + 
+ + public void validate ( PartitionUpdate update ) throws InvalidRequestException 
+ + { 
+ + switch ( indexedColumn . kind ) 
+ + { 
+ + case PARTITION _ KEY : 
+ + validatePartitionKey ( update . partitionKey ( ) ) ; 
+ + break ; 
+ + case CLUSTERING : 
+ + validateClusterings ( update ) ; 
+ + break ; 
+ + case REGULAR : 
+ + validateRows ( update ) ; 
+ + break ; 
+ + case STATIC : 
+ + validateRows ( Collections . singleton ( update . staticRow ( ) ) ) ; 
+ + break ; 
+ + } 
+ + } 
+ + 
+ + protected CBuilder buildIndexClusteringPrefix ( ByteBuffer partitionKey , 
+ + ClusteringPrefix prefix , 
+ + CellPath path ) 
+ + { 
+ + CBuilder builder = CBuilder . create ( getIndexComparator ( ) ) ; 
+ + builder . add ( partitionKey ) ; 
+ + return builder ; 
+ + } 
+ + 
+ + protected ByteBuffer getIndexedValue ( ByteBuffer partitionKey , 
+ + Clustering clustering , 
+ + CellPath path , ByteBuffer cellValue ) 
+ + { 
+ + return cellValue ; 
+ + } 
+ + 
+ + public IndexEntry decodeEntry ( DecoratedKey indexedValue , Row indexEntry ) 
+ + { 
+ + throw new UnsupportedOperationException ( " KEYS indexes do not use a specialized index entry format " ) ; 
+ + } 
+ + 
+ + public boolean isStale ( Row row , ByteBuffer indexValue , int nowInSec ) 
+ + { 
+ + if ( row = = null ) 
+ + return true ; 
+ + 
+ + Cell cell = row . getCell ( indexedColumn ) ; 
+ + 
+ + return ( cell = = null 
+ + | | ! cell . isLive ( nowInSec ) 
+ + | | indexedColumn . type . compare ( indexValue , cell . value ( ) ) ! = 0 ) ; 
+ + } 
+ + 
+ + public Indexer indexerFor ( final DecoratedKey key , 
+ + final int nowInSec , 
+ + final OpOrder . Group opGroup , 
+ + final IndexTransaction . Type transactionType ) 
+ + { 
+ + return new Indexer ( ) 
+ + { 
+ + public void begin ( ) 
+ + { 
+ + } 
+ + 
+ + public void partitionDelete ( DeletionTime deletionTime ) 
+ + { 
+ + } 
+ + 
+ + public void rangeTombstone ( RangeTombstone tombstone ) 
+ + { 
+ + } 
+ + 
+ + public void insertRow ( Row row ) 
+ + { 
+ + if ( isPrimaryKeyIndex ( ) ) 
+ + { 
+ + indexPrimaryKey ( row . clustering ( ) , 
+ + getPrimaryKeyIndexLiveness ( row ) , 
+ + row . deletion ( ) ) ; 
+ + } 
+ + else 
+ + { 
+ + if ( indexedColumn . isComplex ( ) ) 
+ + indexCells ( row . clustering ( ) , row . getComplexColumnData ( indexedColumn ) ) ; 
+ + else 
+ + indexCell ( row . clustering ( ) , row . getCell ( indexedColumn ) ) ; 
+ + } 
+ + } 
+ + 
+ + public void removeRow ( Row row ) 
+ + { 
+ + if ( isPrimaryKeyIndex ( ) ) 
+ + indexPrimaryKey ( row . clustering ( ) , row . primaryKeyLivenessInfo ( ) , row . deletion ( ) ) ; 
+ + 
+ + if ( indexedColumn . isComplex ( ) ) 
+ + removeCells ( row . clustering ( ) , row . getComplexColumnData ( indexedColumn ) ) ; 
+ + else 
+ + removeCell ( row . clustering ( ) , row . getCell ( indexedColumn ) ) ; 
+ + } 
+ + 
+ + 
+ + public void updateRow ( Row oldRow , Row newRow ) 
+ + { 
+ + if ( isPrimaryKeyIndex ( ) ) 
+ + indexPrimaryKey ( newRow . clustering ( ) , 
+ + newRow . primaryKeyLivenessInfo ( ) , 
+ + newRow . deletion ( ) ) ; 
+ + 
+ + if ( indexedColumn . isComplex ( ) ) 
+ + { 
+ + indexCells ( newRow . clustering ( ) , newRow . getComplexColumnData ( indexedColumn ) ) ; 
+ + removeCells ( oldRow . clustering ( ) , oldRow . getComplexColumnData ( indexedColumn ) ) ; 
+ + } 
+ + else 
+ + { 
+ + indexCell ( newRow . clustering ( ) , newRow . getCell ( indexedColumn ) ) ; 
+ + removeCell ( oldRow . clustering ( ) , oldRow . getCell ( indexedColumn ) ) ; 
+ + } 
+ + } 
+ + 
+ + public void finish ( ) 
+ + { 
+ + } 
+ + 
+ + private void indexCells ( Clustering clustering , Iterable < Cell > cells ) 
+ + { 
+ + if ( cells = = null ) 
+ + return ; 
+ + 
+ + for ( Cell cell : cells ) 
+ + indexCell ( clustering , cell ) ; 
+ + } 
+ + 
+ + private void indexCell ( Clustering clustering , Cell cell ) 
+ + { 
+ + if ( cell = = null | | ! cell . isLive ( nowInSec ) ) 
+ + return ; 
+ + 
+ + insert ( key . getKey ( ) , 
+ + clustering , 
+ + cell , 
+ + LivenessInfo . create ( cell . timestamp ( ) , cell . ttl ( ) , cell . localDeletionTime ( ) ) , 
+ + opGroup ) ; 
+ + } 
+ + 
+ + private void removeCells ( Clustering clustering , Iterable < Cell > cells ) 
+ + { 
+ + if ( cells = = null ) 
+ + return ; 
+ + 
+ + for ( Cell cell : cells ) 
+ + removeCell ( clustering , cell ) ; 
+ + } 
+ + 
+ + private void removeCell ( Clustering clustering , Cell cell ) 
+ + { 
+ + if ( cell = = null | | ! cell . isLive ( nowInSec ) ) 
+ + return ; 
+ + 
+ + delete ( key . getKey ( ) , clustering , cell , opGroup , nowInSec ) ; 
+ + } 
+ + 
+ + private void indexPrimaryKey ( final Clustering clustering , 
+ + final LivenessInfo liveness , 
+ + final DeletionTime deletion ) 
+ + { 
+ + if ( liveness . timestamp ( ) ! = LivenessInfo . NO _ TIMESTAMP ) 
+ + insert ( key . getKey ( ) , clustering , null , liveness , opGroup ) ; 
+ + 
+ + if ( ! deletion . isLive ( ) ) 
+ + delete ( key . getKey ( ) , clustering , deletion , opGroup ) ; 
+ + } 
+ + 
+ + private LivenessInfo getPrimaryKeyIndexLiveness ( Row row ) 
+ + { 
+ + long timestamp = row . primaryKeyLivenessInfo ( ) . timestamp ( ) ; 
+ + int ttl = row . primaryKeyLivenessInfo ( ) . ttl ( ) ; 
+ + for ( Cell cell : row . cells ( ) ) 
+ + { 
+ + long cellTimestamp = cell . timestamp ( ) ; 
+ + if ( cell . isLive ( nowInSec ) ) 
+ + { 
+ + if ( cellTimestamp > timestamp ) 
+ + { 
+ + timestamp = cellTimestamp ; 
+ + ttl = cell . ttl ( ) ; 
+ + } 
+ + } 
+ + } 
+ + return LivenessInfo . create ( baseCfs . metadata , timestamp , ttl , nowInSec ) ; 
+ + } 
+ + } ; 
+ + } 
+ + 
+ + / * * 
+ + * Specific to internal indexes , this is called by a 
+ + * searcher when it encounters a stale entry in the index 
+ + * @ param indexKey the partition key in the index table 
+ + * @ param indexClustering the clustering in the index table 
+ + * @ param deletion deletion timestamp etc 
+ + * @ param opGroup the operation under which to perform the deletion 
+ + * / 
+ + public void deleteStaleEntry ( DecoratedKey indexKey , 
+ + Clustering indexClustering , 
+ + DeletionTime deletion , 
+ + OpOrder . Group opGroup ) 
+ + { 
+ + doDelete ( indexKey , indexClustering , deletion , opGroup ) ; 
+ + logger . debug ( " Removed index entry for stale value { } " , indexKey ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Called when adding a new entry to the index 
+ + * / 
+ + private void insert ( ByteBuffer rowKey , 
+ + Clustering clustering , 
+ + Cell cell , 
+ + LivenessInfo info , 
+ + OpOrder . Group opGroup ) 
+ + { 
+ + DecoratedKey valueKey = getIndexKeyFor ( getIndexedValue ( rowKey , 
+ + clustering , 
+ + cell ) ) ; 
+ + Row row = BTreeRow . noCellLiveRow ( buildIndexClustering ( rowKey , clustering , cell ) , info ) ; 
+ + PartitionUpdate upd = partitionUpdate ( valueKey , row ) ; 
+ + indexCfs . apply ( upd , UpdateTransaction . NO _ OP , opGroup , null ) ; 
+ + logger . debug ( " Inserted entry into index for value { } " , valueKey ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Called when deleting entries on non - primary key columns 
+ + * / 
+ + private void delete ( ByteBuffer rowKey , 
+ + Clustering clustering , 
+ + Cell cell , 
+ + OpOrder . Group opGroup , 
+ + int nowInSec ) 
+ + { 
+ + DecoratedKey valueKey = getIndexKeyFor ( getIndexedValue ( rowKey , 
+ + clustering , 
+ + cell ) ) ; 
+ + doDelete ( valueKey , 
+ + buildIndexClustering ( rowKey , clustering , cell ) , 
+ + new DeletionTime ( cell . timestamp ( ) , nowInSec ) , 
+ + opGroup ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Called when deleting entries from indexes on primary key columns 
+ + * / 
+ + private void delete ( ByteBuffer rowKey , 
+ + Clustering clustering , 
+ + DeletionTime deletion , 
+ + OpOrder . Group opGroup ) 
+ + { 
+ + DecoratedKey valueKey = getIndexKeyFor ( getIndexedValue ( rowKey , 
+ + clustering , 
+ + null ) ) ; 
+ + doDelete ( valueKey , 
+ + buildIndexClustering ( rowKey , clustering , null ) , 
+ + deletion , 
+ + opGroup ) ; 
+ + } 
+ + 
+ + private void doDelete ( DecoratedKey indexKey , 
+ + Clustering indexClustering , 
+ + DeletionTime deletion , 
+ + OpOrder . Group opGroup ) 
+ + { 
+ + Row row = BTreeRow . emptyDeletedRow ( indexClustering , deletion ) ; 
+ + PartitionUpdate upd = partitionUpdate ( indexKey , row ) ; 
+ + indexCfs . apply ( upd , UpdateTransaction . NO _ OP , opGroup , null ) ; 
+ + logger . debug ( " Removed index entry for value { } " , indexKey ) ; 
+ + } 
+ + 
+ + private void validatePartitionKey ( DecoratedKey partitionKey ) throws InvalidRequestException 
+ + { 
+ + assert indexedColumn . isPartitionKey ( ) ; 
+ + validateIndexedValue ( getIndexedValue ( partitionKey . getKey ( ) , null , null ) ) ; 
+ + } 
+ + 
+ + private void validateClusterings ( PartitionUpdate update ) throws InvalidRequestException 
+ + { 
+ + assert indexedColumn . isClusteringColumn ( ) ; 
+ + for ( Row row : update ) 
+ + validateIndexedValue ( getIndexedValue ( null , row . clustering ( ) , null ) ) ; 
+ + } 
+ + 
+ + private void validateRows ( Iterable < Row > rows ) 
+ + { 
+ + assert ! indexedColumn . isPrimaryKeyColumn ( ) ; 
+ + for ( Row row : rows ) 
+ + { 
+ + if ( indexedColumn . isComplex ( ) ) 
+ + { 
+ + ComplexColumnData data = row . getComplexColumnData ( indexedColumn ) ; 
+ + if ( data ! = null ) 
+ + { 
+ + for ( Cell cell : data ) 
+ + { 
+ + validateIndexedValue ( getIndexedValue ( null , null , cell . path ( ) , cell . value ( ) ) ) ; 
+ + } 
+ + } 
+ + } 
+ + else 
+ + { 
+ + validateIndexedValue ( getIndexedValue ( null , null , row . getCell ( indexedColumn ) ) ) ; 
+ + } 
+ + } 
+ + } 
+ + 
+ + private void validateIndexedValue ( ByteBuffer value ) 
+ + { 
+ + if ( value ! = null & & value . remaining ( ) > = FBUtilities . MAX _ UNSIGNED _ SHORT ) 
+ + throw new InvalidRequestException ( String . format ( 
+ + " Cannot index value of size % d for index % s on % s . % s ( % s ) ( maximum allowed size = % d ) " , 
+ + value . remaining ( ) , 
+ + getIndexName ( ) , 
+ + baseCfs . metadata . ksName , 
+ + baseCfs . metadata . cfName , 
+ + indexedColumn . name . toString ( ) , 
+ + FBUtilities . MAX _ UNSIGNED _ SHORT ) ) ; 
+ + } 
+ + 
+ + private ByteBuffer getIndexedValue ( ByteBuffer rowKey , 
+ + Clustering clustering , 
+ + Cell cell ) 
+ + { 
+ + return getIndexedValue ( rowKey , 
+ + clustering , 
+ + cell = = null ? null : cell . path ( ) , 
+ + cell = = null ? null : cell . value ( ) 
+ + ) ; 
+ + } 
+ + 
+ + private Clustering buildIndexClustering ( ByteBuffer rowKey , 
+ + Clustering clustering , 
+ + Cell cell ) 
+ + { 
+ + return buildIndexClusteringPrefix ( rowKey , 
+ + clustering , 
+ + cell = = null ? null : cell . path ( ) ) . build ( ) ; 
+ + } 
+ + 
+ + private DecoratedKey getIndexKeyFor ( ByteBuffer value ) 
+ + { 
+ + return indexCfs . decorateKey ( value ) ; 
+ + } 
+ + 
+ + private PartitionUpdate partitionUpdate ( DecoratedKey valueKey , Row row ) 
+ + { 
+ + return PartitionUpdate . singleRowUpdate ( indexCfs . metadata , valueKey , row ) ; 
+ + } 
+ + 
+ + private void invalidate ( ) 
+ + { 
+ + / / interrupt in - progress compactions 
+ + Collection < ColumnFamilyStore > cfss = Collections . singleton ( indexCfs ) ; 
+ + CompactionManager . instance . interruptCompactionForCFs ( cfss , true ) ; 
+ + CompactionManager . instance . waitForCessation ( cfss ) ; 
+ + indexCfs . keyspace . writeOrder . awaitNewBarrier ( ) ; 
+ + indexCfs . forceBlockingFlush ( ) ; 
+ + indexCfs . readOrdering . awaitNewBarrier ( ) ; 
+ + indexCfs . invalidate ( ) ; 
+ + } 
+ + 
+ + private boolean isBuilt ( ) 
+ + { 
+ + return SystemKeyspace . isIndexBuilt ( baseCfs . keyspace . getName ( ) , getIndexName ( ) ) ; 
+ + } 
+ + 
+ + private void markBuilt ( ) 
+ + { 
+ + SystemKeyspace . setIndexBuilt ( baseCfs . keyspace . getName ( ) , getIndexName ( ) ) ; 
+ + } 
+ + 
+ + private void markRemoved ( ) 
+ + { 
+ + SystemKeyspace . setIndexRemoved ( baseCfs . keyspace . getName ( ) , getIndexName ( ) ) ; 
+ + } 
+ + 
+ + private boolean isPrimaryKeyIndex ( ) 
+ + { 
+ + return indexedColumn . isPrimaryKeyColumn ( ) ; 
+ + } 
+ + 
+ + private Callable < ? > getBuildIndexTask ( ) 
+ + { 
+ + return ( ) - > { 
+ + buildBlocking ( ) ; 
+ + return null ; 
+ + } ; 
+ + } 
+ + 
+ + private void buildBlocking ( ) 
+ + { 
+ + baseCfs . forceBlockingFlush ( ) ; 
+ + 
+ + try ( ColumnFamilyStore . RefViewFragment viewFragment = baseCfs . selectAndReference ( View . select ( SSTableSet . CANONICAL ) ) ; 
+ + Refs < SSTableReader > sstables = viewFragment . refs ) 
+ + { 
+ + if ( sstables . isEmpty ( ) ) 
+ + { 
+ + logger . info ( " No SSTable data for { } . { } to build index { } from , marking empty index as built " , 
+ + baseCfs . metadata . ksName , 
+ + baseCfs . metadata . cfName , 
+ + getIndexName ( ) ) ; 
+ + markBuilt ( ) ; 
+ + return ; 
+ + } 
+ + 
+ + logger . info ( " Submitting index build of { } for data in { } " , 
+ + getIndexName ( ) , 
+ + getSSTableNames ( sstables ) ) ; 
+ + 
+ + SecondaryIndexBuilder builder = new SecondaryIndexBuilder ( baseCfs , 
+ + Collections . singleton ( this ) , 
+ + new ReducingKeyIterator ( sstables ) ) ; 
+ + Future < ? > future = CompactionManager . instance . submitIndexBuild ( builder ) ; 
+ + FBUtilities . waitOnFuture ( future ) ; 
+ + indexCfs . forceBlockingFlush ( ) ; 
+ + markBuilt ( ) ; 
+ + } 
+ + logger . info ( " Index build of { } complete " , getIndexName ( ) ) ; 
+ + } 
+ + 
+ + private static String getSSTableNames ( Collection < SSTableReader > sstables ) 
+ + { 
+ + return StreamSupport . stream ( sstables . spliterator ( ) , false ) 
+ + . map ( SSTableReader : : toString ) 
+ + . collect ( Collectors . joining ( " , " ) ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Construct the CFMetadata for an index table , the clustering columns in the index table 
+ + * vary dependent on the kind of the indexed value . 
+ + * @ param baseCfsMetadata 
+ + * @ param indexMetadata 
+ + * @ return 
+ + * / 
+ + public static final CFMetaData indexCfsMetadata ( CFMetaData baseCfsMetadata , IndexMetadata indexMetadata ) 
+ + { 
+ + CassandraIndexFunctions utils = getFunctions ( baseCfsMetadata , indexMetadata ) ; 
+ + ColumnDefinition indexedColumn = indexMetadata . indexedColumn ( baseCfsMetadata ) ; 
+ + AbstractType < ? > indexedValueType = utils . getIndexedValueType ( indexedColumn ) ; 
+ + CFMetaData . Builder builder = CFMetaData . Builder . create ( baseCfsMetadata . ksName , 
+ + baseCfsMetadata . indexColumnFamilyName ( indexMetadata ) ) 
+ + . withId ( baseCfsMetadata . cfId ) 
+ + . withPartitioner ( new LocalPartitioner ( indexedValueType ) ) 
+ + . addPartitionKey ( indexedColumn . name , indexedColumn . type ) ; 
+ + 
+ + builder . addClusteringColumn ( " partition _ key " , baseCfsMetadata . partitioner . partitionOrdering ( ) ) ; 
+ + builder = utils . addIndexClusteringColumns ( builder , baseCfsMetadata , indexedColumn ) ; 
+ + return builder . build ( ) . reloadIndexMetadataProperties ( baseCfsMetadata ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Factory method for new CassandraIndex instances 
+ + * @ param baseCfs 
+ + * @ param indexMetadata 
+ + * @ return 
+ + * / 
+ + public static final CassandraIndex newIndex ( ColumnFamilyStore baseCfs , IndexMetadata indexMetadata ) 
+ + { 
+ + return getFunctions ( baseCfs . metadata , indexMetadata ) . newIndexInstance ( baseCfs , indexMetadata ) ; 
+ + } 
+ + 
+ + private static CassandraIndexFunctions getFunctions ( CFMetaData baseCfMetadata , IndexMetadata indexDef ) 
+ + { 
+ + if ( indexDef . isKeys ( ) ) 
+ + return CassandraIndexFunctions . KEYS _ INDEX _ FUNCTIONS ; 
+ + 
+ + ColumnDefinition indexedColumn = indexDef . indexedColumn ( baseCfMetadata ) ; 
+ + if ( indexedColumn . type . isCollection ( ) & & indexedColumn . type . isMultiCell ( ) ) 
+ + { 
+ + switch ( ( ( CollectionType ) indexedColumn . type ) . kind ) 
+ + { 
+ + case LIST : 
+ + return CassandraIndexFunctions . COLLECTION _ VALUE _ INDEX _ FUNCTIONS ; 
+ + case SET : 
+ + return CassandraIndexFunctions . COLLECTION _ KEY _ INDEX _ FUNCTIONS ; 
+ + case MAP : 
+ + if ( indexDef . options . containsKey ( IndexTarget . INDEX _ KEYS _ OPTION _ NAME ) ) 
+ + return CassandraIndexFunctions . COLLECTION _ KEY _ INDEX _ FUNCTIONS ; 
+ + else if ( indexDef . options . containsKey ( IndexTarget . INDEX _ ENTRIES _ OPTION _ NAME ) ) 
+ + return CassandraIndexFunctions . COLLECTION _ ENTRY _ INDEX _ FUNCTIONS ; 
+ + else 
+ + return CassandraIndexFunctions . COLLECTION _ VALUE _ INDEX _ FUNCTIONS ; 
+ + } 
+ + } 
+ + 
+ + switch ( indexedColumn . kind ) 
+ + { 
+ + case CLUSTERING : 
+ + return CassandraIndexFunctions . CLUSTERING _ COLUMN _ INDEX _ FUNCTIONS ; 
+ + case REGULAR : 
+ + return CassandraIndexFunctions . REGULAR _ COLUMN _ INDEX _ FUNCTIONS ; 
+ + case PARTITION _ KEY : 
+ + return CassandraIndexFunctions . PARTITION _ KEY _ INDEX _ FUNCTIONS ; 
+ + / / case COMPACT _ VALUE : 
+ + / / return new CompositesIndexOnCompactValue ( ) ; 
+ + } 
+ + throw new AssertionError ( ) ; 
+ + } 
+ + } 
+ diff - - git a / test / unit / org / apache / cassandra / index / internal / CustomIndexTest . java b / test / unit / org / apache / cassandra / index / internal / CustomIndexTest . java 
+ new file mode 100644 
+ index 0000000 . . 3cc7987 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / index / internal / CustomIndexTest . java 
+ @ @ - 0 , 0 + 1 , 20 @ @ 
+ + package org . apache . cassandra . index . internal ; 
+ + 
+ + import org . apache . cassandra . cql3 . CQLTester ; 
+ + import org . junit . Test ; 
+ + 
+ + public class CustomIndexTest extends CQLTester 
+ + { 
+ + @ Test 
+ + public void testInserts ( ) throws Throwable 
+ + { 
+ + / / test to ensure that we don ' t deadlock when flushing CFS backed custom indexers 
+ + / / see CASSANDRA - 10181 
+ + createTable ( " CREATE TABLE % s ( a int , b int , c int , d int , PRIMARY KEY ( a , b ) ) " ) ; 
+ + createIndex ( " CREATE CUSTOM INDEX myindex ON % s ( c ) USING ' org . apache . cassandra . index . internal . CustomCassandraIndex ' " ) ; 
+ + 
+ + execute ( " INSERT INTO % s ( a , b , c , d ) VALUES ( ? , ? , ? , ? ) " , 0 , 0 , 0 , 2 ) ; 
+ + execute ( " INSERT INTO % s ( a , b , c , d ) VALUES ( ? , ? , ? , ? ) " , 0 , 1 , 0 , 1 ) ; 
+ + execute ( " INSERT INTO % s ( a , b , c , d ) VALUES ( ? , ? , ? , ? ) " , 0 , 2 , 0 , 0 ) ; 
+ + } 
+ + }
+
+NEAREST DIFF:
+diff - - git a / interface / cassandra . genavro b / interface / cassandra . genavro 
+ index a53ec1f . . 4ee8c8f 100644 
+ - - - a / interface / cassandra . genavro 
+ + + + b / interface / cassandra . genavro 
+ @ @ - 375 , 4 + 375 , 29 @ @ protocol Cassandra { 
+ KeyRange range , 
+ ConsistencyLevel consistency _ level ) 
+ throws InvalidRequestException , UnavailableException , TimedOutException ; 
+ + 
+ + enum Compression { 
+ + GZIP 
+ + } 
+ + 
+ + enum CqlResultType { 
+ + ROWS , VOID 
+ + } 
+ + 
+ + record CqlRow { 
+ + bytes key ; 
+ + array < Column > columns ; 
+ + } 
+ + 
+ + record CqlResult { 
+ + CqlResultType type ; 
+ + union { array < CqlRow > , null } rows ; 
+ + } 
+ + 
+ + / * * 
+ + * Executes a CQL ( Cassandra Query Language ) statement and returns a 
+ + * CqlResult containing the results . 
+ + * / 
+ + CqlResult execute _ cql _ query ( bytes query , Compression compression ) 
+ + throws InvalidRequestException , UnavailableException , TimedOutException ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / avro / AvroValidation . java b / src / java / org / apache / cassandra / avro / AvroValidation . java 
+ index 078a6ee . . ad46bfe 100644 
+ - - - a / src / java / org / apache / cassandra / avro / AvroValidation . java 
+ + + + b / src / java / org / apache / cassandra / avro / AvroValidation . java 
+ @ @ - 48 , 7 + 48 , 7 @ @ import static org . apache . cassandra . avro . AvroRecordFactory . newColumnPath ; 
+ * / 
+ public class AvroValidation 
+ { 
+ - static void validateKey ( ByteBuffer key ) throws InvalidRequestException 
+ + public static void validateKey ( ByteBuffer key ) throws InvalidRequestException 
+ { 
+ if ( key = = null | | key . remaining ( ) = = 0 ) 
+ throw newInvalidRequestException ( " Key may not be empty " ) ; 
+ diff - - git a / src / java / org / apache / cassandra / avro / CassandraServer . java b / src / java / org / apache / cassandra / avro / CassandraServer . java 
+ index 325d3aa . . 68aeda1 100644 
+ - - - a / src / java / org / apache / cassandra / avro / CassandraServer . java 
+ + + + b / src / java / org / apache / cassandra / avro / CassandraServer . java 
+ @ @ - 21 , 6 + 21 , 7 @ @ package org . apache . cassandra . avro ; 
+ * / 
+ 
+ import java . io . IOException ; 
+ + import java . io . UnsupportedEncodingException ; 
+ import java . nio . ByteBuffer ; 
+ import java . util . ArrayList ; 
+ import java . util . Arrays ; 
+ @ @ - 34 , 7 + 35 , 10 @ @ import java . util . concurrent . Callable ; 
+ import java . util . concurrent . ExecutionException ; 
+ import java . util . concurrent . Future ; 
+ import java . util . concurrent . TimeoutException ; 
+ + import java . util . zip . DataFormatException ; 
+ + import java . util . zip . Inflater ; 
+ 
+ + import org . antlr . runtime . RecognitionException ; 
+ import org . apache . avro . Schema ; 
+ import org . apache . avro . generic . GenericArray ; 
+ import org . apache . avro . generic . GenericData ; 
+ @ @ - 59 , 6 + 63 , 7 @ @ import org . apache . cassandra . config . ColumnDefinition ; 
+ import org . apache . cassandra . config . ConfigurationException ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . config . KSMetaData ; 
+ + import org . apache . cassandra . cql . QueryProcessor ; 
+ import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . db . filter . QueryPath ; 
+ import org . apache . cassandra . db . marshal . MarshalException ; 
+ @ @ - 1161 , 4 + 1166 , 47 @ @ public class CassandraServer implements Cassandra { 
+ } 
+ return null ; 
+ } 
+ + 
+ + @ Override 
+ + public CqlResult execute _ cql _ query ( ByteBuffer query , Compression compression ) 
+ + throws UnavailableException , InvalidRequestException , TimedOutException 
+ + { 
+ + String queryString = null ; 
+ + 
+ + / / Decompress the query string . 
+ + try 
+ + { 
+ + switch ( compression ) 
+ + { 
+ + case GZIP : 
+ + Inflater decompressor = new Inflater ( ) ; 
+ + decompressor . setInput ( query . array ( ) , 0 , query . array ( ) . length ) ; 
+ + 
+ + byte [ ] decompressedBytes = new byte [ 100 ] ; 
+ + int length = decompressor . inflate ( decompressedBytes ) ; 
+ + decompressor . end ( ) ; 
+ + 
+ + queryString = new String ( decompressedBytes , 0 , length , " UTF - 8 " ) ; 
+ + } 
+ + } 
+ + catch ( DataFormatException e ) 
+ + { 
+ + throw newInvalidRequestException ( " Error deflating query string . " ) ; 
+ + } 
+ + catch ( UnsupportedEncodingException e ) 
+ + { 
+ + throw newInvalidRequestException ( " Unknown query string encoding . " ) ; 
+ + } 
+ + 
+ + try 
+ + { 
+ + return QueryProcessor . process ( queryString , state ( ) . getKeyspace ( ) ) ; 
+ + } 
+ + catch ( RecognitionException e ) 
+ + { 
+ + InvalidRequestException badQuery = newInvalidRequestException ( " Invalid or malformed CQL query string " ) ; 
+ + badQuery . initCause ( e ) ; 
+ + throw badQuery ; 
+ + } 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / cql / CQLStatement . java b / src / java / org / apache / cassandra / cql / CQLStatement . java 
+ new file mode 100644 
+ index 0000000 . . 3040ddd 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / CQLStatement . java 
+ @ @ - 0 , 0 + 1 , 13 @ @ 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + public class CQLStatement 
+ + { 
+ + public StatementType type ; 
+ + public Object statement ; 
+ + 
+ + public CQLStatement ( StatementType type , Object statement ) 
+ + { 
+ + this . type = type ; 
+ + this . statement = statement ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / cql / Client . java b / src / java / org / apache / cassandra / cql / Client . java 
+ new file mode 100644 
+ index 0000000 . . 03ace7b 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / Client . java 
+ @ @ - 0 , 0 + 1 , 50 @ @ 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + import java . io . IOException ; 
+ + import java . net . URL ; 
+ + import java . nio . ByteBuffer ; 
+ + import java . util . zip . Deflater ; 
+ + 
+ + import org . apache . avro . ipc . HttpTransceiver ; 
+ + import org . apache . avro . specific . SpecificRequestor ; 
+ + import org . apache . cassandra . avro . Cassandra ; 
+ + import org . apache . cassandra . avro . Column ; 
+ + import org . apache . cassandra . avro . Compression ; 
+ + import org . apache . cassandra . avro . CqlResult ; 
+ + import org . apache . cassandra . avro . CqlRow ; 
+ + 
+ + public class Client 
+ + { 
+ + public static void main ( String [ ] args ) throws IOException 
+ + { 
+ + / / Remote setup 
+ + String host = " localhost " , keyspace = " Keyspace1 " ; 
+ + int port = 9160 ; 
+ + 
+ + HttpTransceiver tr = new HttpTransceiver ( new URL ( " http " , host , port , " " ) ) ; 
+ + Cassandra client = ( Cassandra ) SpecificRequestor . getClient ( Cassandra . class , tr ) ; 
+ + client . set _ keyspace ( keyspace ) ; 
+ + 
+ + / / Query compression 
+ + String query = " SELECT FROM Standard2 USING CONSISTENCY . ONE WHERE KEY = \ " eevans \ " AND COL < \ " age \ " COLLIMIT 2 ASC ; " ; 
+ + Deflater compressor = new Deflater ( ) ; 
+ + compressor . setInput ( query . getBytes ( ) ) ; 
+ + compressor . finish ( ) ; 
+ + byte [ ] output = new byte [ 100 ] ; 
+ + System . out . println ( " Query compressed from " + query . length ( ) + " bytes , to " + compressor . deflate ( output ) + " bytes " ) ; 
+ + 
+ + CqlResult res = client . execute _ cql _ query ( ByteBuffer . wrap ( output ) , Compression . GZIP ) ; 
+ + 
+ + switch ( res . type ) 
+ + { 
+ + case ROWS : 
+ + for ( CqlRow row : res . rows ) 
+ + { 
+ + System . out . println ( " Key = " + new String ( row . key . array ( ) ) ) ; 
+ + for ( Column col : row . columns ) 
+ + System . out . println ( " Col = " + new String ( col . name . array ( ) ) + " / " + new String ( col . value . array ( ) ) ) ; 
+ + } 
+ + } 
+ + 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / cql / Column . java b / src / java / org / apache / cassandra / cql / Column . java 
+ new file mode 100644 
+ index 0000000 . . a94942b 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / Column . java 
+ @ @ - 0 , 0 + 1 , 23 @ @ 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + public class Column 
+ + { 
+ + private final Term name ; 
+ + private final Term value ; 
+ + 
+ + public Column ( Term name , Term value ) 
+ + { 
+ + this . name = name ; 
+ + this . value = value ; 
+ + } 
+ + 
+ + public Term getName ( ) 
+ + { 
+ + return name ; 
+ + } 
+ + 
+ + public Term getValue ( ) 
+ + { 
+ + return value ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / cql / Cql . g b / src / java / org / apache / cassandra / cql / Cql . g 
+ new file mode 100644 
+ index 0000000 . . 7911b07 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / Cql . g 
+ @ @ - 0 , 0 + 1 , 199 @ @ 
+ + grammar Cql ; 
+ + 
+ + options { 
+ + language = Java ; 
+ + } 
+ + 
+ + @ header { 
+ + package org . apache . cassandra . cql ; 
+ + import org . apache . cassandra . thrift . ConsistencyLevel ; 
+ + } 
+ + 
+ + @ lexer : : header { 
+ + package org . apache . cassandra . cql ; 
+ + } 
+ + 
+ + query returns [ CQLStatement stmnt ] 
+ + : selectStatement { $ stmnt = new CQLStatement ( StatementType . SELECT , $ selectStatement . expr ) ; } 
+ + | updateStatement { $ stmnt = new CQLStatement ( StatementType . UPDATE , $ updateStatement . expr ) ; } 
+ + ; 
+ + 
+ + / * * 
+ + * SELECT FROM 
+ + * < CF > 
+ + * USING 
+ + * CONSISTENCY . ONE 
+ + * WHERE 
+ + * KEY = " key1 " AND KEY = " key2 " AND 
+ + * COL > 1 AND COL < 100 
+ + * COLLIMIT 10 DESC ; 
+ + * / 
+ + selectStatement returns [ SelectStatement expr ] 
+ + : { 
+ + int numRecords = Integer . MAX _ VALUE ; 
+ + int numColumns = Integer . MAX _ VALUE ; 
+ + boolean reversed = false ; 
+ + ConsistencyLevel cLevel = ConsistencyLevel . ONE ; 
+ + } 
+ + K _ SELECT K _ FROM ? IDENT 
+ + ( K _ USING K _ CONSISTENCY ' . ' K _ LEVEL { cLevel = ConsistencyLevel . valueOf ( $ K _ LEVEL . text ) ; } ) ? 
+ + K _ WHERE selectExpression 
+ + ( limit = ( K _ ROWLIMIT | K _ COLLIMIT ) value = INTEGER 
+ + { 
+ + int count = Integer . parseInt ( $ value . text ) ; 
+ + if ( $ limit . type = = K _ ROWLIMIT ) 
+ + numRecords = count ; 
+ + else 
+ + numColumns = count ; 
+ + } 
+ + ) * 
+ + order = ( K _ ASC | K _ DESC { reversed = true ; } ) ? ' ; ' 
+ + { 
+ + return new SelectStatement ( $ IDENT . text , 
+ + cLevel , 
+ + $ selectExpression . expr , 
+ + numRecords , 
+ + numColumns , 
+ + reversed ) ; 
+ + } 
+ + ; 
+ + 
+ + / * * 
+ + * UPDATE 
+ + * < CF > 
+ + * USING 
+ + * CONSISTENCY . ONE 
+ + * WITH 
+ + * ROW ( " key1 " , COL ( " col1 " , " val1 " ) , . . . ) AND 
+ + * ROW ( " key2 " , COL ( " col1 " , " val1 " ) , . . . ) AND 
+ + * ROW ( " key3 " , COLUMN ( " col1 " , " val1 " ) , . . . ) 
+ + * / 
+ + updateStatement returns [ UpdateStatement expr ] 
+ + : { ConsistencyLevel cLevel = ConsistencyLevel . ONE ; } 
+ + K _ UPDATE IDENT 
+ + ( K _ USING K _ CONSISTENCY ' . ' K _ LEVEL { cLevel = ConsistencyLevel . valueOf ( $ K _ LEVEL . text ) ; } ) ? 
+ + K _ WITH first = rowDef { $ expr = new UpdateStatement ( $ IDENT . text , first , cLevel ) ; } 
+ + ( K _ AND next = rowDef { $ expr . and ( next ) ; } ) * ' ; ' 
+ + ; 
+ + 
+ + / / TODO : date / time , utf8 
+ + term returns [ Term item ] 
+ + : ( t = STRING _ LITERAL | t = LONG ) 
+ + { $ item = new Term ( $ t . text , $ t . type ) ; } 
+ + ; 
+ + 
+ + / / Note : slices are inclusive so > = and > , and < and < = all have the same semantics . 
+ + relation returns [ Relation rel ] 
+ + : kind = ( K _ KEY | K _ COLUMN ) type = ( ' = ' | ' < ' | ' < = ' | ' > = ' | ' > ' ) t = term 
+ + { return new Relation ( $ kind . text , $ type . text , $ t . item ) ; } 
+ + ; 
+ + 
+ + / / relation [ [ AND relation ] . . . ] 
+ + selectExpression returns [ SelectExpression expr ] 
+ + : first = relation { $ expr = new SelectExpression ( first ) ; } 
+ + ( K _ AND next = relation { $ expr . and ( next ) ; } ) * 
+ + ; 
+ + 
+ + columnDef returns [ Column column ] 
+ + : K _ COLUMN ' ( ' n = term ' , ' v = term ' ) ' { $ column = new Column ( $ n . item , $ v . item ) ; } 
+ + ; 
+ + 
+ + rowDef returns [ Row row ] 
+ + : K _ ROW ' ( ' key = term ' , ' first = columnDef { $ row = new Row ( $ key . item , first ) ; } 
+ + ( ' , ' next = columnDef { $ row . and ( next ) ; } ) * ' ) ' 
+ + ; 
+ + 
+ + / / Case - insensitive keywords 
+ + K _ SELECT : S E L E C T ; 
+ + K _ FROM : F R O M ; 
+ + K _ WHERE : W H E R E ; 
+ + K _ AND : A N D ; 
+ + K _ KEY : K E Y ; 
+ + K _ COLUMN : C O L ( U M N ) ? ; 
+ + K _ UPDATE : U P D A T E ; 
+ + K _ WITH : W I T H ; 
+ + K _ ROW : R O W ; 
+ + K _ ROWLIMIT : R O W L I M I T ; 
+ + K _ COLLIMIT : C O L L I M I T ; 
+ + K _ ASC : A S C ( E N D I N G ) ? ; 
+ + K _ DESC : D E S C ( E N D I N G ) ? ; 
+ + K _ USING : U S I N G ; 
+ + K _ CONSISTENCY : C O N S I S T E N C Y ; 
+ + K _ LEVEL : ( Z E R O 
+ + | O N E 
+ + | Q U O R U M 
+ + | A L L 
+ + | D C Q U O R U M 
+ + | D C Q U O R U M S Y N C 
+ + ) 
+ + ; 
+ + 
+ + / / Case - insensitive alpha characters 
+ + fragment A : ( ' a ' | ' A ' ) ; 
+ + fragment B : ( ' b ' | ' B ' ) ; 
+ + fragment C : ( ' c ' | ' C ' ) ; 
+ + fragment D : ( ' d ' | ' D ' ) ; 
+ + fragment E : ( ' e ' | ' E ' ) ; 
+ + fragment F : ( ' f ' | ' F ' ) ; 
+ + fragment G : ( ' g ' | ' G ' ) ; 
+ + fragment H : ( ' h ' | ' H ' ) ; 
+ + fragment I : ( ' i ' | ' I ' ) ; 
+ + fragment J : ( ' j ' | ' J ' ) ; 
+ + fragment K : ( ' k ' | ' K ' ) ; 
+ + fragment L : ( ' l ' | ' L ' ) ; 
+ + fragment M : ( ' m ' | ' M ' ) ; 
+ + fragment N : ( ' n ' | ' N ' ) ; 
+ + fragment O : ( ' o ' | ' O ' ) ; 
+ + fragment P : ( ' p ' | ' P ' ) ; 
+ + fragment Q : ( ' q ' | ' Q ' ) ; 
+ + fragment R : ( ' r ' | ' R ' ) ; 
+ + fragment S : ( ' s ' | ' S ' ) ; 
+ + fragment T : ( ' t ' | ' T ' ) ; 
+ + fragment U : ( ' u ' | ' U ' ) ; 
+ + fragment V : ( ' v ' | ' V ' ) ; 
+ + fragment W : ( ' w ' | ' W ' ) ; 
+ + fragment X : ( ' x ' | ' X ' ) ; 
+ + fragment Y : ( ' y ' | ' Y ' ) ; 
+ + fragment Z : ( ' z ' | ' Z ' ) ; 
+ + 
+ + STRING _ LITERAL 
+ + : ' " ' 
+ + { StringBuilder b = new StringBuilder ( ) ; } 
+ + ( c = ~ ( ' " ' | ' \ r ' | ' \ n ' ) { b . appendCodePoint ( c ) ; } 
+ + | ' " ' ' " ' { b . appendCodePoint ( ' " ' ) ; } 
+ + ) * 
+ + ' " ' 
+ + { setText ( b . toString ( ) ) ; } 
+ + ; 
+ + 
+ + fragment DIGIT 
+ + : ' 0 ' . . ' 9 ' 
+ + ; 
+ + 
+ + fragment LETTER 
+ + : ( ' A ' . . ' Z ' | ' a ' . . ' z ' ) 
+ + ; 
+ + 
+ + INTEGER 
+ + : DIGIT + 
+ + ; 
+ + 
+ + LONG 
+ + : INTEGER ' L ' { setText ( $ INTEGER . text ) ; } 
+ + ; 
+ + 
+ + IDENT 
+ + : LETTER ( LETTER | DIGIT ) * 
+ + ; 
+ + 
+ + WS 
+ + : ( ' ' | ' \ t ' | ' \ n ' | ' \ r ' ) + { $ channel = HIDDEN ; } 
+ + ; 
+ + 
+ + COMMENT 
+ + : ( ' - - ' | ' / / ' ) . * ( ' \ n ' | ' \ r ' ) { $ channel = HIDDEN ; } 
+ + ; 
+ + 
+ + MULTILINE _ COMMENT 
+ + : ' / * ' . * ' * / ' { $ channel = HIDDEN ; } 
+ + ; 
+ diff - - git a / src / java / org / apache / cassandra / cql / QueryProcessor . java b / src / java / org / apache / cassandra / cql / QueryProcessor . java 
+ new file mode 100644 
+ index 0000000 . . 8f028f4 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / QueryProcessor . java 
+ @ @ - 0 , 0 + 1 , 222 @ @ 
+ + 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + import java . io . IOException ; 
+ + import java . nio . ByteBuffer ; 
+ + import java . util . ArrayList ; 
+ + import java . util . Collection ; 
+ + import java . util . HashMap ; 
+ + import java . util . List ; 
+ + import java . util . Map ; 
+ + import java . util . concurrent . TimeoutException ; 
+ + 
+ + import org . antlr . runtime . ANTLRStringStream ; 
+ + import org . antlr . runtime . CharStream ; 
+ + import org . antlr . runtime . CommonTokenStream ; 
+ + import org . antlr . runtime . RecognitionException ; 
+ + import org . antlr . runtime . TokenStream ; 
+ + import org . apache . cassandra . avro . Column ; 
+ + import org . apache . cassandra . avro . CqlResult ; 
+ + import org . apache . cassandra . avro . CqlResultType ; 
+ + import org . apache . cassandra . avro . CqlRow ; 
+ + import org . apache . cassandra . avro . InvalidRequestException ; 
+ + import org . apache . cassandra . avro . TimedOutException ; 
+ + import org . apache . cassandra . avro . UnavailableException ; 
+ + import org . apache . cassandra . db . ColumnFamily ; 
+ + import org . apache . cassandra . db . DecoratedKey ; 
+ + import org . apache . cassandra . db . IColumn ; 
+ + import org . apache . cassandra . db . ReadCommand ; 
+ + import org . apache . cassandra . db . RowMutation ; 
+ + import org . apache . cassandra . db . SliceByNamesReadCommand ; 
+ + import org . apache . cassandra . db . SliceFromReadCommand ; 
+ + import org . apache . cassandra . db . filter . QueryPath ; 
+ + import org . apache . cassandra . service . StorageProxy ; 
+ + import org . apache . cassandra . service . StorageService ; 
+ + import org . apache . cassandra . thrift . ConsistencyLevel ; 
+ + 
+ + import static org . apache . cassandra . avro . AvroValidation . validateKey ; 
+ + 
+ + public class QueryProcessor 
+ + { 
+ + 
+ + public static Map < DecoratedKey < ? > , ColumnFamily > readColumnFamily ( List < ReadCommand > commands , ConsistencyLevel cLevel ) 
+ + throws UnavailableException , InvalidRequestException , TimedOutException 
+ + { 
+ + Map < DecoratedKey < ? > , ColumnFamily > columnFamilyKeyMap = new HashMap < DecoratedKey < ? > , ColumnFamily > ( ) ; 
+ + List < org . apache . cassandra . db . Row > rows ; 
+ + 
+ + try 
+ + { 
+ + rows = StorageProxy . readProtocol ( commands , cLevel ) ; 
+ + } 
+ + catch ( TimeoutException e ) 
+ + { 
+ + throw new TimedOutException ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + catch ( org . apache . cassandra . thrift . UnavailableException e ) 
+ + { 
+ + UnavailableException error = new UnavailableException ( ) ; 
+ + error . initCause ( e ) ; 
+ + throw error ; 
+ + } 
+ + catch ( org . apache . cassandra . thrift . InvalidRequestException e ) 
+ + { 
+ + InvalidRequestException error = new InvalidRequestException ( ) ; 
+ + error . initCause ( e ) ; 
+ + throw error ; 
+ + } 
+ + 
+ + for ( org . apache . cassandra . db . Row row : rows ) 
+ + columnFamilyKeyMap . put ( row . key , row . cf ) ; 
+ + 
+ + return columnFamilyKeyMap ; 
+ + } 
+ + 
+ + public static CqlResult process ( String queryString , String keyspace ) 
+ + throws RecognitionException , UnavailableException , InvalidRequestException , TimedOutException 
+ + { 
+ + CqlParser parser = getParser ( queryString ) ; 
+ + CQLStatement statement = parser . query ( ) ; 
+ + 
+ + CqlResult avroResult = new CqlResult ( ) ; 
+ + 
+ + switch ( statement . type ) 
+ + { 
+ + case SELECT : 
+ + SelectStatement select = ( SelectStatement ) statement . statement ; 
+ + 
+ + QueryPath queryPath = new QueryPath ( select . getColumnFamily ( ) ) ; 
+ + List < ReadCommand > commands = new ArrayList < ReadCommand > ( ) ; 
+ + 
+ + List < CqlRow > avroRows = new ArrayList < CqlRow > ( ) ; 
+ + avroResult . type = CqlResultType . ROWS ; 
+ + 
+ + / / It ' s a multiget . . . 
+ + if ( ! select . getKeyPredicates ( ) . isRange ( ) ) 
+ + { 
+ + 
+ + for ( Term keyName : select . getKeyPredicates ( ) . getTerms ( ) ) 
+ + { 
+ + byte [ ] key = keyName . getBytes ( ) ; / / FIXME : surely not good enough 
+ + validateKey ( key ) ; 
+ + 
+ + / / . . . of a list of column names 
+ + if ( ! select . getColumnPredicates ( ) . isRange ( ) ) 
+ + { 
+ + Collection < byte [ ] > columnNames = new ArrayList < byte [ ] > ( ) ; 
+ + for ( Term column : select . getColumnPredicates ( ) . getTerms ( ) ) 
+ + columnNames . add ( column . getBytes ( ) ) ; / / FIXME : surely not good enough 
+ + 
+ + commands . add ( new SliceByNamesReadCommand ( keyspace , key , queryPath , columnNames ) ) ; 
+ + } 
+ + / / . . . a range ( slice ) of column names 
+ + else 
+ + { 
+ + commands . add ( new SliceFromReadCommand ( keyspace , 
+ + key , 
+ + queryPath , 
+ + select . getColumnPredicates ( ) . getStart ( ) . getBytes ( ) , 
+ + select . getColumnPredicates ( ) . getFinish ( ) . getBytes ( ) , 
+ + select . reversed ( ) , 
+ + select . getNumColumns ( ) ) ) ; 
+ + } 
+ + 
+ + Map < DecoratedKey < ? > , ColumnFamily > columnFamilies = readColumnFamily ( commands , 
+ + select . getConsistencyLevel ( ) ) ; 
+ + List < Column > avroColumns = new ArrayList < Column > ( ) ; 
+ + 
+ + for ( ReadCommand cmd : commands ) 
+ + { 
+ + ColumnFamily cf = columnFamilies . get ( StorageService . getPartitioner ( ) . decorateKey ( cmd . key ) ) ; 
+ + / / TODO : handle reversing order 
+ + for ( IColumn column : cf . getSortedColumns ( ) ) 
+ + { 
+ + Column avroColumn = new Column ( ) ; 
+ + avroColumn . name = ByteBuffer . wrap ( column . name ( ) ) ; 
+ + avroColumn . value = ByteBuffer . wrap ( column . value ( ) ) ; 
+ + avroColumns . add ( avroColumn ) ; 
+ + } 
+ + } 
+ + 
+ + / / Create a new row , add the columns to it , and then add it to the list of rows 
+ + CqlRow avroRow = new CqlRow ( ) ; 
+ + avroRow . key = ByteBuffer . wrap ( key ) ; 
+ + avroRow . columns = avroColumns ; 
+ + avroRows . add ( avroRow ) ; 
+ + } 
+ + } 
+ + else / / It is a range query ( range of keys ) . 
+ + { 
+ + 
+ + } 
+ + 
+ + avroResult . rows = avroRows ; 
+ + return avroResult ; 
+ + 
+ + case UPDATE : 
+ + UpdateStatement update = ( UpdateStatement ) statement . statement ; 
+ + avroResult . type = CqlResultType . VOID ; 
+ + 
+ + List < RowMutation > rowMutations = new ArrayList < RowMutation > ( ) ; 
+ + 
+ + for ( Row row : update . getRows ( ) ) 
+ + { 
+ + RowMutation rm = new RowMutation ( keyspace , row . getKey ( ) . getBytes ( ) ) ; 
+ + 
+ + for ( org . apache . cassandra . cql . Column col : row . getColumns ( ) ) 
+ + { 
+ + rm . add ( new QueryPath ( update . getColumnFamily ( ) , null , col . getName ( ) . getBytes ( ) ) , 
+ + col . getValue ( ) . getBytes ( ) , 
+ + System . currentTimeMillis ( ) ) ; 
+ + rowMutations . add ( rm ) ; 
+ + } 
+ + } 
+ + 
+ + try 
+ + { 
+ + StorageProxy . mutate ( rowMutations , update . getConsistencyLevel ( ) ) ; 
+ + } 
+ + catch ( org . apache . cassandra . thrift . UnavailableException e ) 
+ + { 
+ + throw new UnavailableException ( ) ; 
+ + } 
+ + catch ( TimeoutException e ) 
+ + { 
+ + throw new TimedOutException ( ) ; 
+ + } 
+ + 
+ + return avroResult ; 
+ + } 
+ + 
+ + return null ; / / We should never get here . 
+ + } 
+ + 
+ + private static CqlParser getParser ( String queryStr ) 
+ + { 
+ + CharStream stream = new ANTLRStringStream ( queryStr ) ; 
+ + CqlLexer lexer = new CqlLexer ( stream ) ; 
+ + TokenStream tokenStream = new CommonTokenStream ( lexer ) ; 
+ + return new CqlParser ( tokenStream ) ; 
+ + } 
+ + 
+ + public static void main ( String [ ] args ) throws RecognitionException 
+ + { 
+ + CqlParser parser = getParser ( " SElecT FRoM Standard1 where KEY > \ " foo \ " and key < \ " fnord \ " and COLUMN = \ " bar \ " ; " ) ; 
+ + CQLStatement statement = parser . query ( ) ; 
+ + 
+ + switch ( statement . type ) 
+ + { 
+ + case SELECT : 
+ + SelectStatement st = ( SelectStatement ) statement . statement ; 
+ + System . out . println ( st . getColumnFamily ( ) + " " + st . getKeyPredicates ( ) . getStart ( ) . getText ( ) + 
+ + " " + st . getColumnPredicates ( ) . getTerms ( ) + " " + st . getKeyPredicates ( ) . isRange ( ) ) ; 
+ + case UPDATE : 
+ + return ; 
+ + } 
+ + } 
+ + 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / cql / Relation . java b / src / java / org / apache / cassandra / cql / Relation . java 
+ new file mode 100644 
+ index 0000000 . . 38ebf25 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / Relation . java 
+ @ @ - 0 , 0 + 1 , 67 @ @ 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + / * * 
+ + * Relations encapsulate the relationship between an entity and a value . For 
+ + * example , KEY > ' start ' or COLUMN = ' somecolumn ' . 
+ + * 
+ + * @ author eevans 
+ + * 
+ + * / 
+ + public class Relation 
+ + { 
+ + public Entity entity = Entity . COLUMN ; 
+ + public RelationType type ; 
+ + public Term value ; 
+ + 
+ + / * * 
+ + * Creates a new relation . 
+ + * 
+ + * @ param entity the kind of relation this is ; what the value is compared to . 
+ + * @ param type the type of relation ; how how this entity relates to the value . 
+ + * @ param value the value being compared to the entity . 
+ + * / 
+ + public Relation ( String entity , String type , Term value ) 
+ + { 
+ + if ( entity . toUpperCase ( ) . equals ( " KEY " ) ) 
+ + this . entity = Entity . KEY ; 
+ + 
+ + this . type = RelationType . forString ( type ) ; 
+ + this . value = value ; 
+ + } 
+ + 
+ + public boolean isKey ( ) 
+ + { 
+ + return entity . equals ( Entity . KEY ) ; 
+ + } 
+ + 
+ + public boolean isColumn ( ) 
+ + { 
+ + return entity . equals ( Entity . COLUMN ) ; 
+ + } 
+ + } 
+ + 
+ + enum Entity 
+ + { 
+ + KEY , COLUMN ; 
+ + } 
+ + 
+ + enum RelationType 
+ + { 
+ + EQ , LT , LTE , GTE , GT ; 
+ + 
+ + public static RelationType forString ( String s ) 
+ + { 
+ + if ( s . equals ( " = " ) ) 
+ + return EQ ; 
+ + else if ( s . equals ( " < " ) ) 
+ + return LT ; 
+ + else if ( s . equals ( " < = " ) ) 
+ + return LTE ; 
+ + else if ( s . equals ( " > = " ) ) 
+ + return GTE ; 
+ + else if ( s . equals ( " > " ) ) 
+ + return GT ; 
+ + 
+ + return null ; 
+ + } 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / src / java / org / apache / cassandra / cql / Row . java b / src / java / org / apache / cassandra / cql / Row . java 
+ new file mode 100644 
+ index 0000000 . . c9376c8 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / Row . java 
+ @ @ - 0 , 0 + 1 , 31 @ @ 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + import java . util . ArrayList ; 
+ + import java . util . List ; 
+ + 
+ + public class Row 
+ + { 
+ + private final Term key ; 
+ + private List < Column > columns = new ArrayList < Column > ( ) ; 
+ + 
+ + public Row ( Term key , Column firstColumn ) 
+ + { 
+ + this . key = key ; 
+ + columns . add ( firstColumn ) ; 
+ + } 
+ + 
+ + public void and ( Column col ) 
+ + { 
+ + columns . add ( col ) ; 
+ + } 
+ + 
+ + public Term getKey ( ) 
+ + { 
+ + return key ; 
+ + } 
+ + 
+ + public List < Column > getColumns ( ) 
+ + { 
+ + return columns ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / cql / SelectExpression . java b / src / java / org / apache / cassandra / cql / SelectExpression . java 
+ new file mode 100644 
+ index 0000000 . . e8e0afa 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / SelectExpression . java 
+ @ @ - 0 , 0 + 1 , 114 @ @ 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + import java . util . ArrayList ; 
+ + import java . util . List ; 
+ + 
+ + / * * 
+ + * SelectExpressions encapsulate all of the predicates of a SELECT query . 
+ + * 
+ + * @ author eevans 
+ + * 
+ + * / 
+ + public class SelectExpression 
+ + { 
+ + private Predicates keys = new Predicates ( ) ; 
+ + private Predicates columns = new Predicates ( ) ; 
+ + 
+ + public SelectExpression ( Relation firstRelation ) 
+ + { 
+ + and ( firstRelation ) ; 
+ + } 
+ + 
+ + public void and ( Relation relation ) 
+ + { 
+ + if ( relation . isKey ( ) ) 
+ + { 
+ + if ( relation . type . equals ( RelationType . EQ ) ) 
+ + keys . addTerm ( relation . value ) ; 
+ + else if ( ( relation . type . equals ( RelationType . GT ) | | relation . type . equals ( RelationType . GTE ) ) ) 
+ + keys . setStart ( relation . value ) ; 
+ + else if ( ( relation . type . equals ( RelationType . LT ) | | relation . type . equals ( RelationType . LTE ) ) ) 
+ + keys . setFinish ( relation . value ) ; 
+ + } 
+ + else / / It ' s a column 
+ + { 
+ + if ( relation . type . equals ( RelationType . EQ ) ) 
+ + columns . addTerm ( relation . value ) ; 
+ + else if ( ( relation . type . equals ( RelationType . GT ) | | relation . type . equals ( RelationType . GTE ) ) ) 
+ + columns . setStart ( relation . value ) ; 
+ + else if ( ( relation . type . equals ( RelationType . LT ) | | relation . type . equals ( RelationType . LTE ) ) ) 
+ + columns . setFinish ( relation . value ) ; 
+ + } 
+ + } 
+ + 
+ + public Predicates getKeyPredicates ( ) 
+ + { 
+ + return keys ; 
+ + } 
+ + 
+ + public Predicates getColumnPredicates ( ) 
+ + { 
+ + return columns ; 
+ + } 
+ + } 
+ + 
+ + class Predicates 
+ + { 
+ + private boolean initialized = false ; 
+ + private List < Term > names = new ArrayList < Term > ( ) ; 
+ + private Term start , finish ; 
+ + private boolean isRange = false ; 
+ + 
+ + Term getStart ( ) 
+ + { 
+ + return start = = null ? new Term ( ) : start ; 
+ + } 
+ + 
+ + void setStart ( Term start ) 
+ + { 
+ + / / FIXME : propagate a proper exception 
+ + if ( initialized & & ( ! isRange ( ) ) ) 
+ + throw new RuntimeException ( " You cannot combine discreet names and range operators . " ) ; 
+ + 
+ + initialized = true ; 
+ + isRange = true ; 
+ + this . start = start ; 
+ + } 
+ + 
+ + Term getFinish ( ) 
+ + { 
+ + return finish = = null ? new Term ( ) : finish ; 
+ + } 
+ + 
+ + void setFinish ( Term finish ) 
+ + { 
+ + / / FIXME : propagate a proper exception 
+ + if ( initialized & & ( ! isRange ( ) ) ) 
+ + throw new RuntimeException ( " You cannot combine discreet names and range operators . " ) ; 
+ + 
+ + initialized = true ; 
+ + isRange = true ; 
+ + this . finish = finish ; 
+ + } 
+ + 
+ + List < Term > getTerms ( ) 
+ + { 
+ + return names ; 
+ + } 
+ + 
+ + void addTerm ( Term name ) 
+ + { 
+ + / / FIXME : propagate a proper exception 
+ + if ( initialized & & ( isRange ( ) ) ) 
+ + throw new RuntimeException ( " You cannot combine discreet names and range operators . " ) ; 
+ + 
+ + initialized = true ; 
+ + isRange = false ; 
+ + names . add ( name ) ; 
+ + } 
+ + 
+ + boolean isRange ( ) 
+ + { 
+ + return isRange ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / cql / SelectStatement . java b / src / java / org / apache / cassandra / cql / SelectStatement . java 
+ new file mode 100644 
+ index 0000000 . . 01695c9 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / SelectStatement . java 
+ @ @ - 0 , 0 + 1 , 66 @ @ 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + import org . apache . cassandra . thrift . ConsistencyLevel ; 
+ + 
+ + / * * 
+ + * Encapsulates a completely parsed SELECT query , including the target 
+ + * column family , expression , result count , and ordering clause . 
+ + * 
+ + * @ author eevans 
+ + * 
+ + * / 
+ + public class SelectStatement 
+ + { 
+ + private final String columnFamily ; 
+ + private final ConsistencyLevel cLevel ; 
+ + private final SelectExpression expression ; 
+ + private final int numRecords ; 
+ + private final int numColumns ; 
+ + private final boolean reverse ; 
+ + 
+ + public SelectStatement ( String columnFamily , ConsistencyLevel cLevel , SelectExpression expression , 
+ + int numRecords , int numColumns , boolean reverse ) 
+ + { 
+ + this . columnFamily = columnFamily ; 
+ + this . cLevel = cLevel ; 
+ + this . expression = expression ; 
+ + this . numRecords = numRecords ; 
+ + this . numColumns = numColumns ; 
+ + this . reverse = reverse ; 
+ + } 
+ + 
+ + public Predicates getKeyPredicates ( ) 
+ + { 
+ + return expression . getKeyPredicates ( ) ; 
+ + } 
+ + 
+ + public Predicates getColumnPredicates ( ) 
+ + { 
+ + return expression . getColumnPredicates ( ) ; 
+ + } 
+ + 
+ + public String getColumnFamily ( ) 
+ + { 
+ + return columnFamily ; 
+ + } 
+ + 
+ + public boolean reversed ( ) 
+ + { 
+ + return reverse ; 
+ + } 
+ + 
+ + public ConsistencyLevel getConsistencyLevel ( ) 
+ + { 
+ + return cLevel ; 
+ + } 
+ + 
+ + public int getNumRecords ( ) 
+ + { 
+ + return numRecords ; 
+ + } 
+ + 
+ + public int getNumColumns ( ) 
+ + { 
+ + return numColumns ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / cql / StatementType . java b / src / java / org / apache / cassandra / cql / StatementType . java 
+ new file mode 100644 
+ index 0000000 . . e364267 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / StatementType . java 
+ @ @ - 0 , 0 + 1 , 6 @ @ 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + public enum StatementType 
+ + { 
+ + SELECT , UPDATE ; 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / cql / Term . java b / src / java / org / apache / cassandra / cql / Term . java 
+ new file mode 100644 
+ index 0000000 . . 1ff4e57 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / Term . java 
+ @ @ - 0 , 0 + 1 , 91 @ @ 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ + 
+ + / * * 
+ + * Represents a term processed from a CQL query statement . Terms are things 
+ + * like strings , numbers , UUIDs , etc . 
+ + * 
+ + * @ author eevans 
+ + * 
+ + * / 
+ + public class Term 
+ + { 
+ + private final String text ; 
+ + private final TermType type ; 
+ + 
+ + / * * 
+ + * Create new Term instance from a string , and an integer that corresponds 
+ + * with the token ID from CQLParser . 
+ + * 
+ + * @ param text the text representation of the term . 
+ + * @ param type the term ' s type as an integer token ID . 
+ + * / 
+ + public Term ( String text , int type ) 
+ + { 
+ + this . text = text ; 
+ + this . type = TermType . forInt ( type ) ; 
+ + } 
+ + 
+ + protected Term ( ) 
+ + { 
+ + this . text = " " ; 
+ + this . type = TermType . STRING ; 
+ + } 
+ + 
+ + / * * 
+ + * Get the text that was parsed to create this term . 
+ + * 
+ + * @ return the string term as parsed from a CQL statement . 
+ + * / 
+ + public String getText ( ) 
+ + { 
+ + return text ; 
+ + } 
+ + 
+ + / * * 
+ + * Get the typed value , serialized to a byte [ ] . 
+ + * 
+ + * @ return 
+ + * / 
+ + public byte [ ] getBytes ( ) 
+ + { 
+ + switch ( type ) 
+ + { 
+ + case STRING : 
+ + return text . getBytes ( ) ; 
+ + case LONG : 
+ + return FBUtilities . toByteArray ( Long . parseLong ( text ) ) ; 
+ + } 
+ + 
+ + / / FIXME : handle scenario that should never happen 
+ + return null ; 
+ + } 
+ + 
+ + / * * 
+ + * Get the term ' s type . 
+ + * 
+ + * @ return the type 
+ + * / 
+ + public TermType getType ( ) 
+ + { 
+ + return type ; 
+ + } 
+ + 
+ + } 
+ + 
+ + enum TermType 
+ + { 
+ + STRING , LONG ; 
+ + 
+ + static TermType forInt ( int type ) 
+ + { 
+ + if ( type = = CqlParser . STRING _ LITERAL ) 
+ + return STRING ; 
+ + else if ( type = = CqlParser . LONG ) 
+ + return LONG ; 
+ + 
+ + / / FIXME : handled scenario that should never occur . 
+ + return null ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / cql / UpdateStatement . java b / src / java / org / apache / cassandra / cql / UpdateStatement . java 
+ new file mode 100644 
+ index 0000000 . . ae5b752 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / cql / UpdateStatement . java 
+ @ @ - 0 , 0 + 1 , 40 @ @ 
+ + package org . apache . cassandra . cql ; 
+ + 
+ + import java . util . ArrayList ; 
+ + import java . util . List ; 
+ + 
+ + import org . apache . cassandra . thrift . ConsistencyLevel ; 
+ + 
+ + public class UpdateStatement 
+ + { 
+ + private String columnFamily ; 
+ + private List < Row > rows = new ArrayList < Row > ( ) ; 
+ + private ConsistencyLevel cLevel ; 
+ + 
+ + public UpdateStatement ( String columnFamily , Row first , ConsistencyLevel cLevel ) 
+ + { 
+ + this . columnFamily = columnFamily ; 
+ + this . cLevel = cLevel ; 
+ + and ( first ) ; 
+ + } 
+ + 
+ + public void and ( Row row ) 
+ + { 
+ + rows . add ( row ) ; 
+ + } 
+ + 
+ + public List < Row > getRows ( ) 
+ + { 
+ + return rows ; 
+ + } 
+ + 
+ + public ConsistencyLevel getConsistencyLevel ( ) 
+ + { 
+ + return cLevel ; 
+ + } 
+ + 
+ + public String getColumnFamily ( ) 
+ + { 
+ + return columnFamily ; 
+ + } 
+ + }

@@ -1,0 +1,259 @@
+BLEU SCORE: 0.015284801196484512
+
+TEST MSG: Avoid filtering sstables based on generation when ViewBuilder restarts
+GENERATED MSG: Fix AssertionError while flushing memtable due to materialized views incorrectly inserting empty rows
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index c258203 . . d9a97ad 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 13 <nl> + * Fix view builder bug that can filter out data on restart ( CASSANDRA - 13405 ) <nl> * Fix 2i page size calculation when there are no regular columns ( CASSANDRA - 13400 ) <nl> * Fix the conversion of 2 . X expired rows without regular column data ( CASSANDRA - 13395 ) <nl> * Fix hint delivery when using ext + internal IPs with prefer _ local enabled ( CASSANDRA - 13020 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / view / View . java b / src / java / org / apache / cassandra / db / view / View . java <nl> index 845a6ab . . e471349 100644 <nl> - - - a / src / java / org / apache / cassandra / db / view / View . java <nl> + + + b / src / java / org / apache / cassandra / db / view / View . java <nl> @ @ - 208 , 7 + 208 , 11 @ @ public class View <nl> public ReadQuery getReadQuery ( ) <nl> { <nl> if ( query = = null ) <nl> + { <nl> query = getSelectStatement ( ) . getQuery ( QueryOptions . forInternalCalls ( Collections . emptyList ( ) ) , FBUtilities . nowInSeconds ( ) ) ; <nl> + logger . trace ( " View query : { } " , rawSelect ) ; <nl> + } <nl> + <nl> return query ; <nl> } <nl> <nl> @ @ - 216 , 6 + 220 , 7 @ @ public class View <nl> { <nl> if ( this . builder ! = null ) <nl> { <nl> + logger . debug ( " Stopping current view builder due to schema change " ) ; <nl> this . builder . stop ( ) ; <nl> this . builder = null ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / view / ViewBuilder . java b / src / java / org / apache / cassandra / db / view / ViewBuilder . java <nl> index 37c0e7b . . 94314fd 100644 <nl> - - - a / src / java / org / apache / cassandra / db / view / ViewBuilder . java <nl> + + + b / src / java / org / apache / cassandra / db / view / ViewBuilder . java <nl> @ @ - 23 , 6 + 23 , 7 @ @ import java . util . Collections ; <nl> import java . util . Iterator ; <nl> import java . util . UUID ; <nl> import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . atomic . AtomicInteger ; <nl> import java . util . concurrent . atomic . AtomicLong ; <nl> import javax . annotation . Nullable ; <nl> <nl> @ @ - 74 , 8 + 75 , 12 @ @ public class ViewBuilder extends CompactionInfo . Holder <nl> { <nl> AtomicLong noBase = new AtomicLong ( Long . MAX _ VALUE ) ; <nl> ReadQuery selectQuery = view . getReadQuery ( ) ; <nl> + <nl> if ( ! selectQuery . selectsKey ( key ) ) <nl> + { <nl> + logger . trace ( " Skipping { } , view query filters " , key ) ; <nl> return ; <nl> + } <nl> <nl> int nowInSec = FBUtilities . nowInSeconds ( ) ; <nl> SinglePartitionReadCommand command = view . getSelectStatement ( ) . internalReadForView ( key , nowInSec ) ; <nl> @ @ - 97 , 49 + 102 , 41 @ @ public class ViewBuilder extends CompactionInfo . Holder <nl> <nl> public void run ( ) <nl> { <nl> + logger . debug ( " Starting view builder for { } . { } " , baseCfs . metadata . ksName , view . name ) ; <nl> String ksname = baseCfs . metadata . ksName , viewName = view . name ; <nl> <nl> if ( SystemKeyspace . isViewBuilt ( ksname , viewName ) ) <nl> + { <nl> + logger . debug ( " View already marked built for { } . { } " , baseCfs . metadata . ksName , view . name ) ; <nl> return ; <nl> - <nl> + } <nl> Iterable < Range < Token > > ranges = StorageService . instance . getLocalRanges ( baseCfs . metadata . ksName ) ; <nl> + <nl> final Pair < Integer , Token > buildStatus = SystemKeyspace . getViewBuildStatus ( ksname , viewName ) ; <nl> Token lastToken ; <nl> Function < org . apache . cassandra . db . lifecycle . View , Iterable < SSTableReader > > function ; <nl> if ( buildStatus = = null ) <nl> { <nl> - baseCfs . forceBlockingFlush ( ) ; <nl> - function = org . apache . cassandra . db . lifecycle . View . selectFunction ( SSTableSet . CANONICAL ) ; <nl> - int generation = Integer . MIN _ VALUE ; <nl> - <nl> - try ( Refs < SSTableReader > temp = baseCfs . selectAndReference ( function ) . refs ) <nl> - { <nl> - for ( SSTableReader reader : temp ) <nl> - { <nl> - generation = Math . max ( reader . descriptor . generation , generation ) ; <nl> - } <nl> - } <nl> - <nl> - SystemKeyspace . beginViewBuild ( ksname , viewName , generation ) ; <nl> + logger . debug ( " Starting new view build . flushing base table { } . { } " , baseCfs . metadata . ksName , baseCfs . name ) ; <nl> lastToken = null ; <nl> + <nl> + / / We don ' t track the generation number anymore since if a rebuild is stopped and <nl> + / / restarted the max generation filter may yield no sstables due to compactions . <nl> + / / We only care about max generation * during * a build , not across builds . <nl> + / / see CASSANDRA - 13405 <nl> + SystemKeyspace . beginViewBuild ( ksname , viewName , 0 ) ; <nl> } <nl> else <nl> { <nl> - function = new Function < org . apache . cassandra . db . lifecycle . View , Iterable < SSTableReader > > ( ) <nl> - { <nl> - @ Nullable <nl> - public Iterable < SSTableReader > apply ( org . apache . cassandra . db . lifecycle . View view ) <nl> - { <nl> - Iterable < SSTableReader > readers = org . apache . cassandra . db . lifecycle . View . selectFunction ( SSTableSet . CANONICAL ) . apply ( view ) ; <nl> - if ( readers ! = null ) <nl> - return Iterables . filter ( readers , ssTableReader - > ssTableReader . descriptor . generation < = buildStatus . left ) ; <nl> - return null ; <nl> - } <nl> - } ; <nl> lastToken = buildStatus . right ; <nl> + logger . debug ( " Resuming view build from token { } . flushing base table { } . { } " , lastToken , baseCfs . metadata . ksName , baseCfs . name ) ; <nl> } <nl> <nl> + baseCfs . forceBlockingFlush ( ) ; <nl> + function = org . apache . cassandra . db . lifecycle . View . selectFunction ( SSTableSet . CANONICAL ) ; <nl> + <nl> prevToken = lastToken ; <nl> + long keysBuilt = 0 ; <nl> try ( Refs < SSTableReader > sstables = baseCfs . selectAndReference ( function ) . refs ; <nl> ReducingKeyIterator iter = new ReducingKeyIterator ( sstables ) ) <nl> { <nl> @ @ - 154 , 6 + 151 , 7 @ @ public class ViewBuilder extends CompactionInfo . Holder <nl> if ( range . contains ( token ) ) <nl> { <nl> buildKey ( key ) ; <nl> + + + keysBuilt ; <nl> <nl> if ( prevToken = = null | | prevToken . compareTo ( token ) ! = 0 ) <nl> { <nl> @ @ - 162 , 12 + 160 , 20 @ @ public class ViewBuilder extends CompactionInfo . Holder <nl> } <nl> } <nl> } <nl> + <nl> lastToken = null ; <nl> } <nl> } <nl> <nl> if ( ! isStopped ) <nl> + { <nl> + logger . debug ( " Marking view ( { } . { } ) as built covered { } keys " , ksname , viewName , keysBuilt ) ; <nl> SystemKeyspace . finishViewBuildStatus ( ksname , viewName ) ; <nl> + } <nl> + else <nl> + { <nl> + logger . debug ( " Stopped build for view ( { } . { } ) after covering { } keys " , ksname , viewName , keysBuilt ) ; <nl> + } <nl> } <nl> catch ( Exception e ) <nl> { <nl> @ @ - 198 , 6 + 204 , 7 @ @ public class ViewBuilder extends CompactionInfo . Holder <nl> if ( lastToken = = null | | range . contains ( lastToken ) ) <nl> rangesLeft = 0 ; <nl> } <nl> + <nl> return new CompactionInfo ( baseCfs . metadata , OperationType . VIEW _ BUILD , rangesLeft , rangesTotal , " ranges " , compactionId ) ; <nl> } <nl> <nl> diff - - git a / test / unit / org / apache / cassandra / cql3 / ViewTest . java b / test / unit / org / apache / cassandra / cql3 / ViewTest . java <nl> index 2070bef . . e595ebd 100644 <nl> - - - a / test / unit / org / apache / cassandra / cql3 / ViewTest . java <nl> + + + b / test / unit / org / apache / cassandra / cql3 / ViewTest . java <nl> @ @ - 21 , 8 + 21 , 11 @ @ package org . apache . cassandra . cql3 ; <nl> import java . util . ArrayList ; <nl> import java . util . HashSet ; <nl> import java . util . List ; <nl> + import java . util . concurrent . Future ; <nl> import java . util . concurrent . TimeUnit ; <nl> <nl> + import com . google . common . util . concurrent . Uninterruptibles ; <nl> + <nl> import junit . framework . Assert ; <nl> import org . junit . After ; <nl> import org . junit . Before ; <nl> @ @ - 40 , 6 + 43 , 7 @ @ import org . apache . cassandra . config . ColumnDefinition ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . db . Keyspace ; <nl> import org . apache . cassandra . db . SystemKeyspace ; <nl> + import org . apache . cassandra . db . compaction . CompactionManager ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> import static org . junit . Assert . assertTrue ; <nl> @ @ - 1203 , 4 + 1207 , 59 @ @ public class ViewTest extends CQLTester <nl> assertRowsNet ( protocolVersion , executeNet ( protocolVersion , " SELECT * FROM % s " ) , row ( 0 , 1 ) ) ; <nl> assertRowsNet ( protocolVersion , executeNet ( protocolVersion , " SELECT * FROM mv " ) , row ( 1 , 0 ) ) ; <nl> } <nl> + <nl> + @ Test <nl> + public void testViewBuilderResume ( ) throws Throwable <nl> + { <nl> + createTable ( " CREATE TABLE % s ( " + <nl> + " k int , " + <nl> + " c int , " + <nl> + " val text , " + <nl> + " PRIMARY KEY ( k , c ) ) " ) ; <nl> + <nl> + execute ( " USE " + keyspace ( ) ) ; <nl> + executeNet ( protocolVersion , " USE " + keyspace ( ) ) ; <nl> + <nl> + CompactionManager . instance . setCoreCompactorThreads ( 1 ) ; <nl> + CompactionManager . instance . setMaximumCompactorThreads ( 1 ) ; <nl> + ColumnFamilyStore cfs = getCurrentColumnFamilyStore ( ) ; <nl> + cfs . disableAutoCompaction ( ) ; <nl> + <nl> + for ( int i = 0 ; i < 1024 ; i + + ) <nl> + execute ( " INSERT into % s ( k , c , val ) VALUES ( ? , ? , ? ) " , i , i , " " + i ) ; <nl> + <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + for ( int i = 0 ; i < 1024 ; i + + ) <nl> + execute ( " INSERT into % s ( k , c , val ) VALUES ( ? , ? , ? ) " , i , i , " " + i ) ; <nl> + <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + for ( int i = 0 ; i < 1024 ; i + + ) <nl> + execute ( " INSERT into % s ( k , c , val ) VALUES ( ? , ? , ? ) " , i , i , " " + i ) ; <nl> + <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + for ( int i = 0 ; i < 1024 ; i + + ) <nl> + execute ( " INSERT into % s ( k , c , val ) VALUES ( ? , ? , ? ) " , i , i , " " + i ) ; <nl> + <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + createView ( " mv _ test " , " CREATE MATERIALIZED VIEW % s AS SELECT * FROM % % s WHERE val IS NOT NULL AND k IS NOT NULL AND c IS NOT NULL PRIMARY KEY ( val , k , c ) " ) ; <nl> + <nl> + cfs . enableAutoCompaction ( ) ; <nl> + List < Future < ? > > futures = CompactionManager . instance . submitBackground ( cfs ) ; <nl> + <nl> + / / Force a second MV on the same base table , which will restart the first MV builder . . . <nl> + createView ( " mv _ test2 " , " CREATE MATERIALIZED VIEW % s AS SELECT val , k , c FROM % % s WHERE val IS NOT NULL AND k IS NOT NULL AND c IS NOT NULL PRIMARY KEY ( val , k , c ) " ) ; <nl> + <nl> + <nl> + / / Compact the base table <nl> + FBUtilities . waitOnFutures ( futures ) ; <nl> + <nl> + while ( ! SystemKeyspace . isViewBuilt ( keyspace ( ) , " mv _ test " ) ) <nl> + Uninterruptibles . sleepUninterruptibly ( 1 , TimeUnit . SECONDS ) ; <nl> + <nl> + assertRows ( execute ( " SELECT count ( * ) FROM mv _ test " ) , row ( 1024L ) ) ; <nl> + } <nl> }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index c258203 . . d9a97ad 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 13 
+ + * Fix view builder bug that can filter out data on restart ( CASSANDRA - 13405 ) 
+ * Fix 2i page size calculation when there are no regular columns ( CASSANDRA - 13400 ) 
+ * Fix the conversion of 2 . X expired rows without regular column data ( CASSANDRA - 13395 ) 
+ * Fix hint delivery when using ext + internal IPs with prefer _ local enabled ( CASSANDRA - 13020 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / view / View . java b / src / java / org / apache / cassandra / db / view / View . java 
+ index 845a6ab . . e471349 100644 
+ - - - a / src / java / org / apache / cassandra / db / view / View . java 
+ + + + b / src / java / org / apache / cassandra / db / view / View . java 
+ @ @ - 208 , 7 + 208 , 11 @ @ public class View 
+ public ReadQuery getReadQuery ( ) 
+ { 
+ if ( query = = null ) 
+ + { 
+ query = getSelectStatement ( ) . getQuery ( QueryOptions . forInternalCalls ( Collections . emptyList ( ) ) , FBUtilities . nowInSeconds ( ) ) ; 
+ + logger . trace ( " View query : { } " , rawSelect ) ; 
+ + } 
+ + 
+ return query ; 
+ } 
+ 
+ @ @ - 216 , 6 + 220 , 7 @ @ public class View 
+ { 
+ if ( this . builder ! = null ) 
+ { 
+ + logger . debug ( " Stopping current view builder due to schema change " ) ; 
+ this . builder . stop ( ) ; 
+ this . builder = null ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / view / ViewBuilder . java b / src / java / org / apache / cassandra / db / view / ViewBuilder . java 
+ index 37c0e7b . . 94314fd 100644 
+ - - - a / src / java / org / apache / cassandra / db / view / ViewBuilder . java 
+ + + + b / src / java / org / apache / cassandra / db / view / ViewBuilder . java 
+ @ @ - 23 , 6 + 23 , 7 @ @ import java . util . Collections ; 
+ import java . util . Iterator ; 
+ import java . util . UUID ; 
+ import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . atomic . AtomicInteger ; 
+ import java . util . concurrent . atomic . AtomicLong ; 
+ import javax . annotation . Nullable ; 
+ 
+ @ @ - 74 , 8 + 75 , 12 @ @ public class ViewBuilder extends CompactionInfo . Holder 
+ { 
+ AtomicLong noBase = new AtomicLong ( Long . MAX _ VALUE ) ; 
+ ReadQuery selectQuery = view . getReadQuery ( ) ; 
+ + 
+ if ( ! selectQuery . selectsKey ( key ) ) 
+ + { 
+ + logger . trace ( " Skipping { } , view query filters " , key ) ; 
+ return ; 
+ + } 
+ 
+ int nowInSec = FBUtilities . nowInSeconds ( ) ; 
+ SinglePartitionReadCommand command = view . getSelectStatement ( ) . internalReadForView ( key , nowInSec ) ; 
+ @ @ - 97 , 49 + 102 , 41 @ @ public class ViewBuilder extends CompactionInfo . Holder 
+ 
+ public void run ( ) 
+ { 
+ + logger . debug ( " Starting view builder for { } . { } " , baseCfs . metadata . ksName , view . name ) ; 
+ String ksname = baseCfs . metadata . ksName , viewName = view . name ; 
+ 
+ if ( SystemKeyspace . isViewBuilt ( ksname , viewName ) ) 
+ + { 
+ + logger . debug ( " View already marked built for { } . { } " , baseCfs . metadata . ksName , view . name ) ; 
+ return ; 
+ - 
+ + } 
+ Iterable < Range < Token > > ranges = StorageService . instance . getLocalRanges ( baseCfs . metadata . ksName ) ; 
+ + 
+ final Pair < Integer , Token > buildStatus = SystemKeyspace . getViewBuildStatus ( ksname , viewName ) ; 
+ Token lastToken ; 
+ Function < org . apache . cassandra . db . lifecycle . View , Iterable < SSTableReader > > function ; 
+ if ( buildStatus = = null ) 
+ { 
+ - baseCfs . forceBlockingFlush ( ) ; 
+ - function = org . apache . cassandra . db . lifecycle . View . selectFunction ( SSTableSet . CANONICAL ) ; 
+ - int generation = Integer . MIN _ VALUE ; 
+ - 
+ - try ( Refs < SSTableReader > temp = baseCfs . selectAndReference ( function ) . refs ) 
+ - { 
+ - for ( SSTableReader reader : temp ) 
+ - { 
+ - generation = Math . max ( reader . descriptor . generation , generation ) ; 
+ - } 
+ - } 
+ - 
+ - SystemKeyspace . beginViewBuild ( ksname , viewName , generation ) ; 
+ + logger . debug ( " Starting new view build . flushing base table { } . { } " , baseCfs . metadata . ksName , baseCfs . name ) ; 
+ lastToken = null ; 
+ + 
+ + / / We don ' t track the generation number anymore since if a rebuild is stopped and 
+ + / / restarted the max generation filter may yield no sstables due to compactions . 
+ + / / We only care about max generation * during * a build , not across builds . 
+ + / / see CASSANDRA - 13405 
+ + SystemKeyspace . beginViewBuild ( ksname , viewName , 0 ) ; 
+ } 
+ else 
+ { 
+ - function = new Function < org . apache . cassandra . db . lifecycle . View , Iterable < SSTableReader > > ( ) 
+ - { 
+ - @ Nullable 
+ - public Iterable < SSTableReader > apply ( org . apache . cassandra . db . lifecycle . View view ) 
+ - { 
+ - Iterable < SSTableReader > readers = org . apache . cassandra . db . lifecycle . View . selectFunction ( SSTableSet . CANONICAL ) . apply ( view ) ; 
+ - if ( readers ! = null ) 
+ - return Iterables . filter ( readers , ssTableReader - > ssTableReader . descriptor . generation < = buildStatus . left ) ; 
+ - return null ; 
+ - } 
+ - } ; 
+ lastToken = buildStatus . right ; 
+ + logger . debug ( " Resuming view build from token { } . flushing base table { } . { } " , lastToken , baseCfs . metadata . ksName , baseCfs . name ) ; 
+ } 
+ 
+ + baseCfs . forceBlockingFlush ( ) ; 
+ + function = org . apache . cassandra . db . lifecycle . View . selectFunction ( SSTableSet . CANONICAL ) ; 
+ + 
+ prevToken = lastToken ; 
+ + long keysBuilt = 0 ; 
+ try ( Refs < SSTableReader > sstables = baseCfs . selectAndReference ( function ) . refs ; 
+ ReducingKeyIterator iter = new ReducingKeyIterator ( sstables ) ) 
+ { 
+ @ @ - 154 , 6 + 151 , 7 @ @ public class ViewBuilder extends CompactionInfo . Holder 
+ if ( range . contains ( token ) ) 
+ { 
+ buildKey ( key ) ; 
+ + + + keysBuilt ; 
+ 
+ if ( prevToken = = null | | prevToken . compareTo ( token ) ! = 0 ) 
+ { 
+ @ @ - 162 , 12 + 160 , 20 @ @ public class ViewBuilder extends CompactionInfo . Holder 
+ } 
+ } 
+ } 
+ + 
+ lastToken = null ; 
+ } 
+ } 
+ 
+ if ( ! isStopped ) 
+ + { 
+ + logger . debug ( " Marking view ( { } . { } ) as built covered { } keys " , ksname , viewName , keysBuilt ) ; 
+ SystemKeyspace . finishViewBuildStatus ( ksname , viewName ) ; 
+ + } 
+ + else 
+ + { 
+ + logger . debug ( " Stopped build for view ( { } . { } ) after covering { } keys " , ksname , viewName , keysBuilt ) ; 
+ + } 
+ } 
+ catch ( Exception e ) 
+ { 
+ @ @ - 198 , 6 + 204 , 7 @ @ public class ViewBuilder extends CompactionInfo . Holder 
+ if ( lastToken = = null | | range . contains ( lastToken ) ) 
+ rangesLeft = 0 ; 
+ } 
+ + 
+ return new CompactionInfo ( baseCfs . metadata , OperationType . VIEW _ BUILD , rangesLeft , rangesTotal , " ranges " , compactionId ) ; 
+ } 
+ 
+ diff - - git a / test / unit / org / apache / cassandra / cql3 / ViewTest . java b / test / unit / org / apache / cassandra / cql3 / ViewTest . java 
+ index 2070bef . . e595ebd 100644 
+ - - - a / test / unit / org / apache / cassandra / cql3 / ViewTest . java 
+ + + + b / test / unit / org / apache / cassandra / cql3 / ViewTest . java 
+ @ @ - 21 , 8 + 21 , 11 @ @ package org . apache . cassandra . cql3 ; 
+ import java . util . ArrayList ; 
+ import java . util . HashSet ; 
+ import java . util . List ; 
+ + import java . util . concurrent . Future ; 
+ import java . util . concurrent . TimeUnit ; 
+ 
+ + import com . google . common . util . concurrent . Uninterruptibles ; 
+ + 
+ import junit . framework . Assert ; 
+ import org . junit . After ; 
+ import org . junit . Before ; 
+ @ @ - 40 , 6 + 43 , 7 @ @ import org . apache . cassandra . config . ColumnDefinition ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . db . Keyspace ; 
+ import org . apache . cassandra . db . SystemKeyspace ; 
+ + import org . apache . cassandra . db . compaction . CompactionManager ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ import static org . junit . Assert . assertTrue ; 
+ @ @ - 1203 , 4 + 1207 , 59 @ @ public class ViewTest extends CQLTester 
+ assertRowsNet ( protocolVersion , executeNet ( protocolVersion , " SELECT * FROM % s " ) , row ( 0 , 1 ) ) ; 
+ assertRowsNet ( protocolVersion , executeNet ( protocolVersion , " SELECT * FROM mv " ) , row ( 1 , 0 ) ) ; 
+ } 
+ + 
+ + @ Test 
+ + public void testViewBuilderResume ( ) throws Throwable 
+ + { 
+ + createTable ( " CREATE TABLE % s ( " + 
+ + " k int , " + 
+ + " c int , " + 
+ + " val text , " + 
+ + " PRIMARY KEY ( k , c ) ) " ) ; 
+ + 
+ + execute ( " USE " + keyspace ( ) ) ; 
+ + executeNet ( protocolVersion , " USE " + keyspace ( ) ) ; 
+ + 
+ + CompactionManager . instance . setCoreCompactorThreads ( 1 ) ; 
+ + CompactionManager . instance . setMaximumCompactorThreads ( 1 ) ; 
+ + ColumnFamilyStore cfs = getCurrentColumnFamilyStore ( ) ; 
+ + cfs . disableAutoCompaction ( ) ; 
+ + 
+ + for ( int i = 0 ; i < 1024 ; i + + ) 
+ + execute ( " INSERT into % s ( k , c , val ) VALUES ( ? , ? , ? ) " , i , i , " " + i ) ; 
+ + 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + for ( int i = 0 ; i < 1024 ; i + + ) 
+ + execute ( " INSERT into % s ( k , c , val ) VALUES ( ? , ? , ? ) " , i , i , " " + i ) ; 
+ + 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + for ( int i = 0 ; i < 1024 ; i + + ) 
+ + execute ( " INSERT into % s ( k , c , val ) VALUES ( ? , ? , ? ) " , i , i , " " + i ) ; 
+ + 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + for ( int i = 0 ; i < 1024 ; i + + ) 
+ + execute ( " INSERT into % s ( k , c , val ) VALUES ( ? , ? , ? ) " , i , i , " " + i ) ; 
+ + 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + createView ( " mv _ test " , " CREATE MATERIALIZED VIEW % s AS SELECT * FROM % % s WHERE val IS NOT NULL AND k IS NOT NULL AND c IS NOT NULL PRIMARY KEY ( val , k , c ) " ) ; 
+ + 
+ + cfs . enableAutoCompaction ( ) ; 
+ + List < Future < ? > > futures = CompactionManager . instance . submitBackground ( cfs ) ; 
+ + 
+ + / / Force a second MV on the same base table , which will restart the first MV builder . . . 
+ + createView ( " mv _ test2 " , " CREATE MATERIALIZED VIEW % s AS SELECT val , k , c FROM % % s WHERE val IS NOT NULL AND k IS NOT NULL AND c IS NOT NULL PRIMARY KEY ( val , k , c ) " ) ; 
+ + 
+ + 
+ + / / Compact the base table 
+ + FBUtilities . waitOnFutures ( futures ) ; 
+ + 
+ + while ( ! SystemKeyspace . isViewBuilt ( keyspace ( ) , " mv _ test " ) ) 
+ + Uninterruptibles . sleepUninterruptibly ( 1 , TimeUnit . SECONDS ) ; 
+ + 
+ + assertRows ( execute ( " SELECT count ( * ) FROM mv _ test " ) , row ( 1024L ) ) ; 
+ + } 
+ }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

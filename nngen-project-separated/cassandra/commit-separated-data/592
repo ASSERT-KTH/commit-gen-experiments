@@ -1,0 +1,242 @@
+BLEU SCORE: 0.08556358529213393
+
+TEST MSG: Avoid deadlock due to MV lock contention
+GENERATED MSG: Mutations do not block for completion under view lock contention
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index bf1e7d6 . . c80e045 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 10 <nl> + * Avoid deadlock due to materialized view lock contention ( CASSANDRA - 12689 ) <nl> * Fix for KeyCacheCqlTest flakiness ( CASSANDRA - 12801 ) <nl> * Include SSTable filename in compacting large row message ( CASSANDRA - 12384 ) <nl> * Fix potential socket leak ( CASSANDRA - 12329 , CASSANDRA - 12330 ) <nl> diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> index baea210 . . 7b32a34 100644 <nl> - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> @ @ - 392 , 7 + 392 , 7 @ @ public class DatabaseDescriptor <nl> throw new ConfigurationException ( " concurrent _ reads must be at least 2 , but was " + conf . concurrent _ reads , false ) ; <nl> } <nl> <nl> - if ( conf . concurrent _ writes ! = null & & conf . concurrent _ writes < 2 ) <nl> + if ( conf . concurrent _ writes ! = null & & conf . concurrent _ writes < 2 & & System . getProperty ( " cassandra . test . fail _ mv _ locks _ count " , " " ) . isEmpty ( ) ) <nl> { <nl> throw new ConfigurationException ( " concurrent _ writes must be at least 2 , but was " + conf . concurrent _ writes , false ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / Keyspace . java b / src / java / org / apache / cassandra / db / Keyspace . java <nl> index 8d710d1 . . 75aab8f 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Keyspace . java <nl> + + + b / src / java / org / apache / cassandra / db / Keyspace . java <nl> @ @ - 63 , 6 + 63 , 7 @ @ public class Keyspace <nl> <nl> private static final String TEST _ FAIL _ WRITES _ KS = System . getProperty ( " cassandra . test . fail _ writes _ ks " , " " ) ; <nl> private static final boolean TEST _ FAIL _ WRITES = ! TEST _ FAIL _ WRITES _ KS . isEmpty ( ) ; <nl> + private static int TEST _ FAIL _ MV _ LOCKS _ COUNT = Integer . getInteger ( System . getProperty ( " cassandra . test . fail _ mv _ locks _ count " , " 0 " ) , 0 ) ; <nl> <nl> public final KeyspaceMetrics metric ; <nl> <nl> @ @ - 384 , 6 + 385 , 20 @ @ public class Keyspace <nl> return apply ( mutation , writeCommitLog , true , false , null ) ; <nl> } <nl> <nl> + / * * <nl> + * Should be used if caller is blocking and runs in mutation stage . <nl> + * Otherwise there is a race condition where ALL mutation workers are beeing blocked ending <nl> + * in a complete deadlock of the mutation stage . See CASSANDRA - 12689 . <nl> + * <nl> + * @ param mutation <nl> + * @ param writeCommitLog <nl> + * @ return <nl> + * / <nl> + public CompletableFuture < ? > applyNotDeferrable ( Mutation mutation , boolean writeCommitLog ) <nl> + { <nl> + return apply ( mutation , writeCommitLog , true , false , false , null ) ; <nl> + } <nl> + <nl> public CompletableFuture < ? > apply ( Mutation mutation , boolean writeCommitLog , boolean updateIndexes ) <nl> { <nl> return apply ( mutation , writeCommitLog , updateIndexes , false , null ) ; <nl> @ @ - 394 , 6 + 409 , 15 @ @ public class Keyspace <nl> return apply ( mutation , false , true , true , null ) ; <nl> } <nl> <nl> + public CompletableFuture < ? > apply ( final Mutation mutation , <nl> + final boolean writeCommitLog , <nl> + boolean updateIndexes , <nl> + boolean isClReplay , <nl> + CompletableFuture < ? > future ) <nl> + { <nl> + return apply ( mutation , writeCommitLog , updateIndexes , isClReplay , true , future ) ; <nl> + } <nl> + <nl> / * * <nl> * This method appends a row to the global CommitLog , then updates memtables and indexes . <nl> * <nl> @ @ - 402 , 57 + 426 , 86 @ @ public class Keyspace <nl> * @ param writeCommitLog false to disable commitlog append entirely <nl> * @ param updateIndexes false to disable index updates ( used by CollationController " defragmenting " ) <nl> * @ param isClReplay true if caller is the commitlog replayer <nl> + * @ param isDeferrable true if caller is not waiting for future to complete , so that future may be deferred <nl> * / <nl> public CompletableFuture < ? > apply ( final Mutation mutation , <nl> final boolean writeCommitLog , <nl> boolean updateIndexes , <nl> boolean isClReplay , <nl> + boolean isDeferrable , <nl> CompletableFuture < ? > future ) <nl> { <nl> if ( TEST _ FAIL _ WRITES & & metadata . name . equals ( TEST _ FAIL _ WRITES _ KS ) ) <nl> throw new RuntimeException ( " Testing write failures " ) ; <nl> <nl> - Lock lock = null ; <nl> boolean requiresViewUpdate = updateIndexes & & viewManager . updatesAffectView ( Collections . singleton ( mutation ) , false ) ; <nl> final CompletableFuture < ? > mark = future = = null ? new CompletableFuture < > ( ) : future ; <nl> <nl> + Lock lock = null ; <nl> if ( requiresViewUpdate ) <nl> { <nl> mutation . viewLockAcquireStart . compareAndSet ( 0L , System . currentTimeMillis ( ) ) ; <nl> - lock = ViewManager . acquireLockFor ( mutation . key ( ) . getKey ( ) ) ; <nl> - <nl> - if ( lock = = null ) <nl> + while ( true ) <nl> { <nl> - / / avoid throwing a WTE during commitlog replay <nl> - if ( ! isClReplay & & ( System . currentTimeMillis ( ) - mutation . createdAt ) > DatabaseDescriptor . getWriteRpcTimeout ( ) ) <nl> - { <nl> - logger . trace ( " Could not acquire lock for { } " , ByteBufferUtil . bytesToHex ( mutation . key ( ) . getKey ( ) ) ) ; <nl> - Tracing . trace ( " Could not acquire MV lock " ) ; <nl> - if ( future ! = null ) <nl> - future . completeExceptionally ( new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ) ; <nl> - else <nl> - throw new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ; <nl> - } <nl> + if ( TEST _ FAIL _ MV _ LOCKS _ COUNT = = 0 ) <nl> + lock = ViewManager . acquireLockFor ( mutation . key ( ) . getKey ( ) ) ; <nl> else <nl> + TEST _ FAIL _ MV _ LOCKS _ COUNT - - ; <nl> + <nl> + if ( lock = = null ) <nl> { <nl> - / / This view update can ' t happen right now . so rather than keep this thread busy <nl> - / / we will re - apply ourself to the queue and try again later <nl> - StageManager . getStage ( Stage . MUTATION ) . execute ( ( ) - > <nl> - apply ( mutation , writeCommitLog , true , isClReplay , mark ) <nl> - ) ; <nl> + / / avoid throwing a WTE during commitlog replay <nl> + if ( ! isClReplay & & ( System . currentTimeMillis ( ) - mutation . createdAt ) > DatabaseDescriptor . getWriteRpcTimeout ( ) ) <nl> + { <nl> + logger . trace ( " Could not acquire lock for { } " , ByteBufferUtil . bytesToHex ( mutation . key ( ) . getKey ( ) ) ) ; <nl> + Tracing . trace ( " Could not acquire MV lock " ) ; <nl> + if ( future ! = null ) <nl> + { <nl> + future . completeExceptionally ( new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ) ; <nl> + return mark ; <nl> + } <nl> + else <nl> + { <nl> + throw new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ; <nl> + } <nl> + } <nl> + else if ( isDeferrable ) <nl> + { <nl> + / / This view update can ' t happen right now . so rather than keep this thread busy <nl> + / / we will re - apply ourself to the queue and try again later <nl> + StageManager . getStage ( Stage . MUTATION ) . execute ( ( ) - > <nl> + apply ( mutation , writeCommitLog , true , isClReplay , mark ) <nl> + ) ; <nl> <nl> - return mark ; <nl> + return mark ; <nl> + } <nl> + else <nl> + { <nl> + / / Retry lock on same thread , if mutation is not deferrable . <nl> + / / Mutation is not deferrable , if applied from MutationStage and caller is waiting for future to finish <nl> + / / If blocking caller defers future , this may lead to deadlock situation with all MutationStage workers <nl> + / / being blocked by waiting for futures which will never be processed as all workers are blocked <nl> + try <nl> + { <nl> + / / Wait a little bit before retrying to lock <nl> + Thread . sleep ( 10 ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + / / Just continue <nl> + } <nl> + / / continue in while loop <nl> + } <nl> } <nl> - } <nl> - else <nl> - { <nl> - long acquireTime = System . currentTimeMillis ( ) - mutation . viewLockAcquireStart . get ( ) ; <nl> - if ( ! isClReplay ) <nl> + else <nl> { <nl> - for ( UUID cfid : mutation . getColumnFamilyIds ( ) ) <nl> + long acquireTime = System . currentTimeMillis ( ) - mutation . viewLockAcquireStart . get ( ) ; <nl> + if ( ! isClReplay ) <nl> { <nl> - columnFamilyStores . get ( cfid ) . metric . viewLockAcquireTime . update ( acquireTime , TimeUnit . MILLISECONDS ) ; <nl> + for ( UUID cfid : mutation . getColumnFamilyIds ( ) ) <nl> + columnFamilyStores . get ( cfid ) . metric . viewLockAcquireTime . update ( acquireTime , TimeUnit . MILLISECONDS ) ; <nl> } <nl> + break ; <nl> } <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / Mutation . java b / src / java / org / apache / cassandra / db / Mutation . java <nl> index c6ad9b8 . . 2955677 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Mutation . java <nl> + + + b / src / java / org / apache / cassandra / db / Mutation . java <nl> @ @ - 199 , 22 + 199 , 18 @ @ public class Mutation implements IMutation <nl> return new Mutation ( ks , key , modifications ) ; <nl> } <nl> <nl> - private CompletableFuture < ? > applyFuture ( boolean durableWrites ) <nl> - { <nl> - Keyspace ks = Keyspace . open ( keyspaceName ) ; <nl> - return ks . apply ( this , durableWrites ) ; <nl> - } <nl> - <nl> public CompletableFuture < ? > applyFuture ( ) <nl> { <nl> - return applyFuture ( Keyspace . open ( keyspaceName ) . getMetadata ( ) . params . durableWrites ) ; <nl> + Keyspace ks = Keyspace . open ( keyspaceName ) ; <nl> + return ks . apply ( this , Keyspace . open ( keyspaceName ) . getMetadata ( ) . params . durableWrites ) ; <nl> } <nl> <nl> public void apply ( boolean durableWrites ) <nl> { <nl> try <nl> { <nl> - Uninterruptibles . getUninterruptibly ( applyFuture ( durableWrites ) ) ; <nl> + Keyspace ks = Keyspace . open ( keyspaceName ) ; <nl> + Uninterruptibles . getUninterruptibly ( ks . applyNotDeferrable ( this , durableWrites ) ) ; <nl> } <nl> catch ( ExecutionException e ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / service / paxos / PaxosState . java b / src / java / org / apache / cassandra / service / paxos / PaxosState . java <nl> index e01f568 . . 0940950 100644 <nl> - - - a / src / java / org / apache / cassandra / service / paxos / PaxosState . java <nl> + + + b / src / java / org / apache / cassandra / service / paxos / PaxosState . java <nl> @ @ - 149 , 7 + 149 , 7 @ @ public class PaxosState <nl> Mutation mutation = proposal . makeMutation ( ) ; <nl> try <nl> { <nl> - Uninterruptibles . getUninterruptibly ( Keyspace . open ( mutation . getKeyspaceName ( ) ) . apply ( mutation , true ) ) ; <nl> + Uninterruptibles . getUninterruptibly ( Keyspace . open ( mutation . getKeyspaceName ( ) ) . applyNotDeferrable ( mutation , true ) ) ; <nl> } <nl> catch ( ExecutionException e ) <nl> {
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index bf1e7d6 . . c80e045 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 10 
+ + * Avoid deadlock due to materialized view lock contention ( CASSANDRA - 12689 ) 
+ * Fix for KeyCacheCqlTest flakiness ( CASSANDRA - 12801 ) 
+ * Include SSTable filename in compacting large row message ( CASSANDRA - 12384 ) 
+ * Fix potential socket leak ( CASSANDRA - 12329 , CASSANDRA - 12330 ) 
+ diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ index baea210 . . 7b32a34 100644 
+ - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ @ @ - 392 , 7 + 392 , 7 @ @ public class DatabaseDescriptor 
+ throw new ConfigurationException ( " concurrent _ reads must be at least 2 , but was " + conf . concurrent _ reads , false ) ; 
+ } 
+ 
+ - if ( conf . concurrent _ writes ! = null & & conf . concurrent _ writes < 2 ) 
+ + if ( conf . concurrent _ writes ! = null & & conf . concurrent _ writes < 2 & & System . getProperty ( " cassandra . test . fail _ mv _ locks _ count " , " " ) . isEmpty ( ) ) 
+ { 
+ throw new ConfigurationException ( " concurrent _ writes must be at least 2 , but was " + conf . concurrent _ writes , false ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / Keyspace . java b / src / java / org / apache / cassandra / db / Keyspace . java 
+ index 8d710d1 . . 75aab8f 100644 
+ - - - a / src / java / org / apache / cassandra / db / Keyspace . java 
+ + + + b / src / java / org / apache / cassandra / db / Keyspace . java 
+ @ @ - 63 , 6 + 63 , 7 @ @ public class Keyspace 
+ 
+ private static final String TEST _ FAIL _ WRITES _ KS = System . getProperty ( " cassandra . test . fail _ writes _ ks " , " " ) ; 
+ private static final boolean TEST _ FAIL _ WRITES = ! TEST _ FAIL _ WRITES _ KS . isEmpty ( ) ; 
+ + private static int TEST _ FAIL _ MV _ LOCKS _ COUNT = Integer . getInteger ( System . getProperty ( " cassandra . test . fail _ mv _ locks _ count " , " 0 " ) , 0 ) ; 
+ 
+ public final KeyspaceMetrics metric ; 
+ 
+ @ @ - 384 , 6 + 385 , 20 @ @ public class Keyspace 
+ return apply ( mutation , writeCommitLog , true , false , null ) ; 
+ } 
+ 
+ + / * * 
+ + * Should be used if caller is blocking and runs in mutation stage . 
+ + * Otherwise there is a race condition where ALL mutation workers are beeing blocked ending 
+ + * in a complete deadlock of the mutation stage . See CASSANDRA - 12689 . 
+ + * 
+ + * @ param mutation 
+ + * @ param writeCommitLog 
+ + * @ return 
+ + * / 
+ + public CompletableFuture < ? > applyNotDeferrable ( Mutation mutation , boolean writeCommitLog ) 
+ + { 
+ + return apply ( mutation , writeCommitLog , true , false , false , null ) ; 
+ + } 
+ + 
+ public CompletableFuture < ? > apply ( Mutation mutation , boolean writeCommitLog , boolean updateIndexes ) 
+ { 
+ return apply ( mutation , writeCommitLog , updateIndexes , false , null ) ; 
+ @ @ - 394 , 6 + 409 , 15 @ @ public class Keyspace 
+ return apply ( mutation , false , true , true , null ) ; 
+ } 
+ 
+ + public CompletableFuture < ? > apply ( final Mutation mutation , 
+ + final boolean writeCommitLog , 
+ + boolean updateIndexes , 
+ + boolean isClReplay , 
+ + CompletableFuture < ? > future ) 
+ + { 
+ + return apply ( mutation , writeCommitLog , updateIndexes , isClReplay , true , future ) ; 
+ + } 
+ + 
+ / * * 
+ * This method appends a row to the global CommitLog , then updates memtables and indexes . 
+ * 
+ @ @ - 402 , 57 + 426 , 86 @ @ public class Keyspace 
+ * @ param writeCommitLog false to disable commitlog append entirely 
+ * @ param updateIndexes false to disable index updates ( used by CollationController " defragmenting " ) 
+ * @ param isClReplay true if caller is the commitlog replayer 
+ + * @ param isDeferrable true if caller is not waiting for future to complete , so that future may be deferred 
+ * / 
+ public CompletableFuture < ? > apply ( final Mutation mutation , 
+ final boolean writeCommitLog , 
+ boolean updateIndexes , 
+ boolean isClReplay , 
+ + boolean isDeferrable , 
+ CompletableFuture < ? > future ) 
+ { 
+ if ( TEST _ FAIL _ WRITES & & metadata . name . equals ( TEST _ FAIL _ WRITES _ KS ) ) 
+ throw new RuntimeException ( " Testing write failures " ) ; 
+ 
+ - Lock lock = null ; 
+ boolean requiresViewUpdate = updateIndexes & & viewManager . updatesAffectView ( Collections . singleton ( mutation ) , false ) ; 
+ final CompletableFuture < ? > mark = future = = null ? new CompletableFuture < > ( ) : future ; 
+ 
+ + Lock lock = null ; 
+ if ( requiresViewUpdate ) 
+ { 
+ mutation . viewLockAcquireStart . compareAndSet ( 0L , System . currentTimeMillis ( ) ) ; 
+ - lock = ViewManager . acquireLockFor ( mutation . key ( ) . getKey ( ) ) ; 
+ - 
+ - if ( lock = = null ) 
+ + while ( true ) 
+ { 
+ - / / avoid throwing a WTE during commitlog replay 
+ - if ( ! isClReplay & & ( System . currentTimeMillis ( ) - mutation . createdAt ) > DatabaseDescriptor . getWriteRpcTimeout ( ) ) 
+ - { 
+ - logger . trace ( " Could not acquire lock for { } " , ByteBufferUtil . bytesToHex ( mutation . key ( ) . getKey ( ) ) ) ; 
+ - Tracing . trace ( " Could not acquire MV lock " ) ; 
+ - if ( future ! = null ) 
+ - future . completeExceptionally ( new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ) ; 
+ - else 
+ - throw new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ; 
+ - } 
+ + if ( TEST _ FAIL _ MV _ LOCKS _ COUNT = = 0 ) 
+ + lock = ViewManager . acquireLockFor ( mutation . key ( ) . getKey ( ) ) ; 
+ else 
+ + TEST _ FAIL _ MV _ LOCKS _ COUNT - - ; 
+ + 
+ + if ( lock = = null ) 
+ { 
+ - / / This view update can ' t happen right now . so rather than keep this thread busy 
+ - / / we will re - apply ourself to the queue and try again later 
+ - StageManager . getStage ( Stage . MUTATION ) . execute ( ( ) - > 
+ - apply ( mutation , writeCommitLog , true , isClReplay , mark ) 
+ - ) ; 
+ + / / avoid throwing a WTE during commitlog replay 
+ + if ( ! isClReplay & & ( System . currentTimeMillis ( ) - mutation . createdAt ) > DatabaseDescriptor . getWriteRpcTimeout ( ) ) 
+ + { 
+ + logger . trace ( " Could not acquire lock for { } " , ByteBufferUtil . bytesToHex ( mutation . key ( ) . getKey ( ) ) ) ; 
+ + Tracing . trace ( " Could not acquire MV lock " ) ; 
+ + if ( future ! = null ) 
+ + { 
+ + future . completeExceptionally ( new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ) ; 
+ + return mark ; 
+ + } 
+ + else 
+ + { 
+ + throw new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ; 
+ + } 
+ + } 
+ + else if ( isDeferrable ) 
+ + { 
+ + / / This view update can ' t happen right now . so rather than keep this thread busy 
+ + / / we will re - apply ourself to the queue and try again later 
+ + StageManager . getStage ( Stage . MUTATION ) . execute ( ( ) - > 
+ + apply ( mutation , writeCommitLog , true , isClReplay , mark ) 
+ + ) ; 
+ 
+ - return mark ; 
+ + return mark ; 
+ + } 
+ + else 
+ + { 
+ + / / Retry lock on same thread , if mutation is not deferrable . 
+ + / / Mutation is not deferrable , if applied from MutationStage and caller is waiting for future to finish 
+ + / / If blocking caller defers future , this may lead to deadlock situation with all MutationStage workers 
+ + / / being blocked by waiting for futures which will never be processed as all workers are blocked 
+ + try 
+ + { 
+ + / / Wait a little bit before retrying to lock 
+ + Thread . sleep ( 10 ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + / / Just continue 
+ + } 
+ + / / continue in while loop 
+ + } 
+ } 
+ - } 
+ - else 
+ - { 
+ - long acquireTime = System . currentTimeMillis ( ) - mutation . viewLockAcquireStart . get ( ) ; 
+ - if ( ! isClReplay ) 
+ + else 
+ { 
+ - for ( UUID cfid : mutation . getColumnFamilyIds ( ) ) 
+ + long acquireTime = System . currentTimeMillis ( ) - mutation . viewLockAcquireStart . get ( ) ; 
+ + if ( ! isClReplay ) 
+ { 
+ - columnFamilyStores . get ( cfid ) . metric . viewLockAcquireTime . update ( acquireTime , TimeUnit . MILLISECONDS ) ; 
+ + for ( UUID cfid : mutation . getColumnFamilyIds ( ) ) 
+ + columnFamilyStores . get ( cfid ) . metric . viewLockAcquireTime . update ( acquireTime , TimeUnit . MILLISECONDS ) ; 
+ } 
+ + break ; 
+ } 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / Mutation . java b / src / java / org / apache / cassandra / db / Mutation . java 
+ index c6ad9b8 . . 2955677 100644 
+ - - - a / src / java / org / apache / cassandra / db / Mutation . java 
+ + + + b / src / java / org / apache / cassandra / db / Mutation . java 
+ @ @ - 199 , 22 + 199 , 18 @ @ public class Mutation implements IMutation 
+ return new Mutation ( ks , key , modifications ) ; 
+ } 
+ 
+ - private CompletableFuture < ? > applyFuture ( boolean durableWrites ) 
+ - { 
+ - Keyspace ks = Keyspace . open ( keyspaceName ) ; 
+ - return ks . apply ( this , durableWrites ) ; 
+ - } 
+ - 
+ public CompletableFuture < ? > applyFuture ( ) 
+ { 
+ - return applyFuture ( Keyspace . open ( keyspaceName ) . getMetadata ( ) . params . durableWrites ) ; 
+ + Keyspace ks = Keyspace . open ( keyspaceName ) ; 
+ + return ks . apply ( this , Keyspace . open ( keyspaceName ) . getMetadata ( ) . params . durableWrites ) ; 
+ } 
+ 
+ public void apply ( boolean durableWrites ) 
+ { 
+ try 
+ { 
+ - Uninterruptibles . getUninterruptibly ( applyFuture ( durableWrites ) ) ; 
+ + Keyspace ks = Keyspace . open ( keyspaceName ) ; 
+ + Uninterruptibles . getUninterruptibly ( ks . applyNotDeferrable ( this , durableWrites ) ) ; 
+ } 
+ catch ( ExecutionException e ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / service / paxos / PaxosState . java b / src / java / org / apache / cassandra / service / paxos / PaxosState . java 
+ index e01f568 . . 0940950 100644 
+ - - - a / src / java / org / apache / cassandra / service / paxos / PaxosState . java 
+ + + + b / src / java / org / apache / cassandra / service / paxos / PaxosState . java 
+ @ @ - 149 , 7 + 149 , 7 @ @ public class PaxosState 
+ Mutation mutation = proposal . makeMutation ( ) ; 
+ try 
+ { 
+ - Uninterruptibles . getUninterruptibly ( Keyspace . open ( mutation . getKeyspaceName ( ) ) . apply ( mutation , true ) ) ; 
+ + Uninterruptibles . getUninterruptibly ( Keyspace . open ( mutation . getKeyspaceName ( ) ) . applyNotDeferrable ( mutation , true ) ) ; 
+ } 
+ catch ( ExecutionException e ) 
+ {
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

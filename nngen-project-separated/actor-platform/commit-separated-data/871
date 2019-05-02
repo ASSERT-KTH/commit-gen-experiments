@@ -1,0 +1,703 @@
+BLEU SCORE: 0.254331431291972
+
+TEST MSG: fix ( server : webrtc ) : group calls
+GENERATED MSG: fix ( server : messaging ) : keep right order of messages
+
+TEST DIFF (one line): diff - - git a / actor - server / actor - core / src / main / scala / im / actor / api / rpc . scala b / actor - server / actor - core / src / main / scala / im / actor / api / rpc . scala < nl > index 2afc3f8 . . 84ca8a1 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / api / rpc . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / api / rpc . scala < nl > @ @ - 9 , 7 + 9 , 7 @ @ import scala . concurrent . { ExecutionContext , Future } < nl > import scala . reflect . ClassTag < nl > import scalaz . _ , Scalaz . _ < nl > < nl > - package object rpc extends { < nl > + package object rpc extends PeersImplicits with HistoryImplicits { < nl > < nl > import slick . dbio . NoStream < nl > < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / WeakUpdatesExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / WeakUpdatesExtension . scala < nl > index 95c95dc . . 691a8cd 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / WeakUpdatesExtension . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / WeakUpdatesExtension . scala < nl > @ @ - 22 , 7 + 22 , 10 @ @ final class WeakUpdatesExtensionImpl ( system : ActorSystem ) extends WeakUpdatesExt < nl > private val region = WeakUpdatesManagerRegion . startRegion ( ) ( system ) < nl > private lazy val userExt = UserExtension ( system ) < nl > < nl > - def broadcastUserWeakUpdate ( userId : Int , update : Update , reduceKey : Option [ String ] , group : Option [ String ] = None ) : Future [ Unit ] = { < nl > + def broadcastUsersWeakUpdate ( userIds : Seq [ Int ] , update : Update , reduceKey : Option [ String ] = None , group : Option [ String ] = None ) : Future [ Unit ] = < nl > + Future . sequence ( userIds map ( broadcastUserWeakUpdate ( _ , update , reduceKey , group ) ) ) map ( _ ⇒ ( ) ) < nl > + < nl > + def broadcastUserWeakUpdate ( userId : Int , update : Update , reduceKey : Option [ String ] = None , group : Option [ String ] = None ) : Future [ Unit ] = { < nl > val header = update . header < nl > val serializedData = update . toByteArray < nl > val msg = PushUpdate ( header , serializedData , reduceKey , group ) < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala < nl > index 1f3c6f7 . . 9d5184d 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala < nl > @ @ - 1 , 15 + 1 , 16 @ @ < nl > package im . actor . server . webrtc < nl > < nl > import akka . actor . _ < nl > + import akka . http . scaladsl . util . FastFuture < nl > import akka . pattern . pipe < nl > import im . actor . api . rpc . messaging . { ApiServiceMessage , ApiServiceExPhoneCall } < nl > import im . actor . api . rpc . peers . { ApiPeerType , ApiPeer } < nl > import im . actor . api . rpc . webrtc . _ < nl > - import im . actor . concurrent . ActorStashing < nl > - import im . actor . server . db . DbExtension < nl > + import im . actor . concurrent . { FutureExt , ActorStashing } < nl > import im . actor . server . dialog . DialogExtension < nl > import im . actor . server . eventbus . { EventBus , EventBusExtension } < nl > - import im . actor . server . persist . webrtc . WebrtcCallRepo < nl > + import im . actor . server . group . GroupExtension < nl > + import im . actor . server . model . { PeerType , Peer } < nl > import im . actor . server . sequence . WeakUpdatesExtension < nl > import im . actor . types . _ < nl > < nl > @ @ - 27 , 7 + 28 , 7 @ @ object WebrtcCallErrors { < nl > sealed trait WebrtcCallMessage < nl > < nl > object WebrtcCallMessages { < nl > - final case class StartCall ( callerUserId : Int , receiverUserId : Int , eventBusId : String ) extends WebrtcCallMessage < nl > + final case class StartCall ( callerUserId : Int , peer : Peer , eventBusId : String ) extends WebrtcCallMessage < nl > case object StartCallAck < nl > < nl > case object GetInfo extends WebrtcCallMessage < nl > @ @ - 53 , 28 + 54 , 30 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { < nl > private lazy val weakUpdExt = WeakUpdatesExtension ( context . system ) < nl > private lazy val dialogExt = DialogExtension ( context . system ) < nl > private lazy val eventBusExt = EventBusExtension ( context . system ) < nl > - private val db = DbExtension ( context . system ) . db < nl > + private lazy val groupExt = GroupExtension ( context . system ) < nl > < nl > private var scheduledUpd : Option [ Cancellable ] = None < nl > < nl > def receive = waitForStart < nl > < nl > def waitForStart : Receive = { < nl > - case StartCall ( callerUserId , receiverUserId , eventBusId ) ⇒ < nl > + case StartCall ( callerUserId , peer , eventBusId ) ⇒ < nl > + case class Res ( callees : Seq [ Int ] , schedUpd : Cancellable ) < nl > + < nl > val update = UpdateIncomingCall ( id ) < nl > < nl > ( for { < nl > - _ ← db . run ( WebrtcCallRepo . create ( WebrtcCall ( id , callerUserId , receiverUserId ) ) ) < nl > + callees ← fetchParticipants ( callerUserId , peer ) map ( _ filterNot ( _ = = callerUserId ) ) < nl > _ ← eventBusExt . subscribe ( eventBusId , self ) < nl > - } yield context . system . scheduler . schedule ( 0 . seconds , 5 . seconds ) { < nl > - weakUpdExt . broadcastUserWeakUpdate ( receiverUserId , update , None , None ) < nl > - } ) pipeTo self < nl > + } yield Res ( callees , context . system . scheduler . schedule ( 0 . seconds , 5 . seconds ) { < nl > + weakUpdExt . broadcastUsersWeakUpdate ( callees , update , None , None ) < nl > + } ) ) pipeTo self < nl > < nl > becomeStashing ( replyTo ⇒ { < nl > - case schedUpd : Cancellable ⇒ < nl > + case Res ( callees , schedUpd ) ⇒ < nl > this . scheduledUpd = Some ( schedUpd ) < nl > replyTo ! StartCallAck < nl > - context become callInProgress ( eventBusId , System . currentTimeMillis ( ) , callerUserId , receiverUserId ) < nl > + context become callInProgress ( eventBusId , System . currentTimeMillis ( ) , callerUserId , callees : + callerUserId ) < nl > unstashAll ( ) < nl > case failure : Status . Failure ⇒ < nl > replyTo forward failure < nl > @ @ - 84 , 24 + 87 , 23 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { < nl > } < nl > < nl > def callInProgress ( < nl > - eventBusId : String , < nl > - startTime : Long , < nl > - callerUserId : Int , < nl > - receiverUserId : Int < nl > + eventBusId : String , < nl > + startTime : Long , < nl > + callerUserId : Int , < nl > + participants : Seq [ Int ] < nl > ) : Receive = { < nl > def end ( ) : Unit = { < nl > val duration = ( ( System . currentTimeMillis ( ) - startTime ) / 1000 ) . toInt < nl > < nl > ( for { < nl > - _ ← dialogExt . sendMessage ( < nl > - peer = ApiPeer ( ApiPeerType . Private , receiverUserId ) , < nl > + _ ← FutureExt . ftraverse ( participants ) ( userId ⇒ dialogExt . sendMessage ( < nl > + peer = ApiPeer ( ApiPeerType . Private , userId ) , < nl > senderUserId = callerUserId , < nl > senderAuthId = None , < nl > senderAuthSid = 0 , < nl > randomId = ThreadLocalRandom . current ( ) . nextLong , < nl > message = ApiServiceMessage ( " Call ended " , Some ( ApiServiceExPhoneCall ( duration ) ) ) < nl > - ) < nl > - _ ← db . run ( WebrtcCallRepo . delete ( id ) ) < nl > + ) ) < nl > } yield PoisonPill ) pipeTo self onFailure { < nl > case e ⇒ < nl > log . error ( e , " Failed to stop call " ) < nl > @ @ - 109 , 32 + 111 , 31 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { < nl > } < nl > } < nl > < nl > - def withOrigin ( origin : Int ) ( f : Int ⇒ Any ) = < nl > - if ( callerUserId = = origin ) < nl > - f ( receiverUserId ) < nl > - else if ( receiverUserId = = origin ) < nl > - f ( callerUserId ) < nl > - else < nl > - sender ( ) ! Status . Failure ( WebrtcCallErrors . NotAParticipant ) < nl > - < nl > { < nl > case EventBus . Disposed ( _ ) ⇒ end ( ) < nl > case EventBus . Message ( _ , userId , message ) ⇒ < nl > ApiWebRTCSignaling . parseFrom ( message ) . right foreach { < nl > case ApiAnswerCall ⇒ < nl > scheduledUpd foreach ( _ . cancel ( ) ) < nl > - context become callInProgress ( eventBusId , System . currentTimeMillis ( ) , callerUserId , receiverUserId ) < nl > + context become callInProgress ( eventBusId , System . currentTimeMillis ( ) , callerUserId , participants ) < nl > case ApiEndCall ⇒ < nl > scheduledUpd foreach ( _ . cancel ( ) ) < nl > - withOrigin ( userId ) ( _ ⇒ end ( ) ) < nl > + end ( ) < nl > case _ ⇒ < nl > } < nl > case GetInfo ⇒ < nl > - sender ( ) ! GetInfoAck ( eventBusId , callerUserId , Seq ( callerUserId , receiverUserId ) ) < nl > + sender ( ) ! GetInfoAck ( eventBusId , callerUserId , participants ) < nl > case _ : StartCall ⇒ sender ( ) ! WebrtcCallErrors . CallAlreadyStarted < nl > } < nl > } < nl > < nl > + private def fetchParticipants ( callerUserId : Int , peer : Peer ) = < nl > + peer match { < nl > + case Peer ( PeerType . Private , userId ) ⇒ FastFuture . successful ( Seq ( callerUserId , userId ) ) < nl > + case Peer ( PeerType . Group , groupId ) ⇒ groupExt . getMemberIds ( groupId ) map ( _ . _ 1 ) < nl > + case _ ⇒ FastFuture . failed ( new RuntimeException ( s " Unknown peer type : $ { peer . ` type ` } " ) ) < nl > + } < nl > + < nl > override def postStop ( ) : Unit = { < nl > scheduledUpd foreach ( _ . cancel ( ) ) < nl > super . postStop ( ) < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcExtension . scala < nl > index cab508a . . 8775a09 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcExtension . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcExtension . scala < nl > @ @ - 6 , 6 + 6 , 7 @ @ import akka . cluster . sharding . ShardRegion . { ExtractShardId , ExtractEntityId } < nl > import akka . cluster . sharding . { ClusterShardingSettings , ClusterSharding } < nl > import akka . util . Timeout < nl > import im . actor . config . ActorConfig < nl > + import im . actor . server . model . Peer < nl > import im . actor . types . _ < nl > < nl > import scala . concurrent . Future < nl > @ @ - 33 , 10 + 34 , 10 @ @ final class WebrtcExtension ( system : ActorSystem ) extends Extension { < nl > ClusterSharding ( system ) < nl > . start ( " WebrtcCall " , WebrtcCallActor . props , ClusterShardingSettings ( system ) , extractEntityId , extractShardId ) < nl > < nl > - def doCall ( callerUserId : Int , receiverUserId : Int , eventBusId : String ) : Future [ Long ] = { < nl > + def doCall ( callerUserId : Int , peer : Peer , eventBusId : String ) : Future [ Long ] = { < nl > val callId = ThreadLocalRandom . current ( ) . nextLong ( ) < nl > < nl > - region ? WebrtcCallEnvelope ( callId , StartCall ( callerUserId , receiverUserId , eventBusId ) ) map ( _ ⇒ callId ) < nl > + region ? WebrtcCallEnvelope ( callId , StartCall ( callerUserId , peer , eventBusId ) ) map ( _ ⇒ callId ) < nl > } < nl > < nl > def getInfo ( callId : Long ) : Future [ ( String , UserId , Seq [ UserId ] ) ] = < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / webrtc / WebrtcServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / webrtc / WebrtcServiceImpl . scala < nl > index 442d896 . . 489af19 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / webrtc / WebrtcServiceImpl . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / webrtc / WebrtcServiceImpl . scala < nl > @ @ - 1 , 15 + 1 , 13 @ @ < nl > package im . actor . server . api . rpc . service . webrtc < nl > < nl > import akka . actor . ActorSystem < nl > - import akka . http . scaladsl . util . FastFuture < nl > import im . actor . api . rpc . _ < nl > - import im . actor . api . rpc . misc . ResponseVoid < nl > import im . actor . api . rpc . peers . { ApiPeerType , ApiPeer , ApiOutPeer } < nl > import im . actor . api . rpc . webrtc . { ResponseGetCallInfo , ResponseDoCall , WebrtcService } < nl > import im . actor . concurrent . FutureExt < nl > import im . actor . server . acl . ACLUtils < nl > import im . actor . server . session . _ < nl > - import im . actor . server . webrtc . { WebrtcCallErrors , WebrtcExtension , Webrtc } < nl > + import im . actor . server . webrtc . { WebrtcCallErrors , WebrtcExtension } < nl > < nl > import scala . concurrent . { ExecutionContext , Future } < nl > < nl > @ @ - 38 , 7 + 36 , 7 @ @ final class WebrtcServiceImpl ( implicit system : ActorSystem , sessionRegion : Sessi < nl > authorized ( clientData ) { implicit client ⇒ < nl > withOutPeerF ( peer ) { < nl > for { < nl > - callId ← webrtcExt . doCall ( client . userId , peer . id , eventBusId ) < nl > + callId ← webrtcExt . doCall ( client . userId , peer . asModel , eventBusId ) < nl > } yield Ok ( ResponseDoCall ( callId ) ) < nl > } < nl > }
+NEAREST DIFF (one line): diff - - git a / actor - server / actor - bots / src / main / scala / im / actor / server / bot / services / MessagingBotService . scala b / actor - server / actor - bots / src / main / scala / im / actor / server / bot / services / MessagingBotService . scala < nl > index cf4172b . . 6a28636 100644 < nl > - - - a / actor - server / actor - bots / src / main / scala / im / actor / server / bot / services / MessagingBotService . scala < nl > + + + b / actor - server / actor - bots / src / main / scala / im / actor / server / bot / services / MessagingBotService . scala < nl > @ @ - 18 , 14 + 18 , 15 @ @ private [ bot ] final class MessagingBotService ( system : ActorSystem ) extends BotSer < nl > < nl > private def sendMessage ( peer : OutPeer , randomId : Long , message : MessageBody ) = RequestHandler [ SendMessage , SendMessage # Response ] ( < nl > ( botUserId : BotUserId , botAuthId : BotAuthId , botAuthSid : BotAuthSid ) ⇒ { < nl > - / / FIXME : check access hash < nl > for { < nl > SeqStateDate ( _ , _ , date ) ← dialogExt . sendMessage ( < nl > peer = peer , < nl > senderUserId = botUserId , < nl > senderAuthSid = botAuthSid , < nl > + senderAuthId = Some ( botAuthId ) , < nl > randomId = randomId , < nl > message = message , < nl > + accessHash = Some ( peer . accessHash ) , < nl > isFat = false < nl > ) < nl > } yield Right ( MessageSent ( date ) ) < nl > diff - - git a / actor - server / actor - core / src / main / protobuf / dialog . proto b / actor - server / actor - core / src / main / protobuf / dialog . proto < nl > index 5e056a6 . . 6ffb082 100644 < nl > - - - a / actor - server / actor - core / src / main / protobuf / dialog . proto < nl > + + + b / actor - server / actor - core / src / main / protobuf / dialog . proto < nl > @ @ - 62 , 9 + 62 , 11 @ @ message DialogCommands { < nl > required Peer origin = 7 ; < nl > required Peer dest = 8 ; < nl > required int32 sender _ auth _ sid = 3 ; < nl > + optional int64 sender _ auth _ id = 11 ; < nl > optional int64 date = 9 ; < nl > required int64 random _ id = 4 ; < nl > required bytes message = 5 [ ( scalapb . field ) . type = " im . actor . api . rpc . messaging . ApiMessage " ] ; < nl > + optional int64 access _ hash = 10 ; < nl > required bool is _ fat = 6 ; < nl > } < nl > < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogCommandHandlers . scala b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogCommandHandlers . scala < nl > index 9990cce . . c9231b4 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogCommandHandlers . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogCommandHandlers . scala < nl > @ @ - 43 , 21 + 43 , 27 @ @ trait DialogCommandHandlers extends UpdateCounters with PeersImplicits { < nl > unstashAll ( ) < nl > } : Receive ) orElse reactions ( state ) , discardOld = true ) < nl > < nl > - withCachedFuture [ AuthSidRandomId , SeqStateDate ] ( sm . senderAuthSid → sm . randomId ) { < nl > - val sendDate = calcSendDate ( state ) < nl > - val message = sm . message < nl > - PubSubExtension ( system ) . publish ( PeerMessage ( sm . origin , sm . dest , sm . randomId , sendDate , message ) ) < nl > - ( for { < nl > - _ ← dialogExt . ackSendMessage ( peer , sm . copy ( date = Some ( sendDate ) ) ) < nl > - _ ← db . run ( writeHistoryMessage ( selfPeer , peer , new DateTime ( sendDate ) , sm . randomId , message . header , message . toByteArray ) ) < nl > - _ ← dialogExt . updateCounters ( peer , userId ) < nl > - SeqState ( seq , state ) ← deliveryExt . senderDelivery ( userId , sm . senderAuthSid , peer , sm . randomId , sendDate , message , sm . isFat ) < nl > - } yield SeqStateDate ( seq , state , sendDate ) ) recover { < nl > - case e ⇒ < nl > - log . error ( e , " Failed to send message " ) < nl > - throw e < nl > + validateAccessHash ( sm . dest , sm . senderAuthId , sm . accessHash ) map { valid ⇒ < nl > + if ( valid ) { < nl > + withCachedFuture [ AuthSidRandomId , SeqStateDate ] ( sm . senderAuthSid → sm . randomId ) { < nl > + val sendDate = calcSendDate ( state ) < nl > + val message = sm . message < nl > + PubSubExtension ( system ) . publish ( PeerMessage ( sm . origin , sm . dest , sm . randomId , sendDate , message ) ) < nl > + ( for { < nl > + _ ← dialogExt . ackSendMessage ( peer , sm . copy ( date = Some ( sendDate ) ) ) < nl > + _ ← db . run ( writeHistoryMessage ( selfPeer , peer , new DateTime ( sendDate ) , sm . randomId , message . header , message . toByteArray ) ) < nl > + _ ← dialogExt . updateCounters ( peer , userId ) < nl > + SeqState ( seq , state ) ← deliveryExt . senderDelivery ( userId , sm . senderAuthSid , peer , sm . randomId , sendDate , message , sm . isFat ) < nl > + } yield SeqStateDate ( seq , state , sendDate ) ) recover { < nl > + case e ⇒ < nl > + log . error ( e , " Failed to send message " ) < nl > + throw e < nl > + } < nl > + } pipeTo self < nl > + } else { < nl > + self ! Status . Failure ( InvalidAccessHash ) < nl > } < nl > - } pipeTo self < nl > + } < nl > } < nl > } < nl > < nl > @ @ - 307 , 6 + 313 , 7 @ @ trait DialogCommandHandlers extends UpdateCounters with PeersImplicits { < nl > * Yields unique message date in current dialog . < nl > * When ` candidate ` date is same as last message date , we increment ` candidate ` value by 1 , < nl > * thus resulting date can possibly be in future < nl > + * < nl > * @ param state current dialog state < nl > * @ return unique message date in current dialog < nl > * / < nl > @ @ - 369 , 4 + 376 , 20 @ @ trait DialogCommandHandlers extends UpdateCounters with PeersImplicits { < nl > < nl > private def updateUnfavourited ( state : DialogState ) : Unit = < nl > context become initialized ( state . updated ( Unfavourited ) ) < nl > + < nl > + / * * < nl > + * check access hash < nl > + * If ` optAccessHash ` is ` None ` - we simply don ' t check access hash < nl > + * If ` optSenderAuthId ` is None , and we are validating access hash for private peer - it is invalid < nl > + * / < nl > + private def validateAccessHash ( peer : Peer , optSenderAuthId : Option [ Long ] , optAccessHash : Option [ Long ] ) : Future [ Boolean ] = < nl > + optAccessHash map { hash ⇒ < nl > + peer . ` type ` match { < nl > + case PeerType . Private ⇒ < nl > + optSenderAuthId map { authId ⇒ userExt . checkAccessHash ( peer . id , authId , hash ) } getOrElse Future . successful ( false ) < nl > + case PeerType . Group ⇒ < nl > + groupExt . checkAccessHash ( peer . id , hash ) < nl > + case unknown ⇒ throw new RuntimeException ( s " Unknown peer type $ unknown " ) < nl > + } < nl > + } getOrElse Future . successful ( true ) < nl > } < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogErrors . scala b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogErrors . scala < nl > index 9b347cc . . 32c0836 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogErrors . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogErrors . scala < nl > @ @ - 6 , 6 + 6 , 8 @ @ import scala . util . control . NoStackTrace < nl > < nl > abstract class DialogError ( msg : String ) extends RuntimeException ( msg ) with NoStackTrace < nl > < nl > + case object InvalidAccessHash extends RuntimeException with NoStackTrace < nl > + < nl > object DialogErrors { < nl > object MessageToSelf extends DialogError ( " Private dialog with self is not allowed " ) < nl > < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala < nl > index 49cc747 . . 56319de 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala < nl > @ @ - 77 , 11 + 77 , 20 @ @ final class DialogExtensionImpl ( system : ActorSystem ) extends DialogExtension wit < nl > case _ ⇒ f < nl > } < nl > < nl > - def sendMessage ( peer : ApiPeer , senderUserId : Int , senderAuthSid : Int , randomId : Long , message : ApiMessage , isFat : Boolean = false ) : Future [ SeqStateDate ] = < nl > + def sendMessage ( < nl > + peer : ApiPeer , < nl > + senderUserId : Int , < nl > + senderAuthSid : Int , < nl > + senderAuthId : Option [ Long ] , / / required only in case of access hash check for private peer < nl > + randomId : Long , < nl > + message : ApiMessage , < nl > + accessHash : Option [ Long ] = None , < nl > + isFat : Boolean = false < nl > + ) : Future [ SeqStateDate ] = < nl > withValidPeer ( peer . asModel , senderUserId , Future . successful ( SeqStateDate ( ) ) ) { < nl > val sender = Peer . privat ( senderUserId ) < nl > / / we don ' t set date here , cause actual date set inside dialog processor < nl > - val sendMessage = SendMessage ( sender , peer . asModel , senderAuthSid , date = None , randomId , message , isFat ) < nl > + val sendMessage = SendMessage ( sender , peer . asModel , senderAuthSid , senderAuthId , date = None , randomId , message , accessHash , isFat ) < nl > ( userExt . processorRegion . ref ? Envelope ( sender ) . withSendMessage ( sendMessage ) ) . mapTo [ SeqStateDate ] < nl > } < nl > < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogProcessor . scala b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogProcessor . scala < nl > index ad96aba . . e9c0a4d 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogProcessor . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogProcessor . scala < nl > @ @ - 9 , 6 + 9 , 7 @ @ import im . actor . concurrent . { ActorFutures , ActorStashing } < nl > import im . actor . serialization . ActorSerializer < nl > import im . actor . server . cqrs . ProcessorState < nl > import im . actor . server . db . DbExtension < nl > + import im . actor . server . group . GroupExtension < nl > import im . actor . server . model . { Dialog ⇒ DialogModel , PeerType , Peer } < nl > import im . actor . server . persist . dialog . DialogRepo < nl > import im . actor . server . persist . { GroupRepo , UserRepo } < nl > @ @ - 120 , 6 + 121 , 7 @ @ private [ dialog ] final class DialogProcessor ( val userId : Int , val peer : Peer , ext < nl > < nl > protected val db : Database = DbExtension ( system ) . db < nl > protected val userExt = UserExtension ( system ) < nl > + protected val groupExt = GroupExtension ( system ) < nl > protected implicit val socialRegion = SocialExtension ( system ) . region < nl > protected implicit val timeout = Timeout ( 5 . seconds ) < nl > < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / group / GroupCommandHandlers . scala b / actor - server / actor - core / src / main / scala / im / actor / server / group / GroupCommandHandlers . scala < nl > index b4a960b . . e244939 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / group / GroupCommandHandlers . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / group / GroupCommandHandlers . scala < nl > @ @ - 179 , 6 + 179 , 7 @ @ private [ group ] trait GroupCommandHandlers extends GroupsImplicits with GroupComm < nl > peer = ApiPeer ( ApiPeerType . Group , groupId ) , < nl > senderUserId = joiningUserId , < nl > senderAuthSid = joinintUserAuthSid , < nl > + senderAuthId = None , < nl > randomId = randomId , < nl > message = GroupServiceMessages . userJoined , < nl > isFat = true < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala < nl > index 133e35c . . e3b28c5 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala < nl > @ @ - 2 , 22 + 2 , 17 @ @ package im . actor . server . sequence < nl > < nl > import java . util < nl > < nl > - import akka . event . Logging < nl > - < nl > - import scala . collection . JavaConversions . _ < nl > - import scala . concurrent . ExecutionContext < nl > - import scala . concurrent . duration . _ < nl > - < nl > import akka . actor . ActorSystem < nl > - import akka . util . Timeout < nl > + import akka . event . Logging < nl > import com . relayrides . pushy . apns . _ < nl > import com . relayrides . pushy . apns . util . { SSLContextUtil , SimpleApnsPushNotification } < nl > import com . typesafe . config . Config < nl > import im . actor . server . db . ActorPostgresDriver . api . _ < nl > - < nl > import im . actor . server . db . DbExtension < nl > - import im . actor . server . user . { UserProcessorRegion , UserExtension , UserOffice } < nl > < nl > + import scala . collection . JavaConversions . _ < nl > + import scala . concurrent . ExecutionContext < nl > + import scala . concurrent . duration . _ < nl > import scala . util . Try < nl > < nl > case class ApplePushManagerConfig ( certs : List [ ApnsCert ] ) < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOffice . scala b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOffice . scala < nl > index 3757ecc . . d46d310 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOffice . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOffice . scala < nl > @ @ - 1 , 10 + 1 , 5 @ @ < nl > package im . actor . server . user < nl > < nl > - import scala . util . control . NoStackTrace < nl > - < nl > object UserOffice { < nl > - < nl > - case object InvalidAccessHash extends Exception with NoStackTrace < nl > - < nl > def persistenceIdFor ( userId : Int ) : String = s " User - $ { userId } " < nl > } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / webhooks / http / routes / IngoingHooks . scala b / actor - server / actor - core / src / main / scala / im / actor / server / webhooks / http / routes / IngoingHooks . scala < nl > index 441447c . . e71858b 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / webhooks / http / routes / IngoingHooks . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / webhooks / http / routes / IngoingHooks . scala < nl > @ @ - 51 , 7 + 51 , 7 @ @ trait IngoingHooks extends ContentUnmarshaller with PlayJsonSupport { < nl > for { < nl > ( _ , _ , optBot ) ← GroupExtension ( system ) . getMemberIds ( groupId ) < nl > _ ← optBot map { botId ⇒ < nl > - DialogExtension ( system ) . sendMessage ( ApiPeer ( ApiPeerType . Group , groupId ) , botId , 0 , ThreadLocalRandom . current ( ) . nextLong ( ) , message ) < nl > + DialogExtension ( system ) . sendMessage ( ApiPeer ( ApiPeerType . Group , groupId ) , botId , 0 , None , ThreadLocalRandom . current ( ) . nextLong ( ) , message ) < nl > } getOrElse Future . successful ( Left ( StatusCodes . NotAcceptable ) ) < nl > } yield Right ( ( ) ) < nl > } getOrElse Future . successful ( Left ( StatusCodes . BadRequest ) ) < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala < nl > index ea6955d . . 6426753 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala < nl > @ @ - 94 , 6 + 94 , 7 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { < nl > _ ← dialogExt . sendMessage ( < nl > peer = ApiPeer ( ApiPeerType . Private , receiverUserId ) , < nl > senderUserId = callerUserId , < nl > + senderAuthId = None , < nl > senderAuthSid = 0 , < nl > randomId = ThreadLocalRandom . current ( ) . nextLong , < nl > message = ApiServiceMessage ( " Call ended " , Some ( ApiServiceExPhoneCall ( duration ) ) ) < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / messaging / MessagingHandlers . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / messaging / MessagingHandlers . scala < nl > index 42a9912 . . 13704c1 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / messaging / MessagingHandlers . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / messaging / MessagingHandlers . scala < nl > @ @ - 7 , 7 + 7 , 7 @ @ import im . actor . api . rpc . messaging . _ < nl > import im . actor . api . rpc . misc . _ < nl > import im . actor . api . rpc . peers . _ < nl > import im . actor . config . ActorConfig < nl > - import im . actor . server . dialog . DialogErrors < nl > + import im . actor . server . dialog . { InvalidAccessHash , DialogErrors } < nl > import im . actor . server . group . GroupErrors < nl > import im . actor . server . sequence . SeqStateDate < nl > < nl > @ @ - 23 , 26 + 23 , 20 @ @ private [ messaging ] trait MessagingHandlers { < nl > < nl > override def jhandleSendMessage ( outPeer : ApiOutPeer , randomId : Long , message : ApiMessage , clientData : ClientData ) : Future [ HandlerResult [ ResponseSeqDate ] ] = < nl > authorized ( clientData ) { implicit client ⇒ < nl > - val accessHashCheck = outPeer . ` type ` match { < nl > - case ApiPeerType . Private ⇒ userExt . checkAccessHash ( outPeer . id , client . authId , outPeer . accessHash ) < nl > - case ApiPeerType . Group ⇒ groupExt . checkAccessHash ( outPeer . id , outPeer . accessHash ) < nl > - } < nl > - val seqstateAction = for { < nl > - isChecked ← fromFuture ( accessHashCheck ) < nl > - _ ← fromBoolean ( CommonErrors . InvalidAccessHash ) ( isChecked ) < nl > - result ← fromFuture ( dialogExt . sendMessage ( < nl > + ( for ( < nl > + SeqStateDate ( seq , state , date ) ← fromFuture ( dialogExt . sendMessage ( < nl > peer = outPeer . asPeer , < nl > senderUserId = client . userId , < nl > senderAuthSid = client . authSid , < nl > + senderAuthId = Some ( client . authId ) , < nl > randomId = randomId , < nl > - message = message < nl > + message = message , < nl > + accessHash = Some ( outPeer . accessHash ) < nl > ) ) < nl > - } yield result < nl > - < nl > - ( for ( SeqStateDate ( seq , state , date ) ← seqstateAction ) < nl > - yield ResponseSeqDate ( seq , state . toByteArray , date ) ) . run recover { < nl > + ) yield ResponseSeqDate ( seq , state . toByteArray , date ) ) . run recover { < nl > case GroupErrors . NotAMember ⇒ Error ( CommonErrors . forbidden ( " You are not a group member . " ) ) < nl > case DialogErrors . MessageToSelf ⇒ Error ( CommonErrors . forbidden ( " Sending messages to self is not allowed . " ) ) < nl > + case InvalidAccessHash ⇒ Error ( CommonErrors . InvalidAccessHash ) < nl > } < nl > } < nl > } < nl > diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / MessagingServiceSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / MessagingServiceSpec . scala < nl > index 4a394d6 . . 2875a68 100644 < nl > - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / MessagingServiceSpec . scala < nl > + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / MessagingServiceSpec . scala < nl > @ @ - 9 , 6 + 9 , 7 @ @ import im . actor . api . rpc . files . ApiFileLocation < nl > import im . actor . api . rpc . messaging . _ < nl > import im . actor . api . rpc . misc . ResponseSeqDate < nl > import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType , ApiUserOutPeer } < nl > + import im . actor . api . rpc . sequence . { ApiUpdateContainer , ResponseGetDifference } < nl > import im . actor . server . _ < nl > import im . actor . server . acl . ACLUtils < nl > import im . actor . server . api . rpc . service . groups . { GroupInviteConfig , GroupsServiceImpl } < nl > @ @ - 23 , 7 + 24 , 8 @ @ class MessagingServiceSpec < nl > with ImplicitSequenceService < nl > with ImplicitSessionRegion < nl > with ImplicitAuthService < nl > - with SeqUpdateMatchers { < nl > + with SeqUpdateMatchers < nl > + with MessageParsing { < nl > behavior of " MessagingService " < nl > < nl > " Private Messaging " should " send messages " in s . privat . sendMessage < nl > @ @ - 38 , 6 + 40 , 8 @ @ class MessagingServiceSpec < nl > < nl > it should " not repeat message sending with same authId and RandomId " in s . group . cached < nl > < nl > + " Any Messaging " should " keep original order of sent messages " in s . generic . rightOrder < nl > + < nl > object s { < nl > implicit val ec = system . dispatcher < nl > < nl > @ @ - 311 , 6 + 315 , 79 @ @ class MessagingServiceSpec < nl > } < nl > } < nl > < nl > + object generic { < nl > + < nl > + def rightOrder ( ) = { < nl > + val ( alice , aliceAuthId , aliceAuthSid , _ ) = createUser ( ) < nl > + val ( bob , bobAuthId , bobAuthSid , _ ) = createUser ( ) < nl > + < nl > + val alicePeer = ApiPeer ( ApiPeerType . Private , alice . id ) < nl > + val bobPeer = ApiPeer ( ApiPeerType . Private , bob . id ) < nl > + < nl > + val aliceOutPeer = whenReady ( ACLUtils . getOutPeer ( alicePeer , bobAuthId ) ) ( identity ) < nl > + val bobOutPeer = whenReady ( ACLUtils . getOutPeer ( bobPeer , aliceAuthId ) ) ( identity ) < nl > + < nl > + def sendMessageToAlice ( text : String ) : Future [ ResponseSeqDate ] = { < nl > + implicit val clientData = ClientData ( bobAuthId , 1 , Some ( AuthData ( bob . id , bobAuthSid ) ) ) < nl > + service . handleSendMessage ( aliceOutPeer , ACLUtils . randomLong ( ) , textMessage ( text ) ) map ( _ . toOption . get ) < nl > + } < nl > + < nl > + val toAlice = for ( i ← 1 to 100 ) yield sendMessageToAlice ( i . toString ) < nl > + < nl > + toAlice foreach { whenReady ( _ ) ( identity ) } < nl > + < nl > + { < nl > + implicit val clientData = ClientData ( aliceAuthId , 1 , Some ( AuthData ( alice . id , aliceAuthSid ) ) ) < nl > + < nl > + whenReady ( service . handleLoadHistory ( bobOutPeer , 0L , Int . MaxValue ) ) { resp ⇒ < nl > + inside ( resp ) { < nl > + case Ok ( ResponseLoadHistory ( history , _ ) ) ⇒ < nl > + val textMessages = history map { e ⇒ < nl > + val parsed = parseMessage ( e . message . toByteArray ) < nl > + inside ( parsed ) { < nl > + case Right ( _ : ApiTextMessage ) ⇒ < nl > + } < nl > + val message = parsed . right . get < nl > + message shouldBe an [ ApiTextMessage ] < nl > + message . asInstanceOf [ ApiTextMessage ] < nl > + } < nl > + checkMessageOrder ( textMessages ) < nl > + } < nl > + } < nl > + < nl > + whenReady ( sequenceService . handleGetDifference ( 0 , Array . empty , Vector . empty ) ) { resp ⇒ < nl > + inside ( resp ) { < nl > + case Ok ( diff : ResponseGetDifference ) ⇒ < nl > + val textMessages = diff . updates collect { < nl > + case ApiUpdateContainer ( UpdateMessage . header , bytes ) ⇒ < nl > + val parsed = UpdateMessage . parseFrom ( bytes ) < nl > + parsed should matchPattern { < nl > + case Right ( _ ) ⇒ < nl > + } < nl > + val message = parsed . right . get . message < nl > + message shouldBe an [ ApiTextMessage ] < nl > + message . asInstanceOf [ ApiTextMessage ] < nl > + } < nl > + checkMessageOrder ( textMessages ) < nl > + } < nl > + } < nl > + < nl > + } < nl > + < nl > + def checkMessageOrder ( textMessages : IndexedSeq [ ApiTextMessage ] ) = { < nl > + textMessages should have length 100 < nl > + ( textMessages foldLeft 0 ) { < nl > + case ( acc , el ) ⇒ < nl > + val intValue = el . text . toInt < nl > + if ( intValue > acc ) { } else { fail ( s " order of elements was wrong : $ { textMessages map ( _ . text ) mkString " , " } " ) } < nl > + intValue < nl > + } < nl > + } < nl > + < nl > + } < nl > + < nl > + } < nl > + < nl > } < nl > < nl > } < nl > diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / dialog / DialogProcessorSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / dialog / DialogProcessorSpec . scala < nl > index eabcb6c . . aeefdb7 100644 < nl > - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / dialog / DialogProcessorSpec . scala < nl > + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / dialog / DialogProcessorSpec . scala < nl > @ @ - 1 , 12 + 1 , 13 @ @ < nl > package im . actor . server . dialog < nl > < nl > - import im . actor . api . rpc . messaging . { ApiTextMessage , ResponseLoadHistory } < nl > - import im . actor . api . rpc . { Ok , AuthData , ClientData , PeersImplicits } < nl > + import im . actor . api . rpc . messaging . _ < nl > import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType } < nl > + import im . actor . api . rpc . sequence . { ApiUpdateContainer , ResponseGetDifference } < nl > + import im . actor . api . rpc . { AuthData , ClientData , Ok , PeersImplicits } < nl > + import im . actor . server . _ < nl > import im . actor . server . acl . ACLUtils < nl > import im . actor . server . api . rpc . service . messaging . MessagingServiceImpl < nl > import im . actor . server . sequence . SeqStateDate < nl > - import im . actor . server . { MessageParsing , BaseAppSuite , ImplicitAuthService , ImplicitSessionRegion } < nl > < nl > import scala . concurrent . Future < nl > import scala . language . postfixOps < nl > @ @ - 35 , 10 + 36 , 10 @ @ final class DialogProcessorSpec extends BaseAppSuite < nl > val bobPeer = ApiPeer ( ApiPeerType . Private , bob . id ) < nl > < nl > def sendMessageToBob ( text : String ) : Future [ SeqStateDate ] = < nl > - dialogExt . sendMessage ( bobPeer , alice . id , aliceAuthSid , ACLUtils . randomLong ( ) , textMessage ( text ) ) < nl > + dialogExt . sendMessage ( bobPeer , alice . id , aliceAuthSid , Some ( aliceAuthId ) , ACLUtils . randomLong ( ) , textMessage ( text ) ) < nl > < nl > def sendMessageToAlice ( text : String ) : Future [ SeqStateDate ] = < nl > - dialogExt . sendMessage ( alicePeer , bob . id , bobAuthSid , ACLUtils . randomLong ( ) , textMessage ( text ) ) < nl > + dialogExt . sendMessage ( alicePeer , bob . id , bobAuthSid , Some ( bobAuthId ) , ACLUtils . randomLong ( ) , textMessage ( text ) ) < nl > < nl > val toAlice = for ( i ← 1 to 50 ) yield sendMessageToAlice ( s " Hello $ i " ) < nl > val toBob = for ( i ← 1 to 50 ) yield sendMessageToBob ( s " Hello you back $ i " ) < nl > @ @ - 77 , 10 + 78 , 10 @ @ final class DialogProcessorSpec extends BaseAppSuite < nl > val bobPeer = ApiPeer ( ApiPeerType . Private , bob . id ) < nl > < nl > def sendMessageToBob ( text : String ) : Future [ SeqStateDate ] = < nl > - dialogExt . sendMessage ( bobPeer , alice . id , aliceAuthSid , ACLUtils . randomLong ( ) , textMessage ( text ) ) < nl > + dialogExt . sendMessage ( bobPeer , alice . id , aliceAuthSid , Some ( aliceAuthId ) , ACLUtils . randomLong ( ) , textMessage ( text ) ) < nl > < nl > def sendMessageToAlice ( text : String ) : Future [ SeqStateDate ] = < nl > - dialogExt . sendMessage ( alicePeer , bob . id , bobAuthSid , ACLUtils . randomLong ( ) , textMessage ( text ) ) < nl > + dialogExt . sendMessage ( alicePeer , bob . id , bobAuthSid , Some ( bobAuthId ) , ACLUtils . randomLong ( ) , textMessage ( text ) ) < nl > < nl > val toAlice = for ( i ← 1 to 50 ) yield sendMessageToAlice ( s " Hello $ i " ) < nl > val toBob = for ( i ← 1 to 50 ) yield sendMessageToBob ( s " Hello you back $ i " )
+
+TEST DIFF:
+diff - - git a / actor - server / actor - core / src / main / scala / im / actor / api / rpc . scala b / actor - server / actor - core / src / main / scala / im / actor / api / rpc . scala 
+ index 2afc3f8 . . 84ca8a1 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / api / rpc . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / api / rpc . scala 
+ @ @ - 9 , 7 + 9 , 7 @ @ import scala . concurrent . { ExecutionContext , Future } 
+ import scala . reflect . ClassTag 
+ import scalaz . _ , Scalaz . _ 
+ 
+ - package object rpc extends { 
+ + package object rpc extends PeersImplicits with HistoryImplicits { 
+ 
+ import slick . dbio . NoStream 
+ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / WeakUpdatesExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / WeakUpdatesExtension . scala 
+ index 95c95dc . . 691a8cd 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / WeakUpdatesExtension . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / WeakUpdatesExtension . scala 
+ @ @ - 22 , 7 + 22 , 10 @ @ final class WeakUpdatesExtensionImpl ( system : ActorSystem ) extends WeakUpdatesExt 
+ private val region = WeakUpdatesManagerRegion . startRegion ( ) ( system ) 
+ private lazy val userExt = UserExtension ( system ) 
+ 
+ - def broadcastUserWeakUpdate ( userId : Int , update : Update , reduceKey : Option [ String ] , group : Option [ String ] = None ) : Future [ Unit ] = { 
+ + def broadcastUsersWeakUpdate ( userIds : Seq [ Int ] , update : Update , reduceKey : Option [ String ] = None , group : Option [ String ] = None ) : Future [ Unit ] = 
+ + Future . sequence ( userIds map ( broadcastUserWeakUpdate ( _ , update , reduceKey , group ) ) ) map ( _ ⇒ ( ) ) 
+ + 
+ + def broadcastUserWeakUpdate ( userId : Int , update : Update , reduceKey : Option [ String ] = None , group : Option [ String ] = None ) : Future [ Unit ] = { 
+ val header = update . header 
+ val serializedData = update . toByteArray 
+ val msg = PushUpdate ( header , serializedData , reduceKey , group ) 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala 
+ index 1f3c6f7 . . 9d5184d 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala 
+ @ @ - 1 , 15 + 1 , 16 @ @ 
+ package im . actor . server . webrtc 
+ 
+ import akka . actor . _ 
+ + import akka . http . scaladsl . util . FastFuture 
+ import akka . pattern . pipe 
+ import im . actor . api . rpc . messaging . { ApiServiceMessage , ApiServiceExPhoneCall } 
+ import im . actor . api . rpc . peers . { ApiPeerType , ApiPeer } 
+ import im . actor . api . rpc . webrtc . _ 
+ - import im . actor . concurrent . ActorStashing 
+ - import im . actor . server . db . DbExtension 
+ + import im . actor . concurrent . { FutureExt , ActorStashing } 
+ import im . actor . server . dialog . DialogExtension 
+ import im . actor . server . eventbus . { EventBus , EventBusExtension } 
+ - import im . actor . server . persist . webrtc . WebrtcCallRepo 
+ + import im . actor . server . group . GroupExtension 
+ + import im . actor . server . model . { PeerType , Peer } 
+ import im . actor . server . sequence . WeakUpdatesExtension 
+ import im . actor . types . _ 
+ 
+ @ @ - 27 , 7 + 28 , 7 @ @ object WebrtcCallErrors { 
+ sealed trait WebrtcCallMessage 
+ 
+ object WebrtcCallMessages { 
+ - final case class StartCall ( callerUserId : Int , receiverUserId : Int , eventBusId : String ) extends WebrtcCallMessage 
+ + final case class StartCall ( callerUserId : Int , peer : Peer , eventBusId : String ) extends WebrtcCallMessage 
+ case object StartCallAck 
+ 
+ case object GetInfo extends WebrtcCallMessage 
+ @ @ - 53 , 28 + 54 , 30 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { 
+ private lazy val weakUpdExt = WeakUpdatesExtension ( context . system ) 
+ private lazy val dialogExt = DialogExtension ( context . system ) 
+ private lazy val eventBusExt = EventBusExtension ( context . system ) 
+ - private val db = DbExtension ( context . system ) . db 
+ + private lazy val groupExt = GroupExtension ( context . system ) 
+ 
+ private var scheduledUpd : Option [ Cancellable ] = None 
+ 
+ def receive = waitForStart 
+ 
+ def waitForStart : Receive = { 
+ - case StartCall ( callerUserId , receiverUserId , eventBusId ) ⇒ 
+ + case StartCall ( callerUserId , peer , eventBusId ) ⇒ 
+ + case class Res ( callees : Seq [ Int ] , schedUpd : Cancellable ) 
+ + 
+ val update = UpdateIncomingCall ( id ) 
+ 
+ ( for { 
+ - _ ← db . run ( WebrtcCallRepo . create ( WebrtcCall ( id , callerUserId , receiverUserId ) ) ) 
+ + callees ← fetchParticipants ( callerUserId , peer ) map ( _ filterNot ( _ = = callerUserId ) ) 
+ _ ← eventBusExt . subscribe ( eventBusId , self ) 
+ - } yield context . system . scheduler . schedule ( 0 . seconds , 5 . seconds ) { 
+ - weakUpdExt . broadcastUserWeakUpdate ( receiverUserId , update , None , None ) 
+ - } ) pipeTo self 
+ + } yield Res ( callees , context . system . scheduler . schedule ( 0 . seconds , 5 . seconds ) { 
+ + weakUpdExt . broadcastUsersWeakUpdate ( callees , update , None , None ) 
+ + } ) ) pipeTo self 
+ 
+ becomeStashing ( replyTo ⇒ { 
+ - case schedUpd : Cancellable ⇒ 
+ + case Res ( callees , schedUpd ) ⇒ 
+ this . scheduledUpd = Some ( schedUpd ) 
+ replyTo ! StartCallAck 
+ - context become callInProgress ( eventBusId , System . currentTimeMillis ( ) , callerUserId , receiverUserId ) 
+ + context become callInProgress ( eventBusId , System . currentTimeMillis ( ) , callerUserId , callees : + callerUserId ) 
+ unstashAll ( ) 
+ case failure : Status . Failure ⇒ 
+ replyTo forward failure 
+ @ @ - 84 , 24 + 87 , 23 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { 
+ } 
+ 
+ def callInProgress ( 
+ - eventBusId : String , 
+ - startTime : Long , 
+ - callerUserId : Int , 
+ - receiverUserId : Int 
+ + eventBusId : String , 
+ + startTime : Long , 
+ + callerUserId : Int , 
+ + participants : Seq [ Int ] 
+ ) : Receive = { 
+ def end ( ) : Unit = { 
+ val duration = ( ( System . currentTimeMillis ( ) - startTime ) / 1000 ) . toInt 
+ 
+ ( for { 
+ - _ ← dialogExt . sendMessage ( 
+ - peer = ApiPeer ( ApiPeerType . Private , receiverUserId ) , 
+ + _ ← FutureExt . ftraverse ( participants ) ( userId ⇒ dialogExt . sendMessage ( 
+ + peer = ApiPeer ( ApiPeerType . Private , userId ) , 
+ senderUserId = callerUserId , 
+ senderAuthId = None , 
+ senderAuthSid = 0 , 
+ randomId = ThreadLocalRandom . current ( ) . nextLong , 
+ message = ApiServiceMessage ( " Call ended " , Some ( ApiServiceExPhoneCall ( duration ) ) ) 
+ - ) 
+ - _ ← db . run ( WebrtcCallRepo . delete ( id ) ) 
+ + ) ) 
+ } yield PoisonPill ) pipeTo self onFailure { 
+ case e ⇒ 
+ log . error ( e , " Failed to stop call " ) 
+ @ @ - 109 , 32 + 111 , 31 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { 
+ } 
+ } 
+ 
+ - def withOrigin ( origin : Int ) ( f : Int ⇒ Any ) = 
+ - if ( callerUserId = = origin ) 
+ - f ( receiverUserId ) 
+ - else if ( receiverUserId = = origin ) 
+ - f ( callerUserId ) 
+ - else 
+ - sender ( ) ! Status . Failure ( WebrtcCallErrors . NotAParticipant ) 
+ - 
+ { 
+ case EventBus . Disposed ( _ ) ⇒ end ( ) 
+ case EventBus . Message ( _ , userId , message ) ⇒ 
+ ApiWebRTCSignaling . parseFrom ( message ) . right foreach { 
+ case ApiAnswerCall ⇒ 
+ scheduledUpd foreach ( _ . cancel ( ) ) 
+ - context become callInProgress ( eventBusId , System . currentTimeMillis ( ) , callerUserId , receiverUserId ) 
+ + context become callInProgress ( eventBusId , System . currentTimeMillis ( ) , callerUserId , participants ) 
+ case ApiEndCall ⇒ 
+ scheduledUpd foreach ( _ . cancel ( ) ) 
+ - withOrigin ( userId ) ( _ ⇒ end ( ) ) 
+ + end ( ) 
+ case _ ⇒ 
+ } 
+ case GetInfo ⇒ 
+ - sender ( ) ! GetInfoAck ( eventBusId , callerUserId , Seq ( callerUserId , receiverUserId ) ) 
+ + sender ( ) ! GetInfoAck ( eventBusId , callerUserId , participants ) 
+ case _ : StartCall ⇒ sender ( ) ! WebrtcCallErrors . CallAlreadyStarted 
+ } 
+ } 
+ 
+ + private def fetchParticipants ( callerUserId : Int , peer : Peer ) = 
+ + peer match { 
+ + case Peer ( PeerType . Private , userId ) ⇒ FastFuture . successful ( Seq ( callerUserId , userId ) ) 
+ + case Peer ( PeerType . Group , groupId ) ⇒ groupExt . getMemberIds ( groupId ) map ( _ . _ 1 ) 
+ + case _ ⇒ FastFuture . failed ( new RuntimeException ( s " Unknown peer type : $ { peer . ` type ` } " ) ) 
+ + } 
+ + 
+ override def postStop ( ) : Unit = { 
+ scheduledUpd foreach ( _ . cancel ( ) ) 
+ super . postStop ( ) 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcExtension . scala 
+ index cab508a . . 8775a09 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcExtension . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcExtension . scala 
+ @ @ - 6 , 6 + 6 , 7 @ @ import akka . cluster . sharding . ShardRegion . { ExtractShardId , ExtractEntityId } 
+ import akka . cluster . sharding . { ClusterShardingSettings , ClusterSharding } 
+ import akka . util . Timeout 
+ import im . actor . config . ActorConfig 
+ + import im . actor . server . model . Peer 
+ import im . actor . types . _ 
+ 
+ import scala . concurrent . Future 
+ @ @ - 33 , 10 + 34 , 10 @ @ final class WebrtcExtension ( system : ActorSystem ) extends Extension { 
+ ClusterSharding ( system ) 
+ . start ( " WebrtcCall " , WebrtcCallActor . props , ClusterShardingSettings ( system ) , extractEntityId , extractShardId ) 
+ 
+ - def doCall ( callerUserId : Int , receiverUserId : Int , eventBusId : String ) : Future [ Long ] = { 
+ + def doCall ( callerUserId : Int , peer : Peer , eventBusId : String ) : Future [ Long ] = { 
+ val callId = ThreadLocalRandom . current ( ) . nextLong ( ) 
+ 
+ - region ? WebrtcCallEnvelope ( callId , StartCall ( callerUserId , receiverUserId , eventBusId ) ) map ( _ ⇒ callId ) 
+ + region ? WebrtcCallEnvelope ( callId , StartCall ( callerUserId , peer , eventBusId ) ) map ( _ ⇒ callId ) 
+ } 
+ 
+ def getInfo ( callId : Long ) : Future [ ( String , UserId , Seq [ UserId ] ) ] = 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / webrtc / WebrtcServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / webrtc / WebrtcServiceImpl . scala 
+ index 442d896 . . 489af19 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / webrtc / WebrtcServiceImpl . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / webrtc / WebrtcServiceImpl . scala 
+ @ @ - 1 , 15 + 1 , 13 @ @ 
+ package im . actor . server . api . rpc . service . webrtc 
+ 
+ import akka . actor . ActorSystem 
+ - import akka . http . scaladsl . util . FastFuture 
+ import im . actor . api . rpc . _ 
+ - import im . actor . api . rpc . misc . ResponseVoid 
+ import im . actor . api . rpc . peers . { ApiPeerType , ApiPeer , ApiOutPeer } 
+ import im . actor . api . rpc . webrtc . { ResponseGetCallInfo , ResponseDoCall , WebrtcService } 
+ import im . actor . concurrent . FutureExt 
+ import im . actor . server . acl . ACLUtils 
+ import im . actor . server . session . _ 
+ - import im . actor . server . webrtc . { WebrtcCallErrors , WebrtcExtension , Webrtc } 
+ + import im . actor . server . webrtc . { WebrtcCallErrors , WebrtcExtension } 
+ 
+ import scala . concurrent . { ExecutionContext , Future } 
+ 
+ @ @ - 38 , 7 + 36 , 7 @ @ final class WebrtcServiceImpl ( implicit system : ActorSystem , sessionRegion : Sessi 
+ authorized ( clientData ) { implicit client ⇒ 
+ withOutPeerF ( peer ) { 
+ for { 
+ - callId ← webrtcExt . doCall ( client . userId , peer . id , eventBusId ) 
+ + callId ← webrtcExt . doCall ( client . userId , peer . asModel , eventBusId ) 
+ } yield Ok ( ResponseDoCall ( callId ) ) 
+ } 
+ }
+
+NEAREST DIFF:
+diff - - git a / actor - server / actor - bots / src / main / scala / im / actor / server / bot / services / MessagingBotService . scala b / actor - server / actor - bots / src / main / scala / im / actor / server / bot / services / MessagingBotService . scala 
+ index cf4172b . . 6a28636 100644 
+ - - - a / actor - server / actor - bots / src / main / scala / im / actor / server / bot / services / MessagingBotService . scala 
+ + + + b / actor - server / actor - bots / src / main / scala / im / actor / server / bot / services / MessagingBotService . scala 
+ @ @ - 18 , 14 + 18 , 15 @ @ private [ bot ] final class MessagingBotService ( system : ActorSystem ) extends BotSer 
+ 
+ private def sendMessage ( peer : OutPeer , randomId : Long , message : MessageBody ) = RequestHandler [ SendMessage , SendMessage # Response ] ( 
+ ( botUserId : BotUserId , botAuthId : BotAuthId , botAuthSid : BotAuthSid ) ⇒ { 
+ - / / FIXME : check access hash 
+ for { 
+ SeqStateDate ( _ , _ , date ) ← dialogExt . sendMessage ( 
+ peer = peer , 
+ senderUserId = botUserId , 
+ senderAuthSid = botAuthSid , 
+ + senderAuthId = Some ( botAuthId ) , 
+ randomId = randomId , 
+ message = message , 
+ + accessHash = Some ( peer . accessHash ) , 
+ isFat = false 
+ ) 
+ } yield Right ( MessageSent ( date ) ) 
+ diff - - git a / actor - server / actor - core / src / main / protobuf / dialog . proto b / actor - server / actor - core / src / main / protobuf / dialog . proto 
+ index 5e056a6 . . 6ffb082 100644 
+ - - - a / actor - server / actor - core / src / main / protobuf / dialog . proto 
+ + + + b / actor - server / actor - core / src / main / protobuf / dialog . proto 
+ @ @ - 62 , 9 + 62 , 11 @ @ message DialogCommands { 
+ required Peer origin = 7 ; 
+ required Peer dest = 8 ; 
+ required int32 sender _ auth _ sid = 3 ; 
+ + optional int64 sender _ auth _ id = 11 ; 
+ optional int64 date = 9 ; 
+ required int64 random _ id = 4 ; 
+ required bytes message = 5 [ ( scalapb . field ) . type = " im . actor . api . rpc . messaging . ApiMessage " ] ; 
+ + optional int64 access _ hash = 10 ; 
+ required bool is _ fat = 6 ; 
+ } 
+ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogCommandHandlers . scala b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogCommandHandlers . scala 
+ index 9990cce . . c9231b4 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogCommandHandlers . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogCommandHandlers . scala 
+ @ @ - 43 , 21 + 43 , 27 @ @ trait DialogCommandHandlers extends UpdateCounters with PeersImplicits { 
+ unstashAll ( ) 
+ } : Receive ) orElse reactions ( state ) , discardOld = true ) 
+ 
+ - withCachedFuture [ AuthSidRandomId , SeqStateDate ] ( sm . senderAuthSid → sm . randomId ) { 
+ - val sendDate = calcSendDate ( state ) 
+ - val message = sm . message 
+ - PubSubExtension ( system ) . publish ( PeerMessage ( sm . origin , sm . dest , sm . randomId , sendDate , message ) ) 
+ - ( for { 
+ - _ ← dialogExt . ackSendMessage ( peer , sm . copy ( date = Some ( sendDate ) ) ) 
+ - _ ← db . run ( writeHistoryMessage ( selfPeer , peer , new DateTime ( sendDate ) , sm . randomId , message . header , message . toByteArray ) ) 
+ - _ ← dialogExt . updateCounters ( peer , userId ) 
+ - SeqState ( seq , state ) ← deliveryExt . senderDelivery ( userId , sm . senderAuthSid , peer , sm . randomId , sendDate , message , sm . isFat ) 
+ - } yield SeqStateDate ( seq , state , sendDate ) ) recover { 
+ - case e ⇒ 
+ - log . error ( e , " Failed to send message " ) 
+ - throw e 
+ + validateAccessHash ( sm . dest , sm . senderAuthId , sm . accessHash ) map { valid ⇒ 
+ + if ( valid ) { 
+ + withCachedFuture [ AuthSidRandomId , SeqStateDate ] ( sm . senderAuthSid → sm . randomId ) { 
+ + val sendDate = calcSendDate ( state ) 
+ + val message = sm . message 
+ + PubSubExtension ( system ) . publish ( PeerMessage ( sm . origin , sm . dest , sm . randomId , sendDate , message ) ) 
+ + ( for { 
+ + _ ← dialogExt . ackSendMessage ( peer , sm . copy ( date = Some ( sendDate ) ) ) 
+ + _ ← db . run ( writeHistoryMessage ( selfPeer , peer , new DateTime ( sendDate ) , sm . randomId , message . header , message . toByteArray ) ) 
+ + _ ← dialogExt . updateCounters ( peer , userId ) 
+ + SeqState ( seq , state ) ← deliveryExt . senderDelivery ( userId , sm . senderAuthSid , peer , sm . randomId , sendDate , message , sm . isFat ) 
+ + } yield SeqStateDate ( seq , state , sendDate ) ) recover { 
+ + case e ⇒ 
+ + log . error ( e , " Failed to send message " ) 
+ + throw e 
+ + } 
+ + } pipeTo self 
+ + } else { 
+ + self ! Status . Failure ( InvalidAccessHash ) 
+ } 
+ - } pipeTo self 
+ + } 
+ } 
+ } 
+ 
+ @ @ - 307 , 6 + 313 , 7 @ @ trait DialogCommandHandlers extends UpdateCounters with PeersImplicits { 
+ * Yields unique message date in current dialog . 
+ * When ` candidate ` date is same as last message date , we increment ` candidate ` value by 1 , 
+ * thus resulting date can possibly be in future 
+ + * 
+ * @ param state current dialog state 
+ * @ return unique message date in current dialog 
+ * / 
+ @ @ - 369 , 4 + 376 , 20 @ @ trait DialogCommandHandlers extends UpdateCounters with PeersImplicits { 
+ 
+ private def updateUnfavourited ( state : DialogState ) : Unit = 
+ context become initialized ( state . updated ( Unfavourited ) ) 
+ + 
+ + / * * 
+ + * check access hash 
+ + * If ` optAccessHash ` is ` None ` - we simply don ' t check access hash 
+ + * If ` optSenderAuthId ` is None , and we are validating access hash for private peer - it is invalid 
+ + * / 
+ + private def validateAccessHash ( peer : Peer , optSenderAuthId : Option [ Long ] , optAccessHash : Option [ Long ] ) : Future [ Boolean ] = 
+ + optAccessHash map { hash ⇒ 
+ + peer . ` type ` match { 
+ + case PeerType . Private ⇒ 
+ + optSenderAuthId map { authId ⇒ userExt . checkAccessHash ( peer . id , authId , hash ) } getOrElse Future . successful ( false ) 
+ + case PeerType . Group ⇒ 
+ + groupExt . checkAccessHash ( peer . id , hash ) 
+ + case unknown ⇒ throw new RuntimeException ( s " Unknown peer type $ unknown " ) 
+ + } 
+ + } getOrElse Future . successful ( true ) 
+ } 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogErrors . scala b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogErrors . scala 
+ index 9b347cc . . 32c0836 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogErrors . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogErrors . scala 
+ @ @ - 6 , 6 + 6 , 8 @ @ import scala . util . control . NoStackTrace 
+ 
+ abstract class DialogError ( msg : String ) extends RuntimeException ( msg ) with NoStackTrace 
+ 
+ + case object InvalidAccessHash extends RuntimeException with NoStackTrace 
+ + 
+ object DialogErrors { 
+ object MessageToSelf extends DialogError ( " Private dialog with self is not allowed " ) 
+ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala 
+ index 49cc747 . . 56319de 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala 
+ @ @ - 77 , 11 + 77 , 20 @ @ final class DialogExtensionImpl ( system : ActorSystem ) extends DialogExtension wit 
+ case _ ⇒ f 
+ } 
+ 
+ - def sendMessage ( peer : ApiPeer , senderUserId : Int , senderAuthSid : Int , randomId : Long , message : ApiMessage , isFat : Boolean = false ) : Future [ SeqStateDate ] = 
+ + def sendMessage ( 
+ + peer : ApiPeer , 
+ + senderUserId : Int , 
+ + senderAuthSid : Int , 
+ + senderAuthId : Option [ Long ] , / / required only in case of access hash check for private peer 
+ + randomId : Long , 
+ + message : ApiMessage , 
+ + accessHash : Option [ Long ] = None , 
+ + isFat : Boolean = false 
+ + ) : Future [ SeqStateDate ] = 
+ withValidPeer ( peer . asModel , senderUserId , Future . successful ( SeqStateDate ( ) ) ) { 
+ val sender = Peer . privat ( senderUserId ) 
+ / / we don ' t set date here , cause actual date set inside dialog processor 
+ - val sendMessage = SendMessage ( sender , peer . asModel , senderAuthSid , date = None , randomId , message , isFat ) 
+ + val sendMessage = SendMessage ( sender , peer . asModel , senderAuthSid , senderAuthId , date = None , randomId , message , accessHash , isFat ) 
+ ( userExt . processorRegion . ref ? Envelope ( sender ) . withSendMessage ( sendMessage ) ) . mapTo [ SeqStateDate ] 
+ } 
+ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogProcessor . scala b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogProcessor . scala 
+ index ad96aba . . e9c0a4d 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogProcessor . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogProcessor . scala 
+ @ @ - 9 , 6 + 9 , 7 @ @ import im . actor . concurrent . { ActorFutures , ActorStashing } 
+ import im . actor . serialization . ActorSerializer 
+ import im . actor . server . cqrs . ProcessorState 
+ import im . actor . server . db . DbExtension 
+ + import im . actor . server . group . GroupExtension 
+ import im . actor . server . model . { Dialog ⇒ DialogModel , PeerType , Peer } 
+ import im . actor . server . persist . dialog . DialogRepo 
+ import im . actor . server . persist . { GroupRepo , UserRepo } 
+ @ @ - 120 , 6 + 121 , 7 @ @ private [ dialog ] final class DialogProcessor ( val userId : Int , val peer : Peer , ext 
+ 
+ protected val db : Database = DbExtension ( system ) . db 
+ protected val userExt = UserExtension ( system ) 
+ + protected val groupExt = GroupExtension ( system ) 
+ protected implicit val socialRegion = SocialExtension ( system ) . region 
+ protected implicit val timeout = Timeout ( 5 . seconds ) 
+ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / group / GroupCommandHandlers . scala b / actor - server / actor - core / src / main / scala / im / actor / server / group / GroupCommandHandlers . scala 
+ index b4a960b . . e244939 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / group / GroupCommandHandlers . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / group / GroupCommandHandlers . scala 
+ @ @ - 179 , 6 + 179 , 7 @ @ private [ group ] trait GroupCommandHandlers extends GroupsImplicits with GroupComm 
+ peer = ApiPeer ( ApiPeerType . Group , groupId ) , 
+ senderUserId = joiningUserId , 
+ senderAuthSid = joinintUserAuthSid , 
+ + senderAuthId = None , 
+ randomId = randomId , 
+ message = GroupServiceMessages . userJoined , 
+ isFat = true 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala 
+ index 133e35c . . e3b28c5 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala 
+ @ @ - 2 , 22 + 2 , 17 @ @ package im . actor . server . sequence 
+ 
+ import java . util 
+ 
+ - import akka . event . Logging 
+ - 
+ - import scala . collection . JavaConversions . _ 
+ - import scala . concurrent . ExecutionContext 
+ - import scala . concurrent . duration . _ 
+ - 
+ import akka . actor . ActorSystem 
+ - import akka . util . Timeout 
+ + import akka . event . Logging 
+ import com . relayrides . pushy . apns . _ 
+ import com . relayrides . pushy . apns . util . { SSLContextUtil , SimpleApnsPushNotification } 
+ import com . typesafe . config . Config 
+ import im . actor . server . db . ActorPostgresDriver . api . _ 
+ - 
+ import im . actor . server . db . DbExtension 
+ - import im . actor . server . user . { UserProcessorRegion , UserExtension , UserOffice } 
+ 
+ + import scala . collection . JavaConversions . _ 
+ + import scala . concurrent . ExecutionContext 
+ + import scala . concurrent . duration . _ 
+ import scala . util . Try 
+ 
+ case class ApplePushManagerConfig ( certs : List [ ApnsCert ] ) 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOffice . scala b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOffice . scala 
+ index 3757ecc . . d46d310 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOffice . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOffice . scala 
+ @ @ - 1 , 10 + 1 , 5 @ @ 
+ package im . actor . server . user 
+ 
+ - import scala . util . control . NoStackTrace 
+ - 
+ object UserOffice { 
+ - 
+ - case object InvalidAccessHash extends Exception with NoStackTrace 
+ - 
+ def persistenceIdFor ( userId : Int ) : String = s " User - $ { userId } " 
+ } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / webhooks / http / routes / IngoingHooks . scala b / actor - server / actor - core / src / main / scala / im / actor / server / webhooks / http / routes / IngoingHooks . scala 
+ index 441447c . . e71858b 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / webhooks / http / routes / IngoingHooks . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / webhooks / http / routes / IngoingHooks . scala 
+ @ @ - 51 , 7 + 51 , 7 @ @ trait IngoingHooks extends ContentUnmarshaller with PlayJsonSupport { 
+ for { 
+ ( _ , _ , optBot ) ← GroupExtension ( system ) . getMemberIds ( groupId ) 
+ _ ← optBot map { botId ⇒ 
+ - DialogExtension ( system ) . sendMessage ( ApiPeer ( ApiPeerType . Group , groupId ) , botId , 0 , ThreadLocalRandom . current ( ) . nextLong ( ) , message ) 
+ + DialogExtension ( system ) . sendMessage ( ApiPeer ( ApiPeerType . Group , groupId ) , botId , 0 , None , ThreadLocalRandom . current ( ) . nextLong ( ) , message ) 
+ } getOrElse Future . successful ( Left ( StatusCodes . NotAcceptable ) ) 
+ } yield Right ( ( ) ) 
+ } getOrElse Future . successful ( Left ( StatusCodes . BadRequest ) ) 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala 
+ index ea6955d . . 6426753 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala 
+ @ @ - 94 , 6 + 94 , 7 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { 
+ _ ← dialogExt . sendMessage ( 
+ peer = ApiPeer ( ApiPeerType . Private , receiverUserId ) , 
+ senderUserId = callerUserId , 
+ + senderAuthId = None , 
+ senderAuthSid = 0 , 
+ randomId = ThreadLocalRandom . current ( ) . nextLong , 
+ message = ApiServiceMessage ( " Call ended " , Some ( ApiServiceExPhoneCall ( duration ) ) ) 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / messaging / MessagingHandlers . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / messaging / MessagingHandlers . scala 
+ index 42a9912 . . 13704c1 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / messaging / MessagingHandlers . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / messaging / MessagingHandlers . scala 
+ @ @ - 7 , 7 + 7 , 7 @ @ import im . actor . api . rpc . messaging . _ 
+ import im . actor . api . rpc . misc . _ 
+ import im . actor . api . rpc . peers . _ 
+ import im . actor . config . ActorConfig 
+ - import im . actor . server . dialog . DialogErrors 
+ + import im . actor . server . dialog . { InvalidAccessHash , DialogErrors } 
+ import im . actor . server . group . GroupErrors 
+ import im . actor . server . sequence . SeqStateDate 
+ 
+ @ @ - 23 , 26 + 23 , 20 @ @ private [ messaging ] trait MessagingHandlers { 
+ 
+ override def jhandleSendMessage ( outPeer : ApiOutPeer , randomId : Long , message : ApiMessage , clientData : ClientData ) : Future [ HandlerResult [ ResponseSeqDate ] ] = 
+ authorized ( clientData ) { implicit client ⇒ 
+ - val accessHashCheck = outPeer . ` type ` match { 
+ - case ApiPeerType . Private ⇒ userExt . checkAccessHash ( outPeer . id , client . authId , outPeer . accessHash ) 
+ - case ApiPeerType . Group ⇒ groupExt . checkAccessHash ( outPeer . id , outPeer . accessHash ) 
+ - } 
+ - val seqstateAction = for { 
+ - isChecked ← fromFuture ( accessHashCheck ) 
+ - _ ← fromBoolean ( CommonErrors . InvalidAccessHash ) ( isChecked ) 
+ - result ← fromFuture ( dialogExt . sendMessage ( 
+ + ( for ( 
+ + SeqStateDate ( seq , state , date ) ← fromFuture ( dialogExt . sendMessage ( 
+ peer = outPeer . asPeer , 
+ senderUserId = client . userId , 
+ senderAuthSid = client . authSid , 
+ + senderAuthId = Some ( client . authId ) , 
+ randomId = randomId , 
+ - message = message 
+ + message = message , 
+ + accessHash = Some ( outPeer . accessHash ) 
+ ) ) 
+ - } yield result 
+ - 
+ - ( for ( SeqStateDate ( seq , state , date ) ← seqstateAction ) 
+ - yield ResponseSeqDate ( seq , state . toByteArray , date ) ) . run recover { 
+ + ) yield ResponseSeqDate ( seq , state . toByteArray , date ) ) . run recover { 
+ case GroupErrors . NotAMember ⇒ Error ( CommonErrors . forbidden ( " You are not a group member . " ) ) 
+ case DialogErrors . MessageToSelf ⇒ Error ( CommonErrors . forbidden ( " Sending messages to self is not allowed . " ) ) 
+ + case InvalidAccessHash ⇒ Error ( CommonErrors . InvalidAccessHash ) 
+ } 
+ } 
+ } 
+ diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / MessagingServiceSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / MessagingServiceSpec . scala 
+ index 4a394d6 . . 2875a68 100644 
+ - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / MessagingServiceSpec . scala 
+ + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / MessagingServiceSpec . scala 
+ @ @ - 9 , 6 + 9 , 7 @ @ import im . actor . api . rpc . files . ApiFileLocation 
+ import im . actor . api . rpc . messaging . _ 
+ import im . actor . api . rpc . misc . ResponseSeqDate 
+ import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType , ApiUserOutPeer } 
+ + import im . actor . api . rpc . sequence . { ApiUpdateContainer , ResponseGetDifference } 
+ import im . actor . server . _ 
+ import im . actor . server . acl . ACLUtils 
+ import im . actor . server . api . rpc . service . groups . { GroupInviteConfig , GroupsServiceImpl } 
+ @ @ - 23 , 7 + 24 , 8 @ @ class MessagingServiceSpec 
+ with ImplicitSequenceService 
+ with ImplicitSessionRegion 
+ with ImplicitAuthService 
+ - with SeqUpdateMatchers { 
+ + with SeqUpdateMatchers 
+ + with MessageParsing { 
+ behavior of " MessagingService " 
+ 
+ " Private Messaging " should " send messages " in s . privat . sendMessage 
+ @ @ - 38 , 6 + 40 , 8 @ @ class MessagingServiceSpec 
+ 
+ it should " not repeat message sending with same authId and RandomId " in s . group . cached 
+ 
+ + " Any Messaging " should " keep original order of sent messages " in s . generic . rightOrder 
+ + 
+ object s { 
+ implicit val ec = system . dispatcher 
+ 
+ @ @ - 311 , 6 + 315 , 79 @ @ class MessagingServiceSpec 
+ } 
+ } 
+ 
+ + object generic { 
+ + 
+ + def rightOrder ( ) = { 
+ + val ( alice , aliceAuthId , aliceAuthSid , _ ) = createUser ( ) 
+ + val ( bob , bobAuthId , bobAuthSid , _ ) = createUser ( ) 
+ + 
+ + val alicePeer = ApiPeer ( ApiPeerType . Private , alice . id ) 
+ + val bobPeer = ApiPeer ( ApiPeerType . Private , bob . id ) 
+ + 
+ + val aliceOutPeer = whenReady ( ACLUtils . getOutPeer ( alicePeer , bobAuthId ) ) ( identity ) 
+ + val bobOutPeer = whenReady ( ACLUtils . getOutPeer ( bobPeer , aliceAuthId ) ) ( identity ) 
+ + 
+ + def sendMessageToAlice ( text : String ) : Future [ ResponseSeqDate ] = { 
+ + implicit val clientData = ClientData ( bobAuthId , 1 , Some ( AuthData ( bob . id , bobAuthSid ) ) ) 
+ + service . handleSendMessage ( aliceOutPeer , ACLUtils . randomLong ( ) , textMessage ( text ) ) map ( _ . toOption . get ) 
+ + } 
+ + 
+ + val toAlice = for ( i ← 1 to 100 ) yield sendMessageToAlice ( i . toString ) 
+ + 
+ + toAlice foreach { whenReady ( _ ) ( identity ) } 
+ + 
+ + { 
+ + implicit val clientData = ClientData ( aliceAuthId , 1 , Some ( AuthData ( alice . id , aliceAuthSid ) ) ) 
+ + 
+ + whenReady ( service . handleLoadHistory ( bobOutPeer , 0L , Int . MaxValue ) ) { resp ⇒ 
+ + inside ( resp ) { 
+ + case Ok ( ResponseLoadHistory ( history , _ ) ) ⇒ 
+ + val textMessages = history map { e ⇒ 
+ + val parsed = parseMessage ( e . message . toByteArray ) 
+ + inside ( parsed ) { 
+ + case Right ( _ : ApiTextMessage ) ⇒ 
+ + } 
+ + val message = parsed . right . get 
+ + message shouldBe an [ ApiTextMessage ] 
+ + message . asInstanceOf [ ApiTextMessage ] 
+ + } 
+ + checkMessageOrder ( textMessages ) 
+ + } 
+ + } 
+ + 
+ + whenReady ( sequenceService . handleGetDifference ( 0 , Array . empty , Vector . empty ) ) { resp ⇒ 
+ + inside ( resp ) { 
+ + case Ok ( diff : ResponseGetDifference ) ⇒ 
+ + val textMessages = diff . updates collect { 
+ + case ApiUpdateContainer ( UpdateMessage . header , bytes ) ⇒ 
+ + val parsed = UpdateMessage . parseFrom ( bytes ) 
+ + parsed should matchPattern { 
+ + case Right ( _ ) ⇒ 
+ + } 
+ + val message = parsed . right . get . message 
+ + message shouldBe an [ ApiTextMessage ] 
+ + message . asInstanceOf [ ApiTextMessage ] 
+ + } 
+ + checkMessageOrder ( textMessages ) 
+ + } 
+ + } 
+ + 
+ + } 
+ + 
+ + def checkMessageOrder ( textMessages : IndexedSeq [ ApiTextMessage ] ) = { 
+ + textMessages should have length 100 
+ + ( textMessages foldLeft 0 ) { 
+ + case ( acc , el ) ⇒ 
+ + val intValue = el . text . toInt 
+ + if ( intValue > acc ) { } else { fail ( s " order of elements was wrong : $ { textMessages map ( _ . text ) mkString " , " } " ) } 
+ + intValue 
+ + } 
+ + } 
+ + 
+ + } 
+ + 
+ + } 
+ + 
+ } 
+ 
+ } 
+ diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / dialog / DialogProcessorSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / dialog / DialogProcessorSpec . scala 
+ index eabcb6c . . aeefdb7 100644 
+ - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / dialog / DialogProcessorSpec . scala 
+ + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / dialog / DialogProcessorSpec . scala 
+ @ @ - 1 , 12 + 1 , 13 @ @ 
+ package im . actor . server . dialog 
+ 
+ - import im . actor . api . rpc . messaging . { ApiTextMessage , ResponseLoadHistory } 
+ - import im . actor . api . rpc . { Ok , AuthData , ClientData , PeersImplicits } 
+ + import im . actor . api . rpc . messaging . _ 
+ import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType } 
+ + import im . actor . api . rpc . sequence . { ApiUpdateContainer , ResponseGetDifference } 
+ + import im . actor . api . rpc . { AuthData , ClientData , Ok , PeersImplicits } 
+ + import im . actor . server . _ 
+ import im . actor . server . acl . ACLUtils 
+ import im . actor . server . api . rpc . service . messaging . MessagingServiceImpl 
+ import im . actor . server . sequence . SeqStateDate 
+ - import im . actor . server . { MessageParsing , BaseAppSuite , ImplicitAuthService , ImplicitSessionRegion } 
+ 
+ import scala . concurrent . Future 
+ import scala . language . postfixOps 
+ @ @ - 35 , 10 + 36 , 10 @ @ final class DialogProcessorSpec extends BaseAppSuite 
+ val bobPeer = ApiPeer ( ApiPeerType . Private , bob . id ) 
+ 
+ def sendMessageToBob ( text : String ) : Future [ SeqStateDate ] = 
+ - dialogExt . sendMessage ( bobPeer , alice . id , aliceAuthSid , ACLUtils . randomLong ( ) , textMessage ( text ) ) 
+ + dialogExt . sendMessage ( bobPeer , alice . id , aliceAuthSid , Some ( aliceAuthId ) , ACLUtils . randomLong ( ) , textMessage ( text ) ) 
+ 
+ def sendMessageToAlice ( text : String ) : Future [ SeqStateDate ] = 
+ - dialogExt . sendMessage ( alicePeer , bob . id , bobAuthSid , ACLUtils . randomLong ( ) , textMessage ( text ) ) 
+ + dialogExt . sendMessage ( alicePeer , bob . id , bobAuthSid , Some ( bobAuthId ) , ACLUtils . randomLong ( ) , textMessage ( text ) ) 
+ 
+ val toAlice = for ( i ← 1 to 50 ) yield sendMessageToAlice ( s " Hello $ i " ) 
+ val toBob = for ( i ← 1 to 50 ) yield sendMessageToBob ( s " Hello you back $ i " ) 
+ @ @ - 77 , 10 + 78 , 10 @ @ final class DialogProcessorSpec extends BaseAppSuite 
+ val bobPeer = ApiPeer ( ApiPeerType . Private , bob . id ) 
+ 
+ def sendMessageToBob ( text : String ) : Future [ SeqStateDate ] = 
+ - dialogExt . sendMessage ( bobPeer , alice . id , aliceAuthSid , ACLUtils . randomLong ( ) , textMessage ( text ) ) 
+ + dialogExt . sendMessage ( bobPeer , alice . id , aliceAuthSid , Some ( aliceAuthId ) , ACLUtils . randomLong ( ) , textMessage ( text ) ) 
+ 
+ def sendMessageToAlice ( text : String ) : Future [ SeqStateDate ] = 
+ - dialogExt . sendMessage ( alicePeer , bob . id , bobAuthSid , ACLUtils . randomLong ( ) , textMessage ( text ) ) 
+ + dialogExt . sendMessage ( alicePeer , bob . id , bobAuthSid , Some ( bobAuthId ) , ACLUtils . randomLong ( ) , textMessage ( text ) ) 
+ 
+ val toAlice = for ( i ← 1 to 50 ) yield sendMessageToAlice ( s " Hello $ i " ) 
+ val toBob = for ( i ← 1 to 50 ) yield sendMessageToBob ( s " Hello you back $ i " )

@@ -1,0 +1,1895 @@
+BLEU SCORE: 0.016932492841722675
+
+TEST MSG: Remove usage of AsynchronousExecutor library in favor or a simpler implementation .
+GENERATED MSG: MCL Update
+
+TEST DIFF (one line): diff - - git a / src / main / java / net / minecraftforge / common / chunkio / ChunkIOExecutor . java b / src / main / java / net / minecraftforge / common / chunkio / ChunkIOExecutor . java <nl> index e4cda1d . . 3b8fccb 100644 <nl> - - - a / src / main / java / net / minecraftforge / common / chunkio / ChunkIOExecutor . java <nl> + + + b / src / main / java / net / minecraftforge / common / chunkio / ChunkIOExecutor . java <nl> @ @ - 1 , 32 + 1 , 130 @ @ <nl> package net . minecraftforge . common . chunkio ; <nl> <nl> - import net . minecraftforge . common . util . AsynchronousExecutor ; <nl> + import java . util . Iterator ; <nl> + import java . util . Map ; <nl> + import java . util . concurrent . Executors ; <nl> + import java . util . concurrent . LinkedBlockingQueue ; <nl> + import java . util . concurrent . ThreadFactory ; <nl> + import java . util . concurrent . ThreadPoolExecutor ; <nl> + import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . atomic . AtomicInteger ; <nl> <nl> - public class ChunkIOExecutor { <nl> + import com . google . common . collect . Maps ; <nl> + <nl> + import net . minecraft . world . World ; <nl> + import net . minecraft . world . chunk . Chunk ; <nl> + import net . minecraft . world . chunk . storage . AnvilChunkLoader ; <nl> + import net . minecraft . world . gen . ChunkProviderServer ; <nl> + import net . minecraftforge . fml . common . FMLLog ; <nl> + <nl> + public class ChunkIOExecutor <nl> + { <nl> static final int BASE _ THREADS = 1 ; <nl> static final int PLAYERS _ PER _ THREAD = 50 ; <nl> <nl> - private static final AsynchronousExecutor < QueuedChunk , net . minecraft . world . chunk . Chunk , Runnable , RuntimeException > instance = new AsynchronousExecutor < QueuedChunk , net . minecraft . world . chunk . Chunk , Runnable , RuntimeException > ( new ChunkIOProvider ( ) , BASE _ THREADS ) ; <nl> + private static final Map < QueuedChunk , ChunkIOProvider > tasks = Maps . newConcurrentMap ( ) ; <nl> + private static final ThreadPoolExecutor pool = new ThreadPoolExecutor ( BASE _ THREADS , Integer . MAX _ VALUE , 60L , TimeUnit . SECONDS , <nl> + new LinkedBlockingQueue < Runnable > ( ) , <nl> + new ThreadFactory ( ) <nl> + { <nl> + private AtomicInteger count = new AtomicInteger ( 1 ) ; <nl> + @ Override <nl> + public Thread newThread ( Runnable r ) <nl> + { <nl> + Thread thread = new Thread ( r , " Chunk I / O Executor Thread - " + count . getAndIncrement ( ) ) ; <nl> + thread . setDaemon ( true ) ; <nl> + return thread ; <nl> + } <nl> + } <nl> + ) ; <nl> <nl> - public static net . minecraft . world . chunk . Chunk syncChunkLoad ( net . minecraft . world . World world , net . minecraft . world . chunk . storage . AnvilChunkLoader loader , net . minecraft . world . gen . ChunkProviderServer provider , int x , int z ) { <nl> - return instance . getSkipQueue ( new QueuedChunk ( x , z , loader , world , provider ) ) ; <nl> + / / Load the chunk completely in this thread . Dequeue as needed . . . <nl> + public static Chunk syncChunkLoad ( World world , AnvilChunkLoader loader , ChunkProviderServer provider , int x , int z ) <nl> + { <nl> + QueuedChunk key = new QueuedChunk ( x , z , loader , world , provider ) ; <nl> + ChunkIOProvider task = tasks . get ( key ) ; <nl> + if ( task ! = null ) <nl> + { <nl> + if ( ! pool . remove ( task ) & & ! task . runFinished ( ) ) / / If it wasn ' t in the pool , and run hasn ' t finished , then wait for the async thread . <nl> + { <nl> + synchronized ( task ) <nl> + { <nl> + try <nl> + { <nl> + task . wait ( ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + e . printStackTrace ( ) ; / / Something happened ? Log it ? <nl> + } <nl> + } <nl> + } <nl> + } <nl> + else <nl> + { <nl> + task = new ChunkIOProvider ( key ) ; <nl> + task . run ( ) ; <nl> + } <nl> + task . syncCallback ( ) ; <nl> + return task . getChunk ( ) ; <nl> } <nl> <nl> - public static void queueChunkLoad ( net . minecraft . world . World world , net . minecraft . world . chunk . storage . AnvilChunkLoader loader , net . minecraft . world . gen . ChunkProviderServer provider , int x , int z , Runnable runnable ) { <nl> - instance . add ( new QueuedChunk ( x , z , loader , world , provider ) , runnable ) ; <nl> + / / Queue the chunk to be loaded , and call the runnable when finished <nl> + public static void queueChunkLoad ( World world , AnvilChunkLoader loader , ChunkProviderServer provider , int x , int z , Runnable runnable ) <nl> + { <nl> + QueuedChunk key = new QueuedChunk ( x , z , loader , world , provider ) ; <nl> + ChunkIOProvider task = tasks . get ( key ) ; <nl> + if ( task = = null ) <nl> + { <nl> + task = new ChunkIOProvider ( key ) ; <nl> + task . addCallback ( runnable ) ; / / Add before calling execute for thread safety <nl> + tasks . put ( key , task ) ; <nl> + pool . execute ( task ) ; <nl> + } <nl> + else <nl> + { <nl> + task . addCallback ( runnable ) ; <nl> + } <nl> } <nl> <nl> / / Abuses the fact that hashCode and equals for QueuedChunk only use world and coords <nl> - public static void dropQueuedChunkLoad ( net . minecraft . world . World world , int x , int z , Runnable runnable ) { <nl> - instance . drop ( new QueuedChunk ( x , z , null , world , null ) , runnable ) ; <nl> + / / Remove the chunk from the queue if it ' s in the list . <nl> + public static void dropQueuedChunkLoad ( World world , int x , int z , Runnable runnable ) <nl> + { <nl> + QueuedChunk key = new QueuedChunk ( x , z , null , world , null ) ; <nl> + ChunkIOProvider task = tasks . get ( key ) ; <nl> + if ( task = = null ) <nl> + { <nl> + FMLLog . warning ( " Attempted to dequeue chunk that wasn ' t queued ? % d @ ( % d , % d ) " , world . provider . getDimension ( ) , x , z ) ; <nl> + return ; <nl> + } <nl> + <nl> + task . removeCallback ( runnable ) ; <nl> + <nl> + if ( ! task . hasCallback ( ) ) <nl> + { <nl> + tasks . remove ( key ) ; <nl> + pool . remove ( task ) ; <nl> + } <nl> } <nl> <nl> - public static void adjustPoolSize ( int players ) { <nl> + public static void adjustPoolSize ( int players ) <nl> + { <nl> int size = Math . max ( BASE _ THREADS , ( int ) Math . ceil ( players / PLAYERS _ PER _ THREAD ) ) ; <nl> - instance . setActiveThreads ( size ) ; <nl> + pool . setCorePoolSize ( size ) ; <nl> } <nl> <nl> - public static void tick ( ) { <nl> - instance . finishActive ( ) ; <nl> + public static void tick ( ) <nl> + { <nl> + Iterator < ChunkIOProvider > itr = tasks . values ( ) . iterator ( ) ; <nl> + while ( itr . hasNext ( ) ) <nl> + { <nl> + ChunkIOProvider task = itr . next ( ) ; <nl> + if ( task . runFinished ( ) & & task . hasCallback ( ) ) <nl> + { <nl> + task . syncCallback ( ) ; <nl> + } <nl> + itr . remove ( ) ; <nl> + } <nl> } <nl> } <nl> \ No newline at end of file <nl> diff - - git a / src / main / java / net / minecraftforge / common / chunkio / ChunkIOProvider . java b / src / main / java / net / minecraftforge / common / chunkio / ChunkIOProvider . java <nl> index 4b38198 . . b76a7cf 100644 <nl> - - - a / src / main / java / net / minecraftforge / common / chunkio / ChunkIOProvider . java <nl> + + + b / src / main / java / net / minecraftforge / common / chunkio / ChunkIOProvider . java <nl> @ @ - 1 , 64 + 1 , 113 @ @ <nl> package net . minecraftforge . common . chunkio ; <nl> <nl> - <nl> import net . minecraft . world . ChunkCoordIntPair ; <nl> + import net . minecraft . world . chunk . Chunk ; <nl> + import net . minecraft . world . chunk . storage . AnvilChunkLoader ; <nl> + import net . minecraft . world . gen . ChunkProviderServer ; <nl> + import net . minecraft . nbt . NBTTagCompound ; <nl> import net . minecraftforge . common . MinecraftForge ; <nl> - import net . minecraftforge . common . util . AsynchronousExecutor ; <nl> import net . minecraftforge . event . world . ChunkDataEvent ; <nl> <nl> import java . io . IOException ; <nl> - import java . util . concurrent . atomic . AtomicInteger ; <nl> - <nl> - class ChunkIOProvider implements AsynchronousExecutor . CallBackProvider < QueuedChunk , net . minecraft . world . chunk . Chunk , Runnable , RuntimeException > { <nl> - private final AtomicInteger threadNumber = new AtomicInteger ( 1 ) ; <nl> - <nl> - / / async stuff <nl> - public net . minecraft . world . chunk . Chunk callStage1 ( QueuedChunk queuedChunk ) throws RuntimeException { <nl> - net . minecraft . world . chunk . storage . AnvilChunkLoader loader = queuedChunk . loader ; <nl> - Object [ ] data = null ; <nl> - try { <nl> - data = loader . loadChunk _ _ Async ( queuedChunk . world , queuedChunk . x , queuedChunk . z ) ; <nl> - } catch ( IOException e ) { <nl> - e . printStackTrace ( ) ; <nl> - } <nl> + import java . util . concurrent . ConcurrentLinkedQueue ; <nl> <nl> - if ( data ! = null ) { <nl> - queuedChunk . compound = ( net . minecraft . nbt . NBTTagCompound ) data [ 1 ] ; <nl> - return ( net . minecraft . world . chunk . Chunk ) data [ 0 ] ; <nl> - } <nl> + class ChunkIOProvider implements Runnable <nl> + { <nl> + private QueuedChunk chunkInfo ; <nl> + private Chunk chunk ; <nl> + private NBTTagCompound nbt ; <nl> + private ConcurrentLinkedQueue < Runnable > callbacks = new ConcurrentLinkedQueue < Runnable > ( ) ; <nl> + private boolean ran = false ; <nl> + <nl> + ChunkIOProvider ( QueuedChunk chunk ) <nl> + { <nl> + this . chunkInfo = chunk ; <nl> + } <nl> + <nl> + public void addCallback ( Runnable callback ) <nl> + { <nl> + this . callbacks . add ( callback ) ; <nl> + } <nl> + public void removeCallback ( Runnable callback ) <nl> + { <nl> + this . callbacks . remove ( callback ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void run ( ) / / async stuff <nl> + { <nl> + synchronized ( this ) <nl> + { <nl> + AnvilChunkLoader loader = chunkInfo . loader ; <nl> + Object [ ] data = null ; <nl> + try <nl> + { <nl> + data = loader . loadChunk _ _ Async ( chunkInfo . world , chunkInfo . x , chunkInfo . z ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + e . printStackTrace ( ) ; <nl> + } <nl> <nl> - return null ; <nl> + if ( data ! = null ) <nl> + { <nl> + this . nbt = ( NBTTagCompound ) data [ 1 ] ; <nl> + this . chunk = ( Chunk ) data [ 0 ] ; <nl> + } <nl> + <nl> + this . ran = true ; <nl> + this . notifyAll ( ) ; <nl> + } <nl> } <nl> <nl> / / sync stuff <nl> - public void callStage2 ( QueuedChunk queuedChunk , net . minecraft . world . chunk . Chunk chunk ) throws RuntimeException { <nl> - if ( chunk = = null ) { <nl> + public void syncCallback ( ) <nl> + { <nl> + ChunkProviderServer provider = this . chunkInfo . provider ; <nl> + if ( chunk = = null ) <nl> + { <nl> / / If the chunk loading failed just do it synchronously ( may generate ) <nl> - queuedChunk . provider . originalLoadChunk ( queuedChunk . x , queuedChunk . z ) ; <nl> + provider . originalLoadChunk ( this . chunkInfo . x , this . chunkInfo . z ) ; <nl> return ; <nl> } <nl> <nl> - queuedChunk . loader . loadEntities ( queuedChunk . world , queuedChunk . compound . getCompoundTag ( " Level " ) , chunk ) ; <nl> - MinecraftForge . EVENT _ BUS . post ( new ChunkDataEvent . Load ( chunk , queuedChunk . compound ) ) ; / / Don ' t call ChunkDataEvent . Load async <nl> - chunk . setLastSaveTime ( queuedChunk . provider . worldObj . getTotalWorldTime ( ) ) ; <nl> - queuedChunk . provider . id2ChunkMap . add ( ChunkCoordIntPair . chunkXZ2Int ( queuedChunk . x , queuedChunk . z ) , chunk ) ; <nl> - queuedChunk . provider . loadedChunks . add ( chunk ) ; <nl> - chunk . onChunkLoad ( ) ; <nl> + / / Load Entities <nl> + this . chunkInfo . loader . loadEntities ( this . chunkInfo . world , this . nbt . getCompoundTag ( " Level " ) , this . chunk ) ; <nl> + <nl> + MinecraftForge . EVENT _ BUS . post ( new ChunkDataEvent . Load ( this . chunk , this . nbt ) ) ; / / Don ' t call ChunkDataEvent . Load async <nl> <nl> - if ( queuedChunk . provider . chunkGenerator ! = null ) { <nl> - queuedChunk . provider . chunkGenerator . recreateStructures ( chunk , queuedChunk . x , queuedChunk . z ) ; <nl> + this . chunk . setLastSaveTime ( provider . worldObj . getTotalWorldTime ( ) ) ; <nl> + provider . id2ChunkMap . add ( ChunkCoordIntPair . chunkXZ2Int ( this . chunkInfo . x , this . chunkInfo . z ) , this . chunk ) ; <nl> + provider . loadedChunks . add ( this . chunk ) ; <nl> + this . chunk . onChunkLoad ( ) ; <nl> + <nl> + if ( provider . chunkGenerator ! = null ) <nl> + { <nl> + provider . chunkGenerator . recreateStructures ( this . chunk , this . chunkInfo . x , this . chunkInfo . z ) ; <nl> } <nl> <nl> - chunk . populateChunk ( queuedChunk . provider , queuedChunk . provider . chunkGenerator ) ; <nl> + this . chunk . populateChunk ( provider , provider . chunkGenerator ) ; <nl> + <nl> + for ( Runnable r : this . callbacks ) <nl> + { <nl> + r . run ( ) ; <nl> + } <nl> + <nl> + this . callbacks . clear ( ) ; <nl> + } <nl> + <nl> + public Chunk getChunk ( ) <nl> + { <nl> + return this . chunk ; <nl> } <nl> <nl> - public void callStage3 ( QueuedChunk queuedChunk , net . minecraft . world . chunk . Chunk chunk , Runnable runnable ) throws RuntimeException { <nl> - runnable . run ( ) ; <nl> + public boolean runFinished ( ) <nl> + { <nl> + return this . ran ; <nl> } <nl> <nl> - public Thread newThread ( Runnable runnable ) { <nl> - Thread thread = new Thread ( runnable , " Chunk I / O Executor Thread - " + threadNumber . getAndIncrement ( ) ) ; <nl> - thread . setDaemon ( true ) ; <nl> - return thread ; <nl> + public boolean hasCallback ( ) <nl> + { <nl> + return this . callbacks . size ( ) > 0 ; <nl> } <nl> } <nl> \ No newline at end of file <nl> diff - - git a / src / main / java / net / minecraftforge / common / chunkio / QueuedChunk . java b / src / main / java / net / minecraftforge / common / chunkio / QueuedChunk . java <nl> index 039d75c . . d813242 100644 <nl> - - - a / src / main / java / net / minecraftforge / common / chunkio / QueuedChunk . java <nl> + + + b / src / main / java / net / minecraftforge / common / chunkio / QueuedChunk . java <nl> @ @ - 7 , 7 + 7 , 6 @ @ class QueuedChunk { <nl> final net . minecraft . world . chunk . storage . AnvilChunkLoader loader ; <nl> final net . minecraft . world . World world ; <nl> final net . minecraft . world . gen . ChunkProviderServer provider ; <nl> - net . minecraft . nbt . NBTTagCompound compound ; <nl> <nl> public QueuedChunk ( int x , int z , net . minecraft . world . chunk . storage . AnvilChunkLoader loader , net . minecraft . world . World world , net . minecraft . world . gen . ChunkProviderServer provider ) { <nl> this . x = x ; <nl> diff - - git a / src / main / java / net / minecraftforge / common / util / AsynchronousExecutor . java b / src / main / java / net / minecraftforge / common / util / AsynchronousExecutor . java <nl> deleted file mode 100644 <nl> index 9457c55 . . 0000000 <nl> - - - a / src / main / java / net / minecraftforge / common / util / AsynchronousExecutor . java <nl> + + + / dev / null <nl> @ @ - 1 , 360 + 0 , 0 @ @ <nl> - package net . minecraftforge . common . util ; <nl> - <nl> - import java . util . HashMap ; <nl> - import java . util . LinkedList ; <nl> - import java . util . List ; <nl> - import java . util . Map ; <nl> - import java . util . Queue ; <nl> - import java . util . concurrent . ConcurrentLinkedQueue ; <nl> - import java . util . concurrent . LinkedBlockingQueue ; <nl> - import java . util . concurrent . ThreadFactory ; <nl> - import java . util . concurrent . ThreadPoolExecutor ; <nl> - import java . util . concurrent . TimeUnit ; <nl> - import java . util . concurrent . atomic . AtomicIntegerFieldUpdater ; <nl> - <nl> - import net . minecraftforge . fml . common . FMLLog ; <nl> - <nl> - <nl> - / * * <nl> - * Executes tasks using a multi - stage process executor . Synchronous executions are via { @ link AsynchronousExecutor # finishActive ( ) } or the { @ link AsynchronousExecutor # get ( Object ) } methods . <nl> - * < li \ > Stage 1 creates the object from a parameter , and is usually called asynchronously . <nl> - * < li \ > Stage 2 takes the parameter and object from stage 1 and does any synchronous processing to prepare it . <nl> - * < li \ > Stage 3 takes the parameter and object from stage 1 , as well as a callback that was registered , and performs any synchronous calculations . <nl> - * <nl> - * @ param < P > The type of parameter you provide to make the object that will be created . It should implement { @ link Object # hashCode ( ) } and { @ link Object # equals ( Object ) } if you want to get the value early . <nl> - * @ param < T > The type of object you provide . This is created in stage 1 , and passed to stage 2 , 3 , and returned if get ( ) is called . <nl> - * @ param < C > The type of callback you provide . You may register many of these to be passed to the provider in stage 3 , one at a time . <nl> - * @ param < E > A type of exception you may throw and expect to be handled by the main thread <nl> - * @ author Wesley Wolfe ( c ) 2012 , 2014 <nl> - * / <nl> - public final class AsynchronousExecutor < P , T , C , E extends Throwable > { <nl> - <nl> - public static interface CallBackProvider < P , T , C , E extends Throwable > extends ThreadFactory { <nl> - <nl> - / * * <nl> - * Normally an asynchronous call , but can be synchronous <nl> - * <nl> - * @ param parameter parameter object provided <nl> - * @ return the created object <nl> - * / <nl> - T callStage1 ( P parameter ) throws E ; <nl> - <nl> - / * * <nl> - * Synchronous call <nl> - * <nl> - * @ param parameter parameter object provided <nl> - * @ param object the previously created object <nl> - * / <nl> - void callStage2 ( P parameter , T object ) throws E ; <nl> - <nl> - / * * <nl> - * Synchronous call , called multiple times , once per registered callback <nl> - * <nl> - * @ param parameter parameter object provided <nl> - * @ param object the previously created object <nl> - * @ param callback the current callback to execute <nl> - * / <nl> - void callStage3 ( P parameter , T object , C callback ) throws E ; <nl> - } <nl> - <nl> - private static class StateHolder { <nl> - <nl> - protected static final int PENDING = 0x0 ; <nl> - protected static final int STAGE _ 1 _ ASYNC = PENDING + 1 ; <nl> - protected static final int STAGE _ 1 _ SYNC = STAGE _ 1 _ ASYNC + 1 ; <nl> - protected static final int STAGE _ 1 _ COMPLETE = STAGE _ 1 _ SYNC + 1 ; <nl> - protected static final int FINISHED = STAGE _ 1 _ COMPLETE + 1 ; <nl> - <nl> - protected volatile int state = PENDING ; <nl> - <nl> - protected static final AtomicIntegerFieldUpdater < StateHolder > STATE = AtomicIntegerFieldUpdater . newUpdater ( StateHolder . class , " state " ) ; <nl> - } <nl> - <nl> - private class Task extends StateHolder implements Runnable { <nl> - <nl> - private final P parameter ; <nl> - private T object ; <nl> - private final List < C > callbacks = new LinkedList < C > ( ) ; <nl> - private E t = null ; <nl> - <nl> - private Task ( final P parameter ) { <nl> - this . parameter = parameter ; <nl> - } <nl> - <nl> - public void run ( ) { <nl> - if ( initAsync ( ) ) { <nl> - finished . add ( this ) ; <nl> - } <nl> - } <nl> - <nl> - private boolean initAsync ( ) { <nl> - if ( STATE . compareAndSet ( this , PENDING , STAGE _ 1 _ ASYNC ) ) { <nl> - boolean ret = true ; <nl> - <nl> - try { <nl> - init ( ) ; <nl> - } finally { <nl> - if ( STATE . compareAndSet ( this , STAGE _ 1 _ ASYNC , STAGE _ 1 _ COMPLETE ) ) { <nl> - / / No one is / will be waiting <nl> - } else { <nl> - / / We know that the sync thread will be waiting <nl> - synchronized ( this ) { <nl> - if ( state ! = STAGE _ 1 _ SYNC ) { <nl> - / / They beat us to the synchronized block <nl> - this . notifyAll ( ) ; <nl> - } else { <nl> - / / We beat them to the synchronized block <nl> - } <nl> - state = STAGE _ 1 _ COMPLETE ; / / They ' re already synchronized , atomic locks are not needed <nl> - } <nl> - / / We want to return false , because we know a synchronous task already handled the finish ( ) <nl> - ret = false ; / / Don ' t return inside finally ; VERY bad practice . <nl> - } <nl> - } <nl> - <nl> - return ret ; <nl> - } else { <nl> - return false ; <nl> - } <nl> - } <nl> - <nl> - private void initSync ( ) { <nl> - if ( STATE . compareAndSet ( this , PENDING , STAGE _ 1 _ COMPLETE ) ) { <nl> - / / If we succeed that variable switch , good as done <nl> - init ( ) ; <nl> - } else if ( STATE . compareAndSet ( this , STAGE _ 1 _ ASYNC , STAGE _ 1 _ SYNC ) ) { <nl> - / / Async thread is running , but this shouldn ' t be likely ; we need to sync to wait on them because of it . <nl> - synchronized ( this ) { <nl> - if ( STATE . compareAndSet ( this , STAGE _ 1 _ SYNC , PENDING ) ) { / / They might NOT synchronized yet , atomic lock IS needed <nl> - / / We are the first into the lock <nl> - while ( state ! = STAGE _ 1 _ COMPLETE ) { <nl> - try { <nl> - this . wait ( ) ; <nl> - } catch ( InterruptedException e ) { <nl> - Thread . currentThread ( ) . interrupt ( ) ; <nl> - throw new RuntimeException ( " Unable to handle interruption on " + parameter , e ) ; <nl> - } <nl> - } <nl> - } else { <nl> - / / They beat us to the synchronized block <nl> - } <nl> - } <nl> - } else { <nl> - / / Async thread is not pending , the more likely situation for a task not pending <nl> - } <nl> - } <nl> - <nl> - @ SuppressWarnings ( " unchecked " ) <nl> - private void init ( ) { <nl> - try { <nl> - object = provider . callStage1 ( parameter ) ; <nl> - } catch ( final Throwable t ) { <nl> - this . t = ( E ) t ; <nl> - } <nl> - } <nl> - <nl> - @ SuppressWarnings ( " unchecked " ) <nl> - private T get ( ) throws E { <nl> - initSync ( ) ; <nl> - if ( callbacks . isEmpty ( ) ) { <nl> - / / ' this ' is a placeholder to prevent callbacks from being empty during finish call <nl> - / / See get method below <nl> - callbacks . add ( ( C ) this ) ; <nl> - } <nl> - finish ( ) ; <nl> - return object ; <nl> - } <nl> - <nl> - private void finish ( ) throws E { <nl> - switch ( state ) { <nl> - default : <nl> - case PENDING : <nl> - case STAGE _ 1 _ ASYNC : <nl> - case STAGE _ 1 _ SYNC : <nl> - throw new IllegalStateException ( " Attempting to finish unprepared ( " + state + " ) task ( " + parameter + " ) " ) ; <nl> - case STAGE _ 1 _ COMPLETE : <nl> - try { <nl> - if ( t ! = null ) { <nl> - throw t ; <nl> - } <nl> - if ( callbacks . isEmpty ( ) ) { <nl> - return ; <nl> - } <nl> - <nl> - final CallBackProvider < P , T , C , E > provider = AsynchronousExecutor . this . provider ; <nl> - final P parameter = this . parameter ; <nl> - final T object = this . object ; <nl> - <nl> - provider . callStage2 ( parameter , object ) ; <nl> - for ( C callback : callbacks ) { <nl> - if ( callback = = this ) { <nl> - / / ' this ' is a placeholder to prevent callbacks from being empty on a get ( ) call <nl> - / / See get method above <nl> - continue ; <nl> - } <nl> - provider . callStage3 ( parameter , object , callback ) ; <nl> - } <nl> - } finally { <nl> - tasks . remove ( parameter ) ; <nl> - state = FINISHED ; <nl> - } <nl> - case FINISHED : <nl> - } <nl> - } <nl> - <nl> - private boolean drop ( ) { <nl> - if ( STATE . compareAndSet ( this , PENDING , FINISHED ) ) { <nl> - / / If we succeed that variable switch , good as forgotten <nl> - tasks . remove ( parameter ) ; <nl> - return true ; <nl> - } else { <nl> - / / We need the async thread to finish normally to properly dispose of the task <nl> - return false ; <nl> - } <nl> - } <nl> - } <nl> - <nl> - private final CallBackProvider < P , T , C , E > provider ; <nl> - private final Queue < Task > finished = new ConcurrentLinkedQueue < Task > ( ) ; <nl> - private final Map < P , Task > tasks = new HashMap < P , Task > ( ) ; <nl> - private final ThreadPoolExecutor pool ; <nl> - <nl> - / * * <nl> - * Uses a thread pool to pass executions to the provider . <nl> - * @ see AsynchronousExecutor <nl> - * / <nl> - public AsynchronousExecutor ( final CallBackProvider < P , T , C , E > provider , final int coreSize ) { <nl> - if ( provider = = null ) { <nl> - throw new IllegalArgumentException ( " Provider cannot be null " ) ; <nl> - } <nl> - this . provider = provider ; <nl> - <nl> - / / We have an unbound queue size so do not need a max thread size <nl> - pool = new ThreadPoolExecutor ( coreSize , Integer . MAX _ VALUE , 60l , TimeUnit . SECONDS , new LinkedBlockingQueue < Runnable > ( ) , provider ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Adds a callback to the parameter provided , adding parameter to the queue if needed . <nl> - * < p > <nl> - * This should always be synchronous . <nl> - * / <nl> - public void add ( P parameter , C callback ) { <nl> - Task task = tasks . get ( parameter ) ; <nl> - if ( task = = null ) { <nl> - tasks . put ( parameter , task = new Task ( parameter ) ) ; <nl> - pool . execute ( task ) ; <nl> - } <nl> - task . callbacks . add ( callback ) ; <nl> - } <nl> - <nl> - / * * <nl> - * This removes a particular callback from the specified parameter . <nl> - * < p > <nl> - * If no callbacks remain for a given parameter , then the { @ link CallBackProvider CallBackProvider ' s } stages may be omitted from execution . <nl> - * Stage 3 will have no callbacks , stage 2 will be skipped unless a { @ link # get ( Object ) } is used , and stage 1 will be avoided on a best - effort basis . <nl> - * < p > <nl> - * Subsequent calls to { @ link # getSkipQueue ( Object ) } will always work . <nl> - * < p > <nl> - * Subsequent calls to { @ link # get ( Object ) } might work . <nl> - * < p > <nl> - * This should always be synchronous <nl> - * @ return true if no further execution for the parameter is possible , such that , no exceptions will be thrown in { @ link # finishActive ( ) } for the parameter , and { @ link # get ( Object ) } will throw an { @ link IllegalStateException } , false otherwise <nl> - * @ throws IllegalStateException if parameter is not in the queue anymore <nl> - * @ throws IllegalStateException if the callback was not specified for given parameter <nl> - * / <nl> - public boolean drop ( P parameter , C callback ) throws IllegalStateException { <nl> - final Task task = tasks . get ( parameter ) ; <nl> - if ( task = = null ) { <nl> - / / Print debug info for QueuedChunk and avoid crash <nl> - / / throw new IllegalStateException ( " Unknown " + parameter ) ; <nl> - FMLLog . info ( " Unknown % s " , parameter ) ; <nl> - FMLLog . info ( " This should not happen . Please report this error to Forge . " ) ; <nl> - return false ; <nl> - } <nl> - if ( ! task . callbacks . remove ( callback ) ) { <nl> - throw new IllegalStateException ( " Unknown " + callback + " for " + parameter ) ; <nl> - } <nl> - if ( task . callbacks . isEmpty ( ) ) { <nl> - return task . drop ( ) ; <nl> - } <nl> - return false ; <nl> - } <nl> - <nl> - / * * <nl> - * This method attempts to skip the waiting period for said parameter . <nl> - * < p > <nl> - * This should always be synchronous . <nl> - * @ throws IllegalStateException if the parameter is not in the queue anymore , or sometimes if called from asynchronous thread <nl> - * / <nl> - public T get ( P parameter ) throws E , IllegalStateException { <nl> - final Task task = tasks . get ( parameter ) ; <nl> - if ( task = = null ) { <nl> - throw new IllegalStateException ( " Unknown " + parameter ) ; <nl> - } <nl> - return task . get ( ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Processes a parameter as if it was in the queue , without ever passing to another thread . <nl> - * / <nl> - public T getSkipQueue ( P parameter ) throws E { <nl> - return skipQueue ( parameter ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Processes a parameter as if it was in the queue , without ever passing to another thread . <nl> - * / <nl> - public T getSkipQueue ( P parameter , C callback ) throws E { <nl> - final T object = skipQueue ( parameter ) ; <nl> - provider . callStage3 ( parameter , object , callback ) ; <nl> - return object ; <nl> - } <nl> - <nl> - / * * <nl> - * Processes a parameter as if it was in the queue , without ever passing to another thread . <nl> - * / <nl> - public T getSkipQueue ( P parameter , C . . . callbacks ) throws E { <nl> - final CallBackProvider < P , T , C , E > provider = this . provider ; <nl> - final T object = skipQueue ( parameter ) ; <nl> - for ( C callback : callbacks ) { <nl> - provider . callStage3 ( parameter , object , callback ) ; <nl> - } <nl> - return object ; <nl> - } <nl> - <nl> - / * * <nl> - * Processes a parameter as if it was in the queue , without ever passing to another thread . <nl> - * / <nl> - public T getSkipQueue ( P parameter , Iterable < C > callbacks ) throws E { <nl> - final CallBackProvider < P , T , C , E > provider = this . provider ; <nl> - final T object = skipQueue ( parameter ) ; <nl> - for ( C callback : callbacks ) { <nl> - provider . callStage3 ( parameter , object , callback ) ; <nl> - } <nl> - return object ; <nl> - } <nl> - <nl> - private T skipQueue ( P parameter ) throws E { <nl> - Task task = tasks . get ( parameter ) ; <nl> - if ( task ! = null ) { <nl> - return task . get ( ) ; <nl> - } <nl> - T object = provider . callStage1 ( parameter ) ; <nl> - provider . callStage2 ( parameter , object ) ; <nl> - return object ; <nl> - } <nl> - <nl> - / * * <nl> - * This is the ' heartbeat ' that should be called synchronously to finish any pending tasks <nl> - * / <nl> - public void finishActive ( ) throws E { <nl> - final Queue < Task > finished = this . finished ; <nl> - while ( ! finished . isEmpty ( ) ) { <nl> - finished . poll ( ) . finish ( ) ; <nl> - } <nl> - } <nl> - <nl> - public void setActiveThreads ( final int coreSize ) { <nl> - pool . setCorePoolSize ( coreSize ) ; <nl> - } <nl> - } <nl> \ No newline at end of file <nl> diff - - git a / src / main / resources / lgpl - 3 . 0 . txt b / src / main / resources / lgpl - 3 . 0 . txt <nl> deleted file mode 100644 <nl> index 02bbb60 . . 0000000 <nl> - - - a / src / main / resources / lgpl - 3 . 0 . txt <nl> + + + / dev / null <nl> @ @ - 1 , 165 + 0 , 0 @ @ <nl> - GNU LESSER GENERAL PUBLIC LICENSE <nl> - Version 3 , 29 June 2007 <nl> - <nl> - Copyright ( C ) 2007 Free Software Foundation , Inc . < http : / / fsf . org / > <nl> - Everyone is permitted to copy and distribute verbatim copies <nl> - of this license document , but changing it is not allowed . <nl> - <nl> - <nl> - This version of the GNU Lesser General Public License incorporates <nl> - the terms and conditions of version 3 of the GNU General Public <nl> - License , supplemented by the additional permissions listed below . <nl> - <nl> - 0 . Additional Definitions . <nl> - <nl> - As used herein , " this License " refers to version 3 of the GNU Lesser <nl> - General Public License , and the " GNU GPL " refers to version 3 of the GNU <nl> - General Public License . <nl> - <nl> - " The Library " refers to a covered work governed by this License , <nl> - other than an Application or a Combined Work as defined below . <nl> - <nl> - An " Application " is any work that makes use of an interface provided <nl> - by the Library , but which is not otherwise based on the Library . <nl> - Defining a subclass of a class defined by the Library is deemed a mode <nl> - of using an interface provided by the Library . <nl> - <nl> - A " Combined Work " is a work produced by combining or linking an <nl> - Application with the Library . The particular version of the Library <nl> - with which the Combined Work was made is also called the " Linked <nl> - Version " . <nl> - <nl> - The " Minimal Corresponding Source " for a Combined Work means the <nl> - Corresponding Source for the Combined Work , excluding any source code <nl> - for portions of the Combined Work that , considered in isolation , are <nl> - based on the Application , and not on the Linked Version . <nl> - <nl> - The " Corresponding Application Code " for a Combined Work means the <nl> - object code and / or source code for the Application , including any data <nl> - and utility programs needed for reproducing the Combined Work from the <nl> - Application , but excluding the System Libraries of the Combined Work . <nl> - <nl> - 1 . Exception to Section 3 of the GNU GPL . <nl> - <nl> - You may convey a covered work under sections 3 and 4 of this License <nl> - without being bound by section 3 of the GNU GPL . <nl> - <nl> - 2 . Conveying Modified Versions . <nl> - <nl> - If you modify a copy of the Library , and , in your modifications , a <nl> - facility refers to a function or data to be supplied by an Application <nl> - that uses the facility ( other than as an argument passed when the <nl> - facility is invoked ) , then you may convey a copy of the modified <nl> - version : <nl> - <nl> - a ) under this License , provided that you make a good faith effort to <nl> - ensure that , in the event an Application does not supply the <nl> - function or data , the facility still operates , and performs <nl> - whatever part of its purpose remains meaningful , or <nl> - <nl> - b ) under the GNU GPL , with none of the additional permissions of <nl> - this License applicable to that copy . <nl> - <nl> - 3 . Object Code Incorporating Material from Library Header Files . <nl> - <nl> - The object code form of an Application may incorporate material from <nl> - a header file that is part of the Library . You may convey such object <nl> - code under terms of your choice , provided that , if the incorporated <nl> - material is not limited to numerical parameters , data structure <nl> - layouts and accessors , or small macros , inline functions and templates <nl> - ( ten or fewer lines in length ) , you do both of the following : <nl> - <nl> - a ) Give prominent notice with each copy of the object code that the <nl> - Library is used in it and that the Library and its use are <nl> - covered by this License . <nl> - <nl> - b ) Accompany the object code with a copy of the GNU GPL and this license <nl> - document . <nl> - <nl> - 4 . Combined Works . <nl> - <nl> - You may convey a Combined Work under terms of your choice that , <nl> - taken together , effectively do not restrict modification of the <nl> - portions of the Library contained in the Combined Work and reverse <nl> - engineering for debugging such modifications , if you also do each of <nl> - the following : <nl> - <nl> - a ) Give prominent notice with each copy of the Combined Work that <nl> - the Library is used in it and that the Library and its use are <nl> - covered by this License . <nl> - <nl> - b ) Accompany the Combined Work with a copy of the GNU GPL and this license <nl> - document . <nl> - <nl> - c ) For a Combined Work that displays copyright notices during <nl> - execution , include the copyright notice for the Library among <nl> - these notices , as well as a reference directing the user to the <nl> - copies of the GNU GPL and this license document . <nl> - <nl> - d ) Do one of the following : <nl> - <nl> - 0 ) Convey the Minimal Corresponding Source under the terms of this <nl> - License , and the Corresponding Application Code in a form <nl> - suitable for , and under terms that permit , the user to <nl> - recombine or relink the Application with a modified version of <nl> - the Linked Version to produce a modified Combined Work , in the <nl> - manner specified by section 6 of the GNU GPL for conveying <nl> - Corresponding Source . <nl> - <nl> - 1 ) Use a suitable shared library mechanism for linking with the <nl> - Library . A suitable mechanism is one that ( a ) uses at run time <nl> - a copy of the Library already present on the user ' s computer <nl> - system , and ( b ) will operate properly with a modified version <nl> - of the Library that is interface - compatible with the Linked <nl> - Version . <nl> - <nl> - e ) Provide Installation Information , but only if you would otherwise <nl> - be required to provide such information under section 6 of the <nl> - GNU GPL , and only to the extent that such information is <nl> - necessary to install and execute a modified version of the <nl> - Combined Work produced by recombining or relinking the <nl> - Application with a modified version of the Linked Version . ( If <nl> - you use option 4d0 , the Installation Information must accompany <nl> - the Minimal Corresponding Source and Corresponding Application <nl> - Code . If you use option 4d1 , you must provide the Installation <nl> - Information in the manner specified by section 6 of the GNU GPL <nl> - for conveying Corresponding Source . ) <nl> - <nl> - 5 . Combined Libraries . <nl> - <nl> - You may place library facilities that are a work based on the <nl> - Library side by side in a single library together with other library <nl> - facilities that are not Applications and are not covered by this <nl> - License , and convey such a combined library under terms of your <nl> - choice , if you do both of the following : <nl> - <nl> - a ) Accompany the combined library with a copy of the same work based <nl> - on the Library , uncombined with any other library facilities , <nl> - conveyed under the terms of this License . <nl> - <nl> - b ) Give prominent notice with the combined library that part of it <nl> - is a work based on the Library , and explaining where to find the <nl> - accompanying uncombined form of the same work . <nl> - <nl> - 6 . Revised Versions of the GNU Lesser General Public License . <nl> - <nl> - The Free Software Foundation may publish revised and / or new versions <nl> - of the GNU Lesser General Public License from time to time . Such new <nl> - versions will be similar in spirit to the present version , but may <nl> - differ in detail to address new problems or concerns . <nl> - <nl> - Each version is given a distinguishing version number . If the <nl> - Library as you received it specifies that a certain numbered version <nl> - of the GNU Lesser General Public License " or any later version " <nl> - applies to it , you have the option of following the terms and <nl> - conditions either of that published version or of any later version <nl> - published by the Free Software Foundation . If the Library as you <nl> - received it does not specify a version number of the GNU Lesser <nl> - General Public License , you may choose any version of the GNU Lesser <nl> - General Public License ever published by the Free Software Foundation . <nl> - <nl> - If the Library as you received it specifies that a proxy can decide <nl> - whether future versions of the GNU Lesser General Public License shall <nl> - apply , that proxy ' s public statement of acceptance of any version is <nl> - permanent authorization for you to choose that version for the <nl> - Library . <nl> \ No newline at end of file
+NEAREST DIFF (one line): diff - - git a / common / net / minecraftforge / common / MinecartRegistry . java b / common / net / minecraftforge / common / MinecartRegistry . java <nl> deleted file mode 100644 <nl> index 43cfd23 . . 0000000 <nl> - - - a / common / net / minecraftforge / common / MinecartRegistry . java <nl> + + + / dev / null <nl> @ @ - 1 , 215 + 0 , 0 @ @ <nl> - package net . minecraftforge . common ; <nl> - <nl> - import java . util . HashMap ; <nl> - import java . util . HashSet ; <nl> - import java . util . Map ; <nl> - import java . util . Set ; <nl> - <nl> - import net . minecraft . entity . item . EntityMinecart ; <nl> - import net . minecraft . item . Item ; <nl> - import net . minecraft . item . ItemStack ; <nl> - <nl> - public class MinecartRegistry <nl> - { <nl> - private static Map < MinecartKey , ItemStack > itemForMinecart = new HashMap < MinecartKey , ItemStack > ( ) ; <nl> - private static Map < ItemStack , MinecartKey > minecartForItem = new HashMap < ItemStack , MinecartKey > ( ) ; <nl> - / * * <nl> - * Registers a custom minecart and its corresponding item . <nl> - * This should be the item used to place the minecart by the user , <nl> - * not the item dropped by the cart . <nl> - * @ param cart The minecart . <nl> - * @ param item The item used to place the cart . <nl> - * / <nl> - public static void registerMinecart ( Class < ? extends EntityMinecart > cart , ItemStack item ) <nl> - { <nl> - registerMinecart ( cart , 0 , item ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Registers a minecart and its corresponding item . <nl> - * This should be the item used to place the minecart by the user , <nl> - * not the item dropped by the cart . <nl> - * @ param minecart The minecart . <nl> - * @ param type The minecart type , used to differentiate carts that have the same class . <nl> - * @ param item The item used to place the cart . <nl> - * / <nl> - public static void registerMinecart ( Class < ? extends EntityMinecart > minecart , int type , ItemStack item ) <nl> - { <nl> - MinecartKey key = new MinecartKey ( minecart , type ) ; <nl> - itemForMinecart . put ( key , item ) ; <nl> - minecartForItem . put ( item , key ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Removes a previously registered Minecart . Useful for replacing the vanilla minecarts . <nl> - * @ param minecart <nl> - * @ param type <nl> - * / <nl> - public static void removeMinecart ( Class < ? extends EntityMinecart > minecart , int type ) <nl> - { <nl> - MinecartKey key = new MinecartKey ( minecart , type ) ; <nl> - ItemStack item = itemForMinecart . remove ( key ) ; <nl> - if ( item ! = null ) <nl> - { <nl> - minecartForItem . remove ( item ) ; <nl> - } <nl> - } <nl> - <nl> - / * * <nl> - * This function returns an ItemStack that represents this cart . <nl> - * The player should be able to use this item to place the minecart . <nl> - * This is the item that was registered with the cart via the registerMinecart function , <nl> - * but is not necessary the item the cart drops when destroyed . <nl> - * @ param minecart The cart class <nl> - * @ return An ItemStack that can be used to place the cart . <nl> - * / <nl> - public static ItemStack getItemForCart ( Class < ? extends EntityMinecart > minecart ) <nl> - { <nl> - return getItemForCart ( minecart , 0 ) ; <nl> - } <nl> - <nl> - / * * <nl> - * This function returns an ItemStack that represents this cart . <nl> - * The player should be able to use this item to place the minecart . <nl> - * This is the item that was registered with the cart via the registerMinecart function , <nl> - * but is not necessary the item the cart drops when destroyed . <nl> - * @ param minecart The cart class <nl> - * @ param type The minecartType value <nl> - * @ return An ItemStack that can be used to place the cart . <nl> - * / <nl> - public static ItemStack getItemForCart ( Class < ? extends EntityMinecart > minecart , int type ) <nl> - { <nl> - ItemStack item = itemForMinecart . get ( new MinecartKey ( minecart , type ) ) ; <nl> - if ( item = = null ) <nl> - { <nl> - return null ; <nl> - } <nl> - return item . copy ( ) ; <nl> - } <nl> - <nl> - / * * <nl> - * This function returns an ItemStack that represents this cart . <nl> - * The player should be able to use this item to place the minecart . <nl> - * This is the item that was registered with the cart via the registerMinecart function , <nl> - * but is not necessary the item the cart drops when destroyed . <nl> - * @ param cart The cart entity <nl> - * @ return An ItemStack that can be used to place the cart . <nl> - * / <nl> - public static ItemStack getItemForCart ( EntityMinecart cart ) <nl> - { <nl> - return getItemForCart ( cart . getClass ( ) , cart . getMinecartType ( ) ) ; <nl> - } <nl> - <nl> - / * * <nl> - * The function will return the cart class for a given item . <nl> - * If the item was not registered via the registerMinecart function it will return null . <nl> - * @ param item The item to test . <nl> - * @ return Cart if mapping exists , null if not . <nl> - * / <nl> - public static Class < ? extends EntityMinecart > getCartClassForItem ( ItemStack item ) <nl> - { <nl> - MinecartKey key = null ; <nl> - for ( Map . Entry < ItemStack , MinecartKey > entry : minecartForItem . entrySet ( ) ) <nl> - { <nl> - if ( entry . getKey ( ) . isItemEqual ( item ) ) <nl> - { <nl> - key = entry . getValue ( ) ; <nl> - break ; <nl> - } <nl> - } <nl> - if ( key ! = null ) <nl> - { <nl> - return key . minecart ; <nl> - } <nl> - return null ; <nl> - } <nl> - <nl> - / * * <nl> - * The function will return the cart type for a given item . <nl> - * Will return - 1 if the mapping doesn ' t exist . <nl> - * If the item was not registered via the registerMinecart function it will return null . <nl> - * @ param item The item to test . <nl> - * @ return the cart minecartType value . <nl> - * / <nl> - public static int getCartTypeForItem ( ItemStack item ) <nl> - { <nl> - MinecartKey key = null ; <nl> - for ( Map . Entry < ItemStack , MinecartKey > entry : minecartForItem . entrySet ( ) ) <nl> - { <nl> - if ( entry . getKey ( ) . isItemEqual ( item ) ) <nl> - { <nl> - key = entry . getValue ( ) ; <nl> - break ; <nl> - } <nl> - } <nl> - if ( key ! = null ) <nl> - { <nl> - return key . type ; <nl> - } <nl> - return - 1 ; <nl> - } <nl> - <nl> - / * * <nl> - * Will return a set of all registered minecart items . <nl> - * @ return a copy of the set of all minecart items <nl> - * / <nl> - public static Set < ItemStack > getAllCartItems ( ) <nl> - { <nl> - Set < ItemStack > ret = new HashSet < ItemStack > ( ) ; <nl> - for ( ItemStack item : minecartForItem . keySet ( ) ) <nl> - { <nl> - ret . add ( item . copy ( ) ) ; <nl> - } <nl> - return ret ; <nl> - } <nl> - <nl> - static <nl> - { <nl> - registerMinecart ( EntityMinecart . class , 0 , new ItemStack ( Item . minecartEmpty ) ) ; <nl> - registerMinecart ( EntityMinecart . class , 1 , new ItemStack ( Item . minecartCrate ) ) ; <nl> - registerMinecart ( EntityMinecart . class , 2 , new ItemStack ( Item . minecartPowered ) ) ; <nl> - } <nl> - <nl> - public static class MinecartKey <nl> - { <nl> - public final Class < ? extends EntityMinecart > minecart ; <nl> - public final int type ; <nl> - <nl> - public MinecartKey ( Class < ? extends EntityMinecart > cls , int typtID ) <nl> - { <nl> - minecart = cls ; <nl> - type = typtID ; <nl> - } <nl> - <nl> - @ Override <nl> - public boolean equals ( Object obj ) <nl> - { <nl> - if ( obj = = null ) <nl> - { <nl> - return false ; <nl> - } <nl> - <nl> - if ( getClass ( ) ! = obj . getClass ( ) ) <nl> - { <nl> - return false ; <nl> - } <nl> - <nl> - final MinecartKey other = ( MinecartKey ) obj ; <nl> - if ( this . minecart ! = other . minecart & & ( this . minecart = = null | | ! this . minecart . equals ( other . minecart ) ) ) <nl> - { <nl> - return false ; <nl> - } <nl> - <nl> - return ( this . type = = other . type ) ; <nl> - } <nl> - <nl> - @ Override <nl> - public int hashCode ( ) <nl> - { <nl> - int hash = 7 ; <nl> - hash = 59 * hash + ( this . minecart ! = null ? this . minecart . hashCode ( ) : 0 ) ; <nl> - hash = 59 * hash + this . type ; <nl> - return hash ; <nl> - } <nl> - } <nl> - } <nl> diff - - git a / patches / minecraft / net / minecraft / block / BlockBaseRail . java . patch b / patches / minecraft / net / minecraft / block / BlockBaseRail . java . patch <nl> new file mode 100644 <nl> index 0000000 . . e5d4408 <nl> - - - / dev / null <nl> + + + b / patches / minecraft / net / minecraft / block / BlockBaseRail . java . patch <nl> @ @ - 0 , 0 + 1 , 136 @ @ <nl> + - - - . . / src _ base / minecraft / net / minecraft / block / BlockBaseRail . java <nl> + + + + . . / src _ work / minecraft / net / minecraft / block / BlockBaseRail . java <nl> + @ @ - 3 , 6 + 3 , 7 @ @ <nl> + import java . util . Random ; <nl> + import net . minecraft . block . material . Material ; <nl> + import net . minecraft . creativetab . CreativeTabs ; <nl> + + import net . minecraft . entity . item . EntityMinecart ; <nl> + import net . minecraft . util . AxisAlignedBB ; <nl> + import net . minecraft . util . MovingObjectPosition ; <nl> + import net . minecraft . util . Vec3 ; <nl> + @ @ - 28 , 7 + 29 , 7 @ @ <nl> + * / <nl> + public static final boolean isRailBlock ( int par0 ) <nl> + { <nl> + - return par0 = = Block . rail . blockID | | par0 = = Block . railPowered . blockID | | par0 = = Block . railDetector . blockID | | par0 = = Block . field _ 94337 _ cv . blockID ; <nl> + + return Block . blocksList [ par0 ] instanceof BlockBaseRail ; <nl> + } <nl> + <nl> + protected BlockBaseRail ( int par1 , boolean par2 ) <nl> + @ @ - 105 , 7 + 106 , 7 @ @ <nl> + * / <nl> + public int getRenderType ( ) <nl> + { <nl> + - return 9 ; <nl> + + return renderType ; <nl> + } <nl> + <nl> + / * * <nl> + @ @ - 216 , 4 + 217 , 107 @ @ <nl> + { <nl> + return 0 ; <nl> + } <nl> + + <nl> + + / * * <nl> + + * Return true if the rail can make corners . <nl> + + * Used by placement logic . <nl> + + * @ param world The world . <nl> + + * @ param x The rail X coordinate . <nl> + + * @ param y The rail Y coordinate . <nl> + + * @ param z The rail Z coordinate . <nl> + + * @ return True if the rail can make corners . <nl> + + * / <nl> + + public boolean isFlexibleRail ( World world , int y , int x , int z ) <nl> + + { <nl> + + return ! isPowered ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Returns true if the rail can make up and down slopes . <nl> + + * Used by placement logic . <nl> + + * @ param world The world . <nl> + + * @ param x The rail X coordinate . <nl> + + * @ param y The rail Y coordinate . <nl> + + * @ param z The rail Z coordinate . <nl> + + * @ return True if the rail can make slopes . <nl> + + * / <nl> + + public boolean canMakeSlopes ( World world , int x , int y , int z ) <nl> + + { <nl> + + return true ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Return the rail ' s metadata ( without the power bit if the rail uses one ) . <nl> + + * Can be used to make the cart think the rail something other than it is , <nl> + + * for example when making diamond junctions or switches . <nl> + + * The cart parameter will often be null unless it it called from EntityMinecart . <nl> + + * <nl> + + * Valid rail metadata is defined as follows : <nl> + + * 0x0 : flat track going North - South <nl> + + * 0x1 : flat track going West - East <nl> + + * 0x2 : track ascending to the East <nl> + + * 0x3 : track ascending to the West <nl> + + * 0x4 : track ascending to the North <nl> + + * 0x5 : track ascending to the South <nl> + + * 0x6 : WestNorth corner ( connecting East and South ) <nl> + + * 0x7 : EastNorth corner ( connecting West and South ) <nl> + + * 0x8 : EastSouth corner ( connecting West and North ) <nl> + + * 0x9 : WestSouth corner ( connecting East and North ) <nl> + + * <nl> + + * @ param world The world . <nl> + + * @ param cart The cart asking for the metadata , null if it is not called by EntityMinecart . <nl> + + * @ param y The rail X coordinate . <nl> + + * @ param x The rail Y coordinate . <nl> + + * @ param z The rail Z coordinate . <nl> + + * @ return The metadata . <nl> + + * / <nl> + + public int getBasicRailMetadata ( IBlockAccess world , EntityMinecart cart , int x , int y , int z ) <nl> + + { <nl> + + int meta = world . getBlockMetadata ( x , y , z ) ; <nl> + + if ( isPowered ) <nl> + + { <nl> + + meta = meta & 7 ; <nl> + + } <nl> + + return meta ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Returns the max speed of the rail at the specified position . <nl> + + * @ param world The world . <nl> + + * @ param cart The cart on the rail , may be null . <nl> + + * @ param x The rail X coordinate . <nl> + + * @ param y The rail Y coordinate . <nl> + + * @ param z The rail Z coordinate . <nl> + + * @ return The max speed of the current rail . <nl> + + * / <nl> + + public float getRailMaxSpeed ( World world , EntityMinecart cart , int y , int x , int z ) <nl> + + { <nl> + + return 0 . 4f ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * This function is called by any minecart that passes over this rail . <nl> + + * It is called once per update tick that the minecart is on the rail . <nl> + + * @ param world The world . <nl> + + * @ param cart The cart on the rail . <nl> + + * @ param y The rail X coordinate . <nl> + + * @ param x The rail Y coordinate . <nl> + + * @ param z The rail Z coordinate . <nl> + + * / <nl> + + public void onMinecartPass ( World world , EntityMinecart cart , int y , int x , int z ) <nl> + + { <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Forge : Moved render type to a field and a setter . <nl> + + * This allows for a mod to change the render type <nl> + + * for vanilla rails , and any mod rails that extend <nl> + + * this class . <nl> + + * / <nl> + + private int renderType = 9 ; <nl> + + <nl> + + public void setRenderType ( int value ) <nl> + + { <nl> + + renderType = value ; <nl> + + } <nl> + } <nl> diff - - git a / patches / minecraft / net / minecraft / block / BlockBaseRailLogic . java . patch b / patches / minecraft / net / minecraft / block / BlockBaseRailLogic . java . patch <nl> new file mode 100644 <nl> index 0000000 . . db7e4b1 <nl> - - - / dev / null <nl> + + + b / patches / minecraft / net / minecraft / block / BlockBaseRailLogic . java . patch <nl> @ @ - 0 , 0 + 1 , 70 @ @ <nl> + - - - . . / src _ base / minecraft / net / minecraft / block / BlockBaseRailLogic . java <nl> + + + + . . / src _ work / minecraft / net / minecraft / block / BlockBaseRailLogic . java <nl> + @ @ - 13 , 6 + 13 , 8 @ @ <nl> + private int field _ 94515 _ e ; <nl> + private final boolean field _ 94512 _ f ; <nl> + private List field _ 94513 _ g ; <nl> + + <nl> + + private final boolean canMakeSlopes ; <nl> + <nl> + final BlockBaseRail field _ 94518 _ a ; <nl> + <nl> + @ @ - 25 , 17 + 27 , 11 @ @ <nl> + this . field _ 94514 _ d = par4 ; <nl> + this . field _ 94515 _ e = par5 ; <nl> + int l = par2World . getBlockId ( par3 , par4 , par5 ) ; <nl> + - int i1 = par2World . getBlockMetadata ( par3 , par4 , par5 ) ; <nl> + - <nl> + - if ( ( ( BlockBaseRail ) Block . blocksList [ l ] ) . isPowered ) <nl> + - { <nl> + - this . field _ 94512 _ f = true ; <nl> + - i1 & = - 9 ; <nl> + - } <nl> + - else <nl> + - { <nl> + - this . field _ 94512 _ f = false ; <nl> + - } <nl> + + <nl> + + BlockBaseRail target = ( BlockBaseRail ) Block . blocksList [ l ] ; <nl> + + int i1 = target . getBasicRailMetadata ( par2World , null , par3 , par4 , par5 ) ; <nl> + + field _ 94512 _ f = ! target . isFlexibleRail ( par2World , par3 , par4 , par5 ) ; <nl> + + canMakeSlopes = target . canMakeSlopes ( par2World , par3 , par4 , par5 ) ; <nl> + <nl> + this . func _ 94504 _ a ( i1 ) ; <nl> + } <nl> + @ @ - 227 , 7 + 223 , 7 @ @ <nl> + } <nl> + } <nl> + <nl> + - if ( b0 = = 0 ) <nl> + + if ( b0 = = 0 & & canMakeSlopes ) <nl> + { <nl> + if ( BlockBaseRail . isRailBlockAt ( this . field _ 94516 _ b , this . field _ 94517 _ c , this . field _ 94514 _ d + 1 , this . field _ 94515 _ e - 1 ) ) <nl> + { <nl> + @ @ - 240 , 7 + 236 , 7 @ @ <nl> + } <nl> + } <nl> + <nl> + - if ( b0 = = 1 ) <nl> + + if ( b0 = = 1 & & canMakeSlopes ) <nl> + { <nl> + if ( BlockBaseRail . isRailBlockAt ( this . field _ 94516 _ b , this . field _ 94517 _ c + 1 , this . field _ 94514 _ d + 1 , this . field _ 94515 _ e ) ) <nl> + { <nl> + @ @ - 385 , 7 + 381 , 7 @ @ <nl> + } <nl> + } <nl> + <nl> + - if ( b0 = = 0 ) <nl> + + if ( b0 = = 0 & & canMakeSlopes ) <nl> + { <nl> + if ( BlockBaseRail . isRailBlockAt ( this . field _ 94516 _ b , this . field _ 94517 _ c , this . field _ 94514 _ d + 1 , this . field _ 94515 _ e - 1 ) ) <nl> + { <nl> + @ @ - 398 , 7 + 394 , 7 @ @ <nl> + } <nl> + } <nl> + <nl> + - if ( b0 = = 1 ) <nl> + + if ( b0 = = 1 & & canMakeSlopes ) <nl> + { <nl> + if ( BlockBaseRail . isRailBlockAt ( this . field _ 94516 _ b , this . field _ 94517 _ c + 1 , this . field _ 94514 _ d + 1 , this . field _ 94515 _ e ) ) <nl> + { <nl> diff - - git a / patches / minecraft / net / minecraft / entity / ItemChestMinecart . java . patch b / patches / minecraft / net / minecraft / entity / ItemChestMinecart . java . patch <nl> new file mode 100644 <nl> index 0000000 . . f6d1aaf <nl> - - - / dev / null <nl> + + + b / patches / minecraft / net / minecraft / entity / ItemChestMinecart . java . patch <nl> @ @ - 0 , 0 + 1 , 22 @ @ <nl> + - - - . . / src _ base / minecraft / net / minecraft / entity / ItemChestMinecart . java <nl> + + + + . . / src _ work / minecraft / net / minecraft / entity / ItemChestMinecart . java <nl> + @ @ - 10 , 6 + 10 , 8 @ @ <nl> + import net . minecraft . nbt . NBTTagList ; <nl> + import net . minecraft . util . DamageSource ; <nl> + import net . minecraft . world . World ; <nl> + + import net . minecraftforge . common . MinecraftForge ; <nl> + + import net . minecraftforge . event . entity . minecart . MinecartInteractEvent ; <nl> + <nl> + public class ItemChestMinecart extends EntityMinecart implements IInventory <nl> + { <nl> + @ @ - 292 , 6 + 294 , 10 @ @ <nl> + * / <nl> + public boolean interact ( EntityPlayer par1EntityPlayer ) <nl> + { <nl> + + if ( MinecraftForge . EVENT _ BUS . post ( new MinecartInteractEvent ( this , par1EntityPlayer ) ) ) <nl> + + { <nl> + + return true ; <nl> + + } <nl> + if ( ! this . worldObj . isRemote ) <nl> + { <nl> + par1EntityPlayer . displayGUIChest ( this ) ; <nl> diff - - git a / patches / minecraft / net / minecraft / entity / ItemFurnaceMinecart . java . patch b / patches / minecraft / net / minecraft / entity / ItemFurnaceMinecart . java . patch <nl> new file mode 100644 <nl> index 0000000 . . 548a35f <nl> - - - / dev / null <nl> + + + b / patches / minecraft / net / minecraft / entity / ItemFurnaceMinecart . java . patch <nl> @ @ - 0 , 0 + 1 , 22 @ @ <nl> + - - - . . / src _ base / minecraft / net / minecraft / entity / ItemFurnaceMinecart . java <nl> + + + + . . / src _ work / minecraft / net / minecraft / entity / ItemFurnaceMinecart . java <nl> + @ @ - 8 , 6 + 8 , 8 @ @ <nl> + import net . minecraft . nbt . NBTTagCompound ; <nl> + import net . minecraft . util . MathHelper ; <nl> + import net . minecraft . world . World ; <nl> + + import net . minecraftforge . common . MinecraftForge ; <nl> + + import net . minecraftforge . event . entity . minecart . MinecartInteractEvent ; <nl> + <nl> + public class ItemFurnaceMinecart extends EntityMinecart <nl> + { <nl> + @ @ - 116 , 6 + 118 , 10 @ @ <nl> + * / <nl> + public boolean interact ( EntityPlayer par1EntityPlayer ) <nl> + { <nl> + + if ( MinecraftForge . EVENT _ BUS . post ( new MinecartInteractEvent ( this , par1EntityPlayer ) ) ) <nl> + + { <nl> + + return true ; <nl> + + } <nl> + ItemStack itemstack = par1EntityPlayer . inventory . getCurrentItem ( ) ; <nl> + <nl> + if ( itemstack ! = null & & itemstack . itemID = = Item . coal . itemID ) <nl> diff - - git a / patches / minecraft / net / minecraft / entity / ItemRideableMinecart . java . patch b / patches / minecraft / net / minecraft / entity / ItemRideableMinecart . java . patch <nl> new file mode 100644 <nl> index 0000000 . . 754997e <nl> - - - / dev / null <nl> + + + b / patches / minecraft / net / minecraft / entity / ItemRideableMinecart . java . patch <nl> @ @ - 0 , 0 + 1 , 22 @ @ <nl> + - - - . . / src _ base / minecraft / net / minecraft / entity / ItemRideableMinecart . java <nl> + + + + . . / src _ work / minecraft / net / minecraft / entity / ItemRideableMinecart . java <nl> + @ @ - 3 , 6 + 3 , 8 @ @ <nl> + import net . minecraft . entity . item . EntityMinecart ; <nl> + import net . minecraft . entity . player . EntityPlayer ; <nl> + import net . minecraft . world . World ; <nl> + + import net . minecraftforge . common . MinecraftForge ; <nl> + + import net . minecraftforge . event . entity . minecart . MinecartInteractEvent ; <nl> + <nl> + public class ItemRideableMinecart extends EntityMinecart <nl> + { <nl> + @ @ - 21 , 6 + 23 , 10 @ @ <nl> + * / <nl> + public boolean interact ( EntityPlayer par1EntityPlayer ) <nl> + { <nl> + + if ( MinecraftForge . EVENT _ BUS . post ( new MinecartInteractEvent ( this , par1EntityPlayer ) ) ) <nl> + + { <nl> + + return true ; <nl> + + } <nl> + if ( this . riddenByEntity ! = null & & this . riddenByEntity instanceof EntityPlayer & & this . riddenByEntity ! = par1EntityPlayer ) <nl> + { <nl> + return true ; <nl> diff - - git a / patches / minecraft / net / minecraft / entity / item / EntityMinecart . java . patch b / patches / minecraft / net / minecraft / entity / item / EntityMinecart . java . patch <nl> new file mode 100644 <nl> index 0000000 . . 4115e2f <nl> - - - / dev / null <nl> + + + b / patches / minecraft / net / minecraft / entity / item / EntityMinecart . java . patch <nl> @ @ - 0 , 0 + 1 , 497 @ @ <nl> + - - - . . / src _ base / minecraft / net / minecraft / entity / item / EntityMinecart . java <nl> + + + + . . / src _ work / minecraft / net / minecraft / entity / item / EntityMinecart . java <nl> + @ @ - 24 , 6 + 24 , 10 @ @ <nl> + import net . minecraft . util . Vec3 ; <nl> + import net . minecraft . world . World ; <nl> + import net . minecraft . world . WorldServer ; <nl> + + import net . minecraftforge . common . IMinecartCollisionHandler ; <nl> + + import net . minecraftforge . common . MinecraftForge ; <nl> + + import net . minecraftforge . event . entity . minecart . MinecartCollisionEvent ; <nl> + + import net . minecraftforge . event . entity . minecart . MinecartUpdateEvent ; <nl> + <nl> + public abstract class EntityMinecart extends Entity <nl> + { <nl> + @ @ - 48 , 6 + 52 , 20 @ @ <nl> + @ SideOnly ( Side . CLIENT ) <nl> + protected double velocityZ ; <nl> + <nl> + + / * Forge : Minecart Compatibility Layer Integration . * / <nl> + + public static float defaultMaxSpeedAirLateral = 0 . 4f ; <nl> + + public static float defaultMaxSpeedAirVertical = - 1f ; <nl> + + public static double defaultDragAir = 0 . 94999998807907104D ; <nl> + + protected boolean canUseRail = true ; <nl> + + protected boolean canBePushed = true ; <nl> + + private static IMinecartCollisionHandler collisionHandler = null ; <nl> + + <nl> + + / * Instance versions of the above physics properties * / <nl> + + private float currentSpeedRail = getMaxCartSpeedOnRail ( ) ; <nl> + + protected float maxSpeedAirLateral = defaultMaxSpeedAirLateral ; <nl> + + protected float maxSpeedAirVertical = defaultMaxSpeedAirVertical ; <nl> + + protected double dragAir = defaultDragAir ; <nl> + + <nl> + public EntityMinecart ( World par1World ) <nl> + { <nl> + super ( par1World ) ; <nl> + @ @ - 99 , 6 + 117 , 10 @ @ <nl> + * / <nl> + public AxisAlignedBB getCollisionBox ( Entity par1Entity ) <nl> + { <nl> + + if ( getCollisionHandler ( ) ! = null ) <nl> + + { <nl> + + return getCollisionHandler ( ) . getCollisionBox ( this , par1Entity ) ; <nl> + + } <nl> + return par1Entity . canBePushed ( ) ? par1Entity . boundingBox : null ; <nl> + } <nl> + <nl> + @ @ - 107 , 6 + 129 , 10 @ @ <nl> + * / <nl> + public AxisAlignedBB getBoundingBox ( ) <nl> + { <nl> + + if ( getCollisionHandler ( ) ! = null ) <nl> + + { <nl> + + return getCollisionHandler ( ) . getBoundingBox ( this ) ; <nl> + + } <nl> + return null ; <nl> + } <nl> + <nl> + @ @ - 115 , 7 + 141 , 7 @ @ <nl> + * / <nl> + public boolean canBePushed ( ) <nl> + { <nl> + - return true ; <nl> + + return canBePushed ; <nl> + } <nl> + <nl> + public EntityMinecart ( World par1World , double par2 , double par4 , double par6 ) <nl> + @ @ - 349 , 13 + 375 , 16 @ @ <nl> + double d5 = 0 . 0078125D ; <nl> + int l = this . worldObj . getBlockId ( j , i , k ) ; <nl> + <nl> + - if ( BlockBaseRail . isRailBlock ( l ) ) <nl> + - { <nl> + - this . func _ 94091 _ a ( j , i , k , d4 , d5 , l , this . worldObj . getBlockMetadata ( j , i , k ) ) ; <nl> + + if ( canUseRail ( ) & & BlockBaseRail . isRailBlock ( l ) ) <nl> + + { <nl> + + BlockBaseRail rail = ( BlockBaseRail ) Block . blocksList [ l ] ; <nl> + + float railMaxSpeed = rail . getRailMaxSpeed ( worldObj , this , j , i , k ) ; <nl> + + double maxSpeed = Math . min ( railMaxSpeed , getCurrentCartSpeedCapOnRail ( ) ) ; <nl> + + this . func _ 94091 _ a ( j , i , k , maxSpeed , getSlopeAdjustment ( ) , l , rail . getBasicRailMetadata ( worldObj , this , j , i , k ) ) ; <nl> + } <nl> + else <nl> + { <nl> + - this . func _ 94088 _ b ( d4 ) ; <nl> + + this . func _ 94088 _ b ( onGround ? d4 : getMaxSpeedAirLateral ( ) ) ; <nl> + } <nl> + <nl> + this . doBlockCollisions ( ) ; <nl> + @ @ - 382 , 7 + 411 , 18 @ @ <nl> + } <nl> + <nl> + this . setRotation ( this . rotationYaw , this . rotationPitch ) ; <nl> + - List list = this . worldObj . getEntitiesWithinAABBExcludingEntity ( this , this . boundingBox . expand ( 0 . 20000000298023224D , 0 . 0D , 0 . 20000000298023224D ) ) ; <nl> + + <nl> + + AxisAlignedBB box ; <nl> + + if ( getCollisionHandler ( ) ! = null ) <nl> + + { <nl> + + box = getCollisionHandler ( ) . getMinecartCollisionBox ( this ) ; <nl> + + } <nl> + + else <nl> + + { <nl> + + box = boundingBox . expand ( 0 . 2D , 0 . 0D , 0 . 2D ) ; <nl> + + } <nl> + + <nl> + + List list = this . worldObj . getEntitiesWithinAABBExcludingEntity ( this , box ) ; <nl> + <nl> + if ( list ! = null & & ! list . isEmpty ( ) ) <nl> + { <nl> + @ @ - 406 , 6 + 446 , 8 @ @ <nl> + <nl> + this . riddenByEntity = null ; <nl> + } <nl> + + <nl> + + MinecraftForge . EVENT _ BUS . post ( new MinecartUpdateEvent ( this , j , i , k ) ) ; <nl> + } <nl> + } <nl> + <nl> + @ @ - 431 , 6 + 473 , 17 @ @ <nl> + this . motionZ = par1 ; <nl> + } <nl> + <nl> + + double moveY = motionY ; <nl> + + if ( getMaxSpeedAirVertical ( ) > 0 & & motionY > getMaxSpeedAirVertical ( ) ) <nl> + + { <nl> + + moveY = getMaxSpeedAirVertical ( ) ; <nl> + + if ( Math . abs ( motionX ) < 0 . 3f & & Math . abs ( motionZ ) < 0 . 3f ) <nl> + + { <nl> + + moveY = 0 . 15f ; <nl> + + motionY = moveY ; <nl> + + } <nl> + + } <nl> + + <nl> + if ( this . onGround ) <nl> + { <nl> + this . motionX * = 0 . 5D ; <nl> + @ @ - 438 , 13 + 491 , 13 @ @ <nl> + this . motionZ * = 0 . 5D ; <nl> + } <nl> + <nl> + - this . moveEntity ( this . motionX , this . motionY , this . motionZ ) ; <nl> + + this . moveEntity ( this . motionX , moveY , this . motionZ ) ; <nl> + <nl> + if ( ! this . onGround ) <nl> + { <nl> + - this . motionX * = 0 . 949999988079071D ; <nl> + - this . motionY * = 0 . 949999988079071D ; <nl> + - this . motionZ * = 0 . 949999988079071D ; <nl> + + this . motionX * = getDragAir ( ) ; <nl> + + this . motionY * = getDragAir ( ) ; <nl> + + this . motionZ * = getDragAir ( ) ; <nl> + } <nl> + } <nl> + <nl> + @ @ - 458 , 7 + 511 , 7 @ @ <nl> + <nl> + if ( par8 = = Block . railPowered . blockID ) <nl> + { <nl> + - flag = ( par9 & 8 ) ! = 0 ; <nl> + + flag = ( worldObj . getBlockMetadata ( par1 , par2 , par3 ) & 8 ) ! = 0 ; <nl> + flag1 = ! flag ; <nl> + } <nl> + <nl> + @ @ - 523 , 7 + 576 , 7 @ @ <nl> + } <nl> + } <nl> + <nl> + - if ( flag1 ) <nl> + + if ( flag1 & & shouldDoRailFunctions ( ) ) <nl> + { <nl> + d7 = Math . sqrt ( this . motionX * this . motionX + this . motionZ * this . motionZ ) ; <nl> + <nl> + @ @ - 571 , 36 + 624 , 8 @ @ <nl> + this . posX = d8 + d2 * d7 ; <nl> + this . posZ = d9 + d3 * d7 ; <nl> + this . setPosition ( this . posX , this . posY + ( double ) this . yOffset , this . posZ ) ; <nl> + - d12 = this . motionX ; <nl> + - d13 = this . motionZ ; <nl> + - <nl> + - if ( this . riddenByEntity ! = null ) <nl> + - { <nl> + - d12 * = 0 . 75D ; <nl> + - d13 * = 0 . 75D ; <nl> + - } <nl> + - <nl> + - if ( d12 < - par4 ) <nl> + - { <nl> + - d12 = - par4 ; <nl> + - } <nl> + - <nl> + - if ( d12 > par4 ) <nl> + - { <nl> + - d12 = par4 ; <nl> + - } <nl> + - <nl> + - if ( d13 < - par4 ) <nl> + - { <nl> + - d13 = - par4 ; <nl> + - } <nl> + - <nl> + - if ( d13 > par4 ) <nl> + - { <nl> + - d13 = par4 ; <nl> + - } <nl> + - <nl> + - this . moveEntity ( d12 , 0 . 0D , d13 ) ; <nl> + + <nl> + + moveMinecartOnRail ( par1 , par2 , par3 , par4 ) ; <nl> + <nl> + if ( aint [ 0 ] [ 1 ] ! = 0 & & MathHelper . floor _ double ( this . posX ) - par1 = = aint [ 0 ] [ 0 ] & & MathHelper . floor _ double ( this . posZ ) - par3 = = aint [ 0 ] [ 2 ] ) <nl> + { <nl> + @ @ - 637 , 8 + 662 , 13 @ @ <nl> + this . motionX = d6 * ( double ) ( j1 - par1 ) ; <nl> + this . motionZ = d6 * ( double ) ( k1 - par3 ) ; <nl> + } <nl> + - <nl> + - if ( flag ) <nl> + + <nl> + + if ( shouldDoRailFunctions ( ) ) <nl> + + { <nl> + + ( ( BlockBaseRail ) Block . blocksList [ par8 ] ) . onMinecartPass ( worldObj , this , par1 , par2 , par3 ) ; <nl> + + } <nl> + + <nl> + + if ( flag & & shouldDoRailFunctions ( ) ) <nl> + { <nl> + double d15 = Math . sqrt ( this . motionX * this . motionX + this . motionZ * this . motionZ ) ; <nl> + <nl> + @ @ - 709 , 12 + 739 , 7 @ @ <nl> + } <nl> + else <nl> + { <nl> + - int i1 = this . worldObj . getBlockMetadata ( i , j , k ) ; <nl> + - <nl> + - if ( ( ( BlockBaseRail ) Block . blocksList [ l ] ) . isPowered ( ) ) <nl> + - { <nl> + - i1 & = 7 ; <nl> + - } <nl> + + int i1 = ( ( BlockBaseRail ) Block . blocksList [ l ] ) . getBasicRailMetadata ( worldObj , this , i , j , k ) ; <nl> + <nl> + par3 = ( double ) j ; <nl> + <nl> + @ @ - 760 , 13 + 785 , 8 @ @ <nl> + <nl> + if ( BlockBaseRail . isRailBlock ( l ) ) <nl> + { <nl> + - int i1 = this . worldObj . getBlockMetadata ( i , j , k ) ; <nl> + + int i1 = ( ( BlockBaseRail ) Block . blocksList [ l ] ) . getBasicRailMetadata ( worldObj , this , i , j , k ) ; <nl> + par3 = ( double ) j ; <nl> + - <nl> + - if ( ( ( BlockBaseRail ) Block . blocksList [ l ] ) . isPowered ( ) ) <nl> + - { <nl> + - i1 & = 7 ; <nl> + - } <nl> + <nl> + if ( i1 > = 2 & & i1 < = 5 ) <nl> + { <nl> + @ @ - 872 , 11 + 892 , 17 @ @ <nl> + * / <nl> + public void applyEntityCollision ( Entity par1Entity ) <nl> + { <nl> + + MinecraftForge . EVENT _ BUS . post ( new MinecartCollisionEvent ( this , par1Entity ) ) ; <nl> + + if ( getCollisionHandler ( ) ! = null ) <nl> + + { <nl> + + getCollisionHandler ( ) . onEntityCollision ( this , par1Entity ) ; <nl> + + return ; <nl> + + } <nl> + if ( ! this . worldObj . isRemote ) <nl> + { <nl> + if ( par1Entity ! = this . riddenByEntity ) <nl> + { <nl> + - if ( par1Entity instanceof EntityLiving & & ! ( par1Entity instanceof EntityPlayer ) & & ! ( par1Entity instanceof EntityIronGolem ) & & this . func _ 94087 _ l ( ) = = 0 & & this . motionX * this . motionX + this . motionZ * this . motionZ > 0 . 01D & & this . riddenByEntity = = null & & par1Entity . ridingEntity = = null ) <nl> + + if ( par1Entity instanceof EntityLiving & & ! ( par1Entity instanceof EntityPlayer ) & & ! ( par1Entity instanceof EntityIronGolem ) & & canBeRidden ( ) & & this . motionX * this . motionX + this . motionZ * this . motionZ > 0 . 01D & & this . riddenByEntity = = null & & par1Entity . ridingEntity = = null ) <nl> + { <nl> + par1Entity . mountEntity ( this ) ; <nl> + } <nl> + @ @ - 922 , 7 + 948 , 7 @ @ <nl> + double d7 = par1Entity . motionX + this . motionX ; <nl> + double d8 = par1Entity . motionZ + this . motionZ ; <nl> + <nl> + - if ( ( ( EntityMinecart ) par1Entity ) . func _ 94087 _ l ( ) = = 2 & & this . func _ 94087 _ l ( ) ! = 2 ) <nl> + + if ( ( ( EntityMinecart ) par1Entity ) . isPoweredCart ( ) & & ! isPoweredCart ( ) ) <nl> + { <nl> + this . motionX * = 0 . 20000000298023224D ; <nl> + this . motionZ * = 0 . 20000000298023224D ; <nl> + @ @ - 930 , 7 + 956 , 7 @ @ <nl> + par1Entity . motionX * = 0 . 949999988079071D ; <nl> + par1Entity . motionZ * = 0 . 949999988079071D ; <nl> + } <nl> + - else if ( ( ( EntityMinecart ) par1Entity ) . func _ 94087 _ l ( ) ! = 2 & & this . func _ 94087 _ l ( ) = = 2 ) <nl> + + else if ( ! ( ( EntityMinecart ) par1Entity ) . isPoweredCart ( ) & & isPoweredCart ( ) ) <nl> + { <nl> + par1Entity . motionX * = 0 . 20000000298023224D ; <nl> + par1Entity . motionZ * = 0 . 20000000298023224D ; <nl> + @ @ - 1118 , 4 + 1144 , 206 @ @ <nl> + { <nl> + return this . field _ 94102 _ c ! = null ? this . field _ 94102 _ c : super . getEntityName ( ) ; <nl> + } <nl> + + <nl> + + / * * <nl> + + * Moved to allow overrides . <nl> + + * This code handles minecart movement and speed capping when on a rail . <nl> + + * / <nl> + + public void moveMinecartOnRail ( int x , int y , int z , double par4 ) { <nl> + + double d12 = this . motionX ; <nl> + + double d13 = this . motionZ ; <nl> + + <nl> + + if ( this . riddenByEntity ! = null ) <nl> + + { <nl> + + d12 * = 0 . 75D ; <nl> + + d13 * = 0 . 75D ; <nl> + + } <nl> + + <nl> + + if ( d12 < - par4 ) <nl> + + { <nl> + + d12 = - par4 ; <nl> + + } <nl> + + <nl> + + if ( d12 > par4 ) <nl> + + { <nl> + + d12 = par4 ; <nl> + + } <nl> + + <nl> + + if ( d13 < - par4 ) <nl> + + { <nl> + + d13 = - par4 ; <nl> + + } <nl> + + <nl> + + if ( d13 > par4 ) <nl> + + { <nl> + + d13 = par4 ; <nl> + + } <nl> + + <nl> + + this . moveEntity ( d12 , 0 . 0D , d13 ) ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Gets the current global Minecart Collision handler if none <nl> + + * is registered , returns null <nl> + + * @ return The collision handler or null <nl> + + * / <nl> + + public static IMinecartCollisionHandler getCollisionHandler ( ) <nl> + + { <nl> + + return collisionHandler ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Sets the global Minecart Collision handler , overwrites any <nl> + + * that is currently set . <nl> + + * @ param handler The new handler <nl> + + * / <nl> + + public static void setCollisionHandler ( IMinecartCollisionHandler handler ) <nl> + + { <nl> + + collisionHandler = handler ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * This function returns an ItemStack that represents this cart . <nl> + + * This should be an ItemStack that can be used by the player to place the cart , <nl> + + * but is not necessary the item the cart drops when destroyed . <nl> + + * @ return An ItemStack that can be used to place the cart . <nl> + + * / <nl> + + public ItemStack getCartItem ( ) { <nl> + + if ( this instanceof ItemChestMinecart ) <nl> + + { <nl> + + return new ItemStack ( Item . minecartCrate ) ; <nl> + + } <nl> + + if ( this instanceof ItemTntMinecart ) <nl> + + { <nl> + + return new ItemStack ( Item . field _ 94582 _ cb ) ; <nl> + + } <nl> + + if ( this instanceof ItemFurnaceMinecart ) <nl> + + { <nl> + + return new ItemStack ( Item . minecartPowered ) ; <nl> + + } <nl> + + return new ItemStack ( Item . minecartEmpty ) ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Returns true if this cart can currently use rails . <nl> + + * This function is mainly used to gracefully detach a minecart from a rail . <nl> + + * @ return True if the minecart can use rails . <nl> + + * / <nl> + + public boolean canUseRail ( ) <nl> + + { <nl> + + return canUseRail ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Set whether the minecart can use rails . <nl> + + * This function is mainly used to gracefully detach a minecart from a rail . <nl> + + * @ param use Whether the minecart can currently use rails . <nl> + + * / <nl> + + public void setCanUseRail ( boolean use ) <nl> + + { <nl> + + canUseRail = use ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Return false if this cart should not call onMinecartPass ( ) and should ignore Powered Rails . <nl> + + * @ return True if this cart should call onMinecartPass ( ) . <nl> + + * / <nl> + + public boolean shouldDoRailFunctions ( ) <nl> + + { <nl> + + return true ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Returns true if this cart is self propelled . <nl> + + * @ return True if powered . <nl> + + * / <nl> + + public boolean isPoweredCart ( ) <nl> + + { <nl> + + return func _ 94087 _ l ( ) = = 2 ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Returns true if this cart can be ridden by an Entity . <nl> + + * @ return True if this cart can be ridden . <nl> + + * / <nl> + + public boolean canBeRidden ( ) <nl> + + { <nl> + + if ( this instanceof ItemRideableMinecart ) <nl> + + { <nl> + + return true ; <nl> + + } <nl> + + return false ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Getters / setters for physics variables <nl> + + * / <nl> + + <nl> + + / * * <nl> + + * Returns the carts max speed when traveling on rails . Carts going faster <nl> + + * than 1 . 1 cause issues with chunk loading . Carts cant traverse slopes or <nl> + + * corners at greater than 0 . 5 - 0 . 6 . This value is compared with the rails <nl> + + * max speed and the carts current speed cap to determine the carts current <nl> + + * max speed . A normal rail ' s max speed is 0 . 4 . <nl> + + * <nl> + + * @ return Carts max speed . <nl> + + * / <nl> + + public float getMaxCartSpeedOnRail ( ) <nl> + + { <nl> + + return 1 . 2f ; <nl> + + } <nl> + + <nl> + + / * * <nl> + + * Returns the current speed cap for the cart when traveling on rails . This <nl> + + * functions differs from getMaxCartSpeedOnRail ( ) in that it controls <nl> + + * current movement and cannot be overridden . The value however can never be <nl> + + * higher than getMaxCartSpeedOnRail ( ) . <nl> + + * <nl> + + * @ return <nl> + + * / <nl> + + public final float getCurrentCartSpeedCapOnRail ( ) <nl> + + { <nl> + + return currentSpeedRail ; <nl> + + } <nl> + + <nl> + + public final void setCurrentCartSpeedCapOnRail ( float value ) <nl> + + { <nl> + + value = Math . min ( value , getMaxCartSpeedOnRail ( ) ) ; <nl> + + currentSpeedRail = value ; <nl> + + } <nl> + + <nl> + + public float getMaxSpeedAirLateral ( ) <nl> + + { <nl> + + return maxSpeedAirLateral ; <nl> + + } <nl> + + <nl> + + public void setMaxSpeedAirLateral ( float value ) <nl> + + { <nl> + + maxSpeedAirLateral = value ; <nl> + + } <nl> + + <nl> + + public float getMaxSpeedAirVertical ( ) <nl> + + { <nl> + + return maxSpeedAirVertical ; <nl> + + } <nl> + + <nl> + + public void setMaxSpeedAirVertical ( float value ) <nl> + + { <nl> + + maxSpeedAirVertical = value ; <nl> + + } <nl> + + <nl> + + public double getDragAir ( ) <nl> + + { <nl> + + return dragAir ; <nl> + + } <nl> + + <nl> + + public void setDragAir ( double value ) <nl> + + { <nl> + + dragAir = value ; <nl> + + } <nl> + + <nl> + + public double getSlopeAdjustment ( ) <nl> + + { <nl> + + return 0 . 0078125D ; <nl> + + } <nl> + }
+
+TEST DIFF:
+diff - - git a / src / main / java / net / minecraftforge / common / chunkio / ChunkIOExecutor . java b / src / main / java / net / minecraftforge / common / chunkio / ChunkIOExecutor . java 
+ index e4cda1d . . 3b8fccb 100644 
+ - - - a / src / main / java / net / minecraftforge / common / chunkio / ChunkIOExecutor . java 
+ + + + b / src / main / java / net / minecraftforge / common / chunkio / ChunkIOExecutor . java 
+ @ @ - 1 , 32 + 1 , 130 @ @ 
+ package net . minecraftforge . common . chunkio ; 
+ 
+ - import net . minecraftforge . common . util . AsynchronousExecutor ; 
+ + import java . util . Iterator ; 
+ + import java . util . Map ; 
+ + import java . util . concurrent . Executors ; 
+ + import java . util . concurrent . LinkedBlockingQueue ; 
+ + import java . util . concurrent . ThreadFactory ; 
+ + import java . util . concurrent . ThreadPoolExecutor ; 
+ + import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . atomic . AtomicInteger ; 
+ 
+ - public class ChunkIOExecutor { 
+ + import com . google . common . collect . Maps ; 
+ + 
+ + import net . minecraft . world . World ; 
+ + import net . minecraft . world . chunk . Chunk ; 
+ + import net . minecraft . world . chunk . storage . AnvilChunkLoader ; 
+ + import net . minecraft . world . gen . ChunkProviderServer ; 
+ + import net . minecraftforge . fml . common . FMLLog ; 
+ + 
+ + public class ChunkIOExecutor 
+ + { 
+ static final int BASE _ THREADS = 1 ; 
+ static final int PLAYERS _ PER _ THREAD = 50 ; 
+ 
+ - private static final AsynchronousExecutor < QueuedChunk , net . minecraft . world . chunk . Chunk , Runnable , RuntimeException > instance = new AsynchronousExecutor < QueuedChunk , net . minecraft . world . chunk . Chunk , Runnable , RuntimeException > ( new ChunkIOProvider ( ) , BASE _ THREADS ) ; 
+ + private static final Map < QueuedChunk , ChunkIOProvider > tasks = Maps . newConcurrentMap ( ) ; 
+ + private static final ThreadPoolExecutor pool = new ThreadPoolExecutor ( BASE _ THREADS , Integer . MAX _ VALUE , 60L , TimeUnit . SECONDS , 
+ + new LinkedBlockingQueue < Runnable > ( ) , 
+ + new ThreadFactory ( ) 
+ + { 
+ + private AtomicInteger count = new AtomicInteger ( 1 ) ; 
+ + @ Override 
+ + public Thread newThread ( Runnable r ) 
+ + { 
+ + Thread thread = new Thread ( r , " Chunk I / O Executor Thread - " + count . getAndIncrement ( ) ) ; 
+ + thread . setDaemon ( true ) ; 
+ + return thread ; 
+ + } 
+ + } 
+ + ) ; 
+ 
+ - public static net . minecraft . world . chunk . Chunk syncChunkLoad ( net . minecraft . world . World world , net . minecraft . world . chunk . storage . AnvilChunkLoader loader , net . minecraft . world . gen . ChunkProviderServer provider , int x , int z ) { 
+ - return instance . getSkipQueue ( new QueuedChunk ( x , z , loader , world , provider ) ) ; 
+ + / / Load the chunk completely in this thread . Dequeue as needed . . . 
+ + public static Chunk syncChunkLoad ( World world , AnvilChunkLoader loader , ChunkProviderServer provider , int x , int z ) 
+ + { 
+ + QueuedChunk key = new QueuedChunk ( x , z , loader , world , provider ) ; 
+ + ChunkIOProvider task = tasks . get ( key ) ; 
+ + if ( task ! = null ) 
+ + { 
+ + if ( ! pool . remove ( task ) & & ! task . runFinished ( ) ) / / If it wasn ' t in the pool , and run hasn ' t finished , then wait for the async thread . 
+ + { 
+ + synchronized ( task ) 
+ + { 
+ + try 
+ + { 
+ + task . wait ( ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + e . printStackTrace ( ) ; / / Something happened ? Log it ? 
+ + } 
+ + } 
+ + } 
+ + } 
+ + else 
+ + { 
+ + task = new ChunkIOProvider ( key ) ; 
+ + task . run ( ) ; 
+ + } 
+ + task . syncCallback ( ) ; 
+ + return task . getChunk ( ) ; 
+ } 
+ 
+ - public static void queueChunkLoad ( net . minecraft . world . World world , net . minecraft . world . chunk . storage . AnvilChunkLoader loader , net . minecraft . world . gen . ChunkProviderServer provider , int x , int z , Runnable runnable ) { 
+ - instance . add ( new QueuedChunk ( x , z , loader , world , provider ) , runnable ) ; 
+ + / / Queue the chunk to be loaded , and call the runnable when finished 
+ + public static void queueChunkLoad ( World world , AnvilChunkLoader loader , ChunkProviderServer provider , int x , int z , Runnable runnable ) 
+ + { 
+ + QueuedChunk key = new QueuedChunk ( x , z , loader , world , provider ) ; 
+ + ChunkIOProvider task = tasks . get ( key ) ; 
+ + if ( task = = null ) 
+ + { 
+ + task = new ChunkIOProvider ( key ) ; 
+ + task . addCallback ( runnable ) ; / / Add before calling execute for thread safety 
+ + tasks . put ( key , task ) ; 
+ + pool . execute ( task ) ; 
+ + } 
+ + else 
+ + { 
+ + task . addCallback ( runnable ) ; 
+ + } 
+ } 
+ 
+ / / Abuses the fact that hashCode and equals for QueuedChunk only use world and coords 
+ - public static void dropQueuedChunkLoad ( net . minecraft . world . World world , int x , int z , Runnable runnable ) { 
+ - instance . drop ( new QueuedChunk ( x , z , null , world , null ) , runnable ) ; 
+ + / / Remove the chunk from the queue if it ' s in the list . 
+ + public static void dropQueuedChunkLoad ( World world , int x , int z , Runnable runnable ) 
+ + { 
+ + QueuedChunk key = new QueuedChunk ( x , z , null , world , null ) ; 
+ + ChunkIOProvider task = tasks . get ( key ) ; 
+ + if ( task = = null ) 
+ + { 
+ + FMLLog . warning ( " Attempted to dequeue chunk that wasn ' t queued ? % d @ ( % d , % d ) " , world . provider . getDimension ( ) , x , z ) ; 
+ + return ; 
+ + } 
+ + 
+ + task . removeCallback ( runnable ) ; 
+ + 
+ + if ( ! task . hasCallback ( ) ) 
+ + { 
+ + tasks . remove ( key ) ; 
+ + pool . remove ( task ) ; 
+ + } 
+ } 
+ 
+ - public static void adjustPoolSize ( int players ) { 
+ + public static void adjustPoolSize ( int players ) 
+ + { 
+ int size = Math . max ( BASE _ THREADS , ( int ) Math . ceil ( players / PLAYERS _ PER _ THREAD ) ) ; 
+ - instance . setActiveThreads ( size ) ; 
+ + pool . setCorePoolSize ( size ) ; 
+ } 
+ 
+ - public static void tick ( ) { 
+ - instance . finishActive ( ) ; 
+ + public static void tick ( ) 
+ + { 
+ + Iterator < ChunkIOProvider > itr = tasks . values ( ) . iterator ( ) ; 
+ + while ( itr . hasNext ( ) ) 
+ + { 
+ + ChunkIOProvider task = itr . next ( ) ; 
+ + if ( task . runFinished ( ) & & task . hasCallback ( ) ) 
+ + { 
+ + task . syncCallback ( ) ; 
+ + } 
+ + itr . remove ( ) ; 
+ + } 
+ } 
+ } 
+ \ No newline at end of file 
+ diff - - git a / src / main / java / net / minecraftforge / common / chunkio / ChunkIOProvider . java b / src / main / java / net / minecraftforge / common / chunkio / ChunkIOProvider . java 
+ index 4b38198 . . b76a7cf 100644 
+ - - - a / src / main / java / net / minecraftforge / common / chunkio / ChunkIOProvider . java 
+ + + + b / src / main / java / net / minecraftforge / common / chunkio / ChunkIOProvider . java 
+ @ @ - 1 , 64 + 1 , 113 @ @ 
+ package net . minecraftforge . common . chunkio ; 
+ 
+ - 
+ import net . minecraft . world . ChunkCoordIntPair ; 
+ + import net . minecraft . world . chunk . Chunk ; 
+ + import net . minecraft . world . chunk . storage . AnvilChunkLoader ; 
+ + import net . minecraft . world . gen . ChunkProviderServer ; 
+ + import net . minecraft . nbt . NBTTagCompound ; 
+ import net . minecraftforge . common . MinecraftForge ; 
+ - import net . minecraftforge . common . util . AsynchronousExecutor ; 
+ import net . minecraftforge . event . world . ChunkDataEvent ; 
+ 
+ import java . io . IOException ; 
+ - import java . util . concurrent . atomic . AtomicInteger ; 
+ - 
+ - class ChunkIOProvider implements AsynchronousExecutor . CallBackProvider < QueuedChunk , net . minecraft . world . chunk . Chunk , Runnable , RuntimeException > { 
+ - private final AtomicInteger threadNumber = new AtomicInteger ( 1 ) ; 
+ - 
+ - / / async stuff 
+ - public net . minecraft . world . chunk . Chunk callStage1 ( QueuedChunk queuedChunk ) throws RuntimeException { 
+ - net . minecraft . world . chunk . storage . AnvilChunkLoader loader = queuedChunk . loader ; 
+ - Object [ ] data = null ; 
+ - try { 
+ - data = loader . loadChunk _ _ Async ( queuedChunk . world , queuedChunk . x , queuedChunk . z ) ; 
+ - } catch ( IOException e ) { 
+ - e . printStackTrace ( ) ; 
+ - } 
+ + import java . util . concurrent . ConcurrentLinkedQueue ; 
+ 
+ - if ( data ! = null ) { 
+ - queuedChunk . compound = ( net . minecraft . nbt . NBTTagCompound ) data [ 1 ] ; 
+ - return ( net . minecraft . world . chunk . Chunk ) data [ 0 ] ; 
+ - } 
+ + class ChunkIOProvider implements Runnable 
+ + { 
+ + private QueuedChunk chunkInfo ; 
+ + private Chunk chunk ; 
+ + private NBTTagCompound nbt ; 
+ + private ConcurrentLinkedQueue < Runnable > callbacks = new ConcurrentLinkedQueue < Runnable > ( ) ; 
+ + private boolean ran = false ; 
+ + 
+ + ChunkIOProvider ( QueuedChunk chunk ) 
+ + { 
+ + this . chunkInfo = chunk ; 
+ + } 
+ + 
+ + public void addCallback ( Runnable callback ) 
+ + { 
+ + this . callbacks . add ( callback ) ; 
+ + } 
+ + public void removeCallback ( Runnable callback ) 
+ + { 
+ + this . callbacks . remove ( callback ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void run ( ) / / async stuff 
+ + { 
+ + synchronized ( this ) 
+ + { 
+ + AnvilChunkLoader loader = chunkInfo . loader ; 
+ + Object [ ] data = null ; 
+ + try 
+ + { 
+ + data = loader . loadChunk _ _ Async ( chunkInfo . world , chunkInfo . x , chunkInfo . z ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + e . printStackTrace ( ) ; 
+ + } 
+ 
+ - return null ; 
+ + if ( data ! = null ) 
+ + { 
+ + this . nbt = ( NBTTagCompound ) data [ 1 ] ; 
+ + this . chunk = ( Chunk ) data [ 0 ] ; 
+ + } 
+ + 
+ + this . ran = true ; 
+ + this . notifyAll ( ) ; 
+ + } 
+ } 
+ 
+ / / sync stuff 
+ - public void callStage2 ( QueuedChunk queuedChunk , net . minecraft . world . chunk . Chunk chunk ) throws RuntimeException { 
+ - if ( chunk = = null ) { 
+ + public void syncCallback ( ) 
+ + { 
+ + ChunkProviderServer provider = this . chunkInfo . provider ; 
+ + if ( chunk = = null ) 
+ + { 
+ / / If the chunk loading failed just do it synchronously ( may generate ) 
+ - queuedChunk . provider . originalLoadChunk ( queuedChunk . x , queuedChunk . z ) ; 
+ + provider . originalLoadChunk ( this . chunkInfo . x , this . chunkInfo . z ) ; 
+ return ; 
+ } 
+ 
+ - queuedChunk . loader . loadEntities ( queuedChunk . world , queuedChunk . compound . getCompoundTag ( " Level " ) , chunk ) ; 
+ - MinecraftForge . EVENT _ BUS . post ( new ChunkDataEvent . Load ( chunk , queuedChunk . compound ) ) ; / / Don ' t call ChunkDataEvent . Load async 
+ - chunk . setLastSaveTime ( queuedChunk . provider . worldObj . getTotalWorldTime ( ) ) ; 
+ - queuedChunk . provider . id2ChunkMap . add ( ChunkCoordIntPair . chunkXZ2Int ( queuedChunk . x , queuedChunk . z ) , chunk ) ; 
+ - queuedChunk . provider . loadedChunks . add ( chunk ) ; 
+ - chunk . onChunkLoad ( ) ; 
+ + / / Load Entities 
+ + this . chunkInfo . loader . loadEntities ( this . chunkInfo . world , this . nbt . getCompoundTag ( " Level " ) , this . chunk ) ; 
+ + 
+ + MinecraftForge . EVENT _ BUS . post ( new ChunkDataEvent . Load ( this . chunk , this . nbt ) ) ; / / Don ' t call ChunkDataEvent . Load async 
+ 
+ - if ( queuedChunk . provider . chunkGenerator ! = null ) { 
+ - queuedChunk . provider . chunkGenerator . recreateStructures ( chunk , queuedChunk . x , queuedChunk . z ) ; 
+ + this . chunk . setLastSaveTime ( provider . worldObj . getTotalWorldTime ( ) ) ; 
+ + provider . id2ChunkMap . add ( ChunkCoordIntPair . chunkXZ2Int ( this . chunkInfo . x , this . chunkInfo . z ) , this . chunk ) ; 
+ + provider . loadedChunks . add ( this . chunk ) ; 
+ + this . chunk . onChunkLoad ( ) ; 
+ + 
+ + if ( provider . chunkGenerator ! = null ) 
+ + { 
+ + provider . chunkGenerator . recreateStructures ( this . chunk , this . chunkInfo . x , this . chunkInfo . z ) ; 
+ } 
+ 
+ - chunk . populateChunk ( queuedChunk . provider , queuedChunk . provider . chunkGenerator ) ; 
+ + this . chunk . populateChunk ( provider , provider . chunkGenerator ) ; 
+ + 
+ + for ( Runnable r : this . callbacks ) 
+ + { 
+ + r . run ( ) ; 
+ + } 
+ + 
+ + this . callbacks . clear ( ) ; 
+ + } 
+ + 
+ + public Chunk getChunk ( ) 
+ + { 
+ + return this . chunk ; 
+ } 
+ 
+ - public void callStage3 ( QueuedChunk queuedChunk , net . minecraft . world . chunk . Chunk chunk , Runnable runnable ) throws RuntimeException { 
+ - runnable . run ( ) ; 
+ + public boolean runFinished ( ) 
+ + { 
+ + return this . ran ; 
+ } 
+ 
+ - public Thread newThread ( Runnable runnable ) { 
+ - Thread thread = new Thread ( runnable , " Chunk I / O Executor Thread - " + threadNumber . getAndIncrement ( ) ) ; 
+ - thread . setDaemon ( true ) ; 
+ - return thread ; 
+ + public boolean hasCallback ( ) 
+ + { 
+ + return this . callbacks . size ( ) > 0 ; 
+ } 
+ } 
+ \ No newline at end of file 
+ diff - - git a / src / main / java / net / minecraftforge / common / chunkio / QueuedChunk . java b / src / main / java / net / minecraftforge / common / chunkio / QueuedChunk . java 
+ index 039d75c . . d813242 100644 
+ - - - a / src / main / java / net / minecraftforge / common / chunkio / QueuedChunk . java 
+ + + + b / src / main / java / net / minecraftforge / common / chunkio / QueuedChunk . java 
+ @ @ - 7 , 7 + 7 , 6 @ @ class QueuedChunk { 
+ final net . minecraft . world . chunk . storage . AnvilChunkLoader loader ; 
+ final net . minecraft . world . World world ; 
+ final net . minecraft . world . gen . ChunkProviderServer provider ; 
+ - net . minecraft . nbt . NBTTagCompound compound ; 
+ 
+ public QueuedChunk ( int x , int z , net . minecraft . world . chunk . storage . AnvilChunkLoader loader , net . minecraft . world . World world , net . minecraft . world . gen . ChunkProviderServer provider ) { 
+ this . x = x ; 
+ diff - - git a / src / main / java / net / minecraftforge / common / util / AsynchronousExecutor . java b / src / main / java / net / minecraftforge / common / util / AsynchronousExecutor . java 
+ deleted file mode 100644 
+ index 9457c55 . . 0000000 
+ - - - a / src / main / java / net / minecraftforge / common / util / AsynchronousExecutor . java 
+ + + + / dev / null 
+ @ @ - 1 , 360 + 0 , 0 @ @ 
+ - package net . minecraftforge . common . util ; 
+ - 
+ - import java . util . HashMap ; 
+ - import java . util . LinkedList ; 
+ - import java . util . List ; 
+ - import java . util . Map ; 
+ - import java . util . Queue ; 
+ - import java . util . concurrent . ConcurrentLinkedQueue ; 
+ - import java . util . concurrent . LinkedBlockingQueue ; 
+ - import java . util . concurrent . ThreadFactory ; 
+ - import java . util . concurrent . ThreadPoolExecutor ; 
+ - import java . util . concurrent . TimeUnit ; 
+ - import java . util . concurrent . atomic . AtomicIntegerFieldUpdater ; 
+ - 
+ - import net . minecraftforge . fml . common . FMLLog ; 
+ - 
+ - 
+ - / * * 
+ - * Executes tasks using a multi - stage process executor . Synchronous executions are via { @ link AsynchronousExecutor # finishActive ( ) } or the { @ link AsynchronousExecutor # get ( Object ) } methods . 
+ - * < li \ > Stage 1 creates the object from a parameter , and is usually called asynchronously . 
+ - * < li \ > Stage 2 takes the parameter and object from stage 1 and does any synchronous processing to prepare it . 
+ - * < li \ > Stage 3 takes the parameter and object from stage 1 , as well as a callback that was registered , and performs any synchronous calculations . 
+ - * 
+ - * @ param < P > The type of parameter you provide to make the object that will be created . It should implement { @ link Object # hashCode ( ) } and { @ link Object # equals ( Object ) } if you want to get the value early . 
+ - * @ param < T > The type of object you provide . This is created in stage 1 , and passed to stage 2 , 3 , and returned if get ( ) is called . 
+ - * @ param < C > The type of callback you provide . You may register many of these to be passed to the provider in stage 3 , one at a time . 
+ - * @ param < E > A type of exception you may throw and expect to be handled by the main thread 
+ - * @ author Wesley Wolfe ( c ) 2012 , 2014 
+ - * / 
+ - public final class AsynchronousExecutor < P , T , C , E extends Throwable > { 
+ - 
+ - public static interface CallBackProvider < P , T , C , E extends Throwable > extends ThreadFactory { 
+ - 
+ - / * * 
+ - * Normally an asynchronous call , but can be synchronous 
+ - * 
+ - * @ param parameter parameter object provided 
+ - * @ return the created object 
+ - * / 
+ - T callStage1 ( P parameter ) throws E ; 
+ - 
+ - / * * 
+ - * Synchronous call 
+ - * 
+ - * @ param parameter parameter object provided 
+ - * @ param object the previously created object 
+ - * / 
+ - void callStage2 ( P parameter , T object ) throws E ; 
+ - 
+ - / * * 
+ - * Synchronous call , called multiple times , once per registered callback 
+ - * 
+ - * @ param parameter parameter object provided 
+ - * @ param object the previously created object 
+ - * @ param callback the current callback to execute 
+ - * / 
+ - void callStage3 ( P parameter , T object , C callback ) throws E ; 
+ - } 
+ - 
+ - private static class StateHolder { 
+ - 
+ - protected static final int PENDING = 0x0 ; 
+ - protected static final int STAGE _ 1 _ ASYNC = PENDING + 1 ; 
+ - protected static final int STAGE _ 1 _ SYNC = STAGE _ 1 _ ASYNC + 1 ; 
+ - protected static final int STAGE _ 1 _ COMPLETE = STAGE _ 1 _ SYNC + 1 ; 
+ - protected static final int FINISHED = STAGE _ 1 _ COMPLETE + 1 ; 
+ - 
+ - protected volatile int state = PENDING ; 
+ - 
+ - protected static final AtomicIntegerFieldUpdater < StateHolder > STATE = AtomicIntegerFieldUpdater . newUpdater ( StateHolder . class , " state " ) ; 
+ - } 
+ - 
+ - private class Task extends StateHolder implements Runnable { 
+ - 
+ - private final P parameter ; 
+ - private T object ; 
+ - private final List < C > callbacks = new LinkedList < C > ( ) ; 
+ - private E t = null ; 
+ - 
+ - private Task ( final P parameter ) { 
+ - this . parameter = parameter ; 
+ - } 
+ - 
+ - public void run ( ) { 
+ - if ( initAsync ( ) ) { 
+ - finished . add ( this ) ; 
+ - } 
+ - } 
+ - 
+ - private boolean initAsync ( ) { 
+ - if ( STATE . compareAndSet ( this , PENDING , STAGE _ 1 _ ASYNC ) ) { 
+ - boolean ret = true ; 
+ - 
+ - try { 
+ - init ( ) ; 
+ - } finally { 
+ - if ( STATE . compareAndSet ( this , STAGE _ 1 _ ASYNC , STAGE _ 1 _ COMPLETE ) ) { 
+ - / / No one is / will be waiting 
+ - } else { 
+ - / / We know that the sync thread will be waiting 
+ - synchronized ( this ) { 
+ - if ( state ! = STAGE _ 1 _ SYNC ) { 
+ - / / They beat us to the synchronized block 
+ - this . notifyAll ( ) ; 
+ - } else { 
+ - / / We beat them to the synchronized block 
+ - } 
+ - state = STAGE _ 1 _ COMPLETE ; / / They ' re already synchronized , atomic locks are not needed 
+ - } 
+ - / / We want to return false , because we know a synchronous task already handled the finish ( ) 
+ - ret = false ; / / Don ' t return inside finally ; VERY bad practice . 
+ - } 
+ - } 
+ - 
+ - return ret ; 
+ - } else { 
+ - return false ; 
+ - } 
+ - } 
+ - 
+ - private void initSync ( ) { 
+ - if ( STATE . compareAndSet ( this , PENDING , STAGE _ 1 _ COMPLETE ) ) { 
+ - / / If we succeed that variable switch , good as done 
+ - init ( ) ; 
+ - } else if ( STATE . compareAndSet ( this , STAGE _ 1 _ ASYNC , STAGE _ 1 _ SYNC ) ) { 
+ - / / Async thread is running , but this shouldn ' t be likely ; we need to sync to wait on them because of it . 
+ - synchronized ( this ) { 
+ - if ( STATE . compareAndSet ( this , STAGE _ 1 _ SYNC , PENDING ) ) { / / They might NOT synchronized yet , atomic lock IS needed 
+ - / / We are the first into the lock 
+ - while ( state ! = STAGE _ 1 _ COMPLETE ) { 
+ - try { 
+ - this . wait ( ) ; 
+ - } catch ( InterruptedException e ) { 
+ - Thread . currentThread ( ) . interrupt ( ) ; 
+ - throw new RuntimeException ( " Unable to handle interruption on " + parameter , e ) ; 
+ - } 
+ - } 
+ - } else { 
+ - / / They beat us to the synchronized block 
+ - } 
+ - } 
+ - } else { 
+ - / / Async thread is not pending , the more likely situation for a task not pending 
+ - } 
+ - } 
+ - 
+ - @ SuppressWarnings ( " unchecked " ) 
+ - private void init ( ) { 
+ - try { 
+ - object = provider . callStage1 ( parameter ) ; 
+ - } catch ( final Throwable t ) { 
+ - this . t = ( E ) t ; 
+ - } 
+ - } 
+ - 
+ - @ SuppressWarnings ( " unchecked " ) 
+ - private T get ( ) throws E { 
+ - initSync ( ) ; 
+ - if ( callbacks . isEmpty ( ) ) { 
+ - / / ' this ' is a placeholder to prevent callbacks from being empty during finish call 
+ - / / See get method below 
+ - callbacks . add ( ( C ) this ) ; 
+ - } 
+ - finish ( ) ; 
+ - return object ; 
+ - } 
+ - 
+ - private void finish ( ) throws E { 
+ - switch ( state ) { 
+ - default : 
+ - case PENDING : 
+ - case STAGE _ 1 _ ASYNC : 
+ - case STAGE _ 1 _ SYNC : 
+ - throw new IllegalStateException ( " Attempting to finish unprepared ( " + state + " ) task ( " + parameter + " ) " ) ; 
+ - case STAGE _ 1 _ COMPLETE : 
+ - try { 
+ - if ( t ! = null ) { 
+ - throw t ; 
+ - } 
+ - if ( callbacks . isEmpty ( ) ) { 
+ - return ; 
+ - } 
+ - 
+ - final CallBackProvider < P , T , C , E > provider = AsynchronousExecutor . this . provider ; 
+ - final P parameter = this . parameter ; 
+ - final T object = this . object ; 
+ - 
+ - provider . callStage2 ( parameter , object ) ; 
+ - for ( C callback : callbacks ) { 
+ - if ( callback = = this ) { 
+ - / / ' this ' is a placeholder to prevent callbacks from being empty on a get ( ) call 
+ - / / See get method above 
+ - continue ; 
+ - } 
+ - provider . callStage3 ( parameter , object , callback ) ; 
+ - } 
+ - } finally { 
+ - tasks . remove ( parameter ) ; 
+ - state = FINISHED ; 
+ - } 
+ - case FINISHED : 
+ - } 
+ - } 
+ - 
+ - private boolean drop ( ) { 
+ - if ( STATE . compareAndSet ( this , PENDING , FINISHED ) ) { 
+ - / / If we succeed that variable switch , good as forgotten 
+ - tasks . remove ( parameter ) ; 
+ - return true ; 
+ - } else { 
+ - / / We need the async thread to finish normally to properly dispose of the task 
+ - return false ; 
+ - } 
+ - } 
+ - } 
+ - 
+ - private final CallBackProvider < P , T , C , E > provider ; 
+ - private final Queue < Task > finished = new ConcurrentLinkedQueue < Task > ( ) ; 
+ - private final Map < P , Task > tasks = new HashMap < P , Task > ( ) ; 
+ - private final ThreadPoolExecutor pool ; 
+ - 
+ - / * * 
+ - * Uses a thread pool to pass executions to the provider . 
+ - * @ see AsynchronousExecutor 
+ - * / 
+ - public AsynchronousExecutor ( final CallBackProvider < P , T , C , E > provider , final int coreSize ) { 
+ - if ( provider = = null ) { 
+ - throw new IllegalArgumentException ( " Provider cannot be null " ) ; 
+ - } 
+ - this . provider = provider ; 
+ - 
+ - / / We have an unbound queue size so do not need a max thread size 
+ - pool = new ThreadPoolExecutor ( coreSize , Integer . MAX _ VALUE , 60l , TimeUnit . SECONDS , new LinkedBlockingQueue < Runnable > ( ) , provider ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Adds a callback to the parameter provided , adding parameter to the queue if needed . 
+ - * < p > 
+ - * This should always be synchronous . 
+ - * / 
+ - public void add ( P parameter , C callback ) { 
+ - Task task = tasks . get ( parameter ) ; 
+ - if ( task = = null ) { 
+ - tasks . put ( parameter , task = new Task ( parameter ) ) ; 
+ - pool . execute ( task ) ; 
+ - } 
+ - task . callbacks . add ( callback ) ; 
+ - } 
+ - 
+ - / * * 
+ - * This removes a particular callback from the specified parameter . 
+ - * < p > 
+ - * If no callbacks remain for a given parameter , then the { @ link CallBackProvider CallBackProvider ' s } stages may be omitted from execution . 
+ - * Stage 3 will have no callbacks , stage 2 will be skipped unless a { @ link # get ( Object ) } is used , and stage 1 will be avoided on a best - effort basis . 
+ - * < p > 
+ - * Subsequent calls to { @ link # getSkipQueue ( Object ) } will always work . 
+ - * < p > 
+ - * Subsequent calls to { @ link # get ( Object ) } might work . 
+ - * < p > 
+ - * This should always be synchronous 
+ - * @ return true if no further execution for the parameter is possible , such that , no exceptions will be thrown in { @ link # finishActive ( ) } for the parameter , and { @ link # get ( Object ) } will throw an { @ link IllegalStateException } , false otherwise 
+ - * @ throws IllegalStateException if parameter is not in the queue anymore 
+ - * @ throws IllegalStateException if the callback was not specified for given parameter 
+ - * / 
+ - public boolean drop ( P parameter , C callback ) throws IllegalStateException { 
+ - final Task task = tasks . get ( parameter ) ; 
+ - if ( task = = null ) { 
+ - / / Print debug info for QueuedChunk and avoid crash 
+ - / / throw new IllegalStateException ( " Unknown " + parameter ) ; 
+ - FMLLog . info ( " Unknown % s " , parameter ) ; 
+ - FMLLog . info ( " This should not happen . Please report this error to Forge . " ) ; 
+ - return false ; 
+ - } 
+ - if ( ! task . callbacks . remove ( callback ) ) { 
+ - throw new IllegalStateException ( " Unknown " + callback + " for " + parameter ) ; 
+ - } 
+ - if ( task . callbacks . isEmpty ( ) ) { 
+ - return task . drop ( ) ; 
+ - } 
+ - return false ; 
+ - } 
+ - 
+ - / * * 
+ - * This method attempts to skip the waiting period for said parameter . 
+ - * < p > 
+ - * This should always be synchronous . 
+ - * @ throws IllegalStateException if the parameter is not in the queue anymore , or sometimes if called from asynchronous thread 
+ - * / 
+ - public T get ( P parameter ) throws E , IllegalStateException { 
+ - final Task task = tasks . get ( parameter ) ; 
+ - if ( task = = null ) { 
+ - throw new IllegalStateException ( " Unknown " + parameter ) ; 
+ - } 
+ - return task . get ( ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Processes a parameter as if it was in the queue , without ever passing to another thread . 
+ - * / 
+ - public T getSkipQueue ( P parameter ) throws E { 
+ - return skipQueue ( parameter ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Processes a parameter as if it was in the queue , without ever passing to another thread . 
+ - * / 
+ - public T getSkipQueue ( P parameter , C callback ) throws E { 
+ - final T object = skipQueue ( parameter ) ; 
+ - provider . callStage3 ( parameter , object , callback ) ; 
+ - return object ; 
+ - } 
+ - 
+ - / * * 
+ - * Processes a parameter as if it was in the queue , without ever passing to another thread . 
+ - * / 
+ - public T getSkipQueue ( P parameter , C . . . callbacks ) throws E { 
+ - final CallBackProvider < P , T , C , E > provider = this . provider ; 
+ - final T object = skipQueue ( parameter ) ; 
+ - for ( C callback : callbacks ) { 
+ - provider . callStage3 ( parameter , object , callback ) ; 
+ - } 
+ - return object ; 
+ - } 
+ - 
+ - / * * 
+ - * Processes a parameter as if it was in the queue , without ever passing to another thread . 
+ - * / 
+ - public T getSkipQueue ( P parameter , Iterable < C > callbacks ) throws E { 
+ - final CallBackProvider < P , T , C , E > provider = this . provider ; 
+ - final T object = skipQueue ( parameter ) ; 
+ - for ( C callback : callbacks ) { 
+ - provider . callStage3 ( parameter , object , callback ) ; 
+ - } 
+ - return object ; 
+ - } 
+ - 
+ - private T skipQueue ( P parameter ) throws E { 
+ - Task task = tasks . get ( parameter ) ; 
+ - if ( task ! = null ) { 
+ - return task . get ( ) ; 
+ - } 
+ - T object = provider . callStage1 ( parameter ) ; 
+ - provider . callStage2 ( parameter , object ) ; 
+ - return object ; 
+ - } 
+ - 
+ - / * * 
+ - * This is the ' heartbeat ' that should be called synchronously to finish any pending tasks 
+ - * / 
+ - public void finishActive ( ) throws E { 
+ - final Queue < Task > finished = this . finished ; 
+ - while ( ! finished . isEmpty ( ) ) { 
+ - finished . poll ( ) . finish ( ) ; 
+ - } 
+ - } 
+ - 
+ - public void setActiveThreads ( final int coreSize ) { 
+ - pool . setCorePoolSize ( coreSize ) ; 
+ - } 
+ - } 
+ \ No newline at end of file 
+ diff - - git a / src / main / resources / lgpl - 3 . 0 . txt b / src / main / resources / lgpl - 3 . 0 . txt 
+ deleted file mode 100644 
+ index 02bbb60 . . 0000000 
+ - - - a / src / main / resources / lgpl - 3 . 0 . txt 
+ + + + / dev / null 
+ @ @ - 1 , 165 + 0 , 0 @ @ 
+ - GNU LESSER GENERAL PUBLIC LICENSE 
+ - Version 3 , 29 June 2007 
+ - 
+ - Copyright ( C ) 2007 Free Software Foundation , Inc . < http : / / fsf . org / > 
+ - Everyone is permitted to copy and distribute verbatim copies 
+ - of this license document , but changing it is not allowed . 
+ - 
+ - 
+ - This version of the GNU Lesser General Public License incorporates 
+ - the terms and conditions of version 3 of the GNU General Public 
+ - License , supplemented by the additional permissions listed below . 
+ - 
+ - 0 . Additional Definitions . 
+ - 
+ - As used herein , " this License " refers to version 3 of the GNU Lesser 
+ - General Public License , and the " GNU GPL " refers to version 3 of the GNU 
+ - General Public License . 
+ - 
+ - " The Library " refers to a covered work governed by this License , 
+ - other than an Application or a Combined Work as defined below . 
+ - 
+ - An " Application " is any work that makes use of an interface provided 
+ - by the Library , but which is not otherwise based on the Library . 
+ - Defining a subclass of a class defined by the Library is deemed a mode 
+ - of using an interface provided by the Library . 
+ - 
+ - A " Combined Work " is a work produced by combining or linking an 
+ - Application with the Library . The particular version of the Library 
+ - with which the Combined Work was made is also called the " Linked 
+ - Version " . 
+ - 
+ - The " Minimal Corresponding Source " for a Combined Work means the 
+ - Corresponding Source for the Combined Work , excluding any source code 
+ - for portions of the Combined Work that , considered in isolation , are 
+ - based on the Application , and not on the Linked Version . 
+ - 
+ - The " Corresponding Application Code " for a Combined Work means the 
+ - object code and / or source code for the Application , including any data 
+ - and utility programs needed for reproducing the Combined Work from the 
+ - Application , but excluding the System Libraries of the Combined Work . 
+ - 
+ - 1 . Exception to Section 3 of the GNU GPL . 
+ - 
+ - You may convey a covered work under sections 3 and 4 of this License 
+ - without being bound by section 3 of the GNU GPL . 
+ - 
+ - 2 . Conveying Modified Versions . 
+ - 
+ - If you modify a copy of the Library , and , in your modifications , a 
+ - facility refers to a function or data to be supplied by an Application 
+ - that uses the facility ( other than as an argument passed when the 
+ - facility is invoked ) , then you may convey a copy of the modified 
+ - version : 
+ - 
+ - a ) under this License , provided that you make a good faith effort to 
+ - ensure that , in the event an Application does not supply the 
+ - function or data , the facility still operates , and performs 
+ - whatever part of its purpose remains meaningful , or 
+ - 
+ - b ) under the GNU GPL , with none of the additional permissions of 
+ - this License applicable to that copy . 
+ - 
+ - 3 . Object Code Incorporating Material from Library Header Files . 
+ - 
+ - The object code form of an Application may incorporate material from 
+ - a header file that is part of the Library . You may convey such object 
+ - code under terms of your choice , provided that , if the incorporated 
+ - material is not limited to numerical parameters , data structure 
+ - layouts and accessors , or small macros , inline functions and templates 
+ - ( ten or fewer lines in length ) , you do both of the following : 
+ - 
+ - a ) Give prominent notice with each copy of the object code that the 
+ - Library is used in it and that the Library and its use are 
+ - covered by this License . 
+ - 
+ - b ) Accompany the object code with a copy of the GNU GPL and this license 
+ - document . 
+ - 
+ - 4 . Combined Works . 
+ - 
+ - You may convey a Combined Work under terms of your choice that , 
+ - taken together , effectively do not restrict modification of the 
+ - portions of the Library contained in the Combined Work and reverse 
+ - engineering for debugging such modifications , if you also do each of 
+ - the following : 
+ - 
+ - a ) Give prominent notice with each copy of the Combined Work that 
+ - the Library is used in it and that the Library and its use are 
+ - covered by this License . 
+ - 
+ - b ) Accompany the Combined Work with a copy of the GNU GPL and this license 
+ - document . 
+ - 
+ - c ) For a Combined Work that displays copyright notices during 
+ - execution , include the copyright notice for the Library among 
+ - these notices , as well as a reference directing the user to the 
+ - copies of the GNU GPL and this license document . 
+ - 
+ - d ) Do one of the following : 
+ - 
+ - 0 ) Convey the Minimal Corresponding Source under the terms of this 
+ - License , and the Corresponding Application Code in a form 
+ - suitable for , and under terms that permit , the user to 
+ - recombine or relink the Application with a modified version of 
+ - the Linked Version to produce a modified Combined Work , in the 
+ - manner specified by section 6 of the GNU GPL for conveying 
+ - Corresponding Source . 
+ - 
+ - 1 ) Use a suitable shared library mechanism for linking with the 
+ - Library . A suitable mechanism is one that ( a ) uses at run time 
+ - a copy of the Library already present on the user ' s computer 
+ - system , and ( b ) will operate properly with a modified version 
+ - of the Library that is interface - compatible with the Linked 
+ - Version . 
+ - 
+ - e ) Provide Installation Information , but only if you would otherwise 
+ - be required to provide such information under section 6 of the 
+ - GNU GPL , and only to the extent that such information is 
+ - necessary to install and execute a modified version of the 
+ - Combined Work produced by recombining or relinking the 
+ - Application with a modified version of the Linked Version . ( If 
+ - you use option 4d0 , the Installation Information must accompany 
+ - the Minimal Corresponding Source and Corresponding Application 
+ - Code . If you use option 4d1 , you must provide the Installation 
+ - Information in the manner specified by section 6 of the GNU GPL 
+ - for conveying Corresponding Source . ) 
+ - 
+ - 5 . Combined Libraries . 
+ - 
+ - You may place library facilities that are a work based on the 
+ - Library side by side in a single library together with other library 
+ - facilities that are not Applications and are not covered by this 
+ - License , and convey such a combined library under terms of your 
+ - choice , if you do both of the following : 
+ - 
+ - a ) Accompany the combined library with a copy of the same work based 
+ - on the Library , uncombined with any other library facilities , 
+ - conveyed under the terms of this License . 
+ - 
+ - b ) Give prominent notice with the combined library that part of it 
+ - is a work based on the Library , and explaining where to find the 
+ - accompanying uncombined form of the same work . 
+ - 
+ - 6 . Revised Versions of the GNU Lesser General Public License . 
+ - 
+ - The Free Software Foundation may publish revised and / or new versions 
+ - of the GNU Lesser General Public License from time to time . Such new 
+ - versions will be similar in spirit to the present version , but may 
+ - differ in detail to address new problems or concerns . 
+ - 
+ - Each version is given a distinguishing version number . If the 
+ - Library as you received it specifies that a certain numbered version 
+ - of the GNU Lesser General Public License " or any later version " 
+ - applies to it , you have the option of following the terms and 
+ - conditions either of that published version or of any later version 
+ - published by the Free Software Foundation . If the Library as you 
+ - received it does not specify a version number of the GNU Lesser 
+ - General Public License , you may choose any version of the GNU Lesser 
+ - General Public License ever published by the Free Software Foundation . 
+ - 
+ - If the Library as you received it specifies that a proxy can decide 
+ - whether future versions of the GNU Lesser General Public License shall 
+ - apply , that proxy ' s public statement of acceptance of any version is 
+ - permanent authorization for you to choose that version for the 
+ - Library . 
+ \ No newline at end of file
+
+NEAREST DIFF:
+diff - - git a / common / net / minecraftforge / common / MinecartRegistry . java b / common / net / minecraftforge / common / MinecartRegistry . java 
+ deleted file mode 100644 
+ index 43cfd23 . . 0000000 
+ - - - a / common / net / minecraftforge / common / MinecartRegistry . java 
+ + + + / dev / null 
+ @ @ - 1 , 215 + 0 , 0 @ @ 
+ - package net . minecraftforge . common ; 
+ - 
+ - import java . util . HashMap ; 
+ - import java . util . HashSet ; 
+ - import java . util . Map ; 
+ - import java . util . Set ; 
+ - 
+ - import net . minecraft . entity . item . EntityMinecart ; 
+ - import net . minecraft . item . Item ; 
+ - import net . minecraft . item . ItemStack ; 
+ - 
+ - public class MinecartRegistry 
+ - { 
+ - private static Map < MinecartKey , ItemStack > itemForMinecart = new HashMap < MinecartKey , ItemStack > ( ) ; 
+ - private static Map < ItemStack , MinecartKey > minecartForItem = new HashMap < ItemStack , MinecartKey > ( ) ; 
+ - / * * 
+ - * Registers a custom minecart and its corresponding item . 
+ - * This should be the item used to place the minecart by the user , 
+ - * not the item dropped by the cart . 
+ - * @ param cart The minecart . 
+ - * @ param item The item used to place the cart . 
+ - * / 
+ - public static void registerMinecart ( Class < ? extends EntityMinecart > cart , ItemStack item ) 
+ - { 
+ - registerMinecart ( cart , 0 , item ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Registers a minecart and its corresponding item . 
+ - * This should be the item used to place the minecart by the user , 
+ - * not the item dropped by the cart . 
+ - * @ param minecart The minecart . 
+ - * @ param type The minecart type , used to differentiate carts that have the same class . 
+ - * @ param item The item used to place the cart . 
+ - * / 
+ - public static void registerMinecart ( Class < ? extends EntityMinecart > minecart , int type , ItemStack item ) 
+ - { 
+ - MinecartKey key = new MinecartKey ( minecart , type ) ; 
+ - itemForMinecart . put ( key , item ) ; 
+ - minecartForItem . put ( item , key ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Removes a previously registered Minecart . Useful for replacing the vanilla minecarts . 
+ - * @ param minecart 
+ - * @ param type 
+ - * / 
+ - public static void removeMinecart ( Class < ? extends EntityMinecart > minecart , int type ) 
+ - { 
+ - MinecartKey key = new MinecartKey ( minecart , type ) ; 
+ - ItemStack item = itemForMinecart . remove ( key ) ; 
+ - if ( item ! = null ) 
+ - { 
+ - minecartForItem . remove ( item ) ; 
+ - } 
+ - } 
+ - 
+ - / * * 
+ - * This function returns an ItemStack that represents this cart . 
+ - * The player should be able to use this item to place the minecart . 
+ - * This is the item that was registered with the cart via the registerMinecart function , 
+ - * but is not necessary the item the cart drops when destroyed . 
+ - * @ param minecart The cart class 
+ - * @ return An ItemStack that can be used to place the cart . 
+ - * / 
+ - public static ItemStack getItemForCart ( Class < ? extends EntityMinecart > minecart ) 
+ - { 
+ - return getItemForCart ( minecart , 0 ) ; 
+ - } 
+ - 
+ - / * * 
+ - * This function returns an ItemStack that represents this cart . 
+ - * The player should be able to use this item to place the minecart . 
+ - * This is the item that was registered with the cart via the registerMinecart function , 
+ - * but is not necessary the item the cart drops when destroyed . 
+ - * @ param minecart The cart class 
+ - * @ param type The minecartType value 
+ - * @ return An ItemStack that can be used to place the cart . 
+ - * / 
+ - public static ItemStack getItemForCart ( Class < ? extends EntityMinecart > minecart , int type ) 
+ - { 
+ - ItemStack item = itemForMinecart . get ( new MinecartKey ( minecart , type ) ) ; 
+ - if ( item = = null ) 
+ - { 
+ - return null ; 
+ - } 
+ - return item . copy ( ) ; 
+ - } 
+ - 
+ - / * * 
+ - * This function returns an ItemStack that represents this cart . 
+ - * The player should be able to use this item to place the minecart . 
+ - * This is the item that was registered with the cart via the registerMinecart function , 
+ - * but is not necessary the item the cart drops when destroyed . 
+ - * @ param cart The cart entity 
+ - * @ return An ItemStack that can be used to place the cart . 
+ - * / 
+ - public static ItemStack getItemForCart ( EntityMinecart cart ) 
+ - { 
+ - return getItemForCart ( cart . getClass ( ) , cart . getMinecartType ( ) ) ; 
+ - } 
+ - 
+ - / * * 
+ - * The function will return the cart class for a given item . 
+ - * If the item was not registered via the registerMinecart function it will return null . 
+ - * @ param item The item to test . 
+ - * @ return Cart if mapping exists , null if not . 
+ - * / 
+ - public static Class < ? extends EntityMinecart > getCartClassForItem ( ItemStack item ) 
+ - { 
+ - MinecartKey key = null ; 
+ - for ( Map . Entry < ItemStack , MinecartKey > entry : minecartForItem . entrySet ( ) ) 
+ - { 
+ - if ( entry . getKey ( ) . isItemEqual ( item ) ) 
+ - { 
+ - key = entry . getValue ( ) ; 
+ - break ; 
+ - } 
+ - } 
+ - if ( key ! = null ) 
+ - { 
+ - return key . minecart ; 
+ - } 
+ - return null ; 
+ - } 
+ - 
+ - / * * 
+ - * The function will return the cart type for a given item . 
+ - * Will return - 1 if the mapping doesn ' t exist . 
+ - * If the item was not registered via the registerMinecart function it will return null . 
+ - * @ param item The item to test . 
+ - * @ return the cart minecartType value . 
+ - * / 
+ - public static int getCartTypeForItem ( ItemStack item ) 
+ - { 
+ - MinecartKey key = null ; 
+ - for ( Map . Entry < ItemStack , MinecartKey > entry : minecartForItem . entrySet ( ) ) 
+ - { 
+ - if ( entry . getKey ( ) . isItemEqual ( item ) ) 
+ - { 
+ - key = entry . getValue ( ) ; 
+ - break ; 
+ - } 
+ - } 
+ - if ( key ! = null ) 
+ - { 
+ - return key . type ; 
+ - } 
+ - return - 1 ; 
+ - } 
+ - 
+ - / * * 
+ - * Will return a set of all registered minecart items . 
+ - * @ return a copy of the set of all minecart items 
+ - * / 
+ - public static Set < ItemStack > getAllCartItems ( ) 
+ - { 
+ - Set < ItemStack > ret = new HashSet < ItemStack > ( ) ; 
+ - for ( ItemStack item : minecartForItem . keySet ( ) ) 
+ - { 
+ - ret . add ( item . copy ( ) ) ; 
+ - } 
+ - return ret ; 
+ - } 
+ - 
+ - static 
+ - { 
+ - registerMinecart ( EntityMinecart . class , 0 , new ItemStack ( Item . minecartEmpty ) ) ; 
+ - registerMinecart ( EntityMinecart . class , 1 , new ItemStack ( Item . minecartCrate ) ) ; 
+ - registerMinecart ( EntityMinecart . class , 2 , new ItemStack ( Item . minecartPowered ) ) ; 
+ - } 
+ - 
+ - public static class MinecartKey 
+ - { 
+ - public final Class < ? extends EntityMinecart > minecart ; 
+ - public final int type ; 
+ - 
+ - public MinecartKey ( Class < ? extends EntityMinecart > cls , int typtID ) 
+ - { 
+ - minecart = cls ; 
+ - type = typtID ; 
+ - } 
+ - 
+ - @ Override 
+ - public boolean equals ( Object obj ) 
+ - { 
+ - if ( obj = = null ) 
+ - { 
+ - return false ; 
+ - } 
+ - 
+ - if ( getClass ( ) ! = obj . getClass ( ) ) 
+ - { 
+ - return false ; 
+ - } 
+ - 
+ - final MinecartKey other = ( MinecartKey ) obj ; 
+ - if ( this . minecart ! = other . minecart & & ( this . minecart = = null | | ! this . minecart . equals ( other . minecart ) ) ) 
+ - { 
+ - return false ; 
+ - } 
+ - 
+ - return ( this . type = = other . type ) ; 
+ - } 
+ - 
+ - @ Override 
+ - public int hashCode ( ) 
+ - { 
+ - int hash = 7 ; 
+ - hash = 59 * hash + ( this . minecart ! = null ? this . minecart . hashCode ( ) : 0 ) ; 
+ - hash = 59 * hash + this . type ; 
+ - return hash ; 
+ - } 
+ - } 
+ - } 
+ diff - - git a / patches / minecraft / net / minecraft / block / BlockBaseRail . java . patch b / patches / minecraft / net / minecraft / block / BlockBaseRail . java . patch 
+ new file mode 100644 
+ index 0000000 . . e5d4408 
+ - - - / dev / null 
+ + + + b / patches / minecraft / net / minecraft / block / BlockBaseRail . java . patch 
+ @ @ - 0 , 0 + 1 , 136 @ @ 
+ + - - - . . / src _ base / minecraft / net / minecraft / block / BlockBaseRail . java 
+ + + + + . . / src _ work / minecraft / net / minecraft / block / BlockBaseRail . java 
+ + @ @ - 3 , 6 + 3 , 7 @ @ 
+ + import java . util . Random ; 
+ + import net . minecraft . block . material . Material ; 
+ + import net . minecraft . creativetab . CreativeTabs ; 
+ + + import net . minecraft . entity . item . EntityMinecart ; 
+ + import net . minecraft . util . AxisAlignedBB ; 
+ + import net . minecraft . util . MovingObjectPosition ; 
+ + import net . minecraft . util . Vec3 ; 
+ + @ @ - 28 , 7 + 29 , 7 @ @ 
+ + * / 
+ + public static final boolean isRailBlock ( int par0 ) 
+ + { 
+ + - return par0 = = Block . rail . blockID | | par0 = = Block . railPowered . blockID | | par0 = = Block . railDetector . blockID | | par0 = = Block . field _ 94337 _ cv . blockID ; 
+ + + return Block . blocksList [ par0 ] instanceof BlockBaseRail ; 
+ + } 
+ + 
+ + protected BlockBaseRail ( int par1 , boolean par2 ) 
+ + @ @ - 105 , 7 + 106 , 7 @ @ 
+ + * / 
+ + public int getRenderType ( ) 
+ + { 
+ + - return 9 ; 
+ + + return renderType ; 
+ + } 
+ + 
+ + / * * 
+ + @ @ - 216 , 4 + 217 , 107 @ @ 
+ + { 
+ + return 0 ; 
+ + } 
+ + + 
+ + + / * * 
+ + + * Return true if the rail can make corners . 
+ + + * Used by placement logic . 
+ + + * @ param world The world . 
+ + + * @ param x The rail X coordinate . 
+ + + * @ param y The rail Y coordinate . 
+ + + * @ param z The rail Z coordinate . 
+ + + * @ return True if the rail can make corners . 
+ + + * / 
+ + + public boolean isFlexibleRail ( World world , int y , int x , int z ) 
+ + + { 
+ + + return ! isPowered ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Returns true if the rail can make up and down slopes . 
+ + + * Used by placement logic . 
+ + + * @ param world The world . 
+ + + * @ param x The rail X coordinate . 
+ + + * @ param y The rail Y coordinate . 
+ + + * @ param z The rail Z coordinate . 
+ + + * @ return True if the rail can make slopes . 
+ + + * / 
+ + + public boolean canMakeSlopes ( World world , int x , int y , int z ) 
+ + + { 
+ + + return true ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Return the rail ' s metadata ( without the power bit if the rail uses one ) . 
+ + + * Can be used to make the cart think the rail something other than it is , 
+ + + * for example when making diamond junctions or switches . 
+ + + * The cart parameter will often be null unless it it called from EntityMinecart . 
+ + + * 
+ + + * Valid rail metadata is defined as follows : 
+ + + * 0x0 : flat track going North - South 
+ + + * 0x1 : flat track going West - East 
+ + + * 0x2 : track ascending to the East 
+ + + * 0x3 : track ascending to the West 
+ + + * 0x4 : track ascending to the North 
+ + + * 0x5 : track ascending to the South 
+ + + * 0x6 : WestNorth corner ( connecting East and South ) 
+ + + * 0x7 : EastNorth corner ( connecting West and South ) 
+ + + * 0x8 : EastSouth corner ( connecting West and North ) 
+ + + * 0x9 : WestSouth corner ( connecting East and North ) 
+ + + * 
+ + + * @ param world The world . 
+ + + * @ param cart The cart asking for the metadata , null if it is not called by EntityMinecart . 
+ + + * @ param y The rail X coordinate . 
+ + + * @ param x The rail Y coordinate . 
+ + + * @ param z The rail Z coordinate . 
+ + + * @ return The metadata . 
+ + + * / 
+ + + public int getBasicRailMetadata ( IBlockAccess world , EntityMinecart cart , int x , int y , int z ) 
+ + + { 
+ + + int meta = world . getBlockMetadata ( x , y , z ) ; 
+ + + if ( isPowered ) 
+ + + { 
+ + + meta = meta & 7 ; 
+ + + } 
+ + + return meta ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Returns the max speed of the rail at the specified position . 
+ + + * @ param world The world . 
+ + + * @ param cart The cart on the rail , may be null . 
+ + + * @ param x The rail X coordinate . 
+ + + * @ param y The rail Y coordinate . 
+ + + * @ param z The rail Z coordinate . 
+ + + * @ return The max speed of the current rail . 
+ + + * / 
+ + + public float getRailMaxSpeed ( World world , EntityMinecart cart , int y , int x , int z ) 
+ + + { 
+ + + return 0 . 4f ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * This function is called by any minecart that passes over this rail . 
+ + + * It is called once per update tick that the minecart is on the rail . 
+ + + * @ param world The world . 
+ + + * @ param cart The cart on the rail . 
+ + + * @ param y The rail X coordinate . 
+ + + * @ param x The rail Y coordinate . 
+ + + * @ param z The rail Z coordinate . 
+ + + * / 
+ + + public void onMinecartPass ( World world , EntityMinecart cart , int y , int x , int z ) 
+ + + { 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Forge : Moved render type to a field and a setter . 
+ + + * This allows for a mod to change the render type 
+ + + * for vanilla rails , and any mod rails that extend 
+ + + * this class . 
+ + + * / 
+ + + private int renderType = 9 ; 
+ + + 
+ + + public void setRenderType ( int value ) 
+ + + { 
+ + + renderType = value ; 
+ + + } 
+ + } 
+ diff - - git a / patches / minecraft / net / minecraft / block / BlockBaseRailLogic . java . patch b / patches / minecraft / net / minecraft / block / BlockBaseRailLogic . java . patch 
+ new file mode 100644 
+ index 0000000 . . db7e4b1 
+ - - - / dev / null 
+ + + + b / patches / minecraft / net / minecraft / block / BlockBaseRailLogic . java . patch 
+ @ @ - 0 , 0 + 1 , 70 @ @ 
+ + - - - . . / src _ base / minecraft / net / minecraft / block / BlockBaseRailLogic . java 
+ + + + + . . / src _ work / minecraft / net / minecraft / block / BlockBaseRailLogic . java 
+ + @ @ - 13 , 6 + 13 , 8 @ @ 
+ + private int field _ 94515 _ e ; 
+ + private final boolean field _ 94512 _ f ; 
+ + private List field _ 94513 _ g ; 
+ + + 
+ + + private final boolean canMakeSlopes ; 
+ + 
+ + final BlockBaseRail field _ 94518 _ a ; 
+ + 
+ + @ @ - 25 , 17 + 27 , 11 @ @ 
+ + this . field _ 94514 _ d = par4 ; 
+ + this . field _ 94515 _ e = par5 ; 
+ + int l = par2World . getBlockId ( par3 , par4 , par5 ) ; 
+ + - int i1 = par2World . getBlockMetadata ( par3 , par4 , par5 ) ; 
+ + - 
+ + - if ( ( ( BlockBaseRail ) Block . blocksList [ l ] ) . isPowered ) 
+ + - { 
+ + - this . field _ 94512 _ f = true ; 
+ + - i1 & = - 9 ; 
+ + - } 
+ + - else 
+ + - { 
+ + - this . field _ 94512 _ f = false ; 
+ + - } 
+ + + 
+ + + BlockBaseRail target = ( BlockBaseRail ) Block . blocksList [ l ] ; 
+ + + int i1 = target . getBasicRailMetadata ( par2World , null , par3 , par4 , par5 ) ; 
+ + + field _ 94512 _ f = ! target . isFlexibleRail ( par2World , par3 , par4 , par5 ) ; 
+ + + canMakeSlopes = target . canMakeSlopes ( par2World , par3 , par4 , par5 ) ; 
+ + 
+ + this . func _ 94504 _ a ( i1 ) ; 
+ + } 
+ + @ @ - 227 , 7 + 223 , 7 @ @ 
+ + } 
+ + } 
+ + 
+ + - if ( b0 = = 0 ) 
+ + + if ( b0 = = 0 & & canMakeSlopes ) 
+ + { 
+ + if ( BlockBaseRail . isRailBlockAt ( this . field _ 94516 _ b , this . field _ 94517 _ c , this . field _ 94514 _ d + 1 , this . field _ 94515 _ e - 1 ) ) 
+ + { 
+ + @ @ - 240 , 7 + 236 , 7 @ @ 
+ + } 
+ + } 
+ + 
+ + - if ( b0 = = 1 ) 
+ + + if ( b0 = = 1 & & canMakeSlopes ) 
+ + { 
+ + if ( BlockBaseRail . isRailBlockAt ( this . field _ 94516 _ b , this . field _ 94517 _ c + 1 , this . field _ 94514 _ d + 1 , this . field _ 94515 _ e ) ) 
+ + { 
+ + @ @ - 385 , 7 + 381 , 7 @ @ 
+ + } 
+ + } 
+ + 
+ + - if ( b0 = = 0 ) 
+ + + if ( b0 = = 0 & & canMakeSlopes ) 
+ + { 
+ + if ( BlockBaseRail . isRailBlockAt ( this . field _ 94516 _ b , this . field _ 94517 _ c , this . field _ 94514 _ d + 1 , this . field _ 94515 _ e - 1 ) ) 
+ + { 
+ + @ @ - 398 , 7 + 394 , 7 @ @ 
+ + } 
+ + } 
+ + 
+ + - if ( b0 = = 1 ) 
+ + + if ( b0 = = 1 & & canMakeSlopes ) 
+ + { 
+ + if ( BlockBaseRail . isRailBlockAt ( this . field _ 94516 _ b , this . field _ 94517 _ c + 1 , this . field _ 94514 _ d + 1 , this . field _ 94515 _ e ) ) 
+ + { 
+ diff - - git a / patches / minecraft / net / minecraft / entity / ItemChestMinecart . java . patch b / patches / minecraft / net / minecraft / entity / ItemChestMinecart . java . patch 
+ new file mode 100644 
+ index 0000000 . . f6d1aaf 
+ - - - / dev / null 
+ + + + b / patches / minecraft / net / minecraft / entity / ItemChestMinecart . java . patch 
+ @ @ - 0 , 0 + 1 , 22 @ @ 
+ + - - - . . / src _ base / minecraft / net / minecraft / entity / ItemChestMinecart . java 
+ + + + + . . / src _ work / minecraft / net / minecraft / entity / ItemChestMinecart . java 
+ + @ @ - 10 , 6 + 10 , 8 @ @ 
+ + import net . minecraft . nbt . NBTTagList ; 
+ + import net . minecraft . util . DamageSource ; 
+ + import net . minecraft . world . World ; 
+ + + import net . minecraftforge . common . MinecraftForge ; 
+ + + import net . minecraftforge . event . entity . minecart . MinecartInteractEvent ; 
+ + 
+ + public class ItemChestMinecart extends EntityMinecart implements IInventory 
+ + { 
+ + @ @ - 292 , 6 + 294 , 10 @ @ 
+ + * / 
+ + public boolean interact ( EntityPlayer par1EntityPlayer ) 
+ + { 
+ + + if ( MinecraftForge . EVENT _ BUS . post ( new MinecartInteractEvent ( this , par1EntityPlayer ) ) ) 
+ + + { 
+ + + return true ; 
+ + + } 
+ + if ( ! this . worldObj . isRemote ) 
+ + { 
+ + par1EntityPlayer . displayGUIChest ( this ) ; 
+ diff - - git a / patches / minecraft / net / minecraft / entity / ItemFurnaceMinecart . java . patch b / patches / minecraft / net / minecraft / entity / ItemFurnaceMinecart . java . patch 
+ new file mode 100644 
+ index 0000000 . . 548a35f 
+ - - - / dev / null 
+ + + + b / patches / minecraft / net / minecraft / entity / ItemFurnaceMinecart . java . patch 
+ @ @ - 0 , 0 + 1 , 22 @ @ 
+ + - - - . . / src _ base / minecraft / net / minecraft / entity / ItemFurnaceMinecart . java 
+ + + + + . . / src _ work / minecraft / net / minecraft / entity / ItemFurnaceMinecart . java 
+ + @ @ - 8 , 6 + 8 , 8 @ @ 
+ + import net . minecraft . nbt . NBTTagCompound ; 
+ + import net . minecraft . util . MathHelper ; 
+ + import net . minecraft . world . World ; 
+ + + import net . minecraftforge . common . MinecraftForge ; 
+ + + import net . minecraftforge . event . entity . minecart . MinecartInteractEvent ; 
+ + 
+ + public class ItemFurnaceMinecart extends EntityMinecart 
+ + { 
+ + @ @ - 116 , 6 + 118 , 10 @ @ 
+ + * / 
+ + public boolean interact ( EntityPlayer par1EntityPlayer ) 
+ + { 
+ + + if ( MinecraftForge . EVENT _ BUS . post ( new MinecartInteractEvent ( this , par1EntityPlayer ) ) ) 
+ + + { 
+ + + return true ; 
+ + + } 
+ + ItemStack itemstack = par1EntityPlayer . inventory . getCurrentItem ( ) ; 
+ + 
+ + if ( itemstack ! = null & & itemstack . itemID = = Item . coal . itemID ) 
+ diff - - git a / patches / minecraft / net / minecraft / entity / ItemRideableMinecart . java . patch b / patches / minecraft / net / minecraft / entity / ItemRideableMinecart . java . patch 
+ new file mode 100644 
+ index 0000000 . . 754997e 
+ - - - / dev / null 
+ + + + b / patches / minecraft / net / minecraft / entity / ItemRideableMinecart . java . patch 
+ @ @ - 0 , 0 + 1 , 22 @ @ 
+ + - - - . . / src _ base / minecraft / net / minecraft / entity / ItemRideableMinecart . java 
+ + + + + . . / src _ work / minecraft / net / minecraft / entity / ItemRideableMinecart . java 
+ + @ @ - 3 , 6 + 3 , 8 @ @ 
+ + import net . minecraft . entity . item . EntityMinecart ; 
+ + import net . minecraft . entity . player . EntityPlayer ; 
+ + import net . minecraft . world . World ; 
+ + + import net . minecraftforge . common . MinecraftForge ; 
+ + + import net . minecraftforge . event . entity . minecart . MinecartInteractEvent ; 
+ + 
+ + public class ItemRideableMinecart extends EntityMinecart 
+ + { 
+ + @ @ - 21 , 6 + 23 , 10 @ @ 
+ + * / 
+ + public boolean interact ( EntityPlayer par1EntityPlayer ) 
+ + { 
+ + + if ( MinecraftForge . EVENT _ BUS . post ( new MinecartInteractEvent ( this , par1EntityPlayer ) ) ) 
+ + + { 
+ + + return true ; 
+ + + } 
+ + if ( this . riddenByEntity ! = null & & this . riddenByEntity instanceof EntityPlayer & & this . riddenByEntity ! = par1EntityPlayer ) 
+ + { 
+ + return true ; 
+ diff - - git a / patches / minecraft / net / minecraft / entity / item / EntityMinecart . java . patch b / patches / minecraft / net / minecraft / entity / item / EntityMinecart . java . patch 
+ new file mode 100644 
+ index 0000000 . . 4115e2f 
+ - - - / dev / null 
+ + + + b / patches / minecraft / net / minecraft / entity / item / EntityMinecart . java . patch 
+ @ @ - 0 , 0 + 1 , 497 @ @ 
+ + - - - . . / src _ base / minecraft / net / minecraft / entity / item / EntityMinecart . java 
+ + + + + . . / src _ work / minecraft / net / minecraft / entity / item / EntityMinecart . java 
+ + @ @ - 24 , 6 + 24 , 10 @ @ 
+ + import net . minecraft . util . Vec3 ; 
+ + import net . minecraft . world . World ; 
+ + import net . minecraft . world . WorldServer ; 
+ + + import net . minecraftforge . common . IMinecartCollisionHandler ; 
+ + + import net . minecraftforge . common . MinecraftForge ; 
+ + + import net . minecraftforge . event . entity . minecart . MinecartCollisionEvent ; 
+ + + import net . minecraftforge . event . entity . minecart . MinecartUpdateEvent ; 
+ + 
+ + public abstract class EntityMinecart extends Entity 
+ + { 
+ + @ @ - 48 , 6 + 52 , 20 @ @ 
+ + @ SideOnly ( Side . CLIENT ) 
+ + protected double velocityZ ; 
+ + 
+ + + / * Forge : Minecart Compatibility Layer Integration . * / 
+ + + public static float defaultMaxSpeedAirLateral = 0 . 4f ; 
+ + + public static float defaultMaxSpeedAirVertical = - 1f ; 
+ + + public static double defaultDragAir = 0 . 94999998807907104D ; 
+ + + protected boolean canUseRail = true ; 
+ + + protected boolean canBePushed = true ; 
+ + + private static IMinecartCollisionHandler collisionHandler = null ; 
+ + + 
+ + + / * Instance versions of the above physics properties * / 
+ + + private float currentSpeedRail = getMaxCartSpeedOnRail ( ) ; 
+ + + protected float maxSpeedAirLateral = defaultMaxSpeedAirLateral ; 
+ + + protected float maxSpeedAirVertical = defaultMaxSpeedAirVertical ; 
+ + + protected double dragAir = defaultDragAir ; 
+ + + 
+ + public EntityMinecart ( World par1World ) 
+ + { 
+ + super ( par1World ) ; 
+ + @ @ - 99 , 6 + 117 , 10 @ @ 
+ + * / 
+ + public AxisAlignedBB getCollisionBox ( Entity par1Entity ) 
+ + { 
+ + + if ( getCollisionHandler ( ) ! = null ) 
+ + + { 
+ + + return getCollisionHandler ( ) . getCollisionBox ( this , par1Entity ) ; 
+ + + } 
+ + return par1Entity . canBePushed ( ) ? par1Entity . boundingBox : null ; 
+ + } 
+ + 
+ + @ @ - 107 , 6 + 129 , 10 @ @ 
+ + * / 
+ + public AxisAlignedBB getBoundingBox ( ) 
+ + { 
+ + + if ( getCollisionHandler ( ) ! = null ) 
+ + + { 
+ + + return getCollisionHandler ( ) . getBoundingBox ( this ) ; 
+ + + } 
+ + return null ; 
+ + } 
+ + 
+ + @ @ - 115 , 7 + 141 , 7 @ @ 
+ + * / 
+ + public boolean canBePushed ( ) 
+ + { 
+ + - return true ; 
+ + + return canBePushed ; 
+ + } 
+ + 
+ + public EntityMinecart ( World par1World , double par2 , double par4 , double par6 ) 
+ + @ @ - 349 , 13 + 375 , 16 @ @ 
+ + double d5 = 0 . 0078125D ; 
+ + int l = this . worldObj . getBlockId ( j , i , k ) ; 
+ + 
+ + - if ( BlockBaseRail . isRailBlock ( l ) ) 
+ + - { 
+ + - this . func _ 94091 _ a ( j , i , k , d4 , d5 , l , this . worldObj . getBlockMetadata ( j , i , k ) ) ; 
+ + + if ( canUseRail ( ) & & BlockBaseRail . isRailBlock ( l ) ) 
+ + + { 
+ + + BlockBaseRail rail = ( BlockBaseRail ) Block . blocksList [ l ] ; 
+ + + float railMaxSpeed = rail . getRailMaxSpeed ( worldObj , this , j , i , k ) ; 
+ + + double maxSpeed = Math . min ( railMaxSpeed , getCurrentCartSpeedCapOnRail ( ) ) ; 
+ + + this . func _ 94091 _ a ( j , i , k , maxSpeed , getSlopeAdjustment ( ) , l , rail . getBasicRailMetadata ( worldObj , this , j , i , k ) ) ; 
+ + } 
+ + else 
+ + { 
+ + - this . func _ 94088 _ b ( d4 ) ; 
+ + + this . func _ 94088 _ b ( onGround ? d4 : getMaxSpeedAirLateral ( ) ) ; 
+ + } 
+ + 
+ + this . doBlockCollisions ( ) ; 
+ + @ @ - 382 , 7 + 411 , 18 @ @ 
+ + } 
+ + 
+ + this . setRotation ( this . rotationYaw , this . rotationPitch ) ; 
+ + - List list = this . worldObj . getEntitiesWithinAABBExcludingEntity ( this , this . boundingBox . expand ( 0 . 20000000298023224D , 0 . 0D , 0 . 20000000298023224D ) ) ; 
+ + + 
+ + + AxisAlignedBB box ; 
+ + + if ( getCollisionHandler ( ) ! = null ) 
+ + + { 
+ + + box = getCollisionHandler ( ) . getMinecartCollisionBox ( this ) ; 
+ + + } 
+ + + else 
+ + + { 
+ + + box = boundingBox . expand ( 0 . 2D , 0 . 0D , 0 . 2D ) ; 
+ + + } 
+ + + 
+ + + List list = this . worldObj . getEntitiesWithinAABBExcludingEntity ( this , box ) ; 
+ + 
+ + if ( list ! = null & & ! list . isEmpty ( ) ) 
+ + { 
+ + @ @ - 406 , 6 + 446 , 8 @ @ 
+ + 
+ + this . riddenByEntity = null ; 
+ + } 
+ + + 
+ + + MinecraftForge . EVENT _ BUS . post ( new MinecartUpdateEvent ( this , j , i , k ) ) ; 
+ + } 
+ + } 
+ + 
+ + @ @ - 431 , 6 + 473 , 17 @ @ 
+ + this . motionZ = par1 ; 
+ + } 
+ + 
+ + + double moveY = motionY ; 
+ + + if ( getMaxSpeedAirVertical ( ) > 0 & & motionY > getMaxSpeedAirVertical ( ) ) 
+ + + { 
+ + + moveY = getMaxSpeedAirVertical ( ) ; 
+ + + if ( Math . abs ( motionX ) < 0 . 3f & & Math . abs ( motionZ ) < 0 . 3f ) 
+ + + { 
+ + + moveY = 0 . 15f ; 
+ + + motionY = moveY ; 
+ + + } 
+ + + } 
+ + + 
+ + if ( this . onGround ) 
+ + { 
+ + this . motionX * = 0 . 5D ; 
+ + @ @ - 438 , 13 + 491 , 13 @ @ 
+ + this . motionZ * = 0 . 5D ; 
+ + } 
+ + 
+ + - this . moveEntity ( this . motionX , this . motionY , this . motionZ ) ; 
+ + + this . moveEntity ( this . motionX , moveY , this . motionZ ) ; 
+ + 
+ + if ( ! this . onGround ) 
+ + { 
+ + - this . motionX * = 0 . 949999988079071D ; 
+ + - this . motionY * = 0 . 949999988079071D ; 
+ + - this . motionZ * = 0 . 949999988079071D ; 
+ + + this . motionX * = getDragAir ( ) ; 
+ + + this . motionY * = getDragAir ( ) ; 
+ + + this . motionZ * = getDragAir ( ) ; 
+ + } 
+ + } 
+ + 
+ + @ @ - 458 , 7 + 511 , 7 @ @ 
+ + 
+ + if ( par8 = = Block . railPowered . blockID ) 
+ + { 
+ + - flag = ( par9 & 8 ) ! = 0 ; 
+ + + flag = ( worldObj . getBlockMetadata ( par1 , par2 , par3 ) & 8 ) ! = 0 ; 
+ + flag1 = ! flag ; 
+ + } 
+ + 
+ + @ @ - 523 , 7 + 576 , 7 @ @ 
+ + } 
+ + } 
+ + 
+ + - if ( flag1 ) 
+ + + if ( flag1 & & shouldDoRailFunctions ( ) ) 
+ + { 
+ + d7 = Math . sqrt ( this . motionX * this . motionX + this . motionZ * this . motionZ ) ; 
+ + 
+ + @ @ - 571 , 36 + 624 , 8 @ @ 
+ + this . posX = d8 + d2 * d7 ; 
+ + this . posZ = d9 + d3 * d7 ; 
+ + this . setPosition ( this . posX , this . posY + ( double ) this . yOffset , this . posZ ) ; 
+ + - d12 = this . motionX ; 
+ + - d13 = this . motionZ ; 
+ + - 
+ + - if ( this . riddenByEntity ! = null ) 
+ + - { 
+ + - d12 * = 0 . 75D ; 
+ + - d13 * = 0 . 75D ; 
+ + - } 
+ + - 
+ + - if ( d12 < - par4 ) 
+ + - { 
+ + - d12 = - par4 ; 
+ + - } 
+ + - 
+ + - if ( d12 > par4 ) 
+ + - { 
+ + - d12 = par4 ; 
+ + - } 
+ + - 
+ + - if ( d13 < - par4 ) 
+ + - { 
+ + - d13 = - par4 ; 
+ + - } 
+ + - 
+ + - if ( d13 > par4 ) 
+ + - { 
+ + - d13 = par4 ; 
+ + - } 
+ + - 
+ + - this . moveEntity ( d12 , 0 . 0D , d13 ) ; 
+ + + 
+ + + moveMinecartOnRail ( par1 , par2 , par3 , par4 ) ; 
+ + 
+ + if ( aint [ 0 ] [ 1 ] ! = 0 & & MathHelper . floor _ double ( this . posX ) - par1 = = aint [ 0 ] [ 0 ] & & MathHelper . floor _ double ( this . posZ ) - par3 = = aint [ 0 ] [ 2 ] ) 
+ + { 
+ + @ @ - 637 , 8 + 662 , 13 @ @ 
+ + this . motionX = d6 * ( double ) ( j1 - par1 ) ; 
+ + this . motionZ = d6 * ( double ) ( k1 - par3 ) ; 
+ + } 
+ + - 
+ + - if ( flag ) 
+ + + 
+ + + if ( shouldDoRailFunctions ( ) ) 
+ + + { 
+ + + ( ( BlockBaseRail ) Block . blocksList [ par8 ] ) . onMinecartPass ( worldObj , this , par1 , par2 , par3 ) ; 
+ + + } 
+ + + 
+ + + if ( flag & & shouldDoRailFunctions ( ) ) 
+ + { 
+ + double d15 = Math . sqrt ( this . motionX * this . motionX + this . motionZ * this . motionZ ) ; 
+ + 
+ + @ @ - 709 , 12 + 739 , 7 @ @ 
+ + } 
+ + else 
+ + { 
+ + - int i1 = this . worldObj . getBlockMetadata ( i , j , k ) ; 
+ + - 
+ + - if ( ( ( BlockBaseRail ) Block . blocksList [ l ] ) . isPowered ( ) ) 
+ + - { 
+ + - i1 & = 7 ; 
+ + - } 
+ + + int i1 = ( ( BlockBaseRail ) Block . blocksList [ l ] ) . getBasicRailMetadata ( worldObj , this , i , j , k ) ; 
+ + 
+ + par3 = ( double ) j ; 
+ + 
+ + @ @ - 760 , 13 + 785 , 8 @ @ 
+ + 
+ + if ( BlockBaseRail . isRailBlock ( l ) ) 
+ + { 
+ + - int i1 = this . worldObj . getBlockMetadata ( i , j , k ) ; 
+ + + int i1 = ( ( BlockBaseRail ) Block . blocksList [ l ] ) . getBasicRailMetadata ( worldObj , this , i , j , k ) ; 
+ + par3 = ( double ) j ; 
+ + - 
+ + - if ( ( ( BlockBaseRail ) Block . blocksList [ l ] ) . isPowered ( ) ) 
+ + - { 
+ + - i1 & = 7 ; 
+ + - } 
+ + 
+ + if ( i1 > = 2 & & i1 < = 5 ) 
+ + { 
+ + @ @ - 872 , 11 + 892 , 17 @ @ 
+ + * / 
+ + public void applyEntityCollision ( Entity par1Entity ) 
+ + { 
+ + + MinecraftForge . EVENT _ BUS . post ( new MinecartCollisionEvent ( this , par1Entity ) ) ; 
+ + + if ( getCollisionHandler ( ) ! = null ) 
+ + + { 
+ + + getCollisionHandler ( ) . onEntityCollision ( this , par1Entity ) ; 
+ + + return ; 
+ + + } 
+ + if ( ! this . worldObj . isRemote ) 
+ + { 
+ + if ( par1Entity ! = this . riddenByEntity ) 
+ + { 
+ + - if ( par1Entity instanceof EntityLiving & & ! ( par1Entity instanceof EntityPlayer ) & & ! ( par1Entity instanceof EntityIronGolem ) & & this . func _ 94087 _ l ( ) = = 0 & & this . motionX * this . motionX + this . motionZ * this . motionZ > 0 . 01D & & this . riddenByEntity = = null & & par1Entity . ridingEntity = = null ) 
+ + + if ( par1Entity instanceof EntityLiving & & ! ( par1Entity instanceof EntityPlayer ) & & ! ( par1Entity instanceof EntityIronGolem ) & & canBeRidden ( ) & & this . motionX * this . motionX + this . motionZ * this . motionZ > 0 . 01D & & this . riddenByEntity = = null & & par1Entity . ridingEntity = = null ) 
+ + { 
+ + par1Entity . mountEntity ( this ) ; 
+ + } 
+ + @ @ - 922 , 7 + 948 , 7 @ @ 
+ + double d7 = par1Entity . motionX + this . motionX ; 
+ + double d8 = par1Entity . motionZ + this . motionZ ; 
+ + 
+ + - if ( ( ( EntityMinecart ) par1Entity ) . func _ 94087 _ l ( ) = = 2 & & this . func _ 94087 _ l ( ) ! = 2 ) 
+ + + if ( ( ( EntityMinecart ) par1Entity ) . isPoweredCart ( ) & & ! isPoweredCart ( ) ) 
+ + { 
+ + this . motionX * = 0 . 20000000298023224D ; 
+ + this . motionZ * = 0 . 20000000298023224D ; 
+ + @ @ - 930 , 7 + 956 , 7 @ @ 
+ + par1Entity . motionX * = 0 . 949999988079071D ; 
+ + par1Entity . motionZ * = 0 . 949999988079071D ; 
+ + } 
+ + - else if ( ( ( EntityMinecart ) par1Entity ) . func _ 94087 _ l ( ) ! = 2 & & this . func _ 94087 _ l ( ) = = 2 ) 
+ + + else if ( ! ( ( EntityMinecart ) par1Entity ) . isPoweredCart ( ) & & isPoweredCart ( ) ) 
+ + { 
+ + par1Entity . motionX * = 0 . 20000000298023224D ; 
+ + par1Entity . motionZ * = 0 . 20000000298023224D ; 
+ + @ @ - 1118 , 4 + 1144 , 206 @ @ 
+ + { 
+ + return this . field _ 94102 _ c ! = null ? this . field _ 94102 _ c : super . getEntityName ( ) ; 
+ + } 
+ + + 
+ + + / * * 
+ + + * Moved to allow overrides . 
+ + + * This code handles minecart movement and speed capping when on a rail . 
+ + + * / 
+ + + public void moveMinecartOnRail ( int x , int y , int z , double par4 ) { 
+ + + double d12 = this . motionX ; 
+ + + double d13 = this . motionZ ; 
+ + + 
+ + + if ( this . riddenByEntity ! = null ) 
+ + + { 
+ + + d12 * = 0 . 75D ; 
+ + + d13 * = 0 . 75D ; 
+ + + } 
+ + + 
+ + + if ( d12 < - par4 ) 
+ + + { 
+ + + d12 = - par4 ; 
+ + + } 
+ + + 
+ + + if ( d12 > par4 ) 
+ + + { 
+ + + d12 = par4 ; 
+ + + } 
+ + + 
+ + + if ( d13 < - par4 ) 
+ + + { 
+ + + d13 = - par4 ; 
+ + + } 
+ + + 
+ + + if ( d13 > par4 ) 
+ + + { 
+ + + d13 = par4 ; 
+ + + } 
+ + + 
+ + + this . moveEntity ( d12 , 0 . 0D , d13 ) ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Gets the current global Minecart Collision handler if none 
+ + + * is registered , returns null 
+ + + * @ return The collision handler or null 
+ + + * / 
+ + + public static IMinecartCollisionHandler getCollisionHandler ( ) 
+ + + { 
+ + + return collisionHandler ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Sets the global Minecart Collision handler , overwrites any 
+ + + * that is currently set . 
+ + + * @ param handler The new handler 
+ + + * / 
+ + + public static void setCollisionHandler ( IMinecartCollisionHandler handler ) 
+ + + { 
+ + + collisionHandler = handler ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * This function returns an ItemStack that represents this cart . 
+ + + * This should be an ItemStack that can be used by the player to place the cart , 
+ + + * but is not necessary the item the cart drops when destroyed . 
+ + + * @ return An ItemStack that can be used to place the cart . 
+ + + * / 
+ + + public ItemStack getCartItem ( ) { 
+ + + if ( this instanceof ItemChestMinecart ) 
+ + + { 
+ + + return new ItemStack ( Item . minecartCrate ) ; 
+ + + } 
+ + + if ( this instanceof ItemTntMinecart ) 
+ + + { 
+ + + return new ItemStack ( Item . field _ 94582 _ cb ) ; 
+ + + } 
+ + + if ( this instanceof ItemFurnaceMinecart ) 
+ + + { 
+ + + return new ItemStack ( Item . minecartPowered ) ; 
+ + + } 
+ + + return new ItemStack ( Item . minecartEmpty ) ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Returns true if this cart can currently use rails . 
+ + + * This function is mainly used to gracefully detach a minecart from a rail . 
+ + + * @ return True if the minecart can use rails . 
+ + + * / 
+ + + public boolean canUseRail ( ) 
+ + + { 
+ + + return canUseRail ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Set whether the minecart can use rails . 
+ + + * This function is mainly used to gracefully detach a minecart from a rail . 
+ + + * @ param use Whether the minecart can currently use rails . 
+ + + * / 
+ + + public void setCanUseRail ( boolean use ) 
+ + + { 
+ + + canUseRail = use ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Return false if this cart should not call onMinecartPass ( ) and should ignore Powered Rails . 
+ + + * @ return True if this cart should call onMinecartPass ( ) . 
+ + + * / 
+ + + public boolean shouldDoRailFunctions ( ) 
+ + + { 
+ + + return true ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Returns true if this cart is self propelled . 
+ + + * @ return True if powered . 
+ + + * / 
+ + + public boolean isPoweredCart ( ) 
+ + + { 
+ + + return func _ 94087 _ l ( ) = = 2 ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Returns true if this cart can be ridden by an Entity . 
+ + + * @ return True if this cart can be ridden . 
+ + + * / 
+ + + public boolean canBeRidden ( ) 
+ + + { 
+ + + if ( this instanceof ItemRideableMinecart ) 
+ + + { 
+ + + return true ; 
+ + + } 
+ + + return false ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Getters / setters for physics variables 
+ + + * / 
+ + + 
+ + + / * * 
+ + + * Returns the carts max speed when traveling on rails . Carts going faster 
+ + + * than 1 . 1 cause issues with chunk loading . Carts cant traverse slopes or 
+ + + * corners at greater than 0 . 5 - 0 . 6 . This value is compared with the rails 
+ + + * max speed and the carts current speed cap to determine the carts current 
+ + + * max speed . A normal rail ' s max speed is 0 . 4 . 
+ + + * 
+ + + * @ return Carts max speed . 
+ + + * / 
+ + + public float getMaxCartSpeedOnRail ( ) 
+ + + { 
+ + + return 1 . 2f ; 
+ + + } 
+ + + 
+ + + / * * 
+ + + * Returns the current speed cap for the cart when traveling on rails . This 
+ + + * functions differs from getMaxCartSpeedOnRail ( ) in that it controls 
+ + + * current movement and cannot be overridden . The value however can never be 
+ + + * higher than getMaxCartSpeedOnRail ( ) . 
+ + + * 
+ + + * @ return 
+ + + * / 
+ + + public final float getCurrentCartSpeedCapOnRail ( ) 
+ + + { 
+ + + return currentSpeedRail ; 
+ + + } 
+ + + 
+ + + public final void setCurrentCartSpeedCapOnRail ( float value ) 
+ + + { 
+ + + value = Math . min ( value , getMaxCartSpeedOnRail ( ) ) ; 
+ + + currentSpeedRail = value ; 
+ + + } 
+ + + 
+ + + public float getMaxSpeedAirLateral ( ) 
+ + + { 
+ + + return maxSpeedAirLateral ; 
+ + + } 
+ + + 
+ + + public void setMaxSpeedAirLateral ( float value ) 
+ + + { 
+ + + maxSpeedAirLateral = value ; 
+ + + } 
+ + + 
+ + + public float getMaxSpeedAirVertical ( ) 
+ + + { 
+ + + return maxSpeedAirVertical ; 
+ + + } 
+ + + 
+ + + public void setMaxSpeedAirVertical ( float value ) 
+ + + { 
+ + + maxSpeedAirVertical = value ; 
+ + + } 
+ + + 
+ + + public double getDragAir ( ) 
+ + + { 
+ + + return dragAir ; 
+ + + } 
+ + + 
+ + + public void setDragAir ( double value ) 
+ + + { 
+ + + dragAir = value ; 
+ + + } 
+ + + 
+ + + public double getSlopeAdjustment ( ) 
+ + + { 
+ + + return 0 . 0078125D ; 
+ + + } 
+ + }

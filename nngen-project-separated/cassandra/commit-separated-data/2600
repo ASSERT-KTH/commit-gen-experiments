@@ -1,0 +1,252 @@
+BLEU SCORE: 0.020980574531482755
+
+TEST MSG: Track liveRatio per - memtable , not per - CF
+GENERATED MSG: merge from 1 . 2
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 399cb01 . . e9dca70 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 35 , 6 + 35 , 7 @ @ <nl> ( CASSANDRA - 6867 ) <nl> * Add CqlRecordReader using native pagination ( CASSANDRA - 6311 ) <nl> * Add QueryHandler interface ( CASSANDRA - 6659 ) <nl> + * Track liveRatio per - memtable , not per - CF ( CASSANDRA - 6945 ) <nl> Merged from 1 . 2 : <nl> * Add UNLOGGED , COUNTER options to BATCH documentation ( CASSANDRA - 6816 ) <nl> * add extra SSL cipher suites ( CASSANDRA - 6613 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index b58329e . . 792c155 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 25 , 7 + 25 , 6 @ @ import java . nio . ByteBuffer ; <nl> import java . util . * ; <nl> import java . util . concurrent . * ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> - import java . util . concurrent . atomic . AtomicLong ; <nl> import java . util . regex . Pattern ; <nl> import javax . management . * ; <nl> <nl> @ @ - 105 , 11 + 104 , 6 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> <nl> public final Directories directories ; <nl> <nl> - / * * ratio of in - memory memtable size , to serialized size * / <nl> - volatile double liveRatio = 10 . 0 ; / / reasonable default until we compute what it is based on actual data <nl> - / * * ops count last time we computed liveRatio * / <nl> - private final AtomicLong liveRatioComputedAt = new AtomicLong ( 32 ) ; <nl> - <nl> public final ColumnFamilyMetrics metric ; <nl> public volatile long sampleLatencyNanos ; <nl> <nl> @ @ - 899 , 20 + 893 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> mt . put ( key , columnFamily , indexer ) ; <nl> maybeUpdateRowCache ( key ) ; <nl> metric . writeLatency . addNano ( System . nanoTime ( ) - start ) ; <nl> - <nl> - / / recompute liveRatio , if we have doubled the number of ops since last calculated <nl> - while ( true ) <nl> - { <nl> - long last = liveRatioComputedAt . get ( ) ; <nl> - long operations = metric . writeLatency . latency . count ( ) ; <nl> - if ( operations < 2 * last ) <nl> - break ; <nl> - if ( liveRatioComputedAt . compareAndSet ( last , operations ) ) <nl> - { <nl> - logger . debug ( " computing liveRatio of { } at { } ops " , this , operations ) ; <nl> - mt . updateLiveRatio ( ) ; <nl> - } <nl> - } <nl> + mt . maybeUpdateLiveRatio ( ) ; <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / db / DataTracker . java b / src / java / org / apache / cassandra / db / DataTracker . java <nl> index a1de8e5 . . a9eef98 100644 <nl> - - - a / src / java / org / apache / cassandra / db / DataTracker . java <nl> + + + b / src / java / org / apache / cassandra / db / DataTracker . java <nl> @ @ - 30 , 7 + 30 , 6 @ @ import org . slf4j . LoggerFactory ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . compaction . OperationType ; <nl> import org . apache . cassandra . dht . AbstractBounds ; <nl> - import org . apache . cassandra . io . sstable . Descriptor ; <nl> import org . apache . cassandra . io . sstable . SSTableReader ; <nl> import org . apache . cassandra . io . util . FileUtils ; <nl> import org . apache . cassandra . metrics . StorageMetrics ; <nl> @ @ - 110 , 7 + 109 , 7 @ @ public class DataTracker <nl> public Memtable switchMemtable ( ) <nl> { <nl> / / atomically change the current memtable <nl> - Memtable newMemtable = new Memtable ( cfstore ) ; <nl> + Memtable newMemtable = new Memtable ( cfstore , view . get ( ) . memtable ) ; <nl> Memtable toFlushMemtable ; <nl> View currentView , newView ; <nl> do <nl> @ @ - 131 , 7 + 130 , 7 @ @ public class DataTracker <nl> * / <nl> public void renewMemtable ( ) <nl> { <nl> - Memtable newMemtable = new Memtable ( cfstore ) ; <nl> + Memtable newMemtable = new Memtable ( cfstore , view . get ( ) . memtable ) ; <nl> View currentView , newView ; <nl> do <nl> { <nl> @ @ - 322 , 7 + 321 , 7 @ @ public class DataTracker <nl> / * * ( Re ) initializes the tracker , purging all references . * / <nl> void init ( ) <nl> { <nl> - view . set ( new View ( new Memtable ( cfstore ) , <nl> + view . set ( new View ( new Memtable ( cfstore , null ) , <nl> Collections . < Memtable > emptySet ( ) , <nl> Collections . < SSTableReader > emptySet ( ) , <nl> Collections . < SSTableReader > emptySet ( ) , <nl> diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java <nl> index 1d26779 . . b26b7cd 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Memtable . java <nl> + + + b / src / java / org / apache / cassandra / db / Memtable . java <nl> @ @ - 46 , 6 + 46 , 18 @ @ public class Memtable <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( Memtable . class ) ; <nl> <nl> + / / size in memory can never be less than serialized size . <nl> + private static final double MIN _ SANE _ LIVE _ RATIO = 1 . 0 ; <nl> + / / max liveratio seen w / 1 - byte columns on a 64 - bit jvm was 19 . If it gets higher than 64 something is probably broken . <nl> + private static final double MAX _ SANE _ LIVE _ RATIO = 64 . 0 ; <nl> + / / reasonable initial live ratio used until we compute one . <nl> + private static final double INITIAL _ LIVE _ RATIO = 10 . 0 ; <nl> + <nl> + / / ratio of in - memory memtable size , to serialized size <nl> + private volatile double liveRatio = INITIAL _ LIVE _ RATIO ; <nl> + / / ops count last time we computed liveRatio <nl> + private final AtomicLong liveRatioComputedAt = new AtomicLong ( 32 ) ; <nl> + <nl> / * <nl> * switchMemtable puts Memtable . getSortedContents on the writer executor . When the write is complete , <nl> * we turn the writer into an SSTableReader and add it to ssTables where it is available for reads . <nl> @ @ - 66 , 11 + 78 , 6 @ @ public class Memtable <nl> new NamedThreadFactory ( " FlushWriter " ) , <nl> " internal " ) ; <nl> <nl> - / / size in memory can never be less than serialized size <nl> - private static final double MIN _ SANE _ LIVE _ RATIO = 1 . 0 ; <nl> - / / max liveratio seen w / 1 - byte columns on a 64 - bit jvm was 19 . If it gets higher than 64 something is probably broken . <nl> - private static final double MAX _ SANE _ LIVE _ RATIO = 64 . 0 ; <nl> - <nl> / / We need to take steps to avoid retaining inactive membtables in memory , because counting is slow ( can be <nl> / / minutes , for a large memtable and a busy server ) . A strictly FIFO Memtable queue could keep memtables <nl> / / alive waiting for metering after they ' re flushed and would otherwise be GC ' d . Instead , the approach we take <nl> @ @ - 113 , 12 + 120 , 20 @ @ public class Memtable <nl> / / memtable was created with the new or old comparator . <nl> public final AbstractType initialComparator ; <nl> <nl> - public Memtable ( ColumnFamilyStore cfs ) <nl> + public Memtable ( ColumnFamilyStore cfs , Memtable previous ) <nl> { <nl> this . cfs = cfs ; <nl> this . initialComparator = cfs . metadata . comparator ; <nl> this . cfs . scheduleFlush ( ) ; <nl> <nl> + / / Inherit liveRatio and liveRatioCompareAt from the previous memtable , if available , <nl> + / / to minimise recalculation frequency as much as possible . <nl> + if ( previous ! = null ) <nl> + { <nl> + liveRatio = previous . liveRatio ; <nl> + liveRatioComputedAt . set ( previous . liveRatioComputedAt . get ( ) / 2 ) ; <nl> + } <nl> + <nl> Callable < Set < Object > > provider = new Callable < Set < Object > > ( ) <nl> { <nl> public Set < Object > call ( ) throws Exception <nl> @ @ - 134 , 7 + 149 , 7 @ @ public class Memtable <nl> <nl> public long getLiveSize ( ) <nl> { <nl> - long estimatedSize = ( long ) ( currentSize . get ( ) * cfs . liveRatio ) ; <nl> + long estimatedSize = ( long ) ( currentSize . get ( ) * liveRatio ) ; <nl> <nl> / / liveRatio is just an estimate ; we can get a lower bound directly from the allocator <nl> if ( estimatedSize < allocator . getMinimumSize ( ) ) <nl> @ @ - 158 , 6 + 173 , 23 @ @ public class Memtable <nl> resolve ( key , columnFamily , indexer ) ; <nl> } <nl> <nl> + public void maybeUpdateLiveRatio ( ) <nl> + { <nl> + / / recompute liveRatio , if we have doubled the number of ops since last calculated <nl> + while ( true ) <nl> + { <nl> + long last = liveRatioComputedAt . get ( ) ; <nl> + long operations = currentOperations . get ( ) ; <nl> + if ( operations < 2 * last ) <nl> + break ; <nl> + if ( liveRatioComputedAt . compareAndSet ( last , operations ) ) <nl> + { <nl> + logger . debug ( " computing liveRatio of { } at { } ops " , this , operations ) ; <nl> + updateLiveRatio ( ) ; <nl> + } <nl> + } <nl> + } <nl> + <nl> public void updateLiveRatio ( ) throws RuntimeException <nl> { <nl> if ( ! MemoryMeter . isInitialized ( ) ) <nl> @ @ - 165 , 7 + 197 , 7 @ @ public class Memtable <nl> / / hack for openjdk . we log a warning about this in the startup script too . <nl> logger . error ( " MemoryMeter uninitialized ( jamm not specified as java agent ) ; assuming liveRatio of { } . " <nl> + " Usually this means cassandra - env . sh disabled jamm because you are using a buggy JRE ; " <nl> - + " upgrade to the Sun JRE instead " , cfs . liveRatio ) ; <nl> + + " upgrade to the Sun JRE instead " , liveRatio ) ; <nl> return ; <nl> } <nl> <nl> @ @ - 440 , 14 + 472 , 14 @ @ public class Memtable <nl> } <nl> <nl> / / we want to be very conservative about our estimate , since the penalty for guessing low is OOM <nl> - / / death . thus , higher estimates are believed immediately ; lower ones are averaged w / the old <nl> - if ( newRatio > cfs . liveRatio ) <nl> - cfs . liveRatio = newRatio ; <nl> + / / death . thus , higher estimates are believed immediately ; lower ones are averaged w / the old <nl> + if ( newRatio > memtable . liveRatio ) <nl> + memtable . liveRatio = newRatio ; <nl> else <nl> - cfs . liveRatio = ( cfs . liveRatio + newRatio ) / 2 . 0 ; <nl> + memtable . liveRatio = ( memtable . liveRatio + newRatio ) / 2 . 0 ; <nl> <nl> logger . info ( " { } liveRatio is { } ( just - counted was { } ) . calculation took { } ms for { } cells " , <nl> - cfs , cfs . liveRatio , newRatio , TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) , objects ) ; <nl> + cfs , memtable . liveRatio , newRatio , TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) , objects ) ; <nl> } <nl> finally <nl> {
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index b935425 . . 7f5a487 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 1 . 2 - rc1 <nl> + * fix cqlsh rendering of blob fields ( CASSANDRA - 4970 ) <nl> * fix cqlsh DESCRIBE command ( CASSANDRA - 4913 ) <nl> * save truncation position in system table ( CASSANDRA - 4906 ) <nl> * Move CompressionMetadata off - heap ( CASSANDRA - 4937 ) <nl> diff - - git a / pylib / cqlshlib / formatting . py b / pylib / cqlshlib / formatting . py <nl> index d15c083 . . bab3506 100644 <nl> - - - a / pylib / cqlshlib / formatting . py <nl> + + + b / pylib / cqlshlib / formatting . py <nl> @ @ - 88 , 8 + 88 , 8 @ @ def formatter _ for ( typname ) : <nl> return f <nl> return registrator <nl> <nl> - @ formatter _ for ( ' bytes ' ) <nl> - def format _ value _ bytes ( val , colormap , * * _ ) : <nl> + @ formatter _ for ( ' blob ' ) <nl> + def format _ value _ blob ( val , colormap , * * _ ) : <nl> bval = ' ' . join ( ' % 02x ' % ord ( c ) for c in val ) <nl> return colorme ( bval , colormap , ' hex ' ) <nl>
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 399cb01 . . e9dca70 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 35 , 6 + 35 , 7 @ @ 
+ ( CASSANDRA - 6867 ) 
+ * Add CqlRecordReader using native pagination ( CASSANDRA - 6311 ) 
+ * Add QueryHandler interface ( CASSANDRA - 6659 ) 
+ + * Track liveRatio per - memtable , not per - CF ( CASSANDRA - 6945 ) 
+ Merged from 1 . 2 : 
+ * Add UNLOGGED , COUNTER options to BATCH documentation ( CASSANDRA - 6816 ) 
+ * add extra SSL cipher suites ( CASSANDRA - 6613 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index b58329e . . 792c155 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 25 , 7 + 25 , 6 @ @ import java . nio . ByteBuffer ; 
+ import java . util . * ; 
+ import java . util . concurrent . * ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ - import java . util . concurrent . atomic . AtomicLong ; 
+ import java . util . regex . Pattern ; 
+ import javax . management . * ; 
+ 
+ @ @ - 105 , 11 + 104 , 6 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ 
+ public final Directories directories ; 
+ 
+ - / * * ratio of in - memory memtable size , to serialized size * / 
+ - volatile double liveRatio = 10 . 0 ; / / reasonable default until we compute what it is based on actual data 
+ - / * * ops count last time we computed liveRatio * / 
+ - private final AtomicLong liveRatioComputedAt = new AtomicLong ( 32 ) ; 
+ - 
+ public final ColumnFamilyMetrics metric ; 
+ public volatile long sampleLatencyNanos ; 
+ 
+ @ @ - 899 , 20 + 893 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ mt . put ( key , columnFamily , indexer ) ; 
+ maybeUpdateRowCache ( key ) ; 
+ metric . writeLatency . addNano ( System . nanoTime ( ) - start ) ; 
+ - 
+ - / / recompute liveRatio , if we have doubled the number of ops since last calculated 
+ - while ( true ) 
+ - { 
+ - long last = liveRatioComputedAt . get ( ) ; 
+ - long operations = metric . writeLatency . latency . count ( ) ; 
+ - if ( operations < 2 * last ) 
+ - break ; 
+ - if ( liveRatioComputedAt . compareAndSet ( last , operations ) ) 
+ - { 
+ - logger . debug ( " computing liveRatio of { } at { } ops " , this , operations ) ; 
+ - mt . updateLiveRatio ( ) ; 
+ - } 
+ - } 
+ + mt . maybeUpdateLiveRatio ( ) ; 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / db / DataTracker . java b / src / java / org / apache / cassandra / db / DataTracker . java 
+ index a1de8e5 . . a9eef98 100644 
+ - - - a / src / java / org / apache / cassandra / db / DataTracker . java 
+ + + + b / src / java / org / apache / cassandra / db / DataTracker . java 
+ @ @ - 30 , 7 + 30 , 6 @ @ import org . slf4j . LoggerFactory ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . compaction . OperationType ; 
+ import org . apache . cassandra . dht . AbstractBounds ; 
+ - import org . apache . cassandra . io . sstable . Descriptor ; 
+ import org . apache . cassandra . io . sstable . SSTableReader ; 
+ import org . apache . cassandra . io . util . FileUtils ; 
+ import org . apache . cassandra . metrics . StorageMetrics ; 
+ @ @ - 110 , 7 + 109 , 7 @ @ public class DataTracker 
+ public Memtable switchMemtable ( ) 
+ { 
+ / / atomically change the current memtable 
+ - Memtable newMemtable = new Memtable ( cfstore ) ; 
+ + Memtable newMemtable = new Memtable ( cfstore , view . get ( ) . memtable ) ; 
+ Memtable toFlushMemtable ; 
+ View currentView , newView ; 
+ do 
+ @ @ - 131 , 7 + 130 , 7 @ @ public class DataTracker 
+ * / 
+ public void renewMemtable ( ) 
+ { 
+ - Memtable newMemtable = new Memtable ( cfstore ) ; 
+ + Memtable newMemtable = new Memtable ( cfstore , view . get ( ) . memtable ) ; 
+ View currentView , newView ; 
+ do 
+ { 
+ @ @ - 322 , 7 + 321 , 7 @ @ public class DataTracker 
+ / * * ( Re ) initializes the tracker , purging all references . * / 
+ void init ( ) 
+ { 
+ - view . set ( new View ( new Memtable ( cfstore ) , 
+ + view . set ( new View ( new Memtable ( cfstore , null ) , 
+ Collections . < Memtable > emptySet ( ) , 
+ Collections . < SSTableReader > emptySet ( ) , 
+ Collections . < SSTableReader > emptySet ( ) , 
+ diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java 
+ index 1d26779 . . b26b7cd 100644 
+ - - - a / src / java / org / apache / cassandra / db / Memtable . java 
+ + + + b / src / java / org / apache / cassandra / db / Memtable . java 
+ @ @ - 46 , 6 + 46 , 18 @ @ public class Memtable 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( Memtable . class ) ; 
+ 
+ + / / size in memory can never be less than serialized size . 
+ + private static final double MIN _ SANE _ LIVE _ RATIO = 1 . 0 ; 
+ + / / max liveratio seen w / 1 - byte columns on a 64 - bit jvm was 19 . If it gets higher than 64 something is probably broken . 
+ + private static final double MAX _ SANE _ LIVE _ RATIO = 64 . 0 ; 
+ + / / reasonable initial live ratio used until we compute one . 
+ + private static final double INITIAL _ LIVE _ RATIO = 10 . 0 ; 
+ + 
+ + / / ratio of in - memory memtable size , to serialized size 
+ + private volatile double liveRatio = INITIAL _ LIVE _ RATIO ; 
+ + / / ops count last time we computed liveRatio 
+ + private final AtomicLong liveRatioComputedAt = new AtomicLong ( 32 ) ; 
+ + 
+ / * 
+ * switchMemtable puts Memtable . getSortedContents on the writer executor . When the write is complete , 
+ * we turn the writer into an SSTableReader and add it to ssTables where it is available for reads . 
+ @ @ - 66 , 11 + 78 , 6 @ @ public class Memtable 
+ new NamedThreadFactory ( " FlushWriter " ) , 
+ " internal " ) ; 
+ 
+ - / / size in memory can never be less than serialized size 
+ - private static final double MIN _ SANE _ LIVE _ RATIO = 1 . 0 ; 
+ - / / max liveratio seen w / 1 - byte columns on a 64 - bit jvm was 19 . If it gets higher than 64 something is probably broken . 
+ - private static final double MAX _ SANE _ LIVE _ RATIO = 64 . 0 ; 
+ - 
+ / / We need to take steps to avoid retaining inactive membtables in memory , because counting is slow ( can be 
+ / / minutes , for a large memtable and a busy server ) . A strictly FIFO Memtable queue could keep memtables 
+ / / alive waiting for metering after they ' re flushed and would otherwise be GC ' d . Instead , the approach we take 
+ @ @ - 113 , 12 + 120 , 20 @ @ public class Memtable 
+ / / memtable was created with the new or old comparator . 
+ public final AbstractType initialComparator ; 
+ 
+ - public Memtable ( ColumnFamilyStore cfs ) 
+ + public Memtable ( ColumnFamilyStore cfs , Memtable previous ) 
+ { 
+ this . cfs = cfs ; 
+ this . initialComparator = cfs . metadata . comparator ; 
+ this . cfs . scheduleFlush ( ) ; 
+ 
+ + / / Inherit liveRatio and liveRatioCompareAt from the previous memtable , if available , 
+ + / / to minimise recalculation frequency as much as possible . 
+ + if ( previous ! = null ) 
+ + { 
+ + liveRatio = previous . liveRatio ; 
+ + liveRatioComputedAt . set ( previous . liveRatioComputedAt . get ( ) / 2 ) ; 
+ + } 
+ + 
+ Callable < Set < Object > > provider = new Callable < Set < Object > > ( ) 
+ { 
+ public Set < Object > call ( ) throws Exception 
+ @ @ - 134 , 7 + 149 , 7 @ @ public class Memtable 
+ 
+ public long getLiveSize ( ) 
+ { 
+ - long estimatedSize = ( long ) ( currentSize . get ( ) * cfs . liveRatio ) ; 
+ + long estimatedSize = ( long ) ( currentSize . get ( ) * liveRatio ) ; 
+ 
+ / / liveRatio is just an estimate ; we can get a lower bound directly from the allocator 
+ if ( estimatedSize < allocator . getMinimumSize ( ) ) 
+ @ @ - 158 , 6 + 173 , 23 @ @ public class Memtable 
+ resolve ( key , columnFamily , indexer ) ; 
+ } 
+ 
+ + public void maybeUpdateLiveRatio ( ) 
+ + { 
+ + / / recompute liveRatio , if we have doubled the number of ops since last calculated 
+ + while ( true ) 
+ + { 
+ + long last = liveRatioComputedAt . get ( ) ; 
+ + long operations = currentOperations . get ( ) ; 
+ + if ( operations < 2 * last ) 
+ + break ; 
+ + if ( liveRatioComputedAt . compareAndSet ( last , operations ) ) 
+ + { 
+ + logger . debug ( " computing liveRatio of { } at { } ops " , this , operations ) ; 
+ + updateLiveRatio ( ) ; 
+ + } 
+ + } 
+ + } 
+ + 
+ public void updateLiveRatio ( ) throws RuntimeException 
+ { 
+ if ( ! MemoryMeter . isInitialized ( ) ) 
+ @ @ - 165 , 7 + 197 , 7 @ @ public class Memtable 
+ / / hack for openjdk . we log a warning about this in the startup script too . 
+ logger . error ( " MemoryMeter uninitialized ( jamm not specified as java agent ) ; assuming liveRatio of { } . " 
+ + " Usually this means cassandra - env . sh disabled jamm because you are using a buggy JRE ; " 
+ - + " upgrade to the Sun JRE instead " , cfs . liveRatio ) ; 
+ + + " upgrade to the Sun JRE instead " , liveRatio ) ; 
+ return ; 
+ } 
+ 
+ @ @ - 440 , 14 + 472 , 14 @ @ public class Memtable 
+ } 
+ 
+ / / we want to be very conservative about our estimate , since the penalty for guessing low is OOM 
+ - / / death . thus , higher estimates are believed immediately ; lower ones are averaged w / the old 
+ - if ( newRatio > cfs . liveRatio ) 
+ - cfs . liveRatio = newRatio ; 
+ + / / death . thus , higher estimates are believed immediately ; lower ones are averaged w / the old 
+ + if ( newRatio > memtable . liveRatio ) 
+ + memtable . liveRatio = newRatio ; 
+ else 
+ - cfs . liveRatio = ( cfs . liveRatio + newRatio ) / 2 . 0 ; 
+ + memtable . liveRatio = ( memtable . liveRatio + newRatio ) / 2 . 0 ; 
+ 
+ logger . info ( " { } liveRatio is { } ( just - counted was { } ) . calculation took { } ms for { } cells " , 
+ - cfs , cfs . liveRatio , newRatio , TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) , objects ) ; 
+ + cfs , memtable . liveRatio , newRatio , TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) , objects ) ; 
+ } 
+ finally 
+ {
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index b935425 . . 7f5a487 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 1 . 2 - rc1 
+ + * fix cqlsh rendering of blob fields ( CASSANDRA - 4970 ) 
+ * fix cqlsh DESCRIBE command ( CASSANDRA - 4913 ) 
+ * save truncation position in system table ( CASSANDRA - 4906 ) 
+ * Move CompressionMetadata off - heap ( CASSANDRA - 4937 ) 
+ diff - - git a / pylib / cqlshlib / formatting . py b / pylib / cqlshlib / formatting . py 
+ index d15c083 . . bab3506 100644 
+ - - - a / pylib / cqlshlib / formatting . py 
+ + + + b / pylib / cqlshlib / formatting . py 
+ @ @ - 88 , 8 + 88 , 8 @ @ def formatter _ for ( typname ) : 
+ return f 
+ return registrator 
+ 
+ - @ formatter _ for ( ' bytes ' ) 
+ - def format _ value _ bytes ( val , colormap , * * _ ) : 
+ + @ formatter _ for ( ' blob ' ) 
+ + def format _ value _ blob ( val , colormap , * * _ ) : 
+ bval = ' ' . join ( ' % 02x ' % ord ( c ) for c in val ) 
+ return colorme ( bval , colormap , ' hex ' ) 
+

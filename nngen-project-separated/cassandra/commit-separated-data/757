@@ -1,0 +1,253 @@
+BLEU SCORE: 0.03283637368030199
+
+TEST MSG: Fix potential deadlock in CDC state tracking
+GENERATED MSG: add debug messages to commitlog allocator
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> index 2e97fd5 . . a1158be 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> @ @ - 61 , 6 + 61 , 7 @ @ public abstract class CommitLogSegment <nl> FORBIDDEN , <nl> CONTAINS <nl> } <nl> + Object cdcStateLock = new Object ( ) ; <nl> <nl> private final static AtomicInteger nextId = new AtomicInteger ( 1 ) ; <nl> private static long replayLimitId ; <nl> @ @ - 614 , 7 + 615 , 7 @ @ public abstract class CommitLogSegment <nl> return ; <nl> <nl> / / Also synchronized in CDCSizeTracker . processNewSegment and . processDiscardedSegment <nl> - synchronized ( this ) <nl> + synchronized ( cdcStateLock ) <nl> { <nl> if ( cdcState = = CDCState . CONTAINS & & newState ! = CDCState . CONTAINS ) <nl> throw new IllegalArgumentException ( " Cannot transition from CONTAINS to any other state . " ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManagerCDC . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManagerCDC . java <nl> index 5c6fd3f . . 04beb20 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManagerCDC . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManagerCDC . java <nl> @ @ - 187 , 7 + 187 , 7 @ @ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager <nl> void processNewSegment ( CommitLogSegment segment ) <nl> { <nl> / / See synchronization in CommitLogSegment . setCDCState <nl> - synchronized ( segment ) <nl> + synchronized ( segment . cdcStateLock ) <nl> { <nl> segment . setCDCState ( defaultSegmentSize ( ) + totalCDCSizeOnDisk ( ) > allowableCDCBytes ( ) <nl> ? CDCState . FORBIDDEN <nl> @ @ - 203 , 7 + 203 , 7 @ @ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager <nl> void processDiscardedSegment ( CommitLogSegment segment ) <nl> { <nl> / / See synchronization in CommitLogSegment . setCDCState <nl> - synchronized ( segment ) <nl> + synchronized ( segment . cdcStateLock ) <nl> { <nl> / / Add to flushed size before decrementing unflushed so we don ' t have a window of false generosity <nl> if ( segment . getCDCState ( ) = = CDCState . CONTAINS )
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 918c146 . . c37dd93 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 6 @ @ <nl> 1 . 1 . 1 - dev <nl> + * Optimize reads when row deletion timestamps allow us to restrict <nl> + the set of sstables we check ( CASSANDRA - 4116 ) <nl> * incremental repair by token range ( CASSANDRA - 3912 ) <nl> * streaming commitlog backup + pitr ( CASSANDRA - 3690 ) <nl> * avoid generating redundant compaction tasks during streaming <nl> diff - - git a / src / java / org / apache / cassandra / db / CollationController . java b / src / java / org / apache / cassandra / db / CollationController . java <nl> index 5289d1b . . c73e1e0 100644 <nl> - - - a / src / java / org / apache / cassandra / db / CollationController . java <nl> + + + b / src / java / org / apache / cassandra / db / CollationController . java <nl> @ @ - 23 , 6 + 23 , 8 @ @ import java . io . IOException ; <nl> import java . nio . ByteBuffer ; <nl> import java . util . * ; <nl> <nl> + import com . google . common . collect . Iterables ; <nl> + import com . google . common . collect . Maps ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 104 , 8 + 106 , 15 @ @ public class CollationController <nl> Collections . sort ( view . sstables , SSTable . maxTimestampComparator ) ; <nl> <nl> / / read sorted sstables <nl> + long mostRecentRowTombstone = Long . MIN _ VALUE ; <nl> for ( SSTableReader sstable : view . sstables ) <nl> { <nl> + / / if we ' ve already seen a row tombstone with a timestamp greater <nl> + / / than the most recent update to this sstable , we ' re done , since the rest of the sstables <nl> + / / will also be older <nl> + if ( sstable . getMaxTimestamp ( ) < mostRecentRowTombstone ) <nl> + break ; <nl> + <nl> long currentMaxTs = sstable . getMaxTimestamp ( ) ; <nl> reduceNameFilter ( reducedFilter , container , currentMaxTs ) ; <nl> if ( ( ( NamesQueryFilter ) reducedFilter . filter ) . columns . isEmpty ( ) ) <nl> @ @ - 115 , 7 + 124 , 14 @ @ public class CollationController <nl> iterators . add ( iter ) ; <nl> if ( iter . getColumnFamily ( ) ! = null ) <nl> { <nl> - container . delete ( iter . getColumnFamily ( ) ) ; <nl> + ColumnFamily cf = iter . getColumnFamily ( ) ; <nl> + if ( cf . isMarkedForDelete ( ) ) <nl> + { <nl> + / / track the most recent row level tombstone we encounter <nl> + mostRecentRowTombstone = cf . getMarkedForDeleteAt ( ) ; <nl> + } <nl> + <nl> + container . delete ( cf ) ; <nl> sstablesIterated + + ; <nl> while ( iter . hasNext ( ) ) <nl> container . addColumn ( iter . next ( ) ) ; <nl> @ @ - 212 , 10 + 228 , 10 @ @ public class CollationController <nl> ISortedColumns . Factory factory = mutableColumns <nl> ? cfs . metadata . cfType = = ColumnFamilyType . Super ? ThreadSafeSortedColumns . factory ( ) : AtomicSortedColumns . factory ( ) <nl> : ArrayBackedSortedColumns . factory ( ) ; <nl> - List < IColumnIterator > iterators = new ArrayList < IColumnIterator > ( ) ; <nl> + ColumnFamilyStore . ViewFragment view = cfs . markReferenced ( filter . key ) ; <nl> + List < IColumnIterator > iterators = new ArrayList < IColumnIterator > ( Iterables . size ( view . memtables ) + view . sstables . size ( ) ) ; <nl> ColumnFamily returnCF = ColumnFamily . create ( cfs . metadata , factory , filter . filter . isReversed ( ) ) ; <nl> <nl> - ColumnFamilyStore . ViewFragment view = cfs . markReferenced ( filter . key ) ; <nl> try <nl> { <nl> for ( Memtable memtable : view . memtables ) <nl> @ @ - 227 , 17 + 243 , 37 @ @ public class CollationController <nl> iterators . add ( iter ) ; <nl> } <nl> } <nl> - <nl> + <nl> + long mostRecentRowTombstone = Long . MIN _ VALUE ; <nl> + Map < IColumnIterator , Long > iteratorMaxTimes = Maps . newHashMapWithExpectedSize ( view . sstables . size ( ) ) ; <nl> for ( SSTableReader sstable : view . sstables ) <nl> { <nl> + / / if we ' ve already seen a row tombstone with a timestamp greater <nl> + / / than the most recent update to this sstable , we can skip it <nl> + if ( sstable . getMaxTimestamp ( ) < mostRecentRowTombstone ) <nl> + continue ; <nl> + <nl> IColumnIterator iter = filter . getSSTableColumnIterator ( sstable ) ; <nl> - iterators . add ( iter ) ; <nl> + iteratorMaxTimes . put ( iter , sstable . getMaxTimestamp ( ) ) ; <nl> if ( iter . getColumnFamily ( ) ! = null ) <nl> { <nl> - returnCF . delete ( iter . getColumnFamily ( ) ) ; <nl> + ColumnFamily cf = iter . getColumnFamily ( ) ; <nl> + if ( cf . isMarkedForDelete ( ) ) <nl> + mostRecentRowTombstone = cf . getMarkedForDeleteAt ( ) ; <nl> + <nl> + returnCF . delete ( cf ) ; <nl> sstablesIterated + + ; <nl> } <nl> } <nl> + <nl> + / / If we saw a row tombstone , do a second pass through the iterators we <nl> + / / obtained from the sstables and drop any whose maxTimestamp < that of the <nl> + / / row tombstone <nl> + for ( Map . Entry < IColumnIterator , Long > entry : iteratorMaxTimes . entrySet ( ) ) <nl> + { <nl> + if ( entry . getValue ( ) > = mostRecentRowTombstone ) <nl> + iterators . add ( entry . getKey ( ) ) ; <nl> + } <nl> <nl> / / we need to distinguish between " there is no data at all for this row " ( BF will let us rebuild that efficiently ) <nl> / / and " there used to be data , but it ' s gone now " ( we should cache the empty CF so we don ' t need to rebuild that slower ) <nl> diff - - git a / test / unit / org / apache / cassandra / db / CollationControllerTest . java b / test / unit / org / apache / cassandra / db / CollationControllerTest . java <nl> new file mode 100644 <nl> index 0000000 . . f469639 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / db / CollationControllerTest . java <nl> @ @ - 0 , 0 + 1 , 83 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + package org . apache . cassandra . db ; <nl> + <nl> + import static org . junit . Assert . assertEquals ; <nl> + <nl> + import java . io . IOException ; <nl> + import java . util . concurrent . ExecutionException ; <nl> + <nl> + import org . apache . cassandra . SchemaLoader ; <nl> + import org . apache . cassandra . Util ; <nl> + import org . apache . cassandra . db . filter . QueryFilter ; <nl> + import org . apache . cassandra . db . filter . QueryPath ; <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> + import org . junit . Test ; <nl> + <nl> + public class CollationControllerTest extends SchemaLoader <nl> + { <nl> + @ Test <nl> + public void getTopLevelColumnsSkipsSSTablesModifiedBeforeRowDelete ( ) <nl> + throws IOException , ExecutionException , InterruptedException <nl> + { <nl> + Table table = Table . open ( " Keyspace1 " ) ; <nl> + ColumnFamilyStore store = table . getColumnFamilyStore ( " Standard1 " ) ; <nl> + RowMutation rm ; <nl> + DecoratedKey dk = Util . dk ( " key1 " ) ; <nl> + QueryPath path = new QueryPath ( " Standard1 " , null , ByteBufferUtil . bytes ( " Column1 " ) ) ; <nl> + <nl> + / / add data <nl> + rm = new RowMutation ( " Keyspace1 " , dk . key ) ; <nl> + rm . add ( path , ByteBufferUtil . bytes ( " asdf " ) , 0 ) ; <nl> + rm . apply ( ) ; <nl> + store . forceBlockingFlush ( ) ; <nl> + <nl> + / / remove <nl> + rm = new RowMutation ( " Keyspace1 " , dk . key ) ; <nl> + rm . delete ( new QueryPath ( " Standard1 " ) , 10 ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + / / add another mutation because sstable maxtimestamp isn ' t set <nl> + / / correctly during flush if the most recent mutation is a row delete <nl> + rm = new RowMutation ( " Keyspace1 " , Util . dk ( " key2 " ) . key ) ; <nl> + rm . add ( path , ByteBufferUtil . bytes ( " zxcv " ) , 20 ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + store . forceBlockingFlush ( ) ; <nl> + <nl> + / / A NamesQueryFilter goes down one code path ( through collectTimeOrderedData ( ) ) <nl> + QueryFilter filter = QueryFilter . getNamesFilter ( dk , path , ByteBufferUtil . bytes ( " Column1 " ) ) ; <nl> + CollationController controller = new CollationController ( store , false , filter , Integer . MIN _ VALUE ) ; <nl> + controller . getTopLevelColumns ( ) ; <nl> + assertEquals ( 1 , controller . getSstablesIterated ( ) ) ; <nl> + <nl> + / / SliceQueryFilter goes down another path ( through collectAllData ( ) ) <nl> + / / Add another mutation , with a lower timestamp then force another flush <nl> + / / so we can assert that we ' re not reading every sstable <nl> + rm = new RowMutation ( " Keyspace1 " , dk . key ) ; <nl> + rm . add ( path , ByteBufferUtil . bytes ( " asdf " ) , 5 ) ; <nl> + rm . apply ( ) ; <nl> + store . forceBlockingFlush ( ) ; <nl> + <nl> + filter = QueryFilter . getIdentityFilter ( dk , path ) ; <nl> + controller = new CollationController ( store , false , filter , Integer . MIN _ VALUE ) ; <nl> + controller . getTopLevelColumns ( ) ; <nl> + assertEquals ( 2 , controller . getSstablesIterated ( ) ) ; <nl> + } <nl> + }
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ index 2e97fd5 . . a1158be 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ @ @ - 61 , 6 + 61 , 7 @ @ public abstract class CommitLogSegment 
+ FORBIDDEN , 
+ CONTAINS 
+ } 
+ + Object cdcStateLock = new Object ( ) ; 
+ 
+ private final static AtomicInteger nextId = new AtomicInteger ( 1 ) ; 
+ private static long replayLimitId ; 
+ @ @ - 614 , 7 + 615 , 7 @ @ public abstract class CommitLogSegment 
+ return ; 
+ 
+ / / Also synchronized in CDCSizeTracker . processNewSegment and . processDiscardedSegment 
+ - synchronized ( this ) 
+ + synchronized ( cdcStateLock ) 
+ { 
+ if ( cdcState = = CDCState . CONTAINS & & newState ! = CDCState . CONTAINS ) 
+ throw new IllegalArgumentException ( " Cannot transition from CONTAINS to any other state . " ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManagerCDC . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManagerCDC . java 
+ index 5c6fd3f . . 04beb20 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManagerCDC . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManagerCDC . java 
+ @ @ - 187 , 7 + 187 , 7 @ @ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager 
+ void processNewSegment ( CommitLogSegment segment ) 
+ { 
+ / / See synchronization in CommitLogSegment . setCDCState 
+ - synchronized ( segment ) 
+ + synchronized ( segment . cdcStateLock ) 
+ { 
+ segment . setCDCState ( defaultSegmentSize ( ) + totalCDCSizeOnDisk ( ) > allowableCDCBytes ( ) 
+ ? CDCState . FORBIDDEN 
+ @ @ - 203 , 7 + 203 , 7 @ @ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager 
+ void processDiscardedSegment ( CommitLogSegment segment ) 
+ { 
+ / / See synchronization in CommitLogSegment . setCDCState 
+ - synchronized ( segment ) 
+ + synchronized ( segment . cdcStateLock ) 
+ { 
+ / / Add to flushed size before decrementing unflushed so we don ' t have a window of false generosity 
+ if ( segment . getCDCState ( ) = = CDCState . CONTAINS )
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 918c146 . . c37dd93 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 6 @ @ 
+ 1 . 1 . 1 - dev 
+ + * Optimize reads when row deletion timestamps allow us to restrict 
+ + the set of sstables we check ( CASSANDRA - 4116 ) 
+ * incremental repair by token range ( CASSANDRA - 3912 ) 
+ * streaming commitlog backup + pitr ( CASSANDRA - 3690 ) 
+ * avoid generating redundant compaction tasks during streaming 
+ diff - - git a / src / java / org / apache / cassandra / db / CollationController . java b / src / java / org / apache / cassandra / db / CollationController . java 
+ index 5289d1b . . c73e1e0 100644 
+ - - - a / src / java / org / apache / cassandra / db / CollationController . java 
+ + + + b / src / java / org / apache / cassandra / db / CollationController . java 
+ @ @ - 23 , 6 + 23 , 8 @ @ import java . io . IOException ; 
+ import java . nio . ByteBuffer ; 
+ import java . util . * ; 
+ 
+ + import com . google . common . collect . Iterables ; 
+ + import com . google . common . collect . Maps ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 104 , 8 + 106 , 15 @ @ public class CollationController 
+ Collections . sort ( view . sstables , SSTable . maxTimestampComparator ) ; 
+ 
+ / / read sorted sstables 
+ + long mostRecentRowTombstone = Long . MIN _ VALUE ; 
+ for ( SSTableReader sstable : view . sstables ) 
+ { 
+ + / / if we ' ve already seen a row tombstone with a timestamp greater 
+ + / / than the most recent update to this sstable , we ' re done , since the rest of the sstables 
+ + / / will also be older 
+ + if ( sstable . getMaxTimestamp ( ) < mostRecentRowTombstone ) 
+ + break ; 
+ + 
+ long currentMaxTs = sstable . getMaxTimestamp ( ) ; 
+ reduceNameFilter ( reducedFilter , container , currentMaxTs ) ; 
+ if ( ( ( NamesQueryFilter ) reducedFilter . filter ) . columns . isEmpty ( ) ) 
+ @ @ - 115 , 7 + 124 , 14 @ @ public class CollationController 
+ iterators . add ( iter ) ; 
+ if ( iter . getColumnFamily ( ) ! = null ) 
+ { 
+ - container . delete ( iter . getColumnFamily ( ) ) ; 
+ + ColumnFamily cf = iter . getColumnFamily ( ) ; 
+ + if ( cf . isMarkedForDelete ( ) ) 
+ + { 
+ + / / track the most recent row level tombstone we encounter 
+ + mostRecentRowTombstone = cf . getMarkedForDeleteAt ( ) ; 
+ + } 
+ + 
+ + container . delete ( cf ) ; 
+ sstablesIterated + + ; 
+ while ( iter . hasNext ( ) ) 
+ container . addColumn ( iter . next ( ) ) ; 
+ @ @ - 212 , 10 + 228 , 10 @ @ public class CollationController 
+ ISortedColumns . Factory factory = mutableColumns 
+ ? cfs . metadata . cfType = = ColumnFamilyType . Super ? ThreadSafeSortedColumns . factory ( ) : AtomicSortedColumns . factory ( ) 
+ : ArrayBackedSortedColumns . factory ( ) ; 
+ - List < IColumnIterator > iterators = new ArrayList < IColumnIterator > ( ) ; 
+ + ColumnFamilyStore . ViewFragment view = cfs . markReferenced ( filter . key ) ; 
+ + List < IColumnIterator > iterators = new ArrayList < IColumnIterator > ( Iterables . size ( view . memtables ) + view . sstables . size ( ) ) ; 
+ ColumnFamily returnCF = ColumnFamily . create ( cfs . metadata , factory , filter . filter . isReversed ( ) ) ; 
+ 
+ - ColumnFamilyStore . ViewFragment view = cfs . markReferenced ( filter . key ) ; 
+ try 
+ { 
+ for ( Memtable memtable : view . memtables ) 
+ @ @ - 227 , 17 + 243 , 37 @ @ public class CollationController 
+ iterators . add ( iter ) ; 
+ } 
+ } 
+ - 
+ + 
+ + long mostRecentRowTombstone = Long . MIN _ VALUE ; 
+ + Map < IColumnIterator , Long > iteratorMaxTimes = Maps . newHashMapWithExpectedSize ( view . sstables . size ( ) ) ; 
+ for ( SSTableReader sstable : view . sstables ) 
+ { 
+ + / / if we ' ve already seen a row tombstone with a timestamp greater 
+ + / / than the most recent update to this sstable , we can skip it 
+ + if ( sstable . getMaxTimestamp ( ) < mostRecentRowTombstone ) 
+ + continue ; 
+ + 
+ IColumnIterator iter = filter . getSSTableColumnIterator ( sstable ) ; 
+ - iterators . add ( iter ) ; 
+ + iteratorMaxTimes . put ( iter , sstable . getMaxTimestamp ( ) ) ; 
+ if ( iter . getColumnFamily ( ) ! = null ) 
+ { 
+ - returnCF . delete ( iter . getColumnFamily ( ) ) ; 
+ + ColumnFamily cf = iter . getColumnFamily ( ) ; 
+ + if ( cf . isMarkedForDelete ( ) ) 
+ + mostRecentRowTombstone = cf . getMarkedForDeleteAt ( ) ; 
+ + 
+ + returnCF . delete ( cf ) ; 
+ sstablesIterated + + ; 
+ } 
+ } 
+ + 
+ + / / If we saw a row tombstone , do a second pass through the iterators we 
+ + / / obtained from the sstables and drop any whose maxTimestamp < that of the 
+ + / / row tombstone 
+ + for ( Map . Entry < IColumnIterator , Long > entry : iteratorMaxTimes . entrySet ( ) ) 
+ + { 
+ + if ( entry . getValue ( ) > = mostRecentRowTombstone ) 
+ + iterators . add ( entry . getKey ( ) ) ; 
+ + } 
+ 
+ / / we need to distinguish between " there is no data at all for this row " ( BF will let us rebuild that efficiently ) 
+ / / and " there used to be data , but it ' s gone now " ( we should cache the empty CF so we don ' t need to rebuild that slower ) 
+ diff - - git a / test / unit / org / apache / cassandra / db / CollationControllerTest . java b / test / unit / org / apache / cassandra / db / CollationControllerTest . java 
+ new file mode 100644 
+ index 0000000 . . f469639 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / db / CollationControllerTest . java 
+ @ @ - 0 , 0 + 1 , 83 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + package org . apache . cassandra . db ; 
+ + 
+ + import static org . junit . Assert . assertEquals ; 
+ + 
+ + import java . io . IOException ; 
+ + import java . util . concurrent . ExecutionException ; 
+ + 
+ + import org . apache . cassandra . SchemaLoader ; 
+ + import org . apache . cassandra . Util ; 
+ + import org . apache . cassandra . db . filter . QueryFilter ; 
+ + import org . apache . cassandra . db . filter . QueryPath ; 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ + import org . junit . Test ; 
+ + 
+ + public class CollationControllerTest extends SchemaLoader 
+ + { 
+ + @ Test 
+ + public void getTopLevelColumnsSkipsSSTablesModifiedBeforeRowDelete ( ) 
+ + throws IOException , ExecutionException , InterruptedException 
+ + { 
+ + Table table = Table . open ( " Keyspace1 " ) ; 
+ + ColumnFamilyStore store = table . getColumnFamilyStore ( " Standard1 " ) ; 
+ + RowMutation rm ; 
+ + DecoratedKey dk = Util . dk ( " key1 " ) ; 
+ + QueryPath path = new QueryPath ( " Standard1 " , null , ByteBufferUtil . bytes ( " Column1 " ) ) ; 
+ + 
+ + / / add data 
+ + rm = new RowMutation ( " Keyspace1 " , dk . key ) ; 
+ + rm . add ( path , ByteBufferUtil . bytes ( " asdf " ) , 0 ) ; 
+ + rm . apply ( ) ; 
+ + store . forceBlockingFlush ( ) ; 
+ + 
+ + / / remove 
+ + rm = new RowMutation ( " Keyspace1 " , dk . key ) ; 
+ + rm . delete ( new QueryPath ( " Standard1 " ) , 10 ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + / / add another mutation because sstable maxtimestamp isn ' t set 
+ + / / correctly during flush if the most recent mutation is a row delete 
+ + rm = new RowMutation ( " Keyspace1 " , Util . dk ( " key2 " ) . key ) ; 
+ + rm . add ( path , ByteBufferUtil . bytes ( " zxcv " ) , 20 ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + store . forceBlockingFlush ( ) ; 
+ + 
+ + / / A NamesQueryFilter goes down one code path ( through collectTimeOrderedData ( ) ) 
+ + QueryFilter filter = QueryFilter . getNamesFilter ( dk , path , ByteBufferUtil . bytes ( " Column1 " ) ) ; 
+ + CollationController controller = new CollationController ( store , false , filter , Integer . MIN _ VALUE ) ; 
+ + controller . getTopLevelColumns ( ) ; 
+ + assertEquals ( 1 , controller . getSstablesIterated ( ) ) ; 
+ + 
+ + / / SliceQueryFilter goes down another path ( through collectAllData ( ) ) 
+ + / / Add another mutation , with a lower timestamp then force another flush 
+ + / / so we can assert that we ' re not reading every sstable 
+ + rm = new RowMutation ( " Keyspace1 " , dk . key ) ; 
+ + rm . add ( path , ByteBufferUtil . bytes ( " asdf " ) , 5 ) ; 
+ + rm . apply ( ) ; 
+ + store . forceBlockingFlush ( ) ; 
+ + 
+ + filter = QueryFilter . getIdentityFilter ( dk , path ) ; 
+ + controller = new CollationController ( store , false , filter , Integer . MIN _ VALUE ) ; 
+ + controller . getTopLevelColumns ( ) ; 
+ + assertEquals ( 2 , controller . getSstablesIterated ( ) ) ; 
+ + } 
+ + }

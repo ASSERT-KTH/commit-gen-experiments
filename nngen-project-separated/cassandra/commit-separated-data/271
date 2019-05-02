@@ -1,0 +1,373 @@
+BLEU SCORE: 0.02383853510228548
+
+TEST MSG: Optimize Paxos prepare and propose stage for local requests
+GENERATED MSG: merge from 0 . 7
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 081ed72 . . 6d8d67e 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 4 . 0 <nl> + * Optimize Paxos prepare and propose stage for local requests ( CASSANDRA - 13862 ) <nl> * Throttle base partitions during MV repair streaming to prevent OOM ( CASSANDRA - 13299 ) <nl> * Use compaction threshold for STCS in L0 ( CASSANDRA - 13861 ) <nl> * Fix problem with min _ compress _ ratio : 1 and disallow ratio < 1 ( CASSANDRA - 13703 ) <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index df39530 . . 49bb4b6 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 68 , 7 + 68 , 10 @ @ import org . apache . cassandra . net . * ; <nl> import org . apache . cassandra . service . paxos . Commit ; <nl> import org . apache . cassandra . service . paxos . PaxosState ; <nl> import org . apache . cassandra . service . paxos . PrepareCallback ; <nl> + import org . apache . cassandra . service . paxos . PrepareResponse ; <nl> + import org . apache . cassandra . service . paxos . PrepareVerbHandler ; <nl> import org . apache . cassandra . service . paxos . ProposeCallback ; <nl> + import org . apache . cassandra . service . paxos . ProposeVerbHandler ; <nl> import org . apache . cassandra . net . MessagingService . Verb ; <nl> import org . apache . cassandra . tracing . Tracing ; <nl> import org . apache . cassandra . triggers . TriggerExecutor ; <nl> @ @ - 501 , 7 + 504 , 34 @ @ public class StorageProxy implements StorageProxyMBean <nl> PrepareCallback callback = new PrepareCallback ( toPrepare . update . partitionKey ( ) , toPrepare . update . metadata ( ) , requiredParticipants , consistencyForPaxos , queryStartNanoTime ) ; <nl> MessageOut < Commit > message = new MessageOut < Commit > ( MessagingService . Verb . PAXOS _ PREPARE , toPrepare , Commit . serializer ) ; <nl> for ( InetAddress target : endpoints ) <nl> - MessagingService . instance ( ) . sendRR ( message , target , callback ) ; <nl> + { <nl> + if ( canDoLocalRequest ( target ) ) <nl> + { <nl> + StageManager . getStage ( MessagingService . verbStages . get ( MessagingService . Verb . PAXOS _ PREPARE ) ) . execute ( new Runnable ( ) <nl> + { <nl> + public void run ( ) <nl> + { <nl> + try <nl> + { <nl> + MessageIn < PrepareResponse > message = MessageIn . create ( FBUtilities . getBroadcastAddress ( ) , <nl> + PrepareVerbHandler . doPrepare ( toPrepare ) , <nl> + Collections . < String , byte [ ] > emptyMap ( ) , <nl> + MessagingService . Verb . INTERNAL _ RESPONSE , <nl> + MessagingService . current _ version ) ; <nl> + callback . response ( message ) ; <nl> + } <nl> + catch ( Exception ex ) <nl> + { <nl> + logger . error ( " Failed paxos prepare locally : { } " , ex ) ; <nl> + } <nl> + } <nl> + } ) ; <nl> + } <nl> + else <nl> + { <nl> + MessagingService . instance ( ) . sendRR ( message , target , callback ) ; <nl> + } <nl> + } <nl> callback . await ( ) ; <nl> return callback ; <nl> } <nl> @ @ - 512 , 8 + 542 , 34 @ @ public class StorageProxy implements StorageProxyMBean <nl> ProposeCallback callback = new ProposeCallback ( endpoints . size ( ) , requiredParticipants , ! timeoutIfPartial , consistencyLevel , queryStartNanoTime ) ; <nl> MessageOut < Commit > message = new MessageOut < Commit > ( MessagingService . Verb . PAXOS _ PROPOSE , proposal , Commit . serializer ) ; <nl> for ( InetAddress target : endpoints ) <nl> - MessagingService . instance ( ) . sendRR ( message , target , callback ) ; <nl> - <nl> + { <nl> + if ( canDoLocalRequest ( target ) ) <nl> + { <nl> + StageManager . getStage ( MessagingService . verbStages . get ( MessagingService . Verb . PAXOS _ PROPOSE ) ) . execute ( new Runnable ( ) <nl> + { <nl> + public void run ( ) <nl> + { <nl> + try <nl> + { <nl> + MessageIn < Boolean > message = MessageIn . create ( FBUtilities . getBroadcastAddress ( ) , <nl> + ProposeVerbHandler . doPropose ( proposal ) , <nl> + Collections . < String , byte [ ] > emptyMap ( ) , <nl> + MessagingService . Verb . INTERNAL _ RESPONSE , <nl> + MessagingService . current _ version ) ; <nl> + callback . response ( message ) ; <nl> + } <nl> + catch ( Exception ex ) <nl> + { <nl> + logger . error ( " Failed paxos propose locally : { } " , ex ) ; <nl> + } <nl> + } <nl> + } ) ; <nl> + } <nl> + else <nl> + { <nl> + MessagingService . instance ( ) . sendRR ( message , target , callback ) ; <nl> + } <nl> + } <nl> callback . await ( ) ; <nl> <nl> if ( callback . isSuccessful ( ) ) <nl> diff - - git a / src / java / org / apache / cassandra / service / paxos / PrepareVerbHandler . java b / src / java / org / apache / cassandra / service / paxos / PrepareVerbHandler . java <nl> index 50a537f . . 2750b76 100644 <nl> - - - a / src / java / org / apache / cassandra / service / paxos / PrepareVerbHandler . java <nl> + + + b / src / java / org / apache / cassandra / service / paxos / PrepareVerbHandler . java <nl> @ @ - 28 , 10 + 28 , 14 @ @ import org . apache . cassandra . net . MessagingService ; <nl> <nl> public class PrepareVerbHandler implements IVerbHandler < Commit > <nl> { <nl> + public static PrepareResponse doPrepare ( Commit toPrepare ) <nl> + { <nl> + return PaxosState . prepare ( toPrepare ) ; <nl> + } <nl> + <nl> public void doVerb ( MessageIn < Commit > message , int id ) <nl> { <nl> - PrepareResponse response = PaxosState . prepare ( message . payload ) ; <nl> - MessageOut < PrepareResponse > reply = new MessageOut < PrepareResponse > ( MessagingService . Verb . REQUEST _ RESPONSE , response , PrepareResponse . serializer ) ; <nl> + MessageOut < PrepareResponse > reply = new MessageOut < PrepareResponse > ( MessagingService . Verb . REQUEST _ RESPONSE , doPrepare ( message . payload ) , PrepareResponse . serializer ) ; <nl> MessagingService . instance ( ) . sendReply ( reply , id , message . from ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / paxos / ProposeVerbHandler . java b / src / java / org / apache / cassandra / service / paxos / ProposeVerbHandler . java <nl> index 536ff5a . . 81c9017 100644 <nl> - - - a / src / java / org / apache / cassandra / service / paxos / ProposeVerbHandler . java <nl> + + + b / src / java / org / apache / cassandra / service / paxos / ProposeVerbHandler . java <nl> @ @ - 29 , 10 + 29 , 14 @ @ import org . apache . cassandra . utils . BooleanSerializer ; <nl> <nl> public class ProposeVerbHandler implements IVerbHandler < Commit > <nl> { <nl> + public static Boolean doPropose ( Commit proposal ) <nl> + { <nl> + return PaxosState . propose ( proposal ) ; <nl> + } <nl> + <nl> public void doVerb ( MessageIn < Commit > message , int id ) <nl> { <nl> - Boolean response = PaxosState . propose ( message . payload ) ; <nl> - MessageOut < Boolean > reply = new MessageOut < Boolean > ( MessagingService . Verb . REQUEST _ RESPONSE , response , BooleanSerializer . serializer ) ; <nl> + MessageOut < Boolean > reply = new MessageOut < Boolean > ( MessagingService . Verb . REQUEST _ RESPONSE , doPropose ( message . payload ) , BooleanSerializer . serializer ) ; <nl> MessagingService . instance ( ) . sendReply ( reply , id , message . from ) ; <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / service / PaxosStateTest . java b / test / unit / org / apache / cassandra / service / PaxosStateTest . java <nl> index 6c12001 . . bd7a85f 100644 <nl> - - - a / test / unit / org / apache / cassandra / service / PaxosStateTest . java <nl> + + + b / test / unit / org / apache / cassandra / service / PaxosStateTest . java <nl> @ @ - 18 , 8 + 18 , 11 @ @ <nl> package org . apache . cassandra . service ; <nl> <nl> import java . nio . ByteBuffer ; <nl> + import java . util . UUID ; <nl> <nl> import com . google . common . collect . Iterables ; <nl> + import org . apache . cassandra . service . paxos . PrepareVerbHandler ; <nl> + import org . apache . cassandra . service . paxos . ProposeVerbHandler ; <nl> import org . junit . AfterClass ; <nl> import org . junit . BeforeClass ; <nl> import org . junit . Test ; <nl> @ @ - 100 , 4 + 103 , 25 @ @ public class PaxosStateTest <nl> { <nl> Util . assertEmpty ( Util . cmd ( cfs , key ) . build ( ) ) ; <nl> } <nl> + <nl> + @ Test <nl> + public void testPrepareProposePaxos ( ) throws Throwable <nl> + { <nl> + ColumnFamilyStore cfs = Keyspace . open ( " PaxosStateTestKeyspace1 " ) . getColumnFamilyStore ( " Standard1 " ) ; <nl> + String key = " key " + System . nanoTime ( ) ; <nl> + ByteBuffer value = ByteBufferUtil . bytes ( 0 ) ; <nl> + RowUpdateBuilder builder = new RowUpdateBuilder ( cfs . metadata ( ) , FBUtilities . timestampMicros ( ) , key ) ; <nl> + builder . clustering ( " a " ) . add ( " val " , value ) ; <nl> + PartitionUpdate update = Iterables . getOnlyElement ( builder . build ( ) . getPartitionUpdates ( ) ) ; <nl> + <nl> + / / CFS should be empty initially <nl> + assertNoDataPresent ( cfs , Util . dk ( key ) ) ; <nl> + <nl> + UUID ballot = UUIDGen . getRandomTimeUUIDFromMicros ( System . currentTimeMillis ( ) ) ; <nl> + <nl> + Commit commit = Commit . newPrepare ( Util . dk ( key ) , cfs . metadata ( ) , ballot ) ; <nl> + <nl> + assertTrue ( " paxos prepare stage failed " , PrepareVerbHandler . doPrepare ( commit ) . promised ) ; <nl> + assertTrue ( " paxos propose stage failed " , ProposeVerbHandler . doPropose ( commit ) ) ; <nl> + } <nl> }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index eec904a . . 982454c 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 59 , 6 + 59 , 8 @ @ <nl> the old ones ( CASSANDRA - 1644 ) <nl> * upgrade to Thrift 0 . 5 ( CASSANDRA - 1367 ) <nl> * renamed CL . DCQUORUM to LOCAL _ QUORUM and DCQUORUMSYNC to EACH _ QUORUM <nl> + * cli truncate support ( CASSANDRA - 1653 ) <nl> + * update GC settings in cassandra . bat ( CASSANDRA - 1636 ) <nl> <nl> <nl> 0 . 7 - beta2 <nl> diff - - git a / src / java / org / apache / cassandra / cli / Cli . g b / src / java / org / apache / cassandra / cli / Cli . g <nl> index e59c608 . . a9229ee 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / Cli . g <nl> + + + b / src / java / org / apache / cassandra / cli / Cli . g <nl> @ @ - 55 , 6 + 55 , 7 @ @ tokens { <nl> NODE _ UPDATE _ KEYSPACE ; <nl> NODE _ UPDATE _ COLUMN _ FAMILY ; <nl> NODE _ LIST ; <nl> + NODE _ TRUNCATE ; <nl> <nl> / / Internal Nodes . <nl> NODE _ COLUMN _ ACCESS ; <nl> @ @ - 123 , 6 + 124 , 7 @ @ statement <nl> | setStatement <nl> | showStatement <nl> | listStatement <nl> + | truncateStatement <nl> | - > ^ ( NODE _ NO _ OP ) <nl> ; <nl> <nl> @ @ - 174 , 6 + 176 , 8 @ @ helpStatement <nl> - > ^ ( NODE _ HELP NODE _ THRIFT _ COUNT ) <nl> | K _ HELP K _ LIST <nl> - > ^ ( NODE _ HELP NODE _ LIST ) <nl> + | K _ HELP K _ TRUNCATE <nl> + - > ^ ( NODE _ HELP NODE _ TRUNCATE ) <nl> | K _ HELP <nl> - > ^ ( NODE _ HELP ) <nl> | ' ? ' <nl> @ @ - 231 , 6 + 235 , 11 @ @ listStatement <nl> - > ^ ( NODE _ LIST columnFamily keyRangeExpr ? ^ ( NODE _ LIMIT $ limit ) ? ) <nl> ; <nl> <nl> + truncateStatement <nl> + : K _ TRUNCATE columnFamily <nl> + - > ^ ( NODE _ TRUNCATE columnFamily ) <nl> + ; <nl> + <nl> showClusterName <nl> : K _ SHOW K _ CLUSTER K _ NAME <nl> - > ^ ( NODE _ SHOW _ CLUSTER _ NAME ) <nl> @ @ - 430 , 6 + 439 , 7 @ @ K _ AND : ' AND ' ; <nl> K _ UPDATE : ' UPDATE ' ; <nl> K _ LIST : ' LIST ' ; <nl> K _ LIMIT : ' LIMIT ' ; <nl> + K _ TRUNCATE : ' TRUNCATE ' ; <nl> <nl> / / private syntactic rules <nl> fragment <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliClient . java b / src / java / org / apache / cassandra / cli / CliClient . java <nl> index b6ace98 . . b63105a 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliClient . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliClient . java <nl> @ @ - 171 , 6 + 171 , 9 @ @ public class CliClient extends CliUserHelp <nl> case CliParser . NODE _ LIST : <nl> executeList ( tree ) ; <nl> break ; <nl> + case CliParser . NODE _ TRUNCATE : <nl> + executeTruncate ( tree . getChild ( 0 ) . getText ( ) ) ; <nl> + break ; <nl> case CliParser . NODE _ NO _ OP : <nl> / / comment lines come here ; they are treated as no ops . <nl> break ; <nl> @ @ - 943 , 6 + 946 , 30 @ @ public class CliClient extends CliUserHelp <nl> printSliceList ( columnFamilyDef , keySlices ) ; <nl> } <nl> <nl> + / / TRUNCATE < columnFamily > <nl> + private void executeTruncate ( String columnFamily ) <nl> + { <nl> + if ( ! CliMain . isConnected ( ) | | ! hasKeySpace ( ) ) <nl> + return ; <nl> + <nl> + / / getting CfDef , it will fail if there is no such column family in current keySpace . <nl> + CfDef cfDef = getCfDef ( columnFamily ) ; <nl> + <nl> + try <nl> + { <nl> + thriftClient . truncate ( cfDef . getName ( ) ) ; <nl> + sessionState . out . println ( columnFamily + " truncated . " ) ; <nl> + } <nl> + catch ( InvalidRequestException e ) <nl> + { <nl> + throw new RuntimeException ( e . getWhy ( ) ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new RuntimeException ( e . getMessage ( ) ) ; <nl> + } <nl> + } <nl> + <nl> / / SHOW API VERSION <nl> private void executeShowVersion ( ) throws TException <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliCompleter . java b / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> index f541fe5 . . b033d8f 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> @ @ - 55 , 12 + 55 , 16 @ @ public class CliCompleter extends SimpleCompletor <nl> " help set " , <nl> " help del " , <nl> " help count " , <nl> + " help list " , <nl> + " help truncate " <nl> } ; <nl> private static String [ ] keyspaceCommands = { <nl> " get " , <nl> " set " , <nl> " count " , <nl> - " del " <nl> + " del " , <nl> + " list " , <nl> + " truncate " <nl> } ; <nl> <nl> public CliCompleter ( ) <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliUserHelp . java b / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> index 7c512e2 . . db6a779 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> @ @ - 281 , 6 + 281 , 13 @ @ public class CliUserHelp { <nl> state . out . println ( " list Users [ j : ] limit 40 " ) ; <nl> break ; <nl> <nl> + case CliParser . NODE _ TRUNCATE : <nl> + state . out . println ( " truncate < column _ family > " ) ; <nl> + state . out . println ( " Truncate specified column family . \ n " ) ; <nl> + state . out . println ( " example : " ) ; <nl> + state . out . println ( " truncate Category " ) ; <nl> + break ; <nl> + <nl> default : <nl> state . out . println ( " ? " ) ; <nl> break ; <nl> @ @ - 324 , 7 + 331 , 8 @ @ public class CliUserHelp { <nl> state . out . println ( " del < cf > [ ' < key > ' ] [ ' < super > ' ] [ ' < col > ' ] Delete sub column . " ) ; <nl> state . out . println ( " count < cf > [ ' < key > ' ] Count columns in record . " ) ; <nl> state . out . println ( " count < cf > [ ' < key > ' ] [ ' < super > ' ] Count columns in a super column . " ) ; <nl> - state . out . println ( " list < cf > List all rows in the column family . " ) ; <nl> + state . out . println ( " truncate < column _ family > Truncate specified column family . " ) ; <nl> + state . out . println ( " list < cf > List all rows in the column family . " ) ; <nl> state . out . println ( " list < cf > [ < startKey > : ] " ) ; <nl> state . out . println ( " List rows in the column family beginning with < startKey > . " ) ; <nl> state . out . println ( " list < cf > [ < startKey > : < endKey > ] " ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / cli / CliTest . java b / test / unit / org / apache / cassandra / cli / CliTest . java <nl> index 24a3de0 . . eddcafd 100644 <nl> - - - a / test / unit / org / apache / cassandra / cli / CliTest . java <nl> + + + b / test / unit / org / apache / cassandra / cli / CliTest . java <nl> @ @ - 52 , 6 + 52 , 7 @ @ public class CliTest extends TestCase <nl> " list CF3 [ h : ] " , <nl> " list CF3 limit 10 " , <nl> " list CF3 [ h : g ] limit 10 " , <nl> + " truncate CF1 " , <nl> " update keyspace TestKeySpace with placement _ strategy = ' org . apache . cassandra . locator . LocalStrategy ' " , <nl> " update keyspace TestKeySpace with replication _ factor = 1 and strategy _ options = [ { DC1 : 3 , DC2 : 4 , DC5 : 1 } ] " <nl> } ; <nl> @ @ - 101 , 6 + 102 , 10 @ @ public class CliTest extends TestCase <nl> assertTrue ( result . startsWith ( " = > ( column = " ) ) ; <nl> } <nl> } <nl> + else if ( statement . startsWith ( " truncate " ) ) <nl> + { <nl> + assertTrue ( result . contains ( " truncated . " ) ) ; <nl> + } <nl> <nl> outStream . reset ( ) ; / / reset stream so we have only output from next statement all the time <nl> errStream . reset ( ) ; / / no errors to the end user .
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 081ed72 . . 6d8d67e 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 4 . 0 
+ + * Optimize Paxos prepare and propose stage for local requests ( CASSANDRA - 13862 ) 
+ * Throttle base partitions during MV repair streaming to prevent OOM ( CASSANDRA - 13299 ) 
+ * Use compaction threshold for STCS in L0 ( CASSANDRA - 13861 ) 
+ * Fix problem with min _ compress _ ratio : 1 and disallow ratio < 1 ( CASSANDRA - 13703 ) 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index df39530 . . 49bb4b6 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 68 , 7 + 68 , 10 @ @ import org . apache . cassandra . net . * ; 
+ import org . apache . cassandra . service . paxos . Commit ; 
+ import org . apache . cassandra . service . paxos . PaxosState ; 
+ import org . apache . cassandra . service . paxos . PrepareCallback ; 
+ + import org . apache . cassandra . service . paxos . PrepareResponse ; 
+ + import org . apache . cassandra . service . paxos . PrepareVerbHandler ; 
+ import org . apache . cassandra . service . paxos . ProposeCallback ; 
+ + import org . apache . cassandra . service . paxos . ProposeVerbHandler ; 
+ import org . apache . cassandra . net . MessagingService . Verb ; 
+ import org . apache . cassandra . tracing . Tracing ; 
+ import org . apache . cassandra . triggers . TriggerExecutor ; 
+ @ @ - 501 , 7 + 504 , 34 @ @ public class StorageProxy implements StorageProxyMBean 
+ PrepareCallback callback = new PrepareCallback ( toPrepare . update . partitionKey ( ) , toPrepare . update . metadata ( ) , requiredParticipants , consistencyForPaxos , queryStartNanoTime ) ; 
+ MessageOut < Commit > message = new MessageOut < Commit > ( MessagingService . Verb . PAXOS _ PREPARE , toPrepare , Commit . serializer ) ; 
+ for ( InetAddress target : endpoints ) 
+ - MessagingService . instance ( ) . sendRR ( message , target , callback ) ; 
+ + { 
+ + if ( canDoLocalRequest ( target ) ) 
+ + { 
+ + StageManager . getStage ( MessagingService . verbStages . get ( MessagingService . Verb . PAXOS _ PREPARE ) ) . execute ( new Runnable ( ) 
+ + { 
+ + public void run ( ) 
+ + { 
+ + try 
+ + { 
+ + MessageIn < PrepareResponse > message = MessageIn . create ( FBUtilities . getBroadcastAddress ( ) , 
+ + PrepareVerbHandler . doPrepare ( toPrepare ) , 
+ + Collections . < String , byte [ ] > emptyMap ( ) , 
+ + MessagingService . Verb . INTERNAL _ RESPONSE , 
+ + MessagingService . current _ version ) ; 
+ + callback . response ( message ) ; 
+ + } 
+ + catch ( Exception ex ) 
+ + { 
+ + logger . error ( " Failed paxos prepare locally : { } " , ex ) ; 
+ + } 
+ + } 
+ + } ) ; 
+ + } 
+ + else 
+ + { 
+ + MessagingService . instance ( ) . sendRR ( message , target , callback ) ; 
+ + } 
+ + } 
+ callback . await ( ) ; 
+ return callback ; 
+ } 
+ @ @ - 512 , 8 + 542 , 34 @ @ public class StorageProxy implements StorageProxyMBean 
+ ProposeCallback callback = new ProposeCallback ( endpoints . size ( ) , requiredParticipants , ! timeoutIfPartial , consistencyLevel , queryStartNanoTime ) ; 
+ MessageOut < Commit > message = new MessageOut < Commit > ( MessagingService . Verb . PAXOS _ PROPOSE , proposal , Commit . serializer ) ; 
+ for ( InetAddress target : endpoints ) 
+ - MessagingService . instance ( ) . sendRR ( message , target , callback ) ; 
+ - 
+ + { 
+ + if ( canDoLocalRequest ( target ) ) 
+ + { 
+ + StageManager . getStage ( MessagingService . verbStages . get ( MessagingService . Verb . PAXOS _ PROPOSE ) ) . execute ( new Runnable ( ) 
+ + { 
+ + public void run ( ) 
+ + { 
+ + try 
+ + { 
+ + MessageIn < Boolean > message = MessageIn . create ( FBUtilities . getBroadcastAddress ( ) , 
+ + ProposeVerbHandler . doPropose ( proposal ) , 
+ + Collections . < String , byte [ ] > emptyMap ( ) , 
+ + MessagingService . Verb . INTERNAL _ RESPONSE , 
+ + MessagingService . current _ version ) ; 
+ + callback . response ( message ) ; 
+ + } 
+ + catch ( Exception ex ) 
+ + { 
+ + logger . error ( " Failed paxos propose locally : { } " , ex ) ; 
+ + } 
+ + } 
+ + } ) ; 
+ + } 
+ + else 
+ + { 
+ + MessagingService . instance ( ) . sendRR ( message , target , callback ) ; 
+ + } 
+ + } 
+ callback . await ( ) ; 
+ 
+ if ( callback . isSuccessful ( ) ) 
+ diff - - git a / src / java / org / apache / cassandra / service / paxos / PrepareVerbHandler . java b / src / java / org / apache / cassandra / service / paxos / PrepareVerbHandler . java 
+ index 50a537f . . 2750b76 100644 
+ - - - a / src / java / org / apache / cassandra / service / paxos / PrepareVerbHandler . java 
+ + + + b / src / java / org / apache / cassandra / service / paxos / PrepareVerbHandler . java 
+ @ @ - 28 , 10 + 28 , 14 @ @ import org . apache . cassandra . net . MessagingService ; 
+ 
+ public class PrepareVerbHandler implements IVerbHandler < Commit > 
+ { 
+ + public static PrepareResponse doPrepare ( Commit toPrepare ) 
+ + { 
+ + return PaxosState . prepare ( toPrepare ) ; 
+ + } 
+ + 
+ public void doVerb ( MessageIn < Commit > message , int id ) 
+ { 
+ - PrepareResponse response = PaxosState . prepare ( message . payload ) ; 
+ - MessageOut < PrepareResponse > reply = new MessageOut < PrepareResponse > ( MessagingService . Verb . REQUEST _ RESPONSE , response , PrepareResponse . serializer ) ; 
+ + MessageOut < PrepareResponse > reply = new MessageOut < PrepareResponse > ( MessagingService . Verb . REQUEST _ RESPONSE , doPrepare ( message . payload ) , PrepareResponse . serializer ) ; 
+ MessagingService . instance ( ) . sendReply ( reply , id , message . from ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / paxos / ProposeVerbHandler . java b / src / java / org / apache / cassandra / service / paxos / ProposeVerbHandler . java 
+ index 536ff5a . . 81c9017 100644 
+ - - - a / src / java / org / apache / cassandra / service / paxos / ProposeVerbHandler . java 
+ + + + b / src / java / org / apache / cassandra / service / paxos / ProposeVerbHandler . java 
+ @ @ - 29 , 10 + 29 , 14 @ @ import org . apache . cassandra . utils . BooleanSerializer ; 
+ 
+ public class ProposeVerbHandler implements IVerbHandler < Commit > 
+ { 
+ + public static Boolean doPropose ( Commit proposal ) 
+ + { 
+ + return PaxosState . propose ( proposal ) ; 
+ + } 
+ + 
+ public void doVerb ( MessageIn < Commit > message , int id ) 
+ { 
+ - Boolean response = PaxosState . propose ( message . payload ) ; 
+ - MessageOut < Boolean > reply = new MessageOut < Boolean > ( MessagingService . Verb . REQUEST _ RESPONSE , response , BooleanSerializer . serializer ) ; 
+ + MessageOut < Boolean > reply = new MessageOut < Boolean > ( MessagingService . Verb . REQUEST _ RESPONSE , doPropose ( message . payload ) , BooleanSerializer . serializer ) ; 
+ MessagingService . instance ( ) . sendReply ( reply , id , message . from ) ; 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / service / PaxosStateTest . java b / test / unit / org / apache / cassandra / service / PaxosStateTest . java 
+ index 6c12001 . . bd7a85f 100644 
+ - - - a / test / unit / org / apache / cassandra / service / PaxosStateTest . java 
+ + + + b / test / unit / org / apache / cassandra / service / PaxosStateTest . java 
+ @ @ - 18 , 8 + 18 , 11 @ @ 
+ package org . apache . cassandra . service ; 
+ 
+ import java . nio . ByteBuffer ; 
+ + import java . util . UUID ; 
+ 
+ import com . google . common . collect . Iterables ; 
+ + import org . apache . cassandra . service . paxos . PrepareVerbHandler ; 
+ + import org . apache . cassandra . service . paxos . ProposeVerbHandler ; 
+ import org . junit . AfterClass ; 
+ import org . junit . BeforeClass ; 
+ import org . junit . Test ; 
+ @ @ - 100 , 4 + 103 , 25 @ @ public class PaxosStateTest 
+ { 
+ Util . assertEmpty ( Util . cmd ( cfs , key ) . build ( ) ) ; 
+ } 
+ + 
+ + @ Test 
+ + public void testPrepareProposePaxos ( ) throws Throwable 
+ + { 
+ + ColumnFamilyStore cfs = Keyspace . open ( " PaxosStateTestKeyspace1 " ) . getColumnFamilyStore ( " Standard1 " ) ; 
+ + String key = " key " + System . nanoTime ( ) ; 
+ + ByteBuffer value = ByteBufferUtil . bytes ( 0 ) ; 
+ + RowUpdateBuilder builder = new RowUpdateBuilder ( cfs . metadata ( ) , FBUtilities . timestampMicros ( ) , key ) ; 
+ + builder . clustering ( " a " ) . add ( " val " , value ) ; 
+ + PartitionUpdate update = Iterables . getOnlyElement ( builder . build ( ) . getPartitionUpdates ( ) ) ; 
+ + 
+ + / / CFS should be empty initially 
+ + assertNoDataPresent ( cfs , Util . dk ( key ) ) ; 
+ + 
+ + UUID ballot = UUIDGen . getRandomTimeUUIDFromMicros ( System . currentTimeMillis ( ) ) ; 
+ + 
+ + Commit commit = Commit . newPrepare ( Util . dk ( key ) , cfs . metadata ( ) , ballot ) ; 
+ + 
+ + assertTrue ( " paxos prepare stage failed " , PrepareVerbHandler . doPrepare ( commit ) . promised ) ; 
+ + assertTrue ( " paxos propose stage failed " , ProposeVerbHandler . doPropose ( commit ) ) ; 
+ + } 
+ }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index eec904a . . 982454c 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 59 , 6 + 59 , 8 @ @ 
+ the old ones ( CASSANDRA - 1644 ) 
+ * upgrade to Thrift 0 . 5 ( CASSANDRA - 1367 ) 
+ * renamed CL . DCQUORUM to LOCAL _ QUORUM and DCQUORUMSYNC to EACH _ QUORUM 
+ + * cli truncate support ( CASSANDRA - 1653 ) 
+ + * update GC settings in cassandra . bat ( CASSANDRA - 1636 ) 
+ 
+ 
+ 0 . 7 - beta2 
+ diff - - git a / src / java / org / apache / cassandra / cli / Cli . g b / src / java / org / apache / cassandra / cli / Cli . g 
+ index e59c608 . . a9229ee 100644 
+ - - - a / src / java / org / apache / cassandra / cli / Cli . g 
+ + + + b / src / java / org / apache / cassandra / cli / Cli . g 
+ @ @ - 55 , 6 + 55 , 7 @ @ tokens { 
+ NODE _ UPDATE _ KEYSPACE ; 
+ NODE _ UPDATE _ COLUMN _ FAMILY ; 
+ NODE _ LIST ; 
+ + NODE _ TRUNCATE ; 
+ 
+ / / Internal Nodes . 
+ NODE _ COLUMN _ ACCESS ; 
+ @ @ - 123 , 6 + 124 , 7 @ @ statement 
+ | setStatement 
+ | showStatement 
+ | listStatement 
+ + | truncateStatement 
+ | - > ^ ( NODE _ NO _ OP ) 
+ ; 
+ 
+ @ @ - 174 , 6 + 176 , 8 @ @ helpStatement 
+ - > ^ ( NODE _ HELP NODE _ THRIFT _ COUNT ) 
+ | K _ HELP K _ LIST 
+ - > ^ ( NODE _ HELP NODE _ LIST ) 
+ + | K _ HELP K _ TRUNCATE 
+ + - > ^ ( NODE _ HELP NODE _ TRUNCATE ) 
+ | K _ HELP 
+ - > ^ ( NODE _ HELP ) 
+ | ' ? ' 
+ @ @ - 231 , 6 + 235 , 11 @ @ listStatement 
+ - > ^ ( NODE _ LIST columnFamily keyRangeExpr ? ^ ( NODE _ LIMIT $ limit ) ? ) 
+ ; 
+ 
+ + truncateStatement 
+ + : K _ TRUNCATE columnFamily 
+ + - > ^ ( NODE _ TRUNCATE columnFamily ) 
+ + ; 
+ + 
+ showClusterName 
+ : K _ SHOW K _ CLUSTER K _ NAME 
+ - > ^ ( NODE _ SHOW _ CLUSTER _ NAME ) 
+ @ @ - 430 , 6 + 439 , 7 @ @ K _ AND : ' AND ' ; 
+ K _ UPDATE : ' UPDATE ' ; 
+ K _ LIST : ' LIST ' ; 
+ K _ LIMIT : ' LIMIT ' ; 
+ + K _ TRUNCATE : ' TRUNCATE ' ; 
+ 
+ / / private syntactic rules 
+ fragment 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliClient . java b / src / java / org / apache / cassandra / cli / CliClient . java 
+ index b6ace98 . . b63105a 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliClient . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliClient . java 
+ @ @ - 171 , 6 + 171 , 9 @ @ public class CliClient extends CliUserHelp 
+ case CliParser . NODE _ LIST : 
+ executeList ( tree ) ; 
+ break ; 
+ + case CliParser . NODE _ TRUNCATE : 
+ + executeTruncate ( tree . getChild ( 0 ) . getText ( ) ) ; 
+ + break ; 
+ case CliParser . NODE _ NO _ OP : 
+ / / comment lines come here ; they are treated as no ops . 
+ break ; 
+ @ @ - 943 , 6 + 946 , 30 @ @ public class CliClient extends CliUserHelp 
+ printSliceList ( columnFamilyDef , keySlices ) ; 
+ } 
+ 
+ + / / TRUNCATE < columnFamily > 
+ + private void executeTruncate ( String columnFamily ) 
+ + { 
+ + if ( ! CliMain . isConnected ( ) | | ! hasKeySpace ( ) ) 
+ + return ; 
+ + 
+ + / / getting CfDef , it will fail if there is no such column family in current keySpace . 
+ + CfDef cfDef = getCfDef ( columnFamily ) ; 
+ + 
+ + try 
+ + { 
+ + thriftClient . truncate ( cfDef . getName ( ) ) ; 
+ + sessionState . out . println ( columnFamily + " truncated . " ) ; 
+ + } 
+ + catch ( InvalidRequestException e ) 
+ + { 
+ + throw new RuntimeException ( e . getWhy ( ) ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new RuntimeException ( e . getMessage ( ) ) ; 
+ + } 
+ + } 
+ + 
+ / / SHOW API VERSION 
+ private void executeShowVersion ( ) throws TException 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliCompleter . java b / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ index f541fe5 . . b033d8f 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ @ @ - 55 , 12 + 55 , 16 @ @ public class CliCompleter extends SimpleCompletor 
+ " help set " , 
+ " help del " , 
+ " help count " , 
+ + " help list " , 
+ + " help truncate " 
+ } ; 
+ private static String [ ] keyspaceCommands = { 
+ " get " , 
+ " set " , 
+ " count " , 
+ - " del " 
+ + " del " , 
+ + " list " , 
+ + " truncate " 
+ } ; 
+ 
+ public CliCompleter ( ) 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliUserHelp . java b / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ index 7c512e2 . . db6a779 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ @ @ - 281 , 6 + 281 , 13 @ @ public class CliUserHelp { 
+ state . out . println ( " list Users [ j : ] limit 40 " ) ; 
+ break ; 
+ 
+ + case CliParser . NODE _ TRUNCATE : 
+ + state . out . println ( " truncate < column _ family > " ) ; 
+ + state . out . println ( " Truncate specified column family . \ n " ) ; 
+ + state . out . println ( " example : " ) ; 
+ + state . out . println ( " truncate Category " ) ; 
+ + break ; 
+ + 
+ default : 
+ state . out . println ( " ? " ) ; 
+ break ; 
+ @ @ - 324 , 7 + 331 , 8 @ @ public class CliUserHelp { 
+ state . out . println ( " del < cf > [ ' < key > ' ] [ ' < super > ' ] [ ' < col > ' ] Delete sub column . " ) ; 
+ state . out . println ( " count < cf > [ ' < key > ' ] Count columns in record . " ) ; 
+ state . out . println ( " count < cf > [ ' < key > ' ] [ ' < super > ' ] Count columns in a super column . " ) ; 
+ - state . out . println ( " list < cf > List all rows in the column family . " ) ; 
+ + state . out . println ( " truncate < column _ family > Truncate specified column family . " ) ; 
+ + state . out . println ( " list < cf > List all rows in the column family . " ) ; 
+ state . out . println ( " list < cf > [ < startKey > : ] " ) ; 
+ state . out . println ( " List rows in the column family beginning with < startKey > . " ) ; 
+ state . out . println ( " list < cf > [ < startKey > : < endKey > ] " ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / cli / CliTest . java b / test / unit / org / apache / cassandra / cli / CliTest . java 
+ index 24a3de0 . . eddcafd 100644 
+ - - - a / test / unit / org / apache / cassandra / cli / CliTest . java 
+ + + + b / test / unit / org / apache / cassandra / cli / CliTest . java 
+ @ @ - 52 , 6 + 52 , 7 @ @ public class CliTest extends TestCase 
+ " list CF3 [ h : ] " , 
+ " list CF3 limit 10 " , 
+ " list CF3 [ h : g ] limit 10 " , 
+ + " truncate CF1 " , 
+ " update keyspace TestKeySpace with placement _ strategy = ' org . apache . cassandra . locator . LocalStrategy ' " , 
+ " update keyspace TestKeySpace with replication _ factor = 1 and strategy _ options = [ { DC1 : 3 , DC2 : 4 , DC5 : 1 } ] " 
+ } ; 
+ @ @ - 101 , 6 + 102 , 10 @ @ public class CliTest extends TestCase 
+ assertTrue ( result . startsWith ( " = > ( column = " ) ) ; 
+ } 
+ } 
+ + else if ( statement . startsWith ( " truncate " ) ) 
+ + { 
+ + assertTrue ( result . contains ( " truncated . " ) ) ; 
+ + } 
+ 
+ outStream . reset ( ) ; / / reset stream so we have only output from next statement all the time 
+ errStream . reset ( ) ; / / no errors to the end user .

@@ -1,0 +1,1310 @@
+BLEU SCORE: 0.005105783260904824
+
+TEST MSG: Restore resumable hints delivery
+GENERATED MSG: Bulk loader is no longer a fat client , hadoop bulk loader output format .
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 15e5001 . . 6fdc04a 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 32 , 6 + 32 , 7 @ @ <nl> <nl> <nl> 3 . 9 <nl> + * Restore resumable hints delivery ( CASSANDRA - 11960 ) <nl> * Fix nodetool tablestats miss SSTable count ( CASSANDRA - 12205 ) <nl> * Fixed flacky SSTablesIteratedTest ( CASSANDRA - 12282 ) <nl> * Fixed flacky SSTableRewriterTest : check file counts before calling validateCFS ( CASSANDRA - 12348 ) <nl> diff - - git a / src / java / org / apache / cassandra / hints / ChecksummedDataInput . java b / src / java / org / apache / cassandra / hints / ChecksummedDataInput . java <nl> index 8bb5b6d . . 0db95af 100644 <nl> - - - a / src / java / org / apache / cassandra / hints / ChecksummedDataInput . java <nl> + + + b / src / java / org / apache / cassandra / hints / ChecksummedDataInput . java <nl> @ @ - 26 , 18 + 26 , 19 @ @ import com . google . common . base . Preconditions ; <nl> <nl> import org . apache . cassandra . io . compress . BufferType ; <nl> import org . apache . cassandra . io . util . * ; <nl> + import org . apache . cassandra . utils . CLibrary ; <nl> import org . apache . cassandra . utils . memory . BufferPool ; <nl> <nl> / * * <nl> - * A { @ link RandomAccessReader } wrapper that calctulates the CRC in place . <nl> + * A { @ link RandomAccessReader } wrapper that calculates the CRC in place . <nl> * <nl> * Useful for { @ link org . apache . cassandra . hints . HintsReader } , for example , where we must verify the CRC , yet don ' t want <nl> * to allocate an extra byte array just that purpose . The CRC can be embedded in the input stream and checked via checkCrc ( ) . <nl> * <nl> - * In addition to calculating the CRC , it allows to enforce a maximim known size . This is needed <nl> + * In addition to calculating the CRC , it allows to enforce a maximum known size . This is needed <nl> * so that { @ link org . apache . cassandra . db . Mutation . MutationSerializer } doesn ' t blow up the heap when deserializing a <nl> * corrupted sequence by reading a huge corrupted length of bytes via <nl> - * via { @ link org . apache . cassandra . utils . ByteBufferUtil # readWithLength ( java . io . DataInput ) } . <nl> + * { @ link org . apache . cassandra . utils . ByteBufferUtil # readWithLength ( java . io . DataInput ) } . <nl> * / <nl> public class ChecksummedDataInput extends RebufferingInputStream <nl> { <nl> @ @ - 81 , 13 + 82 , 37 @ @ public class ChecksummedDataInput extends RebufferingInputStream <nl> return getPosition ( ) = = channel . size ( ) ; <nl> } <nl> <nl> + static class Position implements InputPosition <nl> + { <nl> + final long sourcePosition ; <nl> + <nl> + public Position ( long sourcePosition ) <nl> + { <nl> + super ( ) ; <nl> + this . sourcePosition = sourcePosition ; <nl> + } <nl> + <nl> + @ Override <nl> + public long subtract ( InputPosition other ) <nl> + { <nl> + return sourcePosition - ( ( Position ) other ) . sourcePosition ; <nl> + } <nl> + } <nl> + <nl> / * * <nl> - * Returns the position in the source file , which is different for getPosition ( ) for compressed / encrypted files <nl> - * and may be imprecise . <nl> + * Return a seekable representation of the current position . For compressed files this is chunk position <nl> + * in file and offset within chunk . <nl> * / <nl> - public long getSourcePosition ( ) <nl> + public InputPosition getSeekPosition ( ) <nl> { <nl> - return getPosition ( ) ; <nl> + return new Position ( getPosition ( ) ) ; <nl> + } <nl> + <nl> + public void seek ( InputPosition pos ) <nl> + { <nl> + updateCrc ( ) ; <nl> + bufferOffset = ( ( Position ) pos ) . sourcePosition ; <nl> + buffer . position ( 0 ) . limit ( 0 ) ; <nl> } <nl> <nl> public void resetCrc ( ) <nl> @ @ - 110 , 6 + 135 , 15 @ @ public class ChecksummedDataInput extends RebufferingInputStream <nl> return bufferOffset + buffer . position ( ) ; <nl> } <nl> <nl> + / * * <nl> + * Returns the position in the source file , which is different for getPosition ( ) for compressed / encrypted files <nl> + * and may be imprecise . <nl> + * / <nl> + protected long getSourcePosition ( ) <nl> + { <nl> + return bufferOffset ; <nl> + } <nl> + <nl> public void resetLimit ( ) <nl> { <nl> limit = Long . MAX _ VALUE ; <nl> @ @ - 179 , 6 + 213 , 11 @ @ public class ChecksummedDataInput extends RebufferingInputStream <nl> buffer . flip ( ) ; <nl> } <nl> <nl> + public void tryUncacheRead ( ) <nl> + { <nl> + CLibrary . trySkipCache ( getChannel ( ) . getFileDescriptor ( ) , 0 , getSourcePosition ( ) , getPath ( ) ) ; <nl> + } <nl> + <nl> private void updateCrc ( ) <nl> { <nl> if ( crcPosition = = buffer . position ( ) | | crcUpdateDisabled ) <nl> diff - - git a / src / java / org / apache / cassandra / hints / CompressedChecksummedDataInput . java b / src / java / org / apache / cassandra / hints / CompressedChecksummedDataInput . java <nl> index f584dd1 . . 0766fa5 100644 <nl> - - - a / src / java / org / apache / cassandra / hints / CompressedChecksummedDataInput . java <nl> + + + b / src / java / org / apache / cassandra / hints / CompressedChecksummedDataInput . java <nl> @ @ - 23 , 6 + 23 , 7 @ @ import java . nio . ByteBuffer ; <nl> <nl> import com . google . common . annotations . VisibleForTesting ; <nl> <nl> + import org . apache . cassandra . hints . ChecksummedDataInput . Position ; <nl> import org . apache . cassandra . io . FSReadError ; <nl> import org . apache . cassandra . io . compress . ICompressor ; <nl> import org . apache . cassandra . io . util . ChannelProxy ; <nl> @ @ - 31 , 7 + 32 , 8 @ @ import org . apache . cassandra . utils . memory . BufferPool ; <nl> public final class CompressedChecksummedDataInput extends ChecksummedDataInput <nl> { <nl> private final ICompressor compressor ; <nl> - private volatile long filePosition = 0 ; <nl> + private volatile long filePosition = 0 ; / / Current position in file , advanced when reading chunk . <nl> + private volatile long sourcePosition = 0 ; / / Current position in file to report , advanced after consuming chunk . <nl> private volatile ByteBuffer compressedBuffer = null ; <nl> private final ByteBuffer metadataBuffer = ByteBuffer . allocate ( CompressedHintsWriter . METADATA _ SIZE ) ; <nl> <nl> @ @ - 39 , 7 + 41 , 7 @ @ public final class CompressedChecksummedDataInput extends ChecksummedDataInput <nl> { <nl> super ( channel , compressor . preferredBufferType ( ) ) ; <nl> this . compressor = compressor ; <nl> - this . filePosition = filePosition ; <nl> + this . sourcePosition = this . filePosition = filePosition ; <nl> } <nl> <nl> / * * <nl> @ @ - 53 , 12 + 55 , 55 @ @ public final class CompressedChecksummedDataInput extends ChecksummedDataInput <nl> <nl> public long getSourcePosition ( ) <nl> { <nl> - return filePosition ; <nl> + return sourcePosition ; <nl> + } <nl> + <nl> + static class Position extends ChecksummedDataInput . Position <nl> + { <nl> + final long bufferStart ; <nl> + final int bufferPosition ; <nl> + <nl> + public Position ( long sourcePosition , long bufferStart , int bufferPosition ) <nl> + { <nl> + super ( sourcePosition ) ; <nl> + this . bufferStart = bufferStart ; <nl> + this . bufferPosition = bufferPosition ; <nl> + } <nl> + <nl> + @ Override <nl> + public long subtract ( InputPosition o ) <nl> + { <nl> + Position other = ( Position ) o ; <nl> + return bufferStart - other . bufferStart + bufferPosition - other . bufferPosition ; <nl> + } <nl> + } <nl> + <nl> + public InputPosition getSeekPosition ( ) <nl> + { <nl> + return new Position ( sourcePosition , bufferOffset , buffer . position ( ) ) ; <nl> + } <nl> + <nl> + public void seek ( InputPosition p ) <nl> + { <nl> + Position pos = ( Position ) p ; <nl> + bufferOffset = pos . bufferStart ; <nl> + filePosition = pos . sourcePosition ; <nl> + buffer . position ( 0 ) . limit ( 0 ) ; <nl> + resetCrc ( ) ; <nl> + reBuffer ( ) ; <nl> + buffer . position ( pos . bufferPosition ) ; <nl> + assert sourcePosition = = pos . sourcePosition ; <nl> + assert bufferOffset = = pos . bufferStart ; <nl> + assert buffer . position ( ) = = pos . bufferPosition ; <nl> } <nl> <nl> @ Override <nl> protected void readBuffer ( ) <nl> { <nl> + sourcePosition = filePosition ; <nl> + if ( isEOF ( ) ) <nl> + return ; <nl> + <nl> metadataBuffer . clear ( ) ; <nl> channel . read ( metadataBuffer , filePosition ) ; <nl> filePosition + = CompressedHintsWriter . METADATA _ SIZE ; <nl> diff - - git a / src / java / org / apache / cassandra / hints / EncryptedChecksummedDataInput . java b / src / java / org / apache / cassandra / hints / EncryptedChecksummedDataInput . java <nl> index 7ecfbfe . . b335226 100644 <nl> - - - a / src / java / org / apache / cassandra / hints / EncryptedChecksummedDataInput . java <nl> + + + b / src / java / org / apache / cassandra / hints / EncryptedChecksummedDataInput . java <nl> @ @ - 24 , 6 + 24 , 7 @ @ import javax . crypto . Cipher ; <nl> import com . google . common . annotations . VisibleForTesting ; <nl> <nl> import org . apache . cassandra . security . EncryptionUtils ; <nl> + import org . apache . cassandra . hints . CompressedChecksummedDataInput . Position ; <nl> import org . apache . cassandra . io . FSReadError ; <nl> import org . apache . cassandra . io . compress . ICompressor ; <nl> import org . apache . cassandra . io . util . ChannelProxy ; <nl> @ @ - 42 , 6 + 43 , 7 @ @ public class EncryptedChecksummedDataInput extends ChecksummedDataInput <nl> private final ICompressor compressor ; <nl> <nl> private final EncryptionUtils . ChannelProxyReadChannel readChannel ; <nl> + private long sourcePosition ; <nl> <nl> protected EncryptedChecksummedDataInput ( ChannelProxy channel , Cipher cipher , ICompressor compressor , long filePosition ) <nl> { <nl> @ @ - 49 , 6 + 51 , 7 @ @ public class EncryptedChecksummedDataInput extends ChecksummedDataInput <nl> this . cipher = cipher ; <nl> this . compressor = compressor ; <nl> readChannel = new EncryptionUtils . ChannelProxyReadChannel ( channel , filePosition ) ; <nl> + this . sourcePosition = filePosition ; <nl> assert cipher ! = null ; <nl> assert compressor ! = null ; <nl> } <nl> @ @ - 59 , 17 + 62 , 60 @ @ public class EncryptedChecksummedDataInput extends ChecksummedDataInput <nl> * / <nl> public boolean isEOF ( ) <nl> { <nl> - return getSourcePosition ( ) = = channel . size ( ) & & buffer . remaining ( ) = = 0 ; <nl> + return readChannel . getCurrentPosition ( ) = = channel . size ( ) & & buffer . remaining ( ) = = 0 ; <nl> } <nl> <nl> public long getSourcePosition ( ) <nl> { <nl> - return readChannel . getCurrentPosition ( ) ; <nl> + return sourcePosition ; <nl> + } <nl> + <nl> + static class Position extends ChecksummedDataInput . Position <nl> + { <nl> + final long bufferStart ; <nl> + final int bufferPosition ; <nl> + <nl> + public Position ( long sourcePosition , long bufferStart , int bufferPosition ) <nl> + { <nl> + super ( sourcePosition ) ; <nl> + this . bufferStart = bufferStart ; <nl> + this . bufferPosition = bufferPosition ; <nl> + } <nl> + <nl> + @ Override <nl> + public long subtract ( InputPosition o ) <nl> + { <nl> + Position other = ( Position ) o ; <nl> + return bufferStart - other . bufferStart + bufferPosition - other . bufferPosition ; <nl> + } <nl> + } <nl> + <nl> + public InputPosition getSeekPosition ( ) <nl> + { <nl> + return new Position ( sourcePosition , bufferOffset , buffer . position ( ) ) ; <nl> + } <nl> + <nl> + public void seek ( InputPosition p ) <nl> + { <nl> + Position pos = ( Position ) p ; <nl> + bufferOffset = pos . bufferStart ; <nl> + readChannel . setPosition ( pos . sourcePosition ) ; <nl> + buffer . position ( 0 ) . limit ( 0 ) ; <nl> + resetCrc ( ) ; <nl> + reBuffer ( ) ; <nl> + buffer . position ( pos . bufferPosition ) ; <nl> + assert sourcePosition = = pos . sourcePosition ; <nl> + assert bufferOffset = = pos . bufferStart ; <nl> + assert buffer . position ( ) = = pos . bufferPosition ; <nl> } <nl> <nl> @ Override <nl> protected void readBuffer ( ) <nl> { <nl> + this . sourcePosition = readChannel . getCurrentPosition ( ) ; <nl> + if ( isEOF ( ) ) <nl> + return ; <nl> + <nl> try <nl> { <nl> ByteBuffer byteBuffer = reusableBuffers . get ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / hints / HintsDispatchExecutor . java b / src / java / org / apache / cassandra / hints / HintsDispatchExecutor . java <nl> index 5292dc1 . . d7ccf81 100644 <nl> - - - a / src / java / org / apache / cassandra / hints / HintsDispatchExecutor . java <nl> + + + b / src / java / org / apache / cassandra / hints / HintsDispatchExecutor . java <nl> @ @ - 23 , 6 + 23 , 8 @ @ import java . util . Map ; <nl> import java . util . UUID ; <nl> import java . util . concurrent . * ; <nl> import java . util . concurrent . atomic . AtomicBoolean ; <nl> + import java . util . function . BooleanSupplier ; <nl> + import java . util . function . Function ; <nl> import java . util . function . Supplier ; <nl> <nl> import com . google . common . util . concurrent . RateLimiter ; <nl> @ @ - 48 , 12 + 50 , 14 @ @ final class HintsDispatchExecutor <nl> private final File hintsDirectory ; <nl> private final ExecutorService executor ; <nl> private final AtomicBoolean isPaused ; <nl> + private final Function < InetAddress , Boolean > isAlive ; <nl> private final Map < UUID , Future > scheduledDispatches ; <nl> <nl> - HintsDispatchExecutor ( File hintsDirectory , int maxThreads , AtomicBoolean isPaused ) <nl> + HintsDispatchExecutor ( File hintsDirectory , int maxThreads , AtomicBoolean isPaused , Function < InetAddress , Boolean > isAlive ) <nl> { <nl> this . hintsDirectory = hintsDirectory ; <nl> this . isPaused = isPaused ; <nl> + this . isAlive = isAlive ; <nl> <nl> scheduledDispatches = new ConcurrentHashMap < > ( ) ; <nl> executor = new JMXEnabledThreadPoolExecutor ( 1 , <nl> @ @ - 72 , 6 + 76 , 14 @ @ final class HintsDispatchExecutor <nl> { <nl> scheduledDispatches . clear ( ) ; <nl> executor . shutdownNow ( ) ; <nl> + try <nl> + { <nl> + executor . awaitTermination ( 1 , TimeUnit . MINUTES ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + throw new AssertionError ( e ) ; <nl> + } <nl> } <nl> <nl> boolean isScheduled ( HintsStore store ) <nl> @ @ - 249 , 9 + 261 , 10 @ @ final class HintsDispatchExecutor <nl> private boolean deliver ( HintsDescriptor descriptor , InetAddress address ) <nl> { <nl> File file = new File ( hintsDirectory , descriptor . fileName ( ) ) ; <nl> - Long offset = store . getDispatchOffset ( descriptor ) . orElse ( null ) ; <nl> + InputPosition offset = store . getDispatchOffset ( descriptor ) ; <nl> <nl> - try ( HintsDispatcher dispatcher = HintsDispatcher . create ( file , rateLimiter , address , descriptor . hostId , isPaused ) ) <nl> + BooleanSupplier shouldAbort = ( ) - > ! isAlive . apply ( address ) | | isPaused . get ( ) ; <nl> + try ( HintsDispatcher dispatcher = HintsDispatcher . create ( file , rateLimiter , address , descriptor . hostId , shouldAbort ) ) <nl> { <nl> if ( offset ! = null ) <nl> dispatcher . seek ( offset ) ; <nl> @ @ - 265 , 7 + 278 , 7 @ @ final class HintsDispatchExecutor <nl> } <nl> else <nl> { <nl> - store . markDispatchOffset ( descriptor , dispatcher . dispatchOffset ( ) ) ; <nl> + store . markDispatchOffset ( descriptor , dispatcher . dispatchPosition ( ) ) ; <nl> store . offerFirst ( descriptor ) ; <nl> logger . info ( " Finished hinted handoff of file { } to endpoint { } , partially " , descriptor . fileName ( ) , hostId ) ; <nl> return false ; <nl> diff - - git a / src / java / org / apache / cassandra / hints / HintsDispatcher . java b / src / java / org / apache / cassandra / hints / HintsDispatcher . java <nl> index e582d88 . . 00ef52b 100644 <nl> - - - a / src / java / org / apache / cassandra / hints / HintsDispatcher . java <nl> + + + b / src / java / org / apache / cassandra / hints / HintsDispatcher . java <nl> @ @ - 22 , 13 + 22 , 12 @ @ import java . net . InetAddress ; <nl> import java . nio . ByteBuffer ; <nl> import java . util . * ; <nl> import java . util . concurrent . TimeUnit ; <nl> - import java . util . concurrent . atomic . AtomicBoolean ; <nl> + import java . util . function . BooleanSupplier ; <nl> import java . util . function . Function ; <nl> <nl> import com . google . common . util . concurrent . RateLimiter ; <nl> <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - import org . apache . cassandra . gms . FailureDetector ; <nl> import org . apache . cassandra . net . IAsyncCallbackWithFailure ; <nl> import org . apache . cassandra . net . MessageIn ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> @ @ - 42 , 31 + 41 , 31 @ @ import org . apache . cassandra . utils . concurrent . SimpleCondition ; <nl> * / <nl> final class HintsDispatcher implements AutoCloseable <nl> { <nl> - private enum Action { CONTINUE , ABORT , RETRY } <nl> + private enum Action { CONTINUE , ABORT } <nl> <nl> private final HintsReader reader ; <nl> private final UUID hostId ; <nl> private final InetAddress address ; <nl> private final int messagingVersion ; <nl> - private final AtomicBoolean isPaused ; <nl> + private final BooleanSupplier abortRequested ; <nl> <nl> - private long currentPageOffset ; <nl> + private InputPosition currentPagePosition ; <nl> <nl> - private HintsDispatcher ( HintsReader reader , UUID hostId , InetAddress address , int messagingVersion , AtomicBoolean isPaused ) <nl> + private HintsDispatcher ( HintsReader reader , UUID hostId , InetAddress address , int messagingVersion , BooleanSupplier abortRequested ) <nl> { <nl> - currentPageOffset = 0L ; <nl> + currentPagePosition = null ; <nl> <nl> this . reader = reader ; <nl> this . hostId = hostId ; <nl> this . address = address ; <nl> this . messagingVersion = messagingVersion ; <nl> - this . isPaused = isPaused ; <nl> + this . abortRequested = abortRequested ; <nl> } <nl> <nl> - static HintsDispatcher create ( File file , RateLimiter rateLimiter , InetAddress address , UUID hostId , AtomicBoolean isPaused ) <nl> + static HintsDispatcher create ( File file , RateLimiter rateLimiter , InetAddress address , UUID hostId , BooleanSupplier abortRequested ) <nl> { <nl> int messagingVersion = MessagingService . instance ( ) . getVersion ( address ) ; <nl> - return new HintsDispatcher ( HintsReader . open ( file , rateLimiter ) , hostId , address , messagingVersion , isPaused ) ; <nl> + return new HintsDispatcher ( HintsReader . open ( file , rateLimiter ) , hostId , address , messagingVersion , abortRequested ) ; <nl> } <nl> <nl> public void close ( ) <nl> @ @ - 74 , 10 + 73 , 9 @ @ final class HintsDispatcher implements AutoCloseable <nl> reader . close ( ) ; <nl> } <nl> <nl> - void seek ( long bytes ) <nl> + void seek ( InputPosition position ) <nl> { <nl> - reader . seek ( bytes ) ; <nl> - currentPageOffset = 0L ; <nl> + reader . seek ( position ) ; <nl> } <nl> <nl> / * * <nl> @ @ - 87 , 7 + 85 , 7 @ @ final class HintsDispatcher implements AutoCloseable <nl> { <nl> for ( HintsReader . Page page : reader ) <nl> { <nl> - currentPageOffset = page . offset ; <nl> + currentPagePosition = page . position ; <nl> if ( dispatch ( page ) ! = Action . CONTINUE ) <nl> return false ; <nl> } <nl> @ @ - 98 , 28 + 96 , 16 @ @ final class HintsDispatcher implements AutoCloseable <nl> / * * <nl> * @ return offset of the first non - delivered page <nl> * / <nl> - long dispatchOffset ( ) <nl> + InputPosition dispatchPosition ( ) <nl> { <nl> - return currentPageOffset ; <nl> + return currentPagePosition ; <nl> } <nl> <nl> - private boolean isHostAlive ( ) <nl> - { <nl> - return FailureDetector . instance . isAlive ( address ) ; <nl> - } <nl> - <nl> - private boolean isPaused ( ) <nl> - { <nl> - return isPaused . get ( ) ; <nl> - } <nl> <nl> / / retry in case of a timeout ; stop in case of a failure , host going down , or delivery paused <nl> private Action dispatch ( HintsReader . Page page ) <nl> { <nl> - Action action = sendHintsAndAwait ( page ) ; <nl> - return action = = Action . RETRY <nl> - ? dispatch ( page ) <nl> - : action ; <nl> + return sendHintsAndAwait ( page ) ; <nl> } <nl> <nl> private Action sendHintsAndAwait ( HintsReader . Page page ) <nl> @ @ - 142 , 7 + 128 , 7 @ @ final class HintsDispatcher implements AutoCloseable <nl> <nl> for ( Callback cb : callbacks ) <nl> if ( cb . await ( ) ! = Callback . Outcome . SUCCESS ) <nl> - return Action . RETRY ; <nl> + return Action . ABORT ; <nl> <nl> return Action . CONTINUE ; <nl> } <nl> @ @ - 155 , 7 + 141 , 7 @ @ final class HintsDispatcher implements AutoCloseable <nl> { <nl> while ( hints . hasNext ( ) ) <nl> { <nl> - if ( ! isHostAlive ( ) | | isPaused ( ) ) <nl> + if ( abortRequested . getAsBoolean ( ) ) <nl> return Action . ABORT ; <nl> callbacks . add ( sendFunction . apply ( hints . next ( ) ) ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / hints / HintsReader . java b / src / java / org / apache / cassandra / hints / HintsReader . java <nl> index 5e73805 . . e0a73c1 100644 <nl> - - - a / src / java / org / apache / cassandra / hints / HintsReader . java <nl> + + + b / src / java / org / apache / cassandra / hints / HintsReader . java <nl> @ @ - 109 , 9 + 109 , 9 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > <nl> return descriptor ; <nl> } <nl> <nl> - void seek ( long newPosition ) <nl> + void seek ( InputPosition newPosition ) <nl> { <nl> - throw new UnsupportedOperationException ( " Hints are not seekable . " ) ; <nl> + input . seek ( newPosition ) ; <nl> } <nl> <nl> public Iterator < Page > iterator ( ) <nl> @ @ - 126 , 21 + 126 , 21 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > <nl> <nl> final class Page <nl> { <nl> - public final long offset ; <nl> + public final InputPosition position ; <nl> <nl> - private Page ( long offset ) <nl> + private Page ( InputPosition inputPosition ) <nl> { <nl> - this . offset = offset ; <nl> + this . position = inputPosition ; <nl> } <nl> <nl> Iterator < Hint > hintsIterator ( ) <nl> { <nl> - return new HintsIterator ( offset ) ; <nl> + return new HintsIterator ( position ) ; <nl> } <nl> <nl> Iterator < ByteBuffer > buffersIterator ( ) <nl> { <nl> - return new BuffersIterator ( offset ) ; <nl> + return new BuffersIterator ( position ) ; <nl> } <nl> } <nl> <nl> @ @ - 149 , 12 + 149 , 12 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > <nl> @ SuppressWarnings ( " resource " ) <nl> protected Page computeNext ( ) <nl> { <nl> - CLibrary . trySkipCache ( input . getChannel ( ) . getFileDescriptor ( ) , 0 , input . getSourcePosition ( ) , input . getPath ( ) ) ; <nl> + input . tryUncacheRead ( ) ; <nl> <nl> if ( input . isEOF ( ) ) <nl> return endOfData ( ) ; <nl> <nl> - return new Page ( input . getSourcePosition ( ) ) ; <nl> + return new Page ( input . getSeekPosition ( ) ) ; <nl> } <nl> } <nl> <nl> @ @ - 163 , 9 + 163 , 9 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > <nl> * / <nl> final class HintsIterator extends AbstractIterator < Hint > <nl> { <nl> - private final long offset ; <nl> + private final InputPosition offset ; <nl> <nl> - HintsIterator ( long offset ) <nl> + HintsIterator ( InputPosition offset ) <nl> { <nl> super ( ) ; <nl> this . offset = offset ; <nl> @ @ - 177 , 12 + 177 , 12 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > <nl> <nl> do <nl> { <nl> - long position = input . getSourcePosition ( ) ; <nl> + InputPosition position = input . getSeekPosition ( ) ; <nl> <nl> if ( input . isEOF ( ) ) <nl> return endOfData ( ) ; / / reached EOF <nl> <nl> - if ( position - offset > = PAGE _ SIZE ) <nl> + if ( position . subtract ( offset ) > = PAGE _ SIZE ) <nl> return endOfData ( ) ; / / read page size or more bytes <nl> <nl> try <nl> @ @ - 253 , 9 + 253 , 9 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > <nl> * / <nl> final class BuffersIterator extends AbstractIterator < ByteBuffer > <nl> { <nl> - private final long offset ; <nl> + private final InputPosition offset ; <nl> <nl> - BuffersIterator ( long offset ) <nl> + BuffersIterator ( InputPosition offset ) <nl> { <nl> super ( ) ; <nl> this . offset = offset ; <nl> @ @ - 267 , 12 + 267 , 12 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > <nl> <nl> do <nl> { <nl> - long position = input . getSourcePosition ( ) ; <nl> + InputPosition position = input . getSeekPosition ( ) ; <nl> <nl> if ( input . isEOF ( ) ) <nl> return endOfData ( ) ; / / reached EOF <nl> <nl> - if ( position - offset > = PAGE _ SIZE ) <nl> + if ( position . subtract ( offset ) > = PAGE _ SIZE ) <nl> return endOfData ( ) ; / / read page size or more bytes <nl> <nl> try <nl> diff - - git a / src / java / org / apache / cassandra / hints / HintsService . java b / src / java / org / apache / cassandra / hints / HintsService . java <nl> index 5a32786 . . 1a3a403 100644 <nl> - - - a / src / java / org / apache / cassandra / hints / HintsService . java <nl> + + + b / src / java / org / apache / cassandra / hints / HintsService . java <nl> @ @ - 30 , 6 + 30 , 7 @ @ import java . util . function . Supplier ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . ObjectName ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . collect . ImmutableMap ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 37 , 6 + 38 , 8 @ @ import org . slf4j . LoggerFactory ; <nl> import org . apache . cassandra . concurrent . ScheduledExecutors ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . config . ParameterizedClass ; <nl> + import org . apache . cassandra . gms . FailureDetector ; <nl> + import org . apache . cassandra . gms . IFailureDetector ; <nl> import org . apache . cassandra . metrics . HintedHandoffMetrics ; <nl> import org . apache . cassandra . metrics . StorageMetrics ; <nl> import org . apache . cassandra . dht . Token ; <nl> @ @ - 60 , 7 + 63 , 7 @ @ public final class HintsService implements HintsServiceMBean <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( HintsService . class ) ; <nl> <nl> - public static final HintsService instance = new HintsService ( ) ; <nl> + public static HintsService instance = new HintsService ( ) ; <nl> <nl> private static final String MBEAN _ NAME = " org . apache . cassandra . hints : type = HintsService " ; <nl> <nl> @ @ - 82 , 6 + 85 , 12 @ @ public final class HintsService implements HintsServiceMBean <nl> <nl> private HintsService ( ) <nl> { <nl> + this ( FailureDetector . instance ) ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + HintsService ( IFailureDetector failureDetector ) <nl> + { <nl> File hintsDirectory = DatabaseDescriptor . getHintsDirectory ( ) ; <nl> int maxDeliveryThreads = DatabaseDescriptor . getMaxHintsDeliveryThreads ( ) ; <nl> <nl> @ @ - 92 , 7 + 101 , 7 @ @ public final class HintsService implements HintsServiceMBean <nl> bufferPool = new HintsBufferPool ( bufferSize , writeExecutor : : flushBuffer ) ; <nl> <nl> isDispatchPaused = new AtomicBoolean ( true ) ; <nl> - dispatchExecutor = new HintsDispatchExecutor ( hintsDirectory , maxDeliveryThreads , isDispatchPaused ) ; <nl> + dispatchExecutor = new HintsDispatchExecutor ( hintsDirectory , maxDeliveryThreads , isDispatchPaused , failureDetector : : isAlive ) ; <nl> <nl> / / periodically empty the current content of the buffers <nl> int flushPeriod = DatabaseDescriptor . getHintsFlushPeriodInMS ( ) ; <nl> @ @ - 225 , 7 + 234 , 7 @ @ public final class HintsService implements HintsServiceMBean <nl> * Will abort dispatch sessions that are currently in progress ( which is okay , it ' s idempotent ) , <nl> * and make sure the buffers are flushed , hints files written and fsynced . <nl> * / <nl> - public synchronized void shutdownBlocking ( ) <nl> + public synchronized void shutdownBlocking ( ) throws ExecutionException , InterruptedException <nl> { <nl> if ( isShutDown ) <nl> throw new IllegalStateException ( " HintsService has already been shut down " ) ; <nl> @ @ - 237 , 8 + 246 , 8 @ @ public final class HintsService implements HintsServiceMBean <nl> <nl> triggerFlushingFuture . cancel ( false ) ; <nl> <nl> - writeExecutor . flushBufferPool ( bufferPool ) ; <nl> - writeExecutor . closeAllWriters ( ) ; <nl> + writeExecutor . flushBufferPool ( bufferPool ) . get ( ) ; <nl> + writeExecutor . closeAllWriters ( ) . get ( ) ; <nl> <nl> dispatchExecutor . shutdownBlocking ( ) ; <nl> writeExecutor . shutdownBlocking ( ) ; <nl> @ @ - 369 , 4 + 378 , 12 @ @ public final class HintsService implements HintsServiceMBean <nl> { <nl> return catalog ; <nl> } <nl> + <nl> + / * * <nl> + * Returns true in case service is shut down . <nl> + * / <nl> + public boolean isShutDown ( ) <nl> + { <nl> + return isShutDown ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / hints / HintsStore . java b / src / java / org / apache / cassandra / hints / HintsStore . java <nl> index c066331 . . 3572172 100644 <nl> - - - a / src / java / org / apache / cassandra / hints / HintsStore . java <nl> + + + b / src / java / org / apache / cassandra / hints / HintsStore . java <nl> @ @ - 49 , 7 + 49 , 7 @ @ final class HintsStore <nl> private final File hintsDirectory ; <nl> private final ImmutableMap < String , Object > writerParams ; <nl> <nl> - private final Map < HintsDescriptor , Long > dispatchOffsets ; <nl> + private final Map < HintsDescriptor , InputPosition > dispatchPositions ; <nl> private final Deque < HintsDescriptor > dispatchDequeue ; <nl> private final Queue < HintsDescriptor > blacklistedFiles ; <nl> <nl> @ @ - 63 , 7 + 63 , 7 @ @ final class HintsStore <nl> this . hintsDirectory = hintsDirectory ; <nl> this . writerParams = writerParams ; <nl> <nl> - dispatchOffsets = new ConcurrentHashMap < > ( ) ; <nl> + dispatchPositions = new ConcurrentHashMap < > ( ) ; <nl> dispatchDequeue = new ConcurrentLinkedDeque < > ( descriptors ) ; <nl> blacklistedFiles = new ConcurrentLinkedQueue < > ( ) ; <nl> <nl> @ @ - 136 , 19 + 136 , 19 @ @ final class HintsStore <nl> return ! dispatchDequeue . isEmpty ( ) ; <nl> } <nl> <nl> - Optional < Long > getDispatchOffset ( HintsDescriptor descriptor ) <nl> + InputPosition getDispatchOffset ( HintsDescriptor descriptor ) <nl> { <nl> - return Optional . ofNullable ( dispatchOffsets . get ( descriptor ) ) ; <nl> + return dispatchPositions . get ( descriptor ) ; <nl> } <nl> <nl> - void markDispatchOffset ( HintsDescriptor descriptor , long mark ) <nl> + void markDispatchOffset ( HintsDescriptor descriptor , InputPosition inputPosition ) <nl> { <nl> - dispatchOffsets . put ( descriptor , mark ) ; <nl> + dispatchPositions . put ( descriptor , inputPosition ) ; <nl> } <nl> <nl> void cleanUp ( HintsDescriptor descriptor ) <nl> { <nl> - dispatchOffsets . remove ( descriptor ) ; <nl> + dispatchPositions . remove ( descriptor ) ; <nl> } <nl> <nl> void blacklist ( HintsDescriptor descriptor ) <nl> diff - - git a / src / java / org / apache / cassandra / hints / InputPosition . java b / src / java / org / apache / cassandra / hints / InputPosition . java <nl> new file mode 100644 <nl> index 0000000 . . 05f9db0 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / hints / InputPosition . java <nl> @ @ - 0 , 0 + 1 , 9 @ @ <nl> + package org . apache . cassandra . hints ; <nl> + <nl> + / * * <nl> + * Marker interface for file positions as provided by the various ChecksummedDataReader implementations . <nl> + * / <nl> + public interface InputPosition <nl> + { <nl> + long subtract ( InputPosition other ) ; <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / security / EncryptionUtils . java b / src / java / org / apache / cassandra / security / EncryptionUtils . java <nl> index 7e72b3e . . b262259 100644 <nl> - - - a / src / java / org / apache / cassandra / security / EncryptionUtils . java <nl> + + + b / src / java / org / apache / cassandra / security / EncryptionUtils . java <nl> @ @ - 309 , 5 + 309 , 10 @ @ public class EncryptionUtils <nl> { <nl> / / nop <nl> } <nl> + <nl> + public void setPosition ( long sourcePosition ) <nl> + { <nl> + this . currentPosition = sourcePosition ; <nl> + } <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index 0a95827 . . e3b4752 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 570 , 7 + 570 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> drainOnShutdown = new Thread ( new WrappedRunnable ( ) <nl> { <nl> @ Override <nl> - public void runMayThrow ( ) throws InterruptedException <nl> + public void runMayThrow ( ) throws InterruptedException , ExecutionException <nl> { <nl> inShutdownHook = true ; <nl> ExecutorService viewMutationStage = StageManager . getStage ( Stage . VIEW _ MUTATION ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / hints / AlteredHints . java b / test / unit / org / apache / cassandra / hints / AlteredHints . java <nl> index 23dc32a . . 7efe08f 100644 <nl> - - - a / test / unit / org / apache / cassandra / hints / AlteredHints . java <nl> + + + b / test / unit / org / apache / cassandra / hints / AlteredHints . java <nl> @ @ - 107 , 9 + 107 , 11 @ @ public abstract class AlteredHints <nl> { <nl> Assert . assertTrue ( looksLegit ( reader . getInput ( ) ) ) ; <nl> List < Hint > deserialized = new ArrayList < > ( hintNum ) ; <nl> + List < InputPosition > pagePositions = new ArrayList < > ( hintNum ) ; <nl> <nl> for ( HintsReader . Page page : reader ) <nl> { <nl> + pagePositions . add ( page . position ) ; <nl> Iterator < Hint > iterator = page . hintsIterator ( ) ; <nl> while ( iterator . hasNext ( ) ) <nl> { <nl> @ @ - 124 , 6 + 126 , 21 @ @ public abstract class AlteredHints <nl> HintsTestUtil . assertHintsEqual ( expected , deserialized . get ( hintNum ) ) ; <nl> hintNum + + ; <nl> } <nl> + <nl> + / / explicitely seek to each page by iterating collected page positions and check if hints still match as expected <nl> + int hintOffset = 0 ; <nl> + for ( InputPosition pos : pagePositions ) <nl> + { <nl> + reader . seek ( pos ) ; <nl> + HintsReader . Page page = reader . iterator ( ) . next ( ) ; <nl> + Iterator < Hint > iterator = page . hintsIterator ( ) ; <nl> + while ( iterator . hasNext ( ) ) <nl> + { <nl> + Hint seekedHint = iterator . next ( ) ; <nl> + HintsTestUtil . assertHintsEqual ( hints . get ( hintOffset ) , seekedHint ) ; <nl> + hintOffset + + ; <nl> + } <nl> + } <nl> } <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / hints / HintsCatalogTest . java b / test / unit / org / apache / cassandra / hints / HintsCatalogTest . java <nl> index 51b6aa3 . . a255338 100644 <nl> - - - a / test / unit / org / apache / cassandra / hints / HintsCatalogTest . java <nl> + + + b / test / unit / org / apache / cassandra / hints / HintsCatalogTest . java <nl> @ @ - 79 , 6 + 79 , 37 @ @ public class HintsCatalogTest <nl> assertNull ( store2 . poll ( ) ) ; <nl> } <nl> <nl> + @ Test <nl> + public void deleteHintsTest ( ) throws IOException <nl> + { <nl> + File directory = Files . createTempDirectory ( null ) . toFile ( ) ; <nl> + UUID hostId1 = UUID . randomUUID ( ) ; <nl> + UUID hostId2 = UUID . randomUUID ( ) ; <nl> + long now = System . currentTimeMillis ( ) ; <nl> + writeDescriptor ( directory , new HintsDescriptor ( hostId1 , now ) ) ; <nl> + writeDescriptor ( directory , new HintsDescriptor ( hostId1 , now + 1 ) ) ; <nl> + writeDescriptor ( directory , new HintsDescriptor ( hostId2 , now + 2 ) ) ; <nl> + writeDescriptor ( directory , new HintsDescriptor ( hostId2 , now + 3 ) ) ; <nl> + <nl> + / / load catalog containing two stores ( one for each host ) <nl> + HintsCatalog catalog = HintsCatalog . load ( directory , ImmutableMap . of ( ) ) ; <nl> + assertEquals ( 2 , catalog . stores ( ) . count ( ) ) ; <nl> + assertTrue ( catalog . hasFiles ( ) ) ; <nl> + <nl> + / / delete all hints from store 1 <nl> + assertTrue ( catalog . get ( hostId1 ) . hasFiles ( ) ) ; <nl> + catalog . deleteAllHints ( hostId1 ) ; <nl> + assertFalse ( catalog . get ( hostId1 ) . hasFiles ( ) ) ; <nl> + / / stores are still keepts for each host , even after deleting hints <nl> + assertEquals ( 2 , catalog . stores ( ) . count ( ) ) ; <nl> + assertTrue ( catalog . hasFiles ( ) ) ; <nl> + <nl> + / / delete all hints from all stores <nl> + catalog . deleteAllHints ( ) ; <nl> + assertEquals ( 2 , catalog . stores ( ) . count ( ) ) ; <nl> + assertFalse ( catalog . hasFiles ( ) ) ; <nl> + } <nl> + <nl> @ SuppressWarnings ( " EmptyTryBlock " ) <nl> private static void writeDescriptor ( File directory , HintsDescriptor descriptor ) throws IOException <nl> { <nl> diff - - git a / test / unit / org / apache / cassandra / hints / HintsServiceTest . java b / test / unit / org / apache / cassandra / hints / HintsServiceTest . java <nl> new file mode 100644 <nl> index 0000000 . . ffb7f73 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / hints / HintsServiceTest . java <nl> @ @ - 0 , 0 + 1 , 254 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . hints ; <nl> + <nl> + import java . net . InetAddress ; <nl> + import java . util . Collections ; <nl> + import java . util . UUID ; <nl> + import java . util . concurrent . ExecutionException ; <nl> + import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . TimeoutException ; <nl> + import javax . annotation . Nullable ; <nl> + <nl> + import com . google . common . util . concurrent . Futures ; <nl> + import com . google . common . util . concurrent . ListenableFuture ; <nl> + import org . junit . After ; <nl> + import org . junit . Before ; <nl> + import org . junit . BeforeClass ; <nl> + import org . junit . Test ; <nl> + <nl> + import com . datastax . driver . core . utils . MoreFutures ; <nl> + import org . apache . cassandra . SchemaLoader ; <nl> + import org . apache . cassandra . config . CFMetaData ; <nl> + import org . apache . cassandra . config . Schema ; <nl> + import org . apache . cassandra . db . DecoratedKey ; <nl> + import org . apache . cassandra . db . partitions . PartitionUpdate ; <nl> + import org . apache . cassandra . gms . IFailureDetectionEventListener ; <nl> + import org . apache . cassandra . gms . IFailureDetector ; <nl> + import org . apache . cassandra . metrics . StorageMetrics ; <nl> + import org . apache . cassandra . net . MessageIn ; <nl> + import org . apache . cassandra . net . MessagingService ; <nl> + import org . apache . cassandra . net . MockMessagingService ; <nl> + import org . apache . cassandra . net . MockMessagingSpy ; <nl> + import org . apache . cassandra . schema . KeyspaceParams ; <nl> + import org . apache . cassandra . service . StorageService ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> + <nl> + import static org . apache . cassandra . Util . dk ; <nl> + import static org . apache . cassandra . net . MockMessagingService . verb ; <nl> + import static org . junit . Assert . assertEquals ; <nl> + import static org . junit . Assert . assertTrue ; <nl> + <nl> + public class HintsServiceTest <nl> + { <nl> + private static final String KEYSPACE = " hints _ service _ test " ; <nl> + private static final String TABLE = " table " ; <nl> + <nl> + private final MockFailureDetector failureDetector = new MockFailureDetector ( ) ; <nl> + <nl> + @ BeforeClass <nl> + public static void defineSchema ( ) <nl> + { <nl> + SchemaLoader . prepareServer ( ) ; <nl> + StorageService . instance . initServer ( ) ; <nl> + SchemaLoader . createKeyspace ( KEYSPACE , <nl> + KeyspaceParams . simple ( 1 ) , <nl> + SchemaLoader . standardCFMD ( KEYSPACE , TABLE ) ) ; <nl> + } <nl> + <nl> + @ After <nl> + public void cleanup ( ) <nl> + { <nl> + MockMessagingService . cleanup ( ) ; <nl> + } <nl> + <nl> + @ Before <nl> + public void reinstanciateService ( ) throws ExecutionException , InterruptedException <nl> + { <nl> + MessagingService . instance ( ) . clearMessageSinks ( ) ; <nl> + <nl> + if ( ! HintsService . instance . isShutDown ( ) ) <nl> + { <nl> + HintsService . instance . shutdownBlocking ( ) ; <nl> + HintsService . instance . deleteAllHints ( ) ; <nl> + } <nl> + <nl> + failureDetector . isAlive = true ; <nl> + HintsService . instance = new HintsService ( failureDetector ) ; <nl> + HintsService . instance . startDispatch ( ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testDispatchHints ( ) throws InterruptedException , ExecutionException <nl> + { <nl> + long cnt = StorageMetrics . totalHints . getCount ( ) ; <nl> + <nl> + / / create spy for hint messages <nl> + MockMessagingSpy spy = sendHintsAndResponses ( 100 , - 1 ) ; <nl> + <nl> + / / metrics should have been updated with number of create hints <nl> + assertEquals ( cnt + 100 , StorageMetrics . totalHints . getCount ( ) ) ; <nl> + <nl> + / / wait until hints have been send <nl> + spy . interceptMessageOut ( 100 ) . get ( ) ; <nl> + spy . interceptNoMsg ( 500 , TimeUnit . MILLISECONDS ) . get ( ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testPauseAndResume ( ) throws InterruptedException , ExecutionException <nl> + { <nl> + HintsService . instance . pauseDispatch ( ) ; <nl> + <nl> + / / create spy for hint messages <nl> + MockMessagingSpy spy = sendHintsAndResponses ( 100 , - 1 ) ; <nl> + <nl> + / / we should not send any hints while paused <nl> + ListenableFuture < Boolean > noMessagesWhilePaused = spy . interceptNoMsg ( 15 , TimeUnit . SECONDS ) ; <nl> + Futures . addCallback ( noMessagesWhilePaused , new MoreFutures . SuccessCallback < Boolean > ( ) <nl> + { <nl> + public void onSuccess ( @ Nullable Boolean aBoolean ) <nl> + { <nl> + HintsService . instance . resumeDispatch ( ) ; <nl> + } <nl> + } ) ; <nl> + <nl> + Futures . allAsList ( <nl> + noMessagesWhilePaused , <nl> + spy . interceptMessageOut ( 100 ) , <nl> + spy . interceptNoMsg ( 200 , TimeUnit . MILLISECONDS ) <nl> + ) . get ( ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testPageRetry ( ) throws InterruptedException , ExecutionException , TimeoutException <nl> + { <nl> + / / create spy for hint messages , but only create responses for 5 hints <nl> + MockMessagingSpy spy = sendHintsAndResponses ( 20 , 5 ) ; <nl> + <nl> + Futures . allAsList ( <nl> + / / the dispatcher will always send all hints within the current page <nl> + / / and only wait for the acks before going to the next page <nl> + spy . interceptMessageOut ( 20 ) , <nl> + spy . interceptNoMsg ( 200 , TimeUnit . MILLISECONDS ) , <nl> + <nl> + / / next tick will trigger a retry of the same page as we only replied with 5 / 20 acks <nl> + spy . interceptMessageOut ( 20 ) <nl> + ) . get ( ) ; <nl> + <nl> + / / marking the destination node as dead should stop sending hints <nl> + failureDetector . isAlive = false ; <nl> + spy . interceptNoMsg ( 20 , TimeUnit . SECONDS ) . get ( ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testPageSeek ( ) throws InterruptedException , ExecutionException <nl> + { <nl> + / / create spy for hint messages , stop replying after 12k ( should be on 3rd page ) <nl> + MockMessagingSpy spy = sendHintsAndResponses ( 20000 , 12000 ) ; <nl> + <nl> + / / At this point the dispatcher will constantly retry the page we stopped acking , <nl> + / / thus we receive the same hints from the page multiple times and in total more than <nl> + / / all written hints . Lets just consume them for a while and then pause the dispatcher . <nl> + spy . interceptMessageOut ( 22000 ) . get ( ) ; <nl> + HintsService . instance . pauseDispatch ( ) ; <nl> + Thread . sleep ( 1000 ) ; <nl> + <nl> + / / verify that we have a dispatch offset set for the page we ' re currently stuck at <nl> + HintsStore store = HintsService . instance . getCatalog ( ) . get ( StorageService . instance . getLocalHostUUID ( ) ) ; <nl> + HintsDescriptor descriptor = store . poll ( ) ; <nl> + store . offerFirst ( descriptor ) ; / / add again for cleanup during re - instanciation <nl> + InputPosition dispatchOffset = store . getDispatchOffset ( descriptor ) ; <nl> + assertTrue ( dispatchOffset ! = null ) ; <nl> + assertTrue ( ( ( ChecksummedDataInput . Position ) dispatchOffset ) . sourcePosition > 0 ) ; <nl> + } <nl> + <nl> + private MockMessagingSpy sendHintsAndResponses ( int noOfHints , int noOfResponses ) <nl> + { <nl> + / / create spy for hint messages , but only create responses for noOfResponses hints <nl> + MessageIn < HintResponse > messageIn = MessageIn . create ( FBUtilities . getBroadcastAddress ( ) , <nl> + HintResponse . instance , <nl> + Collections . emptyMap ( ) , <nl> + MessagingService . Verb . REQUEST _ RESPONSE , <nl> + MessagingService . current _ version , <nl> + MessageIn . createTimestamp ( ) ) ; <nl> + <nl> + MockMessagingSpy spy ; <nl> + if ( noOfResponses ! = - 1 ) <nl> + { <nl> + spy = MockMessagingService . when ( verb ( MessagingService . Verb . HINT ) ) . respondN ( messageIn , noOfResponses ) ; <nl> + } <nl> + else <nl> + { <nl> + spy = MockMessagingService . when ( verb ( MessagingService . Verb . HINT ) ) . respond ( messageIn ) ; <nl> + } <nl> + <nl> + / / create and write noOfHints using service <nl> + UUID hostId = StorageService . instance . getLocalHostUUID ( ) ; <nl> + for ( int i = 0 ; i < noOfHints ; i + + ) <nl> + { <nl> + long now = System . currentTimeMillis ( ) ; <nl> + DecoratedKey dkey = dk ( String . valueOf ( i ) ) ; <nl> + CFMetaData cfMetaData = Schema . instance . getCFMetaData ( KEYSPACE , TABLE ) ; <nl> + PartitionUpdate . SimpleBuilder builder = PartitionUpdate . simpleBuilder ( cfMetaData , dkey ) . timestamp ( now ) ; <nl> + builder . row ( " column0 " ) . add ( " val " , " value0 " ) ; <nl> + Hint hint = Hint . create ( builder . buildAsMutation ( ) , now ) ; <nl> + HintsService . instance . write ( hostId , hint ) ; <nl> + } <nl> + return spy ; <nl> + } <nl> + <nl> + private static class MockFailureDetector implements IFailureDetector <nl> + { <nl> + private boolean isAlive = true ; <nl> + <nl> + public boolean isAlive ( InetAddress ep ) <nl> + { <nl> + return isAlive ; <nl> + } <nl> + <nl> + public void interpret ( InetAddress ep ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + <nl> + public void report ( InetAddress ep ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + <nl> + public void registerFailureDetectionEventListener ( IFailureDetectionEventListener listener ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + <nl> + public void unregisterFailureDetectionEventListener ( IFailureDetectionEventListener listener ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + <nl> + public void remove ( InetAddress ep ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + <nl> + public void forceConviction ( InetAddress ep ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + } <nl> + }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 7be913e . . 7c5a752 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 2 , 6 + 2 , 8 @ @ <nl> * add command to stop compactions ( CASSANDRA - 1740 ) <nl> * filter out unavailable cipher suites when using encryption ( CASSANDRA - 3178 ) <nl> * ( HADOOP ) add old - style api support for CFIF and CFRR ( CASSANDRA - 2799 ) <nl> + * Support TimeUUIDType column names in Stress . java tool ( CASSANDRA - 3541 ) <nl> + <nl> <nl> 1 . 0 . 5 <nl> * revert CASSANDRA - 3407 ( see CASSANDRA - 3540 ) <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / Session . java b / tools / stress / src / org / apache / cassandra / stress / Session . java <nl> index abbea50 . . ddc6a69 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / Session . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / Session . java <nl> @ @ - 27 , 9 + 27 , 7 @ @ import java . util . concurrent . atomic . AtomicLong ; <nl> <nl> import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . config . ConfigurationException ; <nl> - import org . apache . cassandra . db . compaction . AbstractCompactionStrategy ; <nl> - import org . apache . cassandra . db . marshal . AbstractType ; <nl> - import org . apache . cassandra . db . marshal . TypeParser ; <nl> + import org . apache . cassandra . db . marshal . * ; <nl> import org . apache . commons . cli . * ; <nl> <nl> import org . apache . cassandra . db . ColumnFamilyType ; <nl> @ @ - 50 , 6 + 48 , 8 @ @ public class Session implements Serializable <nl> public static final String DEFAULT _ COMPARATOR = " AsciiType " ; <nl> public static final String DEFAULT _ VALIDATOR = " BytesType " ; <nl> <nl> + private static InetAddress localInetAddress ; <nl> + <nl> public final AtomicInteger operations ; <nl> public final AtomicInteger keys ; <nl> public final AtomicLong latency ; <nl> @ @ - 89 , 6 + 89 , 7 @ @ public class Session implements Serializable <nl> availableOptions . addOption ( " I " , " compression " , true , " Specify the compression to use for sstable , default : no compression " ) ; <nl> availableOptions . addOption ( " Q " , " query - names " , true , " Comma - separated list of column names to retrieve from each row . " ) ; <nl> availableOptions . addOption ( " Z " , " compaction - strategy " , true , " CompactionStrategy to use . " ) ; <nl> + availableOptions . addOption ( " U " , " comparator " , true , " Column Comparator to use . Currently supported types are : TimeUUIDType , AsciiType , UTF8Type . " ) ; <nl> } <nl> <nl> private int numKeys = 1000 * 1000 ; <nl> @ @ - 131 , 6 + 132 , 8 @ @ public class Session implements Serializable <nl> protected float sigma ; <nl> <nl> public final InetAddress sendToDaemon ; <nl> + public final String comparator ; <nl> + public final boolean timeUUIDComparator ; <nl> <nl> public Session ( String [ ] arguments ) throws IllegalArgumentException <nl> { <nl> @ @ - 321 , 6 + 324 , 35 @ @ public class Session implements Serializable <nl> System . exit ( 1 ) ; <nl> } <nl> } <nl> + <nl> + if ( cmd . hasOption ( " U " ) ) <nl> + { <nl> + AbstractType parsed = null ; <nl> + <nl> + try <nl> + { <nl> + parsed = TypeParser . parse ( cmd . getOptionValue ( " U " ) ) ; <nl> + } <nl> + catch ( ConfigurationException e ) <nl> + { <nl> + System . err . println ( e . getMessage ( ) ) ; <nl> + System . exit ( 1 ) ; <nl> + } <nl> + <nl> + comparator = cmd . getOptionValue ( " U " ) ; <nl> + timeUUIDComparator = parsed instanceof TimeUUIDType ; <nl> + <nl> + if ( ! ( parsed instanceof TimeUUIDType | | parsed instanceof AsciiType | | parsed instanceof UTF8Type ) ) <nl> + { <nl> + System . err . println ( " Currently supported types are : TimeUUIDType , AsciiType , UTF8Type . " ) ; <nl> + System . exit ( 1 ) ; <nl> + } <nl> + } <nl> + else <nl> + { <nl> + comparator = null ; <nl> + timeUUIDComparator = false ; <nl> + } <nl> } <nl> catch ( ParseException e ) <nl> { <nl> @ @ - 464 , 6 + 496 , 7 @ @ public class Session implements Serializable <nl> public void createKeySpaces ( ) <nl> { <nl> KsDef keyspace = new KsDef ( ) ; <nl> + String defaultComparator = comparator = = null ? DEFAULT _ COMPARATOR : comparator ; <nl> <nl> / / column family for standard columns <nl> CfDef standardCfDef = new CfDef ( " Keyspace1 " , " Standard1 " ) ; <nl> @ @ - 471 , 7 + 504 , 7 @ @ public class Session implements Serializable <nl> if ( compression ! = null ) <nl> compressionOptions . put ( " sstable _ compression " , compression ) ; <nl> <nl> - standardCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) <nl> + standardCfDef . setComparator _ type ( defaultComparator ) <nl> . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) <nl> . setCompression _ options ( compressionOptions ) ; <nl> <nl> @ @ - 485 , 7 + 518 , 7 @ @ public class Session implements Serializable <nl> / / column family with super columns <nl> CfDef superCfDef = new CfDef ( " Keyspace1 " , " Super1 " ) . setColumn _ type ( " Super " ) ; <nl> superCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) <nl> - . setSubcomparator _ type ( DEFAULT _ COMPARATOR ) <nl> + . setSubcomparator _ type ( defaultComparator ) <nl> . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) <nl> . setCompression _ options ( compressionOptions ) ; <nl> <nl> @ @ - 574 , 4 + 607 , 20 @ @ public class Session implements Serializable <nl> return client ; <nl> } <nl> <nl> + public static InetAddress getLocalAddress ( ) <nl> + { <nl> + if ( localInetAddress = = null ) <nl> + { <nl> + try <nl> + { <nl> + localInetAddress = InetAddress . getLocalHost ( ) ; <nl> + } <nl> + catch ( UnknownHostException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + return localInetAddress ; <nl> + } <nl> } <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java b / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java <nl> index 45d33cb . . c81df6f 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java <nl> @ @ - 52 , 9 + 52 , 9 @ @ public class Inserter extends Operation <nl> <nl> for ( int i = 0 ; i < session . getColumnsPerKey ( ) ; i + + ) <nl> { <nl> - String columnName = ( " C " + Integer . toString ( i ) ) ; <nl> - ByteBuffer columnValue = values . get ( i % values . size ( ) ) ; <nl> - columns . add ( new Column ( ByteBufferUtil . bytes ( columnName ) ) . setValue ( columnValue ) . setTimestamp ( System . currentTimeMillis ( ) ) ) ; <nl> + columns . add ( new Column ( columnName ( i , session . timeUUIDComparator ) ) <nl> + . setValue ( values . get ( i % values . size ( ) ) ) <nl> + . setTimestamp ( System . currentTimeMillis ( ) ) ) ; <nl> } <nl> <nl> if ( session . getColumnFamilyType ( ) = = ColumnFamilyType . Super ) <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / util / Operation . java b / tools / stress / src / org / apache / cassandra / stress / util / Operation . java <nl> index 10b97ad . . dd5128f 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / util / Operation . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / util / Operation . java <nl> @ @ - 27 , 11 + 27 , 14 @ @ import java . util . Random ; <nl> <nl> import static com . google . common . base . Charsets . UTF _ 8 ; <nl> <nl> + import org . apache . cassandra . db . marshal . TimeUUIDType ; <nl> import org . apache . cassandra . stress . Session ; <nl> import org . apache . cassandra . stress . Stress ; <nl> import org . apache . cassandra . thrift . Cassandra ; <nl> import org . apache . cassandra . thrift . InvalidRequestException ; <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . apache . cassandra . utils . UUIDGen ; <nl> <nl> public abstract class Operation <nl> { <nl> @ @ - 200 , 6 + 203 , 13 @ @ public abstract class Operation <nl> return result . toString ( ) ; <nl> } <nl> <nl> + protected ByteBuffer columnName ( int index , boolean timeUUIDComparator ) <nl> + { <nl> + return timeUUIDComparator <nl> + ? TimeUUIDType . instance . decompose ( UUIDGen . makeType1UUIDFromHost ( Session . getLocalAddress ( ) ) ) <nl> + : ByteBufferUtil . bytes ( String . format ( " C % d " , index ) ) ; <nl> + } <nl> + <nl> protected String getExceptionMessage ( Exception e ) <nl> { <nl> String className = e . getClass ( ) . getSimpleName ( ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 15e5001 . . 6fdc04a 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 32 , 6 + 32 , 7 @ @ 
+ 
+ 
+ 3 . 9 
+ + * Restore resumable hints delivery ( CASSANDRA - 11960 ) 
+ * Fix nodetool tablestats miss SSTable count ( CASSANDRA - 12205 ) 
+ * Fixed flacky SSTablesIteratedTest ( CASSANDRA - 12282 ) 
+ * Fixed flacky SSTableRewriterTest : check file counts before calling validateCFS ( CASSANDRA - 12348 ) 
+ diff - - git a / src / java / org / apache / cassandra / hints / ChecksummedDataInput . java b / src / java / org / apache / cassandra / hints / ChecksummedDataInput . java 
+ index 8bb5b6d . . 0db95af 100644 
+ - - - a / src / java / org / apache / cassandra / hints / ChecksummedDataInput . java 
+ + + + b / src / java / org / apache / cassandra / hints / ChecksummedDataInput . java 
+ @ @ - 26 , 18 + 26 , 19 @ @ import com . google . common . base . Preconditions ; 
+ 
+ import org . apache . cassandra . io . compress . BufferType ; 
+ import org . apache . cassandra . io . util . * ; 
+ + import org . apache . cassandra . utils . CLibrary ; 
+ import org . apache . cassandra . utils . memory . BufferPool ; 
+ 
+ / * * 
+ - * A { @ link RandomAccessReader } wrapper that calctulates the CRC in place . 
+ + * A { @ link RandomAccessReader } wrapper that calculates the CRC in place . 
+ * 
+ * Useful for { @ link org . apache . cassandra . hints . HintsReader } , for example , where we must verify the CRC , yet don ' t want 
+ * to allocate an extra byte array just that purpose . The CRC can be embedded in the input stream and checked via checkCrc ( ) . 
+ * 
+ - * In addition to calculating the CRC , it allows to enforce a maximim known size . This is needed 
+ + * In addition to calculating the CRC , it allows to enforce a maximum known size . This is needed 
+ * so that { @ link org . apache . cassandra . db . Mutation . MutationSerializer } doesn ' t blow up the heap when deserializing a 
+ * corrupted sequence by reading a huge corrupted length of bytes via 
+ - * via { @ link org . apache . cassandra . utils . ByteBufferUtil # readWithLength ( java . io . DataInput ) } . 
+ + * { @ link org . apache . cassandra . utils . ByteBufferUtil # readWithLength ( java . io . DataInput ) } . 
+ * / 
+ public class ChecksummedDataInput extends RebufferingInputStream 
+ { 
+ @ @ - 81 , 13 + 82 , 37 @ @ public class ChecksummedDataInput extends RebufferingInputStream 
+ return getPosition ( ) = = channel . size ( ) ; 
+ } 
+ 
+ + static class Position implements InputPosition 
+ + { 
+ + final long sourcePosition ; 
+ + 
+ + public Position ( long sourcePosition ) 
+ + { 
+ + super ( ) ; 
+ + this . sourcePosition = sourcePosition ; 
+ + } 
+ + 
+ + @ Override 
+ + public long subtract ( InputPosition other ) 
+ + { 
+ + return sourcePosition - ( ( Position ) other ) . sourcePosition ; 
+ + } 
+ + } 
+ + 
+ / * * 
+ - * Returns the position in the source file , which is different for getPosition ( ) for compressed / encrypted files 
+ - * and may be imprecise . 
+ + * Return a seekable representation of the current position . For compressed files this is chunk position 
+ + * in file and offset within chunk . 
+ * / 
+ - public long getSourcePosition ( ) 
+ + public InputPosition getSeekPosition ( ) 
+ { 
+ - return getPosition ( ) ; 
+ + return new Position ( getPosition ( ) ) ; 
+ + } 
+ + 
+ + public void seek ( InputPosition pos ) 
+ + { 
+ + updateCrc ( ) ; 
+ + bufferOffset = ( ( Position ) pos ) . sourcePosition ; 
+ + buffer . position ( 0 ) . limit ( 0 ) ; 
+ } 
+ 
+ public void resetCrc ( ) 
+ @ @ - 110 , 6 + 135 , 15 @ @ public class ChecksummedDataInput extends RebufferingInputStream 
+ return bufferOffset + buffer . position ( ) ; 
+ } 
+ 
+ + / * * 
+ + * Returns the position in the source file , which is different for getPosition ( ) for compressed / encrypted files 
+ + * and may be imprecise . 
+ + * / 
+ + protected long getSourcePosition ( ) 
+ + { 
+ + return bufferOffset ; 
+ + } 
+ + 
+ public void resetLimit ( ) 
+ { 
+ limit = Long . MAX _ VALUE ; 
+ @ @ - 179 , 6 + 213 , 11 @ @ public class ChecksummedDataInput extends RebufferingInputStream 
+ buffer . flip ( ) ; 
+ } 
+ 
+ + public void tryUncacheRead ( ) 
+ + { 
+ + CLibrary . trySkipCache ( getChannel ( ) . getFileDescriptor ( ) , 0 , getSourcePosition ( ) , getPath ( ) ) ; 
+ + } 
+ + 
+ private void updateCrc ( ) 
+ { 
+ if ( crcPosition = = buffer . position ( ) | | crcUpdateDisabled ) 
+ diff - - git a / src / java / org / apache / cassandra / hints / CompressedChecksummedDataInput . java b / src / java / org / apache / cassandra / hints / CompressedChecksummedDataInput . java 
+ index f584dd1 . . 0766fa5 100644 
+ - - - a / src / java / org / apache / cassandra / hints / CompressedChecksummedDataInput . java 
+ + + + b / src / java / org / apache / cassandra / hints / CompressedChecksummedDataInput . java 
+ @ @ - 23 , 6 + 23 , 7 @ @ import java . nio . ByteBuffer ; 
+ 
+ import com . google . common . annotations . VisibleForTesting ; 
+ 
+ + import org . apache . cassandra . hints . ChecksummedDataInput . Position ; 
+ import org . apache . cassandra . io . FSReadError ; 
+ import org . apache . cassandra . io . compress . ICompressor ; 
+ import org . apache . cassandra . io . util . ChannelProxy ; 
+ @ @ - 31 , 7 + 32 , 8 @ @ import org . apache . cassandra . utils . memory . BufferPool ; 
+ public final class CompressedChecksummedDataInput extends ChecksummedDataInput 
+ { 
+ private final ICompressor compressor ; 
+ - private volatile long filePosition = 0 ; 
+ + private volatile long filePosition = 0 ; / / Current position in file , advanced when reading chunk . 
+ + private volatile long sourcePosition = 0 ; / / Current position in file to report , advanced after consuming chunk . 
+ private volatile ByteBuffer compressedBuffer = null ; 
+ private final ByteBuffer metadataBuffer = ByteBuffer . allocate ( CompressedHintsWriter . METADATA _ SIZE ) ; 
+ 
+ @ @ - 39 , 7 + 41 , 7 @ @ public final class CompressedChecksummedDataInput extends ChecksummedDataInput 
+ { 
+ super ( channel , compressor . preferredBufferType ( ) ) ; 
+ this . compressor = compressor ; 
+ - this . filePosition = filePosition ; 
+ + this . sourcePosition = this . filePosition = filePosition ; 
+ } 
+ 
+ / * * 
+ @ @ - 53 , 12 + 55 , 55 @ @ public final class CompressedChecksummedDataInput extends ChecksummedDataInput 
+ 
+ public long getSourcePosition ( ) 
+ { 
+ - return filePosition ; 
+ + return sourcePosition ; 
+ + } 
+ + 
+ + static class Position extends ChecksummedDataInput . Position 
+ + { 
+ + final long bufferStart ; 
+ + final int bufferPosition ; 
+ + 
+ + public Position ( long sourcePosition , long bufferStart , int bufferPosition ) 
+ + { 
+ + super ( sourcePosition ) ; 
+ + this . bufferStart = bufferStart ; 
+ + this . bufferPosition = bufferPosition ; 
+ + } 
+ + 
+ + @ Override 
+ + public long subtract ( InputPosition o ) 
+ + { 
+ + Position other = ( Position ) o ; 
+ + return bufferStart - other . bufferStart + bufferPosition - other . bufferPosition ; 
+ + } 
+ + } 
+ + 
+ + public InputPosition getSeekPosition ( ) 
+ + { 
+ + return new Position ( sourcePosition , bufferOffset , buffer . position ( ) ) ; 
+ + } 
+ + 
+ + public void seek ( InputPosition p ) 
+ + { 
+ + Position pos = ( Position ) p ; 
+ + bufferOffset = pos . bufferStart ; 
+ + filePosition = pos . sourcePosition ; 
+ + buffer . position ( 0 ) . limit ( 0 ) ; 
+ + resetCrc ( ) ; 
+ + reBuffer ( ) ; 
+ + buffer . position ( pos . bufferPosition ) ; 
+ + assert sourcePosition = = pos . sourcePosition ; 
+ + assert bufferOffset = = pos . bufferStart ; 
+ + assert buffer . position ( ) = = pos . bufferPosition ; 
+ } 
+ 
+ @ Override 
+ protected void readBuffer ( ) 
+ { 
+ + sourcePosition = filePosition ; 
+ + if ( isEOF ( ) ) 
+ + return ; 
+ + 
+ metadataBuffer . clear ( ) ; 
+ channel . read ( metadataBuffer , filePosition ) ; 
+ filePosition + = CompressedHintsWriter . METADATA _ SIZE ; 
+ diff - - git a / src / java / org / apache / cassandra / hints / EncryptedChecksummedDataInput . java b / src / java / org / apache / cassandra / hints / EncryptedChecksummedDataInput . java 
+ index 7ecfbfe . . b335226 100644 
+ - - - a / src / java / org / apache / cassandra / hints / EncryptedChecksummedDataInput . java 
+ + + + b / src / java / org / apache / cassandra / hints / EncryptedChecksummedDataInput . java 
+ @ @ - 24 , 6 + 24 , 7 @ @ import javax . crypto . Cipher ; 
+ import com . google . common . annotations . VisibleForTesting ; 
+ 
+ import org . apache . cassandra . security . EncryptionUtils ; 
+ + import org . apache . cassandra . hints . CompressedChecksummedDataInput . Position ; 
+ import org . apache . cassandra . io . FSReadError ; 
+ import org . apache . cassandra . io . compress . ICompressor ; 
+ import org . apache . cassandra . io . util . ChannelProxy ; 
+ @ @ - 42 , 6 + 43 , 7 @ @ public class EncryptedChecksummedDataInput extends ChecksummedDataInput 
+ private final ICompressor compressor ; 
+ 
+ private final EncryptionUtils . ChannelProxyReadChannel readChannel ; 
+ + private long sourcePosition ; 
+ 
+ protected EncryptedChecksummedDataInput ( ChannelProxy channel , Cipher cipher , ICompressor compressor , long filePosition ) 
+ { 
+ @ @ - 49 , 6 + 51 , 7 @ @ public class EncryptedChecksummedDataInput extends ChecksummedDataInput 
+ this . cipher = cipher ; 
+ this . compressor = compressor ; 
+ readChannel = new EncryptionUtils . ChannelProxyReadChannel ( channel , filePosition ) ; 
+ + this . sourcePosition = filePosition ; 
+ assert cipher ! = null ; 
+ assert compressor ! = null ; 
+ } 
+ @ @ - 59 , 17 + 62 , 60 @ @ public class EncryptedChecksummedDataInput extends ChecksummedDataInput 
+ * / 
+ public boolean isEOF ( ) 
+ { 
+ - return getSourcePosition ( ) = = channel . size ( ) & & buffer . remaining ( ) = = 0 ; 
+ + return readChannel . getCurrentPosition ( ) = = channel . size ( ) & & buffer . remaining ( ) = = 0 ; 
+ } 
+ 
+ public long getSourcePosition ( ) 
+ { 
+ - return readChannel . getCurrentPosition ( ) ; 
+ + return sourcePosition ; 
+ + } 
+ + 
+ + static class Position extends ChecksummedDataInput . Position 
+ + { 
+ + final long bufferStart ; 
+ + final int bufferPosition ; 
+ + 
+ + public Position ( long sourcePosition , long bufferStart , int bufferPosition ) 
+ + { 
+ + super ( sourcePosition ) ; 
+ + this . bufferStart = bufferStart ; 
+ + this . bufferPosition = bufferPosition ; 
+ + } 
+ + 
+ + @ Override 
+ + public long subtract ( InputPosition o ) 
+ + { 
+ + Position other = ( Position ) o ; 
+ + return bufferStart - other . bufferStart + bufferPosition - other . bufferPosition ; 
+ + } 
+ + } 
+ + 
+ + public InputPosition getSeekPosition ( ) 
+ + { 
+ + return new Position ( sourcePosition , bufferOffset , buffer . position ( ) ) ; 
+ + } 
+ + 
+ + public void seek ( InputPosition p ) 
+ + { 
+ + Position pos = ( Position ) p ; 
+ + bufferOffset = pos . bufferStart ; 
+ + readChannel . setPosition ( pos . sourcePosition ) ; 
+ + buffer . position ( 0 ) . limit ( 0 ) ; 
+ + resetCrc ( ) ; 
+ + reBuffer ( ) ; 
+ + buffer . position ( pos . bufferPosition ) ; 
+ + assert sourcePosition = = pos . sourcePosition ; 
+ + assert bufferOffset = = pos . bufferStart ; 
+ + assert buffer . position ( ) = = pos . bufferPosition ; 
+ } 
+ 
+ @ Override 
+ protected void readBuffer ( ) 
+ { 
+ + this . sourcePosition = readChannel . getCurrentPosition ( ) ; 
+ + if ( isEOF ( ) ) 
+ + return ; 
+ + 
+ try 
+ { 
+ ByteBuffer byteBuffer = reusableBuffers . get ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / hints / HintsDispatchExecutor . java b / src / java / org / apache / cassandra / hints / HintsDispatchExecutor . java 
+ index 5292dc1 . . d7ccf81 100644 
+ - - - a / src / java / org / apache / cassandra / hints / HintsDispatchExecutor . java 
+ + + + b / src / java / org / apache / cassandra / hints / HintsDispatchExecutor . java 
+ @ @ - 23 , 6 + 23 , 8 @ @ import java . util . Map ; 
+ import java . util . UUID ; 
+ import java . util . concurrent . * ; 
+ import java . util . concurrent . atomic . AtomicBoolean ; 
+ + import java . util . function . BooleanSupplier ; 
+ + import java . util . function . Function ; 
+ import java . util . function . Supplier ; 
+ 
+ import com . google . common . util . concurrent . RateLimiter ; 
+ @ @ - 48 , 12 + 50 , 14 @ @ final class HintsDispatchExecutor 
+ private final File hintsDirectory ; 
+ private final ExecutorService executor ; 
+ private final AtomicBoolean isPaused ; 
+ + private final Function < InetAddress , Boolean > isAlive ; 
+ private final Map < UUID , Future > scheduledDispatches ; 
+ 
+ - HintsDispatchExecutor ( File hintsDirectory , int maxThreads , AtomicBoolean isPaused ) 
+ + HintsDispatchExecutor ( File hintsDirectory , int maxThreads , AtomicBoolean isPaused , Function < InetAddress , Boolean > isAlive ) 
+ { 
+ this . hintsDirectory = hintsDirectory ; 
+ this . isPaused = isPaused ; 
+ + this . isAlive = isAlive ; 
+ 
+ scheduledDispatches = new ConcurrentHashMap < > ( ) ; 
+ executor = new JMXEnabledThreadPoolExecutor ( 1 , 
+ @ @ - 72 , 6 + 76 , 14 @ @ final class HintsDispatchExecutor 
+ { 
+ scheduledDispatches . clear ( ) ; 
+ executor . shutdownNow ( ) ; 
+ + try 
+ + { 
+ + executor . awaitTermination ( 1 , TimeUnit . MINUTES ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + throw new AssertionError ( e ) ; 
+ + } 
+ } 
+ 
+ boolean isScheduled ( HintsStore store ) 
+ @ @ - 249 , 9 + 261 , 10 @ @ final class HintsDispatchExecutor 
+ private boolean deliver ( HintsDescriptor descriptor , InetAddress address ) 
+ { 
+ File file = new File ( hintsDirectory , descriptor . fileName ( ) ) ; 
+ - Long offset = store . getDispatchOffset ( descriptor ) . orElse ( null ) ; 
+ + InputPosition offset = store . getDispatchOffset ( descriptor ) ; 
+ 
+ - try ( HintsDispatcher dispatcher = HintsDispatcher . create ( file , rateLimiter , address , descriptor . hostId , isPaused ) ) 
+ + BooleanSupplier shouldAbort = ( ) - > ! isAlive . apply ( address ) | | isPaused . get ( ) ; 
+ + try ( HintsDispatcher dispatcher = HintsDispatcher . create ( file , rateLimiter , address , descriptor . hostId , shouldAbort ) ) 
+ { 
+ if ( offset ! = null ) 
+ dispatcher . seek ( offset ) ; 
+ @ @ - 265 , 7 + 278 , 7 @ @ final class HintsDispatchExecutor 
+ } 
+ else 
+ { 
+ - store . markDispatchOffset ( descriptor , dispatcher . dispatchOffset ( ) ) ; 
+ + store . markDispatchOffset ( descriptor , dispatcher . dispatchPosition ( ) ) ; 
+ store . offerFirst ( descriptor ) ; 
+ logger . info ( " Finished hinted handoff of file { } to endpoint { } , partially " , descriptor . fileName ( ) , hostId ) ; 
+ return false ; 
+ diff - - git a / src / java / org / apache / cassandra / hints / HintsDispatcher . java b / src / java / org / apache / cassandra / hints / HintsDispatcher . java 
+ index e582d88 . . 00ef52b 100644 
+ - - - a / src / java / org / apache / cassandra / hints / HintsDispatcher . java 
+ + + + b / src / java / org / apache / cassandra / hints / HintsDispatcher . java 
+ @ @ - 22 , 13 + 22 , 12 @ @ import java . net . InetAddress ; 
+ import java . nio . ByteBuffer ; 
+ import java . util . * ; 
+ import java . util . concurrent . TimeUnit ; 
+ - import java . util . concurrent . atomic . AtomicBoolean ; 
+ + import java . util . function . BooleanSupplier ; 
+ import java . util . function . Function ; 
+ 
+ import com . google . common . util . concurrent . RateLimiter ; 
+ 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - import org . apache . cassandra . gms . FailureDetector ; 
+ import org . apache . cassandra . net . IAsyncCallbackWithFailure ; 
+ import org . apache . cassandra . net . MessageIn ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ @ @ - 42 , 31 + 41 , 31 @ @ import org . apache . cassandra . utils . concurrent . SimpleCondition ; 
+ * / 
+ final class HintsDispatcher implements AutoCloseable 
+ { 
+ - private enum Action { CONTINUE , ABORT , RETRY } 
+ + private enum Action { CONTINUE , ABORT } 
+ 
+ private final HintsReader reader ; 
+ private final UUID hostId ; 
+ private final InetAddress address ; 
+ private final int messagingVersion ; 
+ - private final AtomicBoolean isPaused ; 
+ + private final BooleanSupplier abortRequested ; 
+ 
+ - private long currentPageOffset ; 
+ + private InputPosition currentPagePosition ; 
+ 
+ - private HintsDispatcher ( HintsReader reader , UUID hostId , InetAddress address , int messagingVersion , AtomicBoolean isPaused ) 
+ + private HintsDispatcher ( HintsReader reader , UUID hostId , InetAddress address , int messagingVersion , BooleanSupplier abortRequested ) 
+ { 
+ - currentPageOffset = 0L ; 
+ + currentPagePosition = null ; 
+ 
+ this . reader = reader ; 
+ this . hostId = hostId ; 
+ this . address = address ; 
+ this . messagingVersion = messagingVersion ; 
+ - this . isPaused = isPaused ; 
+ + this . abortRequested = abortRequested ; 
+ } 
+ 
+ - static HintsDispatcher create ( File file , RateLimiter rateLimiter , InetAddress address , UUID hostId , AtomicBoolean isPaused ) 
+ + static HintsDispatcher create ( File file , RateLimiter rateLimiter , InetAddress address , UUID hostId , BooleanSupplier abortRequested ) 
+ { 
+ int messagingVersion = MessagingService . instance ( ) . getVersion ( address ) ; 
+ - return new HintsDispatcher ( HintsReader . open ( file , rateLimiter ) , hostId , address , messagingVersion , isPaused ) ; 
+ + return new HintsDispatcher ( HintsReader . open ( file , rateLimiter ) , hostId , address , messagingVersion , abortRequested ) ; 
+ } 
+ 
+ public void close ( ) 
+ @ @ - 74 , 10 + 73 , 9 @ @ final class HintsDispatcher implements AutoCloseable 
+ reader . close ( ) ; 
+ } 
+ 
+ - void seek ( long bytes ) 
+ + void seek ( InputPosition position ) 
+ { 
+ - reader . seek ( bytes ) ; 
+ - currentPageOffset = 0L ; 
+ + reader . seek ( position ) ; 
+ } 
+ 
+ / * * 
+ @ @ - 87 , 7 + 85 , 7 @ @ final class HintsDispatcher implements AutoCloseable 
+ { 
+ for ( HintsReader . Page page : reader ) 
+ { 
+ - currentPageOffset = page . offset ; 
+ + currentPagePosition = page . position ; 
+ if ( dispatch ( page ) ! = Action . CONTINUE ) 
+ return false ; 
+ } 
+ @ @ - 98 , 28 + 96 , 16 @ @ final class HintsDispatcher implements AutoCloseable 
+ / * * 
+ * @ return offset of the first non - delivered page 
+ * / 
+ - long dispatchOffset ( ) 
+ + InputPosition dispatchPosition ( ) 
+ { 
+ - return currentPageOffset ; 
+ + return currentPagePosition ; 
+ } 
+ 
+ - private boolean isHostAlive ( ) 
+ - { 
+ - return FailureDetector . instance . isAlive ( address ) ; 
+ - } 
+ - 
+ - private boolean isPaused ( ) 
+ - { 
+ - return isPaused . get ( ) ; 
+ - } 
+ 
+ / / retry in case of a timeout ; stop in case of a failure , host going down , or delivery paused 
+ private Action dispatch ( HintsReader . Page page ) 
+ { 
+ - Action action = sendHintsAndAwait ( page ) ; 
+ - return action = = Action . RETRY 
+ - ? dispatch ( page ) 
+ - : action ; 
+ + return sendHintsAndAwait ( page ) ; 
+ } 
+ 
+ private Action sendHintsAndAwait ( HintsReader . Page page ) 
+ @ @ - 142 , 7 + 128 , 7 @ @ final class HintsDispatcher implements AutoCloseable 
+ 
+ for ( Callback cb : callbacks ) 
+ if ( cb . await ( ) ! = Callback . Outcome . SUCCESS ) 
+ - return Action . RETRY ; 
+ + return Action . ABORT ; 
+ 
+ return Action . CONTINUE ; 
+ } 
+ @ @ - 155 , 7 + 141 , 7 @ @ final class HintsDispatcher implements AutoCloseable 
+ { 
+ while ( hints . hasNext ( ) ) 
+ { 
+ - if ( ! isHostAlive ( ) | | isPaused ( ) ) 
+ + if ( abortRequested . getAsBoolean ( ) ) 
+ return Action . ABORT ; 
+ callbacks . add ( sendFunction . apply ( hints . next ( ) ) ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / hints / HintsReader . java b / src / java / org / apache / cassandra / hints / HintsReader . java 
+ index 5e73805 . . e0a73c1 100644 
+ - - - a / src / java / org / apache / cassandra / hints / HintsReader . java 
+ + + + b / src / java / org / apache / cassandra / hints / HintsReader . java 
+ @ @ - 109 , 9 + 109 , 9 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > 
+ return descriptor ; 
+ } 
+ 
+ - void seek ( long newPosition ) 
+ + void seek ( InputPosition newPosition ) 
+ { 
+ - throw new UnsupportedOperationException ( " Hints are not seekable . " ) ; 
+ + input . seek ( newPosition ) ; 
+ } 
+ 
+ public Iterator < Page > iterator ( ) 
+ @ @ - 126 , 21 + 126 , 21 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > 
+ 
+ final class Page 
+ { 
+ - public final long offset ; 
+ + public final InputPosition position ; 
+ 
+ - private Page ( long offset ) 
+ + private Page ( InputPosition inputPosition ) 
+ { 
+ - this . offset = offset ; 
+ + this . position = inputPosition ; 
+ } 
+ 
+ Iterator < Hint > hintsIterator ( ) 
+ { 
+ - return new HintsIterator ( offset ) ; 
+ + return new HintsIterator ( position ) ; 
+ } 
+ 
+ Iterator < ByteBuffer > buffersIterator ( ) 
+ { 
+ - return new BuffersIterator ( offset ) ; 
+ + return new BuffersIterator ( position ) ; 
+ } 
+ } 
+ 
+ @ @ - 149 , 12 + 149 , 12 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > 
+ @ SuppressWarnings ( " resource " ) 
+ protected Page computeNext ( ) 
+ { 
+ - CLibrary . trySkipCache ( input . getChannel ( ) . getFileDescriptor ( ) , 0 , input . getSourcePosition ( ) , input . getPath ( ) ) ; 
+ + input . tryUncacheRead ( ) ; 
+ 
+ if ( input . isEOF ( ) ) 
+ return endOfData ( ) ; 
+ 
+ - return new Page ( input . getSourcePosition ( ) ) ; 
+ + return new Page ( input . getSeekPosition ( ) ) ; 
+ } 
+ } 
+ 
+ @ @ - 163 , 9 + 163 , 9 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > 
+ * / 
+ final class HintsIterator extends AbstractIterator < Hint > 
+ { 
+ - private final long offset ; 
+ + private final InputPosition offset ; 
+ 
+ - HintsIterator ( long offset ) 
+ + HintsIterator ( InputPosition offset ) 
+ { 
+ super ( ) ; 
+ this . offset = offset ; 
+ @ @ - 177 , 12 + 177 , 12 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > 
+ 
+ do 
+ { 
+ - long position = input . getSourcePosition ( ) ; 
+ + InputPosition position = input . getSeekPosition ( ) ; 
+ 
+ if ( input . isEOF ( ) ) 
+ return endOfData ( ) ; / / reached EOF 
+ 
+ - if ( position - offset > = PAGE _ SIZE ) 
+ + if ( position . subtract ( offset ) > = PAGE _ SIZE ) 
+ return endOfData ( ) ; / / read page size or more bytes 
+ 
+ try 
+ @ @ - 253 , 9 + 253 , 9 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > 
+ * / 
+ final class BuffersIterator extends AbstractIterator < ByteBuffer > 
+ { 
+ - private final long offset ; 
+ + private final InputPosition offset ; 
+ 
+ - BuffersIterator ( long offset ) 
+ + BuffersIterator ( InputPosition offset ) 
+ { 
+ super ( ) ; 
+ this . offset = offset ; 
+ @ @ - 267 , 12 + 267 , 12 @ @ class HintsReader implements AutoCloseable , Iterable < HintsReader . Page > 
+ 
+ do 
+ { 
+ - long position = input . getSourcePosition ( ) ; 
+ + InputPosition position = input . getSeekPosition ( ) ; 
+ 
+ if ( input . isEOF ( ) ) 
+ return endOfData ( ) ; / / reached EOF 
+ 
+ - if ( position - offset > = PAGE _ SIZE ) 
+ + if ( position . subtract ( offset ) > = PAGE _ SIZE ) 
+ return endOfData ( ) ; / / read page size or more bytes 
+ 
+ try 
+ diff - - git a / src / java / org / apache / cassandra / hints / HintsService . java b / src / java / org / apache / cassandra / hints / HintsService . java 
+ index 5a32786 . . 1a3a403 100644 
+ - - - a / src / java / org / apache / cassandra / hints / HintsService . java 
+ + + + b / src / java / org / apache / cassandra / hints / HintsService . java 
+ @ @ - 30 , 6 + 30 , 7 @ @ import java . util . function . Supplier ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . ObjectName ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . collect . ImmutableMap ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 37 , 6 + 38 , 8 @ @ import org . slf4j . LoggerFactory ; 
+ import org . apache . cassandra . concurrent . ScheduledExecutors ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . config . ParameterizedClass ; 
+ + import org . apache . cassandra . gms . FailureDetector ; 
+ + import org . apache . cassandra . gms . IFailureDetector ; 
+ import org . apache . cassandra . metrics . HintedHandoffMetrics ; 
+ import org . apache . cassandra . metrics . StorageMetrics ; 
+ import org . apache . cassandra . dht . Token ; 
+ @ @ - 60 , 7 + 63 , 7 @ @ public final class HintsService implements HintsServiceMBean 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( HintsService . class ) ; 
+ 
+ - public static final HintsService instance = new HintsService ( ) ; 
+ + public static HintsService instance = new HintsService ( ) ; 
+ 
+ private static final String MBEAN _ NAME = " org . apache . cassandra . hints : type = HintsService " ; 
+ 
+ @ @ - 82 , 6 + 85 , 12 @ @ public final class HintsService implements HintsServiceMBean 
+ 
+ private HintsService ( ) 
+ { 
+ + this ( FailureDetector . instance ) ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + HintsService ( IFailureDetector failureDetector ) 
+ + { 
+ File hintsDirectory = DatabaseDescriptor . getHintsDirectory ( ) ; 
+ int maxDeliveryThreads = DatabaseDescriptor . getMaxHintsDeliveryThreads ( ) ; 
+ 
+ @ @ - 92 , 7 + 101 , 7 @ @ public final class HintsService implements HintsServiceMBean 
+ bufferPool = new HintsBufferPool ( bufferSize , writeExecutor : : flushBuffer ) ; 
+ 
+ isDispatchPaused = new AtomicBoolean ( true ) ; 
+ - dispatchExecutor = new HintsDispatchExecutor ( hintsDirectory , maxDeliveryThreads , isDispatchPaused ) ; 
+ + dispatchExecutor = new HintsDispatchExecutor ( hintsDirectory , maxDeliveryThreads , isDispatchPaused , failureDetector : : isAlive ) ; 
+ 
+ / / periodically empty the current content of the buffers 
+ int flushPeriod = DatabaseDescriptor . getHintsFlushPeriodInMS ( ) ; 
+ @ @ - 225 , 7 + 234 , 7 @ @ public final class HintsService implements HintsServiceMBean 
+ * Will abort dispatch sessions that are currently in progress ( which is okay , it ' s idempotent ) , 
+ * and make sure the buffers are flushed , hints files written and fsynced . 
+ * / 
+ - public synchronized void shutdownBlocking ( ) 
+ + public synchronized void shutdownBlocking ( ) throws ExecutionException , InterruptedException 
+ { 
+ if ( isShutDown ) 
+ throw new IllegalStateException ( " HintsService has already been shut down " ) ; 
+ @ @ - 237 , 8 + 246 , 8 @ @ public final class HintsService implements HintsServiceMBean 
+ 
+ triggerFlushingFuture . cancel ( false ) ; 
+ 
+ - writeExecutor . flushBufferPool ( bufferPool ) ; 
+ - writeExecutor . closeAllWriters ( ) ; 
+ + writeExecutor . flushBufferPool ( bufferPool ) . get ( ) ; 
+ + writeExecutor . closeAllWriters ( ) . get ( ) ; 
+ 
+ dispatchExecutor . shutdownBlocking ( ) ; 
+ writeExecutor . shutdownBlocking ( ) ; 
+ @ @ - 369 , 4 + 378 , 12 @ @ public final class HintsService implements HintsServiceMBean 
+ { 
+ return catalog ; 
+ } 
+ + 
+ + / * * 
+ + * Returns true in case service is shut down . 
+ + * / 
+ + public boolean isShutDown ( ) 
+ + { 
+ + return isShutDown ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / hints / HintsStore . java b / src / java / org / apache / cassandra / hints / HintsStore . java 
+ index c066331 . . 3572172 100644 
+ - - - a / src / java / org / apache / cassandra / hints / HintsStore . java 
+ + + + b / src / java / org / apache / cassandra / hints / HintsStore . java 
+ @ @ - 49 , 7 + 49 , 7 @ @ final class HintsStore 
+ private final File hintsDirectory ; 
+ private final ImmutableMap < String , Object > writerParams ; 
+ 
+ - private final Map < HintsDescriptor , Long > dispatchOffsets ; 
+ + private final Map < HintsDescriptor , InputPosition > dispatchPositions ; 
+ private final Deque < HintsDescriptor > dispatchDequeue ; 
+ private final Queue < HintsDescriptor > blacklistedFiles ; 
+ 
+ @ @ - 63 , 7 + 63 , 7 @ @ final class HintsStore 
+ this . hintsDirectory = hintsDirectory ; 
+ this . writerParams = writerParams ; 
+ 
+ - dispatchOffsets = new ConcurrentHashMap < > ( ) ; 
+ + dispatchPositions = new ConcurrentHashMap < > ( ) ; 
+ dispatchDequeue = new ConcurrentLinkedDeque < > ( descriptors ) ; 
+ blacklistedFiles = new ConcurrentLinkedQueue < > ( ) ; 
+ 
+ @ @ - 136 , 19 + 136 , 19 @ @ final class HintsStore 
+ return ! dispatchDequeue . isEmpty ( ) ; 
+ } 
+ 
+ - Optional < Long > getDispatchOffset ( HintsDescriptor descriptor ) 
+ + InputPosition getDispatchOffset ( HintsDescriptor descriptor ) 
+ { 
+ - return Optional . ofNullable ( dispatchOffsets . get ( descriptor ) ) ; 
+ + return dispatchPositions . get ( descriptor ) ; 
+ } 
+ 
+ - void markDispatchOffset ( HintsDescriptor descriptor , long mark ) 
+ + void markDispatchOffset ( HintsDescriptor descriptor , InputPosition inputPosition ) 
+ { 
+ - dispatchOffsets . put ( descriptor , mark ) ; 
+ + dispatchPositions . put ( descriptor , inputPosition ) ; 
+ } 
+ 
+ void cleanUp ( HintsDescriptor descriptor ) 
+ { 
+ - dispatchOffsets . remove ( descriptor ) ; 
+ + dispatchPositions . remove ( descriptor ) ; 
+ } 
+ 
+ void blacklist ( HintsDescriptor descriptor ) 
+ diff - - git a / src / java / org / apache / cassandra / hints / InputPosition . java b / src / java / org / apache / cassandra / hints / InputPosition . java 
+ new file mode 100644 
+ index 0000000 . . 05f9db0 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / hints / InputPosition . java 
+ @ @ - 0 , 0 + 1 , 9 @ @ 
+ + package org . apache . cassandra . hints ; 
+ + 
+ + / * * 
+ + * Marker interface for file positions as provided by the various ChecksummedDataReader implementations . 
+ + * / 
+ + public interface InputPosition 
+ + { 
+ + long subtract ( InputPosition other ) ; 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / security / EncryptionUtils . java b / src / java / org / apache / cassandra / security / EncryptionUtils . java 
+ index 7e72b3e . . b262259 100644 
+ - - - a / src / java / org / apache / cassandra / security / EncryptionUtils . java 
+ + + + b / src / java / org / apache / cassandra / security / EncryptionUtils . java 
+ @ @ - 309 , 5 + 309 , 10 @ @ public class EncryptionUtils 
+ { 
+ / / nop 
+ } 
+ + 
+ + public void setPosition ( long sourcePosition ) 
+ + { 
+ + this . currentPosition = sourcePosition ; 
+ + } 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index 0a95827 . . e3b4752 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 570 , 7 + 570 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ drainOnShutdown = new Thread ( new WrappedRunnable ( ) 
+ { 
+ @ Override 
+ - public void runMayThrow ( ) throws InterruptedException 
+ + public void runMayThrow ( ) throws InterruptedException , ExecutionException 
+ { 
+ inShutdownHook = true ; 
+ ExecutorService viewMutationStage = StageManager . getStage ( Stage . VIEW _ MUTATION ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / hints / AlteredHints . java b / test / unit / org / apache / cassandra / hints / AlteredHints . java 
+ index 23dc32a . . 7efe08f 100644 
+ - - - a / test / unit / org / apache / cassandra / hints / AlteredHints . java 
+ + + + b / test / unit / org / apache / cassandra / hints / AlteredHints . java 
+ @ @ - 107 , 9 + 107 , 11 @ @ public abstract class AlteredHints 
+ { 
+ Assert . assertTrue ( looksLegit ( reader . getInput ( ) ) ) ; 
+ List < Hint > deserialized = new ArrayList < > ( hintNum ) ; 
+ + List < InputPosition > pagePositions = new ArrayList < > ( hintNum ) ; 
+ 
+ for ( HintsReader . Page page : reader ) 
+ { 
+ + pagePositions . add ( page . position ) ; 
+ Iterator < Hint > iterator = page . hintsIterator ( ) ; 
+ while ( iterator . hasNext ( ) ) 
+ { 
+ @ @ - 124 , 6 + 126 , 21 @ @ public abstract class AlteredHints 
+ HintsTestUtil . assertHintsEqual ( expected , deserialized . get ( hintNum ) ) ; 
+ hintNum + + ; 
+ } 
+ + 
+ + / / explicitely seek to each page by iterating collected page positions and check if hints still match as expected 
+ + int hintOffset = 0 ; 
+ + for ( InputPosition pos : pagePositions ) 
+ + { 
+ + reader . seek ( pos ) ; 
+ + HintsReader . Page page = reader . iterator ( ) . next ( ) ; 
+ + Iterator < Hint > iterator = page . hintsIterator ( ) ; 
+ + while ( iterator . hasNext ( ) ) 
+ + { 
+ + Hint seekedHint = iterator . next ( ) ; 
+ + HintsTestUtil . assertHintsEqual ( hints . get ( hintOffset ) , seekedHint ) ; 
+ + hintOffset + + ; 
+ + } 
+ + } 
+ } 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / hints / HintsCatalogTest . java b / test / unit / org / apache / cassandra / hints / HintsCatalogTest . java 
+ index 51b6aa3 . . a255338 100644 
+ - - - a / test / unit / org / apache / cassandra / hints / HintsCatalogTest . java 
+ + + + b / test / unit / org / apache / cassandra / hints / HintsCatalogTest . java 
+ @ @ - 79 , 6 + 79 , 37 @ @ public class HintsCatalogTest 
+ assertNull ( store2 . poll ( ) ) ; 
+ } 
+ 
+ + @ Test 
+ + public void deleteHintsTest ( ) throws IOException 
+ + { 
+ + File directory = Files . createTempDirectory ( null ) . toFile ( ) ; 
+ + UUID hostId1 = UUID . randomUUID ( ) ; 
+ + UUID hostId2 = UUID . randomUUID ( ) ; 
+ + long now = System . currentTimeMillis ( ) ; 
+ + writeDescriptor ( directory , new HintsDescriptor ( hostId1 , now ) ) ; 
+ + writeDescriptor ( directory , new HintsDescriptor ( hostId1 , now + 1 ) ) ; 
+ + writeDescriptor ( directory , new HintsDescriptor ( hostId2 , now + 2 ) ) ; 
+ + writeDescriptor ( directory , new HintsDescriptor ( hostId2 , now + 3 ) ) ; 
+ + 
+ + / / load catalog containing two stores ( one for each host ) 
+ + HintsCatalog catalog = HintsCatalog . load ( directory , ImmutableMap . of ( ) ) ; 
+ + assertEquals ( 2 , catalog . stores ( ) . count ( ) ) ; 
+ + assertTrue ( catalog . hasFiles ( ) ) ; 
+ + 
+ + / / delete all hints from store 1 
+ + assertTrue ( catalog . get ( hostId1 ) . hasFiles ( ) ) ; 
+ + catalog . deleteAllHints ( hostId1 ) ; 
+ + assertFalse ( catalog . get ( hostId1 ) . hasFiles ( ) ) ; 
+ + / / stores are still keepts for each host , even after deleting hints 
+ + assertEquals ( 2 , catalog . stores ( ) . count ( ) ) ; 
+ + assertTrue ( catalog . hasFiles ( ) ) ; 
+ + 
+ + / / delete all hints from all stores 
+ + catalog . deleteAllHints ( ) ; 
+ + assertEquals ( 2 , catalog . stores ( ) . count ( ) ) ; 
+ + assertFalse ( catalog . hasFiles ( ) ) ; 
+ + } 
+ + 
+ @ SuppressWarnings ( " EmptyTryBlock " ) 
+ private static void writeDescriptor ( File directory , HintsDescriptor descriptor ) throws IOException 
+ { 
+ diff - - git a / test / unit / org / apache / cassandra / hints / HintsServiceTest . java b / test / unit / org / apache / cassandra / hints / HintsServiceTest . java 
+ new file mode 100644 
+ index 0000000 . . ffb7f73 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / hints / HintsServiceTest . java 
+ @ @ - 0 , 0 + 1 , 254 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . hints ; 
+ + 
+ + import java . net . InetAddress ; 
+ + import java . util . Collections ; 
+ + import java . util . UUID ; 
+ + import java . util . concurrent . ExecutionException ; 
+ + import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . TimeoutException ; 
+ + import javax . annotation . Nullable ; 
+ + 
+ + import com . google . common . util . concurrent . Futures ; 
+ + import com . google . common . util . concurrent . ListenableFuture ; 
+ + import org . junit . After ; 
+ + import org . junit . Before ; 
+ + import org . junit . BeforeClass ; 
+ + import org . junit . Test ; 
+ + 
+ + import com . datastax . driver . core . utils . MoreFutures ; 
+ + import org . apache . cassandra . SchemaLoader ; 
+ + import org . apache . cassandra . config . CFMetaData ; 
+ + import org . apache . cassandra . config . Schema ; 
+ + import org . apache . cassandra . db . DecoratedKey ; 
+ + import org . apache . cassandra . db . partitions . PartitionUpdate ; 
+ + import org . apache . cassandra . gms . IFailureDetectionEventListener ; 
+ + import org . apache . cassandra . gms . IFailureDetector ; 
+ + import org . apache . cassandra . metrics . StorageMetrics ; 
+ + import org . apache . cassandra . net . MessageIn ; 
+ + import org . apache . cassandra . net . MessagingService ; 
+ + import org . apache . cassandra . net . MockMessagingService ; 
+ + import org . apache . cassandra . net . MockMessagingSpy ; 
+ + import org . apache . cassandra . schema . KeyspaceParams ; 
+ + import org . apache . cassandra . service . StorageService ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ + 
+ + import static org . apache . cassandra . Util . dk ; 
+ + import static org . apache . cassandra . net . MockMessagingService . verb ; 
+ + import static org . junit . Assert . assertEquals ; 
+ + import static org . junit . Assert . assertTrue ; 
+ + 
+ + public class HintsServiceTest 
+ + { 
+ + private static final String KEYSPACE = " hints _ service _ test " ; 
+ + private static final String TABLE = " table " ; 
+ + 
+ + private final MockFailureDetector failureDetector = new MockFailureDetector ( ) ; 
+ + 
+ + @ BeforeClass 
+ + public static void defineSchema ( ) 
+ + { 
+ + SchemaLoader . prepareServer ( ) ; 
+ + StorageService . instance . initServer ( ) ; 
+ + SchemaLoader . createKeyspace ( KEYSPACE , 
+ + KeyspaceParams . simple ( 1 ) , 
+ + SchemaLoader . standardCFMD ( KEYSPACE , TABLE ) ) ; 
+ + } 
+ + 
+ + @ After 
+ + public void cleanup ( ) 
+ + { 
+ + MockMessagingService . cleanup ( ) ; 
+ + } 
+ + 
+ + @ Before 
+ + public void reinstanciateService ( ) throws ExecutionException , InterruptedException 
+ + { 
+ + MessagingService . instance ( ) . clearMessageSinks ( ) ; 
+ + 
+ + if ( ! HintsService . instance . isShutDown ( ) ) 
+ + { 
+ + HintsService . instance . shutdownBlocking ( ) ; 
+ + HintsService . instance . deleteAllHints ( ) ; 
+ + } 
+ + 
+ + failureDetector . isAlive = true ; 
+ + HintsService . instance = new HintsService ( failureDetector ) ; 
+ + HintsService . instance . startDispatch ( ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testDispatchHints ( ) throws InterruptedException , ExecutionException 
+ + { 
+ + long cnt = StorageMetrics . totalHints . getCount ( ) ; 
+ + 
+ + / / create spy for hint messages 
+ + MockMessagingSpy spy = sendHintsAndResponses ( 100 , - 1 ) ; 
+ + 
+ + / / metrics should have been updated with number of create hints 
+ + assertEquals ( cnt + 100 , StorageMetrics . totalHints . getCount ( ) ) ; 
+ + 
+ + / / wait until hints have been send 
+ + spy . interceptMessageOut ( 100 ) . get ( ) ; 
+ + spy . interceptNoMsg ( 500 , TimeUnit . MILLISECONDS ) . get ( ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testPauseAndResume ( ) throws InterruptedException , ExecutionException 
+ + { 
+ + HintsService . instance . pauseDispatch ( ) ; 
+ + 
+ + / / create spy for hint messages 
+ + MockMessagingSpy spy = sendHintsAndResponses ( 100 , - 1 ) ; 
+ + 
+ + / / we should not send any hints while paused 
+ + ListenableFuture < Boolean > noMessagesWhilePaused = spy . interceptNoMsg ( 15 , TimeUnit . SECONDS ) ; 
+ + Futures . addCallback ( noMessagesWhilePaused , new MoreFutures . SuccessCallback < Boolean > ( ) 
+ + { 
+ + public void onSuccess ( @ Nullable Boolean aBoolean ) 
+ + { 
+ + HintsService . instance . resumeDispatch ( ) ; 
+ + } 
+ + } ) ; 
+ + 
+ + Futures . allAsList ( 
+ + noMessagesWhilePaused , 
+ + spy . interceptMessageOut ( 100 ) , 
+ + spy . interceptNoMsg ( 200 , TimeUnit . MILLISECONDS ) 
+ + ) . get ( ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testPageRetry ( ) throws InterruptedException , ExecutionException , TimeoutException 
+ + { 
+ + / / create spy for hint messages , but only create responses for 5 hints 
+ + MockMessagingSpy spy = sendHintsAndResponses ( 20 , 5 ) ; 
+ + 
+ + Futures . allAsList ( 
+ + / / the dispatcher will always send all hints within the current page 
+ + / / and only wait for the acks before going to the next page 
+ + spy . interceptMessageOut ( 20 ) , 
+ + spy . interceptNoMsg ( 200 , TimeUnit . MILLISECONDS ) , 
+ + 
+ + / / next tick will trigger a retry of the same page as we only replied with 5 / 20 acks 
+ + spy . interceptMessageOut ( 20 ) 
+ + ) . get ( ) ; 
+ + 
+ + / / marking the destination node as dead should stop sending hints 
+ + failureDetector . isAlive = false ; 
+ + spy . interceptNoMsg ( 20 , TimeUnit . SECONDS ) . get ( ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testPageSeek ( ) throws InterruptedException , ExecutionException 
+ + { 
+ + / / create spy for hint messages , stop replying after 12k ( should be on 3rd page ) 
+ + MockMessagingSpy spy = sendHintsAndResponses ( 20000 , 12000 ) ; 
+ + 
+ + / / At this point the dispatcher will constantly retry the page we stopped acking , 
+ + / / thus we receive the same hints from the page multiple times and in total more than 
+ + / / all written hints . Lets just consume them for a while and then pause the dispatcher . 
+ + spy . interceptMessageOut ( 22000 ) . get ( ) ; 
+ + HintsService . instance . pauseDispatch ( ) ; 
+ + Thread . sleep ( 1000 ) ; 
+ + 
+ + / / verify that we have a dispatch offset set for the page we ' re currently stuck at 
+ + HintsStore store = HintsService . instance . getCatalog ( ) . get ( StorageService . instance . getLocalHostUUID ( ) ) ; 
+ + HintsDescriptor descriptor = store . poll ( ) ; 
+ + store . offerFirst ( descriptor ) ; / / add again for cleanup during re - instanciation 
+ + InputPosition dispatchOffset = store . getDispatchOffset ( descriptor ) ; 
+ + assertTrue ( dispatchOffset ! = null ) ; 
+ + assertTrue ( ( ( ChecksummedDataInput . Position ) dispatchOffset ) . sourcePosition > 0 ) ; 
+ + } 
+ + 
+ + private MockMessagingSpy sendHintsAndResponses ( int noOfHints , int noOfResponses ) 
+ + { 
+ + / / create spy for hint messages , but only create responses for noOfResponses hints 
+ + MessageIn < HintResponse > messageIn = MessageIn . create ( FBUtilities . getBroadcastAddress ( ) , 
+ + HintResponse . instance , 
+ + Collections . emptyMap ( ) , 
+ + MessagingService . Verb . REQUEST _ RESPONSE , 
+ + MessagingService . current _ version , 
+ + MessageIn . createTimestamp ( ) ) ; 
+ + 
+ + MockMessagingSpy spy ; 
+ + if ( noOfResponses ! = - 1 ) 
+ + { 
+ + spy = MockMessagingService . when ( verb ( MessagingService . Verb . HINT ) ) . respondN ( messageIn , noOfResponses ) ; 
+ + } 
+ + else 
+ + { 
+ + spy = MockMessagingService . when ( verb ( MessagingService . Verb . HINT ) ) . respond ( messageIn ) ; 
+ + } 
+ + 
+ + / / create and write noOfHints using service 
+ + UUID hostId = StorageService . instance . getLocalHostUUID ( ) ; 
+ + for ( int i = 0 ; i < noOfHints ; i + + ) 
+ + { 
+ + long now = System . currentTimeMillis ( ) ; 
+ + DecoratedKey dkey = dk ( String . valueOf ( i ) ) ; 
+ + CFMetaData cfMetaData = Schema . instance . getCFMetaData ( KEYSPACE , TABLE ) ; 
+ + PartitionUpdate . SimpleBuilder builder = PartitionUpdate . simpleBuilder ( cfMetaData , dkey ) . timestamp ( now ) ; 
+ + builder . row ( " column0 " ) . add ( " val " , " value0 " ) ; 
+ + Hint hint = Hint . create ( builder . buildAsMutation ( ) , now ) ; 
+ + HintsService . instance . write ( hostId , hint ) ; 
+ + } 
+ + return spy ; 
+ + } 
+ + 
+ + private static class MockFailureDetector implements IFailureDetector 
+ + { 
+ + private boolean isAlive = true ; 
+ + 
+ + public boolean isAlive ( InetAddress ep ) 
+ + { 
+ + return isAlive ; 
+ + } 
+ + 
+ + public void interpret ( InetAddress ep ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + 
+ + public void report ( InetAddress ep ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + 
+ + public void registerFailureDetectionEventListener ( IFailureDetectionEventListener listener ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + 
+ + public void unregisterFailureDetectionEventListener ( IFailureDetectionEventListener listener ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + 
+ + public void remove ( InetAddress ep ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + 
+ + public void forceConviction ( InetAddress ep ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + } 
+ + }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 7be913e . . 7c5a752 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 2 , 6 + 2 , 8 @ @ 
+ * add command to stop compactions ( CASSANDRA - 1740 ) 
+ * filter out unavailable cipher suites when using encryption ( CASSANDRA - 3178 ) 
+ * ( HADOOP ) add old - style api support for CFIF and CFRR ( CASSANDRA - 2799 ) 
+ + * Support TimeUUIDType column names in Stress . java tool ( CASSANDRA - 3541 ) 
+ + 
+ 
+ 1 . 0 . 5 
+ * revert CASSANDRA - 3407 ( see CASSANDRA - 3540 ) 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / Session . java b / tools / stress / src / org / apache / cassandra / stress / Session . java 
+ index abbea50 . . ddc6a69 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / Session . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / Session . java 
+ @ @ - 27 , 9 + 27 , 7 @ @ import java . util . concurrent . atomic . AtomicLong ; 
+ 
+ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . config . ConfigurationException ; 
+ - import org . apache . cassandra . db . compaction . AbstractCompactionStrategy ; 
+ - import org . apache . cassandra . db . marshal . AbstractType ; 
+ - import org . apache . cassandra . db . marshal . TypeParser ; 
+ + import org . apache . cassandra . db . marshal . * ; 
+ import org . apache . commons . cli . * ; 
+ 
+ import org . apache . cassandra . db . ColumnFamilyType ; 
+ @ @ - 50 , 6 + 48 , 8 @ @ public class Session implements Serializable 
+ public static final String DEFAULT _ COMPARATOR = " AsciiType " ; 
+ public static final String DEFAULT _ VALIDATOR = " BytesType " ; 
+ 
+ + private static InetAddress localInetAddress ; 
+ + 
+ public final AtomicInteger operations ; 
+ public final AtomicInteger keys ; 
+ public final AtomicLong latency ; 
+ @ @ - 89 , 6 + 89 , 7 @ @ public class Session implements Serializable 
+ availableOptions . addOption ( " I " , " compression " , true , " Specify the compression to use for sstable , default : no compression " ) ; 
+ availableOptions . addOption ( " Q " , " query - names " , true , " Comma - separated list of column names to retrieve from each row . " ) ; 
+ availableOptions . addOption ( " Z " , " compaction - strategy " , true , " CompactionStrategy to use . " ) ; 
+ + availableOptions . addOption ( " U " , " comparator " , true , " Column Comparator to use . Currently supported types are : TimeUUIDType , AsciiType , UTF8Type . " ) ; 
+ } 
+ 
+ private int numKeys = 1000 * 1000 ; 
+ @ @ - 131 , 6 + 132 , 8 @ @ public class Session implements Serializable 
+ protected float sigma ; 
+ 
+ public final InetAddress sendToDaemon ; 
+ + public final String comparator ; 
+ + public final boolean timeUUIDComparator ; 
+ 
+ public Session ( String [ ] arguments ) throws IllegalArgumentException 
+ { 
+ @ @ - 321 , 6 + 324 , 35 @ @ public class Session implements Serializable 
+ System . exit ( 1 ) ; 
+ } 
+ } 
+ + 
+ + if ( cmd . hasOption ( " U " ) ) 
+ + { 
+ + AbstractType parsed = null ; 
+ + 
+ + try 
+ + { 
+ + parsed = TypeParser . parse ( cmd . getOptionValue ( " U " ) ) ; 
+ + } 
+ + catch ( ConfigurationException e ) 
+ + { 
+ + System . err . println ( e . getMessage ( ) ) ; 
+ + System . exit ( 1 ) ; 
+ + } 
+ + 
+ + comparator = cmd . getOptionValue ( " U " ) ; 
+ + timeUUIDComparator = parsed instanceof TimeUUIDType ; 
+ + 
+ + if ( ! ( parsed instanceof TimeUUIDType | | parsed instanceof AsciiType | | parsed instanceof UTF8Type ) ) 
+ + { 
+ + System . err . println ( " Currently supported types are : TimeUUIDType , AsciiType , UTF8Type . " ) ; 
+ + System . exit ( 1 ) ; 
+ + } 
+ + } 
+ + else 
+ + { 
+ + comparator = null ; 
+ + timeUUIDComparator = false ; 
+ + } 
+ } 
+ catch ( ParseException e ) 
+ { 
+ @ @ - 464 , 6 + 496 , 7 @ @ public class Session implements Serializable 
+ public void createKeySpaces ( ) 
+ { 
+ KsDef keyspace = new KsDef ( ) ; 
+ + String defaultComparator = comparator = = null ? DEFAULT _ COMPARATOR : comparator ; 
+ 
+ / / column family for standard columns 
+ CfDef standardCfDef = new CfDef ( " Keyspace1 " , " Standard1 " ) ; 
+ @ @ - 471 , 7 + 504 , 7 @ @ public class Session implements Serializable 
+ if ( compression ! = null ) 
+ compressionOptions . put ( " sstable _ compression " , compression ) ; 
+ 
+ - standardCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) 
+ + standardCfDef . setComparator _ type ( defaultComparator ) 
+ . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) 
+ . setCompression _ options ( compressionOptions ) ; 
+ 
+ @ @ - 485 , 7 + 518 , 7 @ @ public class Session implements Serializable 
+ / / column family with super columns 
+ CfDef superCfDef = new CfDef ( " Keyspace1 " , " Super1 " ) . setColumn _ type ( " Super " ) ; 
+ superCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) 
+ - . setSubcomparator _ type ( DEFAULT _ COMPARATOR ) 
+ + . setSubcomparator _ type ( defaultComparator ) 
+ . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) 
+ . setCompression _ options ( compressionOptions ) ; 
+ 
+ @ @ - 574 , 4 + 607 , 20 @ @ public class Session implements Serializable 
+ return client ; 
+ } 
+ 
+ + public static InetAddress getLocalAddress ( ) 
+ + { 
+ + if ( localInetAddress = = null ) 
+ + { 
+ + try 
+ + { 
+ + localInetAddress = InetAddress . getLocalHost ( ) ; 
+ + } 
+ + catch ( UnknownHostException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + return localInetAddress ; 
+ + } 
+ } 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java b / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java 
+ index 45d33cb . . c81df6f 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / operations / Inserter . java 
+ @ @ - 52 , 9 + 52 , 9 @ @ public class Inserter extends Operation 
+ 
+ for ( int i = 0 ; i < session . getColumnsPerKey ( ) ; i + + ) 
+ { 
+ - String columnName = ( " C " + Integer . toString ( i ) ) ; 
+ - ByteBuffer columnValue = values . get ( i % values . size ( ) ) ; 
+ - columns . add ( new Column ( ByteBufferUtil . bytes ( columnName ) ) . setValue ( columnValue ) . setTimestamp ( System . currentTimeMillis ( ) ) ) ; 
+ + columns . add ( new Column ( columnName ( i , session . timeUUIDComparator ) ) 
+ + . setValue ( values . get ( i % values . size ( ) ) ) 
+ + . setTimestamp ( System . currentTimeMillis ( ) ) ) ; 
+ } 
+ 
+ if ( session . getColumnFamilyType ( ) = = ColumnFamilyType . Super ) 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / util / Operation . java b / tools / stress / src / org / apache / cassandra / stress / util / Operation . java 
+ index 10b97ad . . dd5128f 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / util / Operation . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / util / Operation . java 
+ @ @ - 27 , 11 + 27 , 14 @ @ import java . util . Random ; 
+ 
+ import static com . google . common . base . Charsets . UTF _ 8 ; 
+ 
+ + import org . apache . cassandra . db . marshal . TimeUUIDType ; 
+ import org . apache . cassandra . stress . Session ; 
+ import org . apache . cassandra . stress . Stress ; 
+ import org . apache . cassandra . thrift . Cassandra ; 
+ import org . apache . cassandra . thrift . InvalidRequestException ; 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . apache . cassandra . utils . UUIDGen ; 
+ 
+ public abstract class Operation 
+ { 
+ @ @ - 200 , 6 + 203 , 13 @ @ public abstract class Operation 
+ return result . toString ( ) ; 
+ } 
+ 
+ + protected ByteBuffer columnName ( int index , boolean timeUUIDComparator ) 
+ + { 
+ + return timeUUIDComparator 
+ + ? TimeUUIDType . instance . decompose ( UUIDGen . makeType1UUIDFromHost ( Session . getLocalAddress ( ) ) ) 
+ + : ByteBufferUtil . bytes ( String . format ( " C % d " , index ) ) ; 
+ + } 
+ + 
+ protected String getExceptionMessage ( Exception e ) 
+ { 
+ String className = e . getClass ( ) . getSimpleName ( ) ;

@@ -1,0 +1,637 @@
+BLEU SCORE: 0.018738883683389617
+
+TEST MSG: Make sure that SEP Worker shuts down when pool is shutdown
+GENERATED MSG: merge from 0 . 5 branch
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / concurrent / SEPWorker . java b / src / java / org / apache / cassandra / concurrent / SEPWorker . java <nl> index 4549b48 . . d998ab7 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / SEPWorker . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / SEPWorker . java <nl> @ @ - 74 , 9 + 74 , 14 @ @ final class SEPWorker extends AtomicReference < SEPWorker . Work > implements Runnabl <nl> { <nl> while ( true ) <nl> { <nl> + if ( pool . shuttingDown ) <nl> + return ; <nl> + <nl> if ( isSpinning ( ) & & ! selfAssign ( ) ) <nl> { <nl> doWaitSpin ( ) ; <nl> + / / if the pool is terminating , but we have been assigned STOP _ SIGNALLED , if we do not re - check <nl> + / / whether the pool is shutting down this thread will go to sleep and block forever <nl> continue ; <nl> } <nl> <nl> @ @ - 118 , 8 + 123 , 12 @ @ final class SEPWorker extends AtomicReference < SEPWorker . Work > implements Runnabl <nl> <nl> / / return our work permit , and maybe signal shutdown <nl> assigned . returnWorkPermit ( ) ; <nl> - if ( shutdown & & assigned . getActiveTaskCount ( ) = = 0 ) <nl> - assigned . shutdown . signalAll ( ) ; <nl> + if ( shutdown ) <nl> + { <nl> + if ( assigned . getActiveTaskCount ( ) = = 0 ) <nl> + assigned . shutdown . signalAll ( ) ; <nl> + return ; <nl> + } <nl> assigned = null ; <nl> <nl> / / try to immediately reassign ourselves some work ; if we fail , start spinning <nl> @ @ - 169 , 7 + 178 , 11 @ @ final class SEPWorker extends AtomicReference < SEPWorker . Work > implements Runnabl <nl> <nl> / / if we ' re being descheduled , place ourselves in the descheduled collection <nl> if ( work . isStop ( ) ) <nl> + { <nl> pool . descheduled . put ( workerId , this ) ; <nl> + if ( pool . shuttingDown ) <nl> + return true ; <nl> + } <nl> <nl> / / if we ' re currently stopped , and the new state is not a stop signal <nl> / / ( which we can immediately convert to stopped ) , unpark the worker <nl> diff - - git a / src / java / org / apache / cassandra / concurrent / SharedExecutorPool . java b / src / java / org / apache / cassandra / concurrent / SharedExecutorPool . java <nl> index 5352ad7 . . 62bede9 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / SharedExecutorPool . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / SharedExecutorPool . java <nl> @ @ - 24 , 8 + 24 , 7 @ @ import java . util . concurrent . CopyOnWriteArrayList ; <nl> import java . util . concurrent . TimeUnit ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> import java . util . concurrent . atomic . AtomicLong ; <nl> - <nl> - import com . google . common . annotations . VisibleForTesting ; <nl> + import java . util . concurrent . locks . LockSupport ; <nl> <nl> import static org . apache . cassandra . concurrent . SEPWorker . Work ; <nl> <nl> @ @ - 77 , 6 + 76 , 8 @ @ public class SharedExecutorPool <nl> / / the collection of threads that have been asked to stop / deschedule - new workers are scheduled from here last <nl> final ConcurrentSkipListMap < Long , SEPWorker > descheduled = new ConcurrentSkipListMap < > ( ) ; <nl> <nl> + volatile boolean shuttingDown = false ; <nl> + <nl> public SharedExecutorPool ( String poolName ) <nl> { <nl> this . poolName = poolName ; <nl> @ @ - 113 , 13 + 114 , 31 @ @ public class SharedExecutorPool <nl> return executor ; <nl> } <nl> <nl> - @ VisibleForTesting <nl> - public static void shutdownSharedPool ( ) throws InterruptedException <nl> + public void shutdown ( ) throws InterruptedException <nl> { <nl> - for ( SEPExecutor executor : SHARED . executors ) <nl> - executor . shutdown ( ) ; <nl> + shuttingDown = true ; <nl> + for ( SEPExecutor executor : executors ) <nl> + executor . shutdownNow ( ) ; <nl> + <nl> + terminateWorkers ( ) ; <nl> + <nl> + long until = System . nanoTime ( ) + TimeUnit . MINUTES . toNanos ( 1L ) ; <nl> + for ( SEPExecutor executor : executors ) <nl> + executor . shutdown . await ( until - System . nanoTime ( ) , TimeUnit . NANOSECONDS ) ; <nl> + } <nl> + <nl> + void terminateWorkers ( ) <nl> + { <nl> + assert shuttingDown ; <nl> + <nl> + / / To terminate our workers , we only need to unpark thread to make it runnable again , <nl> + / / so that the pool . shuttingDown boolean is checked . If work was already in the process <nl> + / / of being scheduled , worker will terminate upon running the task . <nl> + Map . Entry < Long , SEPWorker > e ; <nl> + while ( null ! = ( e = descheduled . pollFirstEntry ( ) ) ) <nl> + e . getValue ( ) . assign ( Work . SPINNING , false ) ; <nl> <nl> - for ( SEPExecutor executor : SHARED . executors ) <nl> - executor . awaitTermination ( 60 , TimeUnit . SECONDS ) ; <nl> + while ( null ! = ( e = spinning . pollFirstEntry ( ) ) ) <nl> + LockSupport . unpark ( e . getValue ( ) . thread ) ; <nl> } <nl> } <nl> diff - - git a / test / distributed / org / apache / cassandra / distributed / Instance . java b / test / distributed / org / apache / cassandra / distributed / Instance . java <nl> index f9ee5bb . . f344411 100644 <nl> - - - a / test / distributed / org / apache / cassandra / distributed / Instance . java <nl> + + + b / test / distributed / org / apache / cassandra / distributed / Instance . java <nl> @ @ - 345 , 7 + 345 , 7 @ @ public class Instance extends InvokableInstance <nl> BufferPool : : shutdownLocalCleaner , <nl> Ref : : shutdownReferenceReaper , <nl> StageManager : : shutdownAndWait , <nl> - SharedExecutorPool : : shutdownSharedPool , <nl> + SharedExecutorPool . SHARED : : shutdown , <nl> Memtable . MEMORY _ POOL : : shutdown , <nl> ScheduledExecutors : : shutdownAndWait ) ; <nl> error = shutdownAndWait ( error , ActiveRepairService . repairCommandExecutor ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / concurrent / SEPExecutorTest . java b / test / unit / org / apache / cassandra / concurrent / SEPExecutorTest . java <nl> new file mode 100644 <nl> index 0000000 . . 011a8ba <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / concurrent / SEPExecutorTest . java <nl> @ @ - 0 , 0 + 1 , 70 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + <nl> + package org . apache . cassandra . concurrent ; <nl> + <nl> + import java . io . OutputStream ; <nl> + import java . io . PrintStream ; <nl> + import java . util . Arrays ; <nl> + import java . util . concurrent . ExecutorService ; <nl> + <nl> + import org . junit . Assert ; <nl> + import org . junit . Test ; <nl> + <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> + <nl> + public class SEPExecutorTest <nl> + { <nl> + @ Test <nl> + public void shutdownTest ( ) throws Throwable <nl> + { <nl> + for ( int i = 0 ; i < 1000 ; i + + ) <nl> + { <nl> + shutdownOnce ( i ) ; <nl> + } <nl> + } <nl> + <nl> + private static void shutdownOnce ( int run ) throws Throwable <nl> + { <nl> + SharedExecutorPool sharedPool = new SharedExecutorPool ( " SharedPool " ) ; <nl> + String MAGIC = " UNREPEATABLE _ MAGIC _ STRING " ; <nl> + OutputStream nullOutputStream = new OutputStream ( ) { <nl> + public void write ( int b ) { } <nl> + } ; <nl> + PrintStream nullPrintSteam = new PrintStream ( nullOutputStream ) ; <nl> + <nl> + for ( int idx = 0 ; idx < 20 ; idx + + ) <nl> + { <nl> + ExecutorService es = sharedPool . newExecutor ( FBUtilities . getAvailableProcessors ( ) , Integer . MAX _ VALUE , " STAGE " , run + MAGIC + idx ) ; <nl> + / / Write to black hole <nl> + es . execute ( ( ) - > nullPrintSteam . println ( " TEST " + es ) ) ; <nl> + } <nl> + <nl> + / / shutdown does not guarantee that threads are actually dead once it exits , only that they will stop promptly afterwards <nl> + sharedPool . shutdown ( ) ; <nl> + for ( Thread thread : Thread . getAllStackTraces ( ) . keySet ( ) ) <nl> + { <nl> + if ( thread . getName ( ) . contains ( MAGIC ) ) <nl> + { <nl> + thread . join ( 100 ) ; <nl> + if ( thread . isAlive ( ) ) <nl> + Assert . fail ( thread + " is still running " + Arrays . toString ( thread . getStackTrace ( ) ) ) ; <nl> + } <nl> + } <nl> + } <nl> + }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 5c7902c . . e0863eb 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 8 @ @ <nl> - 0 . 5 . 0 dev <nl> + 0 . 5 . 0 RC1 <nl> + * Fix potential NPE in get _ range _ slice ( CASSANDRA - 623 ) <nl> + <nl> + <nl> + 0 . 5 . 0 beta 2 <nl> * Bootstrap improvements ( several tickets ) <nl> * add nodeprobe repair anti - entropy feature ( CASSANDRA - 193 , CASSANDRA - 520 ) <nl> * fix possibility of partition when many nodes restart at once <nl> @ @ - 20 , 6 + 24 , 7 @ @ <nl> incorrectly ( and temporarily ) marked as down ( CASSANDRA - 610 ) <nl> * respect memtable thresholds during log replay ( CASSANDRA - 609 ) <nl> * support ConsistencyLevel . ALL on read ( CASSANDRA - 584 ) <nl> + * add nodeprobe removetoken command ( CASSANDRA - 564 ) <nl> <nl> <nl> 0 . 5 . 0 beta <nl> diff - - git a / build . xml b / build . xml <nl> index b47d5b3 . . 3d965e9 100644 <nl> - - - a / build . xml <nl> + + + b / build . xml <nl> @ @ - 37 , 7 + 37 , 7 @ @ <nl> < property name = " test . name " value = " * Test " / > <nl> < property name = " test . unit . src " value = " $ { test . dir } / unit " / > <nl> < property name = " dist . dir " value = " $ { build . dir } / dist " / > <nl> - < property name = " version " value = " 0 . 4 . 2 " / > <nl> + < property name = " version " value = " 0 . 5 . 0 - beta2 " / > <nl> < property name = " final . name " value = " $ { ant . project . name } - $ { version } " / > <nl> <nl> < ! - - http : / / cobertura . sourceforge . net / - - > <nl> diff - - git a / interface / cassandra . thrift b / interface / cassandra . thrift <nl> index 0a30153 . . 8eb6226 100644 <nl> - - - a / interface / cassandra . thrift <nl> + + + b / interface / cassandra . thrift <nl> @ @ - 40 , 7 + 40 , 7 @ @ namespace rb CassandraThrift <nl> # no promises are made other than " if both are equal , you ' re good . " <nl> # in particular , don ' t try to parse numeric information out and assume <nl> # that a " greater " version is a superset of a " smaller " one . <nl> - const string VERSION = " 0 . 5 - beta1 " <nl> + const string VERSION = " 0 . 5 - beta2 " <nl> <nl> <nl> # <nl> diff - - git a / interface / gen - java / org / apache / cassandra / service / Constants . java b / interface / gen - java / org / apache / cassandra / service / Constants . java <nl> index 1b9a2ed . . 2228465 100644 <nl> - - - a / interface / gen - java / org / apache / cassandra / service / Constants . java <nl> + + + b / interface / gen - java / org / apache / cassandra / service / Constants . java <nl> @ @ - 40 , 6 + 40 , 6 @ @ import org . slf4j . LoggerFactory ; <nl> <nl> public class Constants { <nl> <nl> - public static final String VERSION = " 0 . 5 - beta1 " ; <nl> + public static final String VERSION = " 0 . 5 - beta2 " ; <nl> <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / BinaryMemtable . java b / src / java / org / apache / cassandra / db / BinaryMemtable . java <nl> index 7b522be . . b413e0b 100644 <nl> - - - a / src / java / org / apache / cassandra / db / BinaryMemtable . java <nl> + + + b / src / java / org / apache / cassandra / db / BinaryMemtable . java <nl> @ @ - 132 , 7 + 132 , 7 @ @ public class BinaryMemtable implements IFlushable < DecoratedKey > <nl> assert ! columnFamilies _ . isEmpty ( ) ; <nl> logger _ . info ( " Sorting " + this ) ; <nl> List < DecoratedKey > keys = new ArrayList < DecoratedKey > ( columnFamilies _ . keySet ( ) ) ; <nl> - Collections . sort ( keys , partitioner _ . getDecoratedKeyComparator ( ) ) ; <nl> + Collections . sort ( keys ) ; <nl> return keys ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index bc7c43a . . 93f19b5 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1289 , 8 + 1289 , 6 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> { <nl> final DecoratedKey startWithDK = partitioner . decorateKey ( startWith ) ; <nl> final DecoratedKey stopAtDK = partitioner . decorateKey ( stopAt ) ; <nl> - / / ( OPP key decoration is a no - op so using the " decorated " comparator against raw keys is fine ) <nl> - final Comparator < DecoratedKey > comparator = partitioner . getDecoratedKeyComparator ( ) ; <nl> <nl> / / create a CollatedIterator that will return unique keys from different sources <nl> / / ( current memtable , historical memtables , and SSTables ) in the correct order . <nl> @ @ - 1302 , 8 + 1300 , 8 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> { <nl> public boolean apply ( DecoratedKey key ) <nl> { <nl> - return comparator . compare ( startWithDK , key ) < = 0 <nl> - & & ( stopAt . isEmpty ( ) | | comparator . compare ( key , stopAtDK ) < = 0 ) ; <nl> + return startWithDK . compareTo ( key ) < = 0 <nl> + & & ( stopAt . isEmpty ( ) | | key . compareTo ( stopAtDK ) < = 0 ) ; <nl> } <nl> } ; <nl> <nl> @ @ - 1343 , 7 + 1341 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> iterators . add ( iter ) ; <nl> } <nl> <nl> - Iterator < DecoratedKey > collated = IteratorUtils . collatedIterator ( comparator , iterators ) ; <nl> + Iterator < DecoratedKey > collated = IteratorUtils . collatedIterator ( DecoratedKey . comparator , iterators ) ; <nl> Iterable < DecoratedKey > reduced = new ReducingIterator < DecoratedKey , DecoratedKey > ( collated ) { <nl> DecoratedKey current ; <nl> <nl> @ @ - 1366 , 7 + 1364 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> boolean rangeCompletedLocally = false ; <nl> for ( DecoratedKey current : reduced ) <nl> { <nl> - if ( ! stopAt . isEmpty ( ) & & comparator . compare ( stopAtDK , current ) < 0 ) <nl> + if ( ! stopAt . isEmpty ( ) & & stopAtDK . compareTo ( current ) < 0 ) <nl> { <nl> rangeCompletedLocally = true ; <nl> break ; <nl> @ @ - 1411 , 9 + 1409 , 6 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> public RangeReply getKeyRangeRaw ( final DecoratedKey startWith , final DecoratedKey stopAt , int maxResults ) <nl> throws IOException , ExecutionException , InterruptedException <nl> { <nl> - / / ( OPP key decoration is a no - op so using the " decorated " comparator against raw keys is fine ) <nl> - final Comparator < DecoratedKey > comparator = partitioner . getDecoratedKeyComparator ( ) ; <nl> - <nl> / / create a CollatedIterator that will return unique keys from different sources <nl> / / ( current memtable , historical memtables , and SSTables ) in the correct order . <nl> List < Iterator < DecoratedKey > > iterators = new ArrayList < Iterator < DecoratedKey > > ( ) ; <nl> @ @ - 1424 , 8 + 1419 , 8 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> { <nl> public boolean apply ( DecoratedKey key ) <nl> { <nl> - return comparator . compare ( startWith , key ) < = 0 <nl> - & & ( stopAt . isEmpty ( ) | | comparator . compare ( key , stopAt ) < = 0 ) ; <nl> + return startWith . compareTo ( key ) < = 0 <nl> + & & ( stopAt . isEmpty ( ) | | key . compareTo ( stopAt ) < = 0 ) ; <nl> } <nl> } ; <nl> <nl> @ @ - 1465 , 7 + 1460 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> iterators . add ( iter ) ; <nl> } <nl> <nl> - Iterator < DecoratedKey > collated = IteratorUtils . collatedIterator ( comparator , iterators ) ; <nl> + Iterator < DecoratedKey > collated = IteratorUtils . collatedIterator ( DecoratedKey . comparator , iterators ) ; <nl> Iterable < DecoratedKey > reduced = new ReducingIterator < DecoratedKey , DecoratedKey > ( collated ) { <nl> DecoratedKey current ; <nl> <nl> @ @ - 1487 , 7 + 1482 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> boolean rangeCompletedLocally = false ; <nl> for ( DecoratedKey current : reduced ) <nl> { <nl> - if ( ! stopAt . isEmpty ( ) & & comparator . compare ( stopAt , current ) < 0 ) <nl> + if ( ! stopAt . isEmpty ( ) & & stopAt . compareTo ( current ) < 0 ) <nl> { <nl> rangeCompletedLocally = true ; <nl> break ; <nl> diff - - git a / src / java / org / apache / cassandra / db / DecoratedKey . java b / src / java / org / apache / cassandra / db / DecoratedKey . java <nl> index 5895ecf . . 178535e 100644 <nl> - - - a / src / java / org / apache / cassandra / db / DecoratedKey . java <nl> + + + b / src / java / org / apache / cassandra / db / DecoratedKey . java <nl> @ @ - 21 , 6 + 21 , 7 @ @ package org . apache . cassandra . db ; <nl> import java . io . DataOutput ; <nl> import java . io . IOException ; <nl> import java . io . DataInput ; <nl> + import java . util . Comparator ; <nl> <nl> import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . io . ICompactSerializer2 ; <nl> @ @ - 44 , 6 + 45 , 14 @ @ public class DecoratedKey < T extends Token > implements Comparable < DecoratedKey > <nl> return serializer ; <nl> } <nl> <nl> + public static final Comparator < DecoratedKey > comparator = new Comparator < DecoratedKey > ( ) <nl> + { <nl> + public int compare ( DecoratedKey o1 , DecoratedKey o2 ) <nl> + { <nl> + return o1 . compareTo ( o2 ) ; <nl> + } <nl> + } ; <nl> + <nl> public final T token ; <nl> public final String key ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java <nl> index 399e37a . . aca6950 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Memtable . java <nl> + + + b / src / java / org / apache / cassandra / db / Memtable . java <nl> @ @ - 182 , 9 + 182 , 8 @ @ public class Memtable implements Comparable < Memtable > , IFlushable < DecoratedKey > <nl> { <nl> logger _ . info ( " Sorting " + this ) ; <nl> / / sort keys in the order they would be in when decorated <nl> - Comparator < DecoratedKey > dc = partitioner _ . getDecoratedKeyComparator ( ) ; <nl> ArrayList < DecoratedKey > orderedKeys = new ArrayList < DecoratedKey > ( columnFamilies _ . keySet ( ) ) ; <nl> - Collections . sort ( orderedKeys , dc ) ; <nl> + Collections . sort ( orderedKeys ) ; <nl> return orderedKeys ; <nl> } <nl> <nl> @ @ - 225 , 7 + 224 , 7 @ @ public class Memtable implements Comparable < Memtable > , IFlushable < DecoratedKey > <nl> / / cannot create a PQ of size zero ( wtf ? ) <nl> return Arrays . asList ( new DecoratedKey [ 0 ] ) . iterator ( ) ; <nl> } <nl> - PriorityQueue < DecoratedKey > pq = new PriorityQueue < DecoratedKey > ( columnFamilies _ . size ( ) , partitioner _ . getDecoratedKeyComparator ( ) ) ; <nl> + PriorityQueue < DecoratedKey > pq = new PriorityQueue < DecoratedKey > ( columnFamilies _ . size ( ) ) ; <nl> pq . addAll ( columnFamilies _ . keySet ( ) ) ; <nl> return new DestructivePQIterator < DecoratedKey > ( pq ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / dht / CollatingOrderPreservingPartitioner . java b / src / java / org / apache / cassandra / dht / CollatingOrderPreservingPartitioner . java <nl> index 9b4ad56 . . b214196 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / CollatingOrderPreservingPartitioner . java <nl> + + + b / src / java / org / apache / cassandra / dht / CollatingOrderPreservingPartitioner . java <nl> @ @ - 37 , 16 + 37 , 6 @ @ public class CollatingOrderPreservingPartitioner implements IPartitioner < BytesTo <nl> <nl> public static final BigInteger BYTE _ MASK = new BigInteger ( " 255 " ) ; <nl> <nl> - / * * <nl> - * Comparators for decorated keys . <nl> - * / <nl> - private static final Comparator < DecoratedKey < BytesToken > > comparator = new Comparator < DecoratedKey < BytesToken > > ( ) { <nl> - public int compare ( DecoratedKey < BytesToken > o1 , DecoratedKey < BytesToken > o2 ) <nl> - { <nl> - return FBUtilities . compareByteArrays ( o1 . token . token , o2 . token . token ) ; <nl> - } <nl> - } ; <nl> - <nl> public DecoratedKey < BytesToken > decorateKey ( String key ) <nl> { <nl> return new DecoratedKey < BytesToken > ( getToken ( key ) , key ) ; <nl> @ @ - 62 , 11 + 52 , 6 @ @ public class CollatingOrderPreservingPartitioner implements IPartitioner < BytesTo <nl> return key . key ; <nl> } <nl> <nl> - public Comparator < DecoratedKey < BytesToken > > getDecoratedKeyComparator ( ) <nl> - { <nl> - return comparator ; <nl> - } <nl> - <nl> public BytesToken midpoint ( BytesToken ltoken , BytesToken rtoken ) <nl> { <nl> int sigbytes = Math . max ( ltoken . token . length , rtoken . token . length ) ; <nl> diff - - git a / src / java / org / apache / cassandra / dht / IPartitioner . java b / src / java / org / apache / cassandra / dht / IPartitioner . java <nl> index d141758 . . 02fd665 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / IPartitioner . java <nl> + + + b / src / java / org / apache / cassandra / dht / IPartitioner . java <nl> @ @ - 49 , 11 + 49 , 6 @ @ public interface IPartitioner < T extends Token > <nl> public DecoratedKey < T > decorateKey ( String key ) ; <nl> <nl> / * * <nl> - * @ return a comparator for decorated key objects , not strings <nl> - * / <nl> - public Comparator < DecoratedKey < T > > getDecoratedKeyComparator ( ) ; <nl> - <nl> - / * * <nl> * Calculate a Token representing the approximate " middle " of the given <nl> * range . <nl> * <nl> diff - - git a / src / java / org / apache / cassandra / dht / OrderPreservingPartitioner . java b / src / java / org / apache / cassandra / dht / OrderPreservingPartitioner . java <nl> index e50b576 . . 9f13b95 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / OrderPreservingPartitioner . java <nl> + + + b / src / java / org / apache / cassandra / dht / OrderPreservingPartitioner . java <nl> @ @ - 35 , 17 + 35 , 6 @ @ public class OrderPreservingPartitioner implements IPartitioner < StringToken > <nl> <nl> public static final BigInteger CHAR _ MASK = new BigInteger ( " 65535 " ) ; <nl> <nl> - / * * <nl> - * Comparators for decorated keys . <nl> - * / <nl> - private static final Comparator < DecoratedKey < StringToken > > comparator = <nl> - new Comparator < DecoratedKey < StringToken > > ( ) { <nl> - public int compare ( DecoratedKey < StringToken > o1 , DecoratedKey < StringToken > o2 ) <nl> - { <nl> - return o1 . key . compareTo ( o2 . key ) ; <nl> - } <nl> - } ; <nl> - <nl> public DecoratedKey < StringToken > decorateKey ( String key ) <nl> { <nl> return new DecoratedKey < StringToken > ( new StringToken ( key ) , key ) ; <nl> @ @ - 61 , 11 + 50 , 6 @ @ public class OrderPreservingPartitioner implements IPartitioner < StringToken > <nl> return key . key ; <nl> } <nl> <nl> - public Comparator < DecoratedKey < StringToken > > getDecoratedKeyComparator ( ) <nl> - { <nl> - return comparator ; <nl> - } <nl> - <nl> public StringToken midpoint ( StringToken ltoken , StringToken rtoken ) <nl> { <nl> int sigchars = Math . max ( ltoken . token . length ( ) , rtoken . token . length ( ) ) ; <nl> diff - - git a / src / java / org / apache / cassandra / dht / RandomPartitioner . java b / src / java / org / apache / cassandra / dht / RandomPartitioner . java <nl> index 129d1ed . . 3b4c1f2 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / RandomPartitioner . java <nl> + + + b / src / java / org / apache / cassandra / dht / RandomPartitioner . java <nl> @ @ - 38 , 21 + 38 , 6 @ @ public class RandomPartitioner implements IPartitioner < BigIntegerToken > <nl> public static final BigIntegerToken MINIMUM = new BigIntegerToken ( " 0 " ) ; <nl> <nl> private static final String DELIMITER = " : " ; <nl> - <nl> - private static final Comparator < DecoratedKey < BigIntegerToken > > comparator = <nl> - new Comparator < DecoratedKey < BigIntegerToken > > ( ) { <nl> - public int compare ( DecoratedKey < BigIntegerToken > o1 , DecoratedKey < BigIntegerToken > o2 ) <nl> - { <nl> - / / first , compare on the bigint hash " decoration " . usually this will be enough . <nl> - int v = o1 . token . compareTo ( o2 . token ) ; <nl> - if ( v ! = 0 ) { <nl> - return v ; <nl> - } <nl> - <nl> - / / if the hashes are equal , compare the strings <nl> - return o1 . key . compareTo ( o2 . key ) ; <nl> - } <nl> - } ; <nl> <nl> public DecoratedKey < BigIntegerToken > decorateKey ( String key ) <nl> { <nl> @ @ - 73 , 11 + 58 , 6 @ @ public class RandomPartitioner implements IPartitioner < BigIntegerToken > <nl> return key . token + DELIMITER + key . key ; <nl> } <nl> <nl> - public Comparator < DecoratedKey < BigIntegerToken > > getDecoratedKeyComparator ( ) <nl> - { <nl> - return comparator ; <nl> - } <nl> - <nl> public BigIntegerToken midpoint ( BigIntegerToken ltoken , BigIntegerToken rtoken ) <nl> { <nl> Pair < BigInteger , Boolean > midpair = FBUtilities . midpoint ( ltoken . token , rtoken . token , 127 ) ; <nl> diff - - git a / src / java / org / apache / cassandra / io / IteratingRow . java b / src / java / org / apache / cassandra / io / IteratingRow . java <nl> index 53ff86c . . 7962c79 100644 <nl> - - - a / src / java / org / apache / cassandra / io / IteratingRow . java <nl> + + + b / src / java / org / apache / cassandra / io / IteratingRow . java <nl> @ @ - 109 , 6 + 109 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl <nl> <nl> public int compareTo ( IteratingRow o ) <nl> { <nl> - return partitioner . getDecoratedKeyComparator ( ) . compare ( key , o . key ) ; <nl> + return key . compareTo ( o . key ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / SSTable . java b / src / java / org / apache / cassandra / io / SSTable . java <nl> index 58224de . . ab83679 100644 <nl> - - - a / src / java / org / apache / cassandra / io / SSTable . java <nl> + + + b / src / java / org / apache / cassandra / io / SSTable . java <nl> @ @ - 179 , 7 + 179 , 7 @ @ public abstract class SSTable <nl> <nl> public int compareTo ( KeyPosition kp ) <nl> { <nl> - return partitioner . getDecoratedKeyComparator ( ) . compare ( key , kp . key ) ; <nl> + return key . compareTo ( kp . key ) ; <nl> } <nl> <nl> public String toString ( ) <nl> diff - - git a / src / java / org / apache / cassandra / io / SSTableReader . java b / src / java / org / apache / cassandra / io / SSTableReader . java <nl> index 33b990b . . 329826f 100644 <nl> - - - a / src / java / org / apache / cassandra / io / SSTableReader . java <nl> + + + b / src / java / org / apache / cassandra / io / SSTableReader . java <nl> @ @ - 310 , 7 + 310 , 7 @ @ public class SSTableReader extends SSTable implements Comparable < SSTableReader > <nl> return - 1 ; <nl> } <nl> long position = input . readLong ( ) ; <nl> - int v = partitioner . getDecoratedKeyComparator ( ) . compare ( indexDecoratedKey , decoratedKey ) ; <nl> + int v = indexDecoratedKey . compareTo ( decoratedKey ) ; <nl> if ( v = = 0 ) <nl> { <nl> if ( keyCache ! = null ) <nl> @ @ - 352 , 7 + 352 , 7 @ @ public class SSTableReader extends SSTable implements Comparable < SSTableReader > <nl> return - 1 ; <nl> } <nl> long position = input . readLong ( ) ; <nl> - int v = partitioner . getDecoratedKeyComparator ( ) . compare ( indexDecoratedKey , decoratedKey ) ; <nl> + int v = indexDecoratedKey . compareTo ( decoratedKey ) ; <nl> if ( v > = 0 ) <nl> return position ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / SSTableWriter . java b / src / java / org / apache / cassandra / io / SSTableWriter . java <nl> index 8562461 . . db336c1 100644 <nl> - - - a / src / java / org / apache / cassandra / io / SSTableWriter . java <nl> + + + b / src / java / org / apache / cassandra / io / SSTableWriter . java <nl> @ @ - 61 , 8 + 61 , 7 @ @ public class SSTableWriter extends SSTable <nl> { <nl> throw new IOException ( " Keys must not be null . " ) ; <nl> } <nl> - Comparator < DecoratedKey > c = partitioner . getDecoratedKeyComparator ( ) ; <nl> - if ( lastWrittenKey ! = null & & c . compare ( lastWrittenKey , decoratedKey ) > 0 ) <nl> + if ( lastWrittenKey ! = null & & lastWrittenKey . compareTo ( decoratedKey ) > 0 ) <nl> { <nl> logger . info ( " Last written key : " + lastWrittenKey ) ; <nl> logger . info ( " Current key : " + decoratedKey ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index bf62cf1 . . 2543c90 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 78 , 7 + 78 , 7 @ @ public class StorageProxy implements StorageProxyMBean <nl> public int compare ( String o1 , String o2 ) <nl> { <nl> IPartitioner p = StorageService . getPartitioner ( ) ; <nl> - return p . getDecoratedKeyComparator ( ) . compare ( p . decorateKey ( o1 ) , p . decorateKey ( o2 ) ) ; <nl> + return p . decorateKey ( o1 ) . compareTo ( p . decorateKey ( o2 ) ) ; <nl> } <nl> } ; <nl> <nl> diff - - git a / test / unit / org / apache / cassandra / service / ReadResponseResolverTest . java b / test / unit / org / apache / cassandra / service / ReadResponseResolverTest . java <nl> index 6f3bae6 . . 2436427 100644 <nl> - - - a / test / unit / org / apache / cassandra / service / ReadResponseResolverTest . java <nl> + + + b / test / unit / org / apache / cassandra / service / ReadResponseResolverTest . java <nl> @ @ - 1 , 4 + 1 , 25 @ @ <nl> package org . apache . cassandra . service ; <nl> + / * <nl> + * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * <nl> + * / <nl> + <nl> <nl> import java . util . Arrays ; <nl>
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / concurrent / SEPWorker . java b / src / java / org / apache / cassandra / concurrent / SEPWorker . java 
+ index 4549b48 . . d998ab7 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / SEPWorker . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / SEPWorker . java 
+ @ @ - 74 , 9 + 74 , 14 @ @ final class SEPWorker extends AtomicReference < SEPWorker . Work > implements Runnabl 
+ { 
+ while ( true ) 
+ { 
+ + if ( pool . shuttingDown ) 
+ + return ; 
+ + 
+ if ( isSpinning ( ) & & ! selfAssign ( ) ) 
+ { 
+ doWaitSpin ( ) ; 
+ + / / if the pool is terminating , but we have been assigned STOP _ SIGNALLED , if we do not re - check 
+ + / / whether the pool is shutting down this thread will go to sleep and block forever 
+ continue ; 
+ } 
+ 
+ @ @ - 118 , 8 + 123 , 12 @ @ final class SEPWorker extends AtomicReference < SEPWorker . Work > implements Runnabl 
+ 
+ / / return our work permit , and maybe signal shutdown 
+ assigned . returnWorkPermit ( ) ; 
+ - if ( shutdown & & assigned . getActiveTaskCount ( ) = = 0 ) 
+ - assigned . shutdown . signalAll ( ) ; 
+ + if ( shutdown ) 
+ + { 
+ + if ( assigned . getActiveTaskCount ( ) = = 0 ) 
+ + assigned . shutdown . signalAll ( ) ; 
+ + return ; 
+ + } 
+ assigned = null ; 
+ 
+ / / try to immediately reassign ourselves some work ; if we fail , start spinning 
+ @ @ - 169 , 7 + 178 , 11 @ @ final class SEPWorker extends AtomicReference < SEPWorker . Work > implements Runnabl 
+ 
+ / / if we ' re being descheduled , place ourselves in the descheduled collection 
+ if ( work . isStop ( ) ) 
+ + { 
+ pool . descheduled . put ( workerId , this ) ; 
+ + if ( pool . shuttingDown ) 
+ + return true ; 
+ + } 
+ 
+ / / if we ' re currently stopped , and the new state is not a stop signal 
+ / / ( which we can immediately convert to stopped ) , unpark the worker 
+ diff - - git a / src / java / org / apache / cassandra / concurrent / SharedExecutorPool . java b / src / java / org / apache / cassandra / concurrent / SharedExecutorPool . java 
+ index 5352ad7 . . 62bede9 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / SharedExecutorPool . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / SharedExecutorPool . java 
+ @ @ - 24 , 8 + 24 , 7 @ @ import java . util . concurrent . CopyOnWriteArrayList ; 
+ import java . util . concurrent . TimeUnit ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ import java . util . concurrent . atomic . AtomicLong ; 
+ - 
+ - import com . google . common . annotations . VisibleForTesting ; 
+ + import java . util . concurrent . locks . LockSupport ; 
+ 
+ import static org . apache . cassandra . concurrent . SEPWorker . Work ; 
+ 
+ @ @ - 77 , 6 + 76 , 8 @ @ public class SharedExecutorPool 
+ / / the collection of threads that have been asked to stop / deschedule - new workers are scheduled from here last 
+ final ConcurrentSkipListMap < Long , SEPWorker > descheduled = new ConcurrentSkipListMap < > ( ) ; 
+ 
+ + volatile boolean shuttingDown = false ; 
+ + 
+ public SharedExecutorPool ( String poolName ) 
+ { 
+ this . poolName = poolName ; 
+ @ @ - 113 , 13 + 114 , 31 @ @ public class SharedExecutorPool 
+ return executor ; 
+ } 
+ 
+ - @ VisibleForTesting 
+ - public static void shutdownSharedPool ( ) throws InterruptedException 
+ + public void shutdown ( ) throws InterruptedException 
+ { 
+ - for ( SEPExecutor executor : SHARED . executors ) 
+ - executor . shutdown ( ) ; 
+ + shuttingDown = true ; 
+ + for ( SEPExecutor executor : executors ) 
+ + executor . shutdownNow ( ) ; 
+ + 
+ + terminateWorkers ( ) ; 
+ + 
+ + long until = System . nanoTime ( ) + TimeUnit . MINUTES . toNanos ( 1L ) ; 
+ + for ( SEPExecutor executor : executors ) 
+ + executor . shutdown . await ( until - System . nanoTime ( ) , TimeUnit . NANOSECONDS ) ; 
+ + } 
+ + 
+ + void terminateWorkers ( ) 
+ + { 
+ + assert shuttingDown ; 
+ + 
+ + / / To terminate our workers , we only need to unpark thread to make it runnable again , 
+ + / / so that the pool . shuttingDown boolean is checked . If work was already in the process 
+ + / / of being scheduled , worker will terminate upon running the task . 
+ + Map . Entry < Long , SEPWorker > e ; 
+ + while ( null ! = ( e = descheduled . pollFirstEntry ( ) ) ) 
+ + e . getValue ( ) . assign ( Work . SPINNING , false ) ; 
+ 
+ - for ( SEPExecutor executor : SHARED . executors ) 
+ - executor . awaitTermination ( 60 , TimeUnit . SECONDS ) ; 
+ + while ( null ! = ( e = spinning . pollFirstEntry ( ) ) ) 
+ + LockSupport . unpark ( e . getValue ( ) . thread ) ; 
+ } 
+ } 
+ diff - - git a / test / distributed / org / apache / cassandra / distributed / Instance . java b / test / distributed / org / apache / cassandra / distributed / Instance . java 
+ index f9ee5bb . . f344411 100644 
+ - - - a / test / distributed / org / apache / cassandra / distributed / Instance . java 
+ + + + b / test / distributed / org / apache / cassandra / distributed / Instance . java 
+ @ @ - 345 , 7 + 345 , 7 @ @ public class Instance extends InvokableInstance 
+ BufferPool : : shutdownLocalCleaner , 
+ Ref : : shutdownReferenceReaper , 
+ StageManager : : shutdownAndWait , 
+ - SharedExecutorPool : : shutdownSharedPool , 
+ + SharedExecutorPool . SHARED : : shutdown , 
+ Memtable . MEMORY _ POOL : : shutdown , 
+ ScheduledExecutors : : shutdownAndWait ) ; 
+ error = shutdownAndWait ( error , ActiveRepairService . repairCommandExecutor ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / concurrent / SEPExecutorTest . java b / test / unit / org / apache / cassandra / concurrent / SEPExecutorTest . java 
+ new file mode 100644 
+ index 0000000 . . 011a8ba 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / concurrent / SEPExecutorTest . java 
+ @ @ - 0 , 0 + 1 , 70 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + 
+ + package org . apache . cassandra . concurrent ; 
+ + 
+ + import java . io . OutputStream ; 
+ + import java . io . PrintStream ; 
+ + import java . util . Arrays ; 
+ + import java . util . concurrent . ExecutorService ; 
+ + 
+ + import org . junit . Assert ; 
+ + import org . junit . Test ; 
+ + 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ + 
+ + public class SEPExecutorTest 
+ + { 
+ + @ Test 
+ + public void shutdownTest ( ) throws Throwable 
+ + { 
+ + for ( int i = 0 ; i < 1000 ; i + + ) 
+ + { 
+ + shutdownOnce ( i ) ; 
+ + } 
+ + } 
+ + 
+ + private static void shutdownOnce ( int run ) throws Throwable 
+ + { 
+ + SharedExecutorPool sharedPool = new SharedExecutorPool ( " SharedPool " ) ; 
+ + String MAGIC = " UNREPEATABLE _ MAGIC _ STRING " ; 
+ + OutputStream nullOutputStream = new OutputStream ( ) { 
+ + public void write ( int b ) { } 
+ + } ; 
+ + PrintStream nullPrintSteam = new PrintStream ( nullOutputStream ) ; 
+ + 
+ + for ( int idx = 0 ; idx < 20 ; idx + + ) 
+ + { 
+ + ExecutorService es = sharedPool . newExecutor ( FBUtilities . getAvailableProcessors ( ) , Integer . MAX _ VALUE , " STAGE " , run + MAGIC + idx ) ; 
+ + / / Write to black hole 
+ + es . execute ( ( ) - > nullPrintSteam . println ( " TEST " + es ) ) ; 
+ + } 
+ + 
+ + / / shutdown does not guarantee that threads are actually dead once it exits , only that they will stop promptly afterwards 
+ + sharedPool . shutdown ( ) ; 
+ + for ( Thread thread : Thread . getAllStackTraces ( ) . keySet ( ) ) 
+ + { 
+ + if ( thread . getName ( ) . contains ( MAGIC ) ) 
+ + { 
+ + thread . join ( 100 ) ; 
+ + if ( thread . isAlive ( ) ) 
+ + Assert . fail ( thread + " is still running " + Arrays . toString ( thread . getStackTrace ( ) ) ) ; 
+ + } 
+ + } 
+ + } 
+ + }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 5c7902c . . e0863eb 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 8 @ @ 
+ - 0 . 5 . 0 dev 
+ + 0 . 5 . 0 RC1 
+ + * Fix potential NPE in get _ range _ slice ( CASSANDRA - 623 ) 
+ + 
+ + 
+ + 0 . 5 . 0 beta 2 
+ * Bootstrap improvements ( several tickets ) 
+ * add nodeprobe repair anti - entropy feature ( CASSANDRA - 193 , CASSANDRA - 520 ) 
+ * fix possibility of partition when many nodes restart at once 
+ @ @ - 20 , 6 + 24 , 7 @ @ 
+ incorrectly ( and temporarily ) marked as down ( CASSANDRA - 610 ) 
+ * respect memtable thresholds during log replay ( CASSANDRA - 609 ) 
+ * support ConsistencyLevel . ALL on read ( CASSANDRA - 584 ) 
+ + * add nodeprobe removetoken command ( CASSANDRA - 564 ) 
+ 
+ 
+ 0 . 5 . 0 beta 
+ diff - - git a / build . xml b / build . xml 
+ index b47d5b3 . . 3d965e9 100644 
+ - - - a / build . xml 
+ + + + b / build . xml 
+ @ @ - 37 , 7 + 37 , 7 @ @ 
+ < property name = " test . name " value = " * Test " / > 
+ < property name = " test . unit . src " value = " $ { test . dir } / unit " / > 
+ < property name = " dist . dir " value = " $ { build . dir } / dist " / > 
+ - < property name = " version " value = " 0 . 4 . 2 " / > 
+ + < property name = " version " value = " 0 . 5 . 0 - beta2 " / > 
+ < property name = " final . name " value = " $ { ant . project . name } - $ { version } " / > 
+ 
+ < ! - - http : / / cobertura . sourceforge . net / - - > 
+ diff - - git a / interface / cassandra . thrift b / interface / cassandra . thrift 
+ index 0a30153 . . 8eb6226 100644 
+ - - - a / interface / cassandra . thrift 
+ + + + b / interface / cassandra . thrift 
+ @ @ - 40 , 7 + 40 , 7 @ @ namespace rb CassandraThrift 
+ # no promises are made other than " if both are equal , you ' re good . " 
+ # in particular , don ' t try to parse numeric information out and assume 
+ # that a " greater " version is a superset of a " smaller " one . 
+ - const string VERSION = " 0 . 5 - beta1 " 
+ + const string VERSION = " 0 . 5 - beta2 " 
+ 
+ 
+ # 
+ diff - - git a / interface / gen - java / org / apache / cassandra / service / Constants . java b / interface / gen - java / org / apache / cassandra / service / Constants . java 
+ index 1b9a2ed . . 2228465 100644 
+ - - - a / interface / gen - java / org / apache / cassandra / service / Constants . java 
+ + + + b / interface / gen - java / org / apache / cassandra / service / Constants . java 
+ @ @ - 40 , 6 + 40 , 6 @ @ import org . slf4j . LoggerFactory ; 
+ 
+ public class Constants { 
+ 
+ - public static final String VERSION = " 0 . 5 - beta1 " ; 
+ + public static final String VERSION = " 0 . 5 - beta2 " ; 
+ 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / BinaryMemtable . java b / src / java / org / apache / cassandra / db / BinaryMemtable . java 
+ index 7b522be . . b413e0b 100644 
+ - - - a / src / java / org / apache / cassandra / db / BinaryMemtable . java 
+ + + + b / src / java / org / apache / cassandra / db / BinaryMemtable . java 
+ @ @ - 132 , 7 + 132 , 7 @ @ public class BinaryMemtable implements IFlushable < DecoratedKey > 
+ assert ! columnFamilies _ . isEmpty ( ) ; 
+ logger _ . info ( " Sorting " + this ) ; 
+ List < DecoratedKey > keys = new ArrayList < DecoratedKey > ( columnFamilies _ . keySet ( ) ) ; 
+ - Collections . sort ( keys , partitioner _ . getDecoratedKeyComparator ( ) ) ; 
+ + Collections . sort ( keys ) ; 
+ return keys ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index bc7c43a . . 93f19b5 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1289 , 8 + 1289 , 6 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ { 
+ final DecoratedKey startWithDK = partitioner . decorateKey ( startWith ) ; 
+ final DecoratedKey stopAtDK = partitioner . decorateKey ( stopAt ) ; 
+ - / / ( OPP key decoration is a no - op so using the " decorated " comparator against raw keys is fine ) 
+ - final Comparator < DecoratedKey > comparator = partitioner . getDecoratedKeyComparator ( ) ; 
+ 
+ / / create a CollatedIterator that will return unique keys from different sources 
+ / / ( current memtable , historical memtables , and SSTables ) in the correct order . 
+ @ @ - 1302 , 8 + 1300 , 8 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ { 
+ public boolean apply ( DecoratedKey key ) 
+ { 
+ - return comparator . compare ( startWithDK , key ) < = 0 
+ - & & ( stopAt . isEmpty ( ) | | comparator . compare ( key , stopAtDK ) < = 0 ) ; 
+ + return startWithDK . compareTo ( key ) < = 0 
+ + & & ( stopAt . isEmpty ( ) | | key . compareTo ( stopAtDK ) < = 0 ) ; 
+ } 
+ } ; 
+ 
+ @ @ - 1343 , 7 + 1341 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ iterators . add ( iter ) ; 
+ } 
+ 
+ - Iterator < DecoratedKey > collated = IteratorUtils . collatedIterator ( comparator , iterators ) ; 
+ + Iterator < DecoratedKey > collated = IteratorUtils . collatedIterator ( DecoratedKey . comparator , iterators ) ; 
+ Iterable < DecoratedKey > reduced = new ReducingIterator < DecoratedKey , DecoratedKey > ( collated ) { 
+ DecoratedKey current ; 
+ 
+ @ @ - 1366 , 7 + 1364 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ boolean rangeCompletedLocally = false ; 
+ for ( DecoratedKey current : reduced ) 
+ { 
+ - if ( ! stopAt . isEmpty ( ) & & comparator . compare ( stopAtDK , current ) < 0 ) 
+ + if ( ! stopAt . isEmpty ( ) & & stopAtDK . compareTo ( current ) < 0 ) 
+ { 
+ rangeCompletedLocally = true ; 
+ break ; 
+ @ @ - 1411 , 9 + 1409 , 6 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ public RangeReply getKeyRangeRaw ( final DecoratedKey startWith , final DecoratedKey stopAt , int maxResults ) 
+ throws IOException , ExecutionException , InterruptedException 
+ { 
+ - / / ( OPP key decoration is a no - op so using the " decorated " comparator against raw keys is fine ) 
+ - final Comparator < DecoratedKey > comparator = partitioner . getDecoratedKeyComparator ( ) ; 
+ - 
+ / / create a CollatedIterator that will return unique keys from different sources 
+ / / ( current memtable , historical memtables , and SSTables ) in the correct order . 
+ List < Iterator < DecoratedKey > > iterators = new ArrayList < Iterator < DecoratedKey > > ( ) ; 
+ @ @ - 1424 , 8 + 1419 , 8 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ { 
+ public boolean apply ( DecoratedKey key ) 
+ { 
+ - return comparator . compare ( startWith , key ) < = 0 
+ - & & ( stopAt . isEmpty ( ) | | comparator . compare ( key , stopAt ) < = 0 ) ; 
+ + return startWith . compareTo ( key ) < = 0 
+ + & & ( stopAt . isEmpty ( ) | | key . compareTo ( stopAt ) < = 0 ) ; 
+ } 
+ } ; 
+ 
+ @ @ - 1465 , 7 + 1460 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ iterators . add ( iter ) ; 
+ } 
+ 
+ - Iterator < DecoratedKey > collated = IteratorUtils . collatedIterator ( comparator , iterators ) ; 
+ + Iterator < DecoratedKey > collated = IteratorUtils . collatedIterator ( DecoratedKey . comparator , iterators ) ; 
+ Iterable < DecoratedKey > reduced = new ReducingIterator < DecoratedKey , DecoratedKey > ( collated ) { 
+ DecoratedKey current ; 
+ 
+ @ @ - 1487 , 7 + 1482 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ boolean rangeCompletedLocally = false ; 
+ for ( DecoratedKey current : reduced ) 
+ { 
+ - if ( ! stopAt . isEmpty ( ) & & comparator . compare ( stopAt , current ) < 0 ) 
+ + if ( ! stopAt . isEmpty ( ) & & stopAt . compareTo ( current ) < 0 ) 
+ { 
+ rangeCompletedLocally = true ; 
+ break ; 
+ diff - - git a / src / java / org / apache / cassandra / db / DecoratedKey . java b / src / java / org / apache / cassandra / db / DecoratedKey . java 
+ index 5895ecf . . 178535e 100644 
+ - - - a / src / java / org / apache / cassandra / db / DecoratedKey . java 
+ + + + b / src / java / org / apache / cassandra / db / DecoratedKey . java 
+ @ @ - 21 , 6 + 21 , 7 @ @ package org . apache . cassandra . db ; 
+ import java . io . DataOutput ; 
+ import java . io . IOException ; 
+ import java . io . DataInput ; 
+ + import java . util . Comparator ; 
+ 
+ import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . io . ICompactSerializer2 ; 
+ @ @ - 44 , 6 + 45 , 14 @ @ public class DecoratedKey < T extends Token > implements Comparable < DecoratedKey > 
+ return serializer ; 
+ } 
+ 
+ + public static final Comparator < DecoratedKey > comparator = new Comparator < DecoratedKey > ( ) 
+ + { 
+ + public int compare ( DecoratedKey o1 , DecoratedKey o2 ) 
+ + { 
+ + return o1 . compareTo ( o2 ) ; 
+ + } 
+ + } ; 
+ + 
+ public final T token ; 
+ public final String key ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java 
+ index 399e37a . . aca6950 100644 
+ - - - a / src / java / org / apache / cassandra / db / Memtable . java 
+ + + + b / src / java / org / apache / cassandra / db / Memtable . java 
+ @ @ - 182 , 9 + 182 , 8 @ @ public class Memtable implements Comparable < Memtable > , IFlushable < DecoratedKey > 
+ { 
+ logger _ . info ( " Sorting " + this ) ; 
+ / / sort keys in the order they would be in when decorated 
+ - Comparator < DecoratedKey > dc = partitioner _ . getDecoratedKeyComparator ( ) ; 
+ ArrayList < DecoratedKey > orderedKeys = new ArrayList < DecoratedKey > ( columnFamilies _ . keySet ( ) ) ; 
+ - Collections . sort ( orderedKeys , dc ) ; 
+ + Collections . sort ( orderedKeys ) ; 
+ return orderedKeys ; 
+ } 
+ 
+ @ @ - 225 , 7 + 224 , 7 @ @ public class Memtable implements Comparable < Memtable > , IFlushable < DecoratedKey > 
+ / / cannot create a PQ of size zero ( wtf ? ) 
+ return Arrays . asList ( new DecoratedKey [ 0 ] ) . iterator ( ) ; 
+ } 
+ - PriorityQueue < DecoratedKey > pq = new PriorityQueue < DecoratedKey > ( columnFamilies _ . size ( ) , partitioner _ . getDecoratedKeyComparator ( ) ) ; 
+ + PriorityQueue < DecoratedKey > pq = new PriorityQueue < DecoratedKey > ( columnFamilies _ . size ( ) ) ; 
+ pq . addAll ( columnFamilies _ . keySet ( ) ) ; 
+ return new DestructivePQIterator < DecoratedKey > ( pq ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / dht / CollatingOrderPreservingPartitioner . java b / src / java / org / apache / cassandra / dht / CollatingOrderPreservingPartitioner . java 
+ index 9b4ad56 . . b214196 100644 
+ - - - a / src / java / org / apache / cassandra / dht / CollatingOrderPreservingPartitioner . java 
+ + + + b / src / java / org / apache / cassandra / dht / CollatingOrderPreservingPartitioner . java 
+ @ @ - 37 , 16 + 37 , 6 @ @ public class CollatingOrderPreservingPartitioner implements IPartitioner < BytesTo 
+ 
+ public static final BigInteger BYTE _ MASK = new BigInteger ( " 255 " ) ; 
+ 
+ - / * * 
+ - * Comparators for decorated keys . 
+ - * / 
+ - private static final Comparator < DecoratedKey < BytesToken > > comparator = new Comparator < DecoratedKey < BytesToken > > ( ) { 
+ - public int compare ( DecoratedKey < BytesToken > o1 , DecoratedKey < BytesToken > o2 ) 
+ - { 
+ - return FBUtilities . compareByteArrays ( o1 . token . token , o2 . token . token ) ; 
+ - } 
+ - } ; 
+ - 
+ public DecoratedKey < BytesToken > decorateKey ( String key ) 
+ { 
+ return new DecoratedKey < BytesToken > ( getToken ( key ) , key ) ; 
+ @ @ - 62 , 11 + 52 , 6 @ @ public class CollatingOrderPreservingPartitioner implements IPartitioner < BytesTo 
+ return key . key ; 
+ } 
+ 
+ - public Comparator < DecoratedKey < BytesToken > > getDecoratedKeyComparator ( ) 
+ - { 
+ - return comparator ; 
+ - } 
+ - 
+ public BytesToken midpoint ( BytesToken ltoken , BytesToken rtoken ) 
+ { 
+ int sigbytes = Math . max ( ltoken . token . length , rtoken . token . length ) ; 
+ diff - - git a / src / java / org / apache / cassandra / dht / IPartitioner . java b / src / java / org / apache / cassandra / dht / IPartitioner . java 
+ index d141758 . . 02fd665 100644 
+ - - - a / src / java / org / apache / cassandra / dht / IPartitioner . java 
+ + + + b / src / java / org / apache / cassandra / dht / IPartitioner . java 
+ @ @ - 49 , 11 + 49 , 6 @ @ public interface IPartitioner < T extends Token > 
+ public DecoratedKey < T > decorateKey ( String key ) ; 
+ 
+ / * * 
+ - * @ return a comparator for decorated key objects , not strings 
+ - * / 
+ - public Comparator < DecoratedKey < T > > getDecoratedKeyComparator ( ) ; 
+ - 
+ - / * * 
+ * Calculate a Token representing the approximate " middle " of the given 
+ * range . 
+ * 
+ diff - - git a / src / java / org / apache / cassandra / dht / OrderPreservingPartitioner . java b / src / java / org / apache / cassandra / dht / OrderPreservingPartitioner . java 
+ index e50b576 . . 9f13b95 100644 
+ - - - a / src / java / org / apache / cassandra / dht / OrderPreservingPartitioner . java 
+ + + + b / src / java / org / apache / cassandra / dht / OrderPreservingPartitioner . java 
+ @ @ - 35 , 17 + 35 , 6 @ @ public class OrderPreservingPartitioner implements IPartitioner < StringToken > 
+ 
+ public static final BigInteger CHAR _ MASK = new BigInteger ( " 65535 " ) ; 
+ 
+ - / * * 
+ - * Comparators for decorated keys . 
+ - * / 
+ - private static final Comparator < DecoratedKey < StringToken > > comparator = 
+ - new Comparator < DecoratedKey < StringToken > > ( ) { 
+ - public int compare ( DecoratedKey < StringToken > o1 , DecoratedKey < StringToken > o2 ) 
+ - { 
+ - return o1 . key . compareTo ( o2 . key ) ; 
+ - } 
+ - } ; 
+ - 
+ public DecoratedKey < StringToken > decorateKey ( String key ) 
+ { 
+ return new DecoratedKey < StringToken > ( new StringToken ( key ) , key ) ; 
+ @ @ - 61 , 11 + 50 , 6 @ @ public class OrderPreservingPartitioner implements IPartitioner < StringToken > 
+ return key . key ; 
+ } 
+ 
+ - public Comparator < DecoratedKey < StringToken > > getDecoratedKeyComparator ( ) 
+ - { 
+ - return comparator ; 
+ - } 
+ - 
+ public StringToken midpoint ( StringToken ltoken , StringToken rtoken ) 
+ { 
+ int sigchars = Math . max ( ltoken . token . length ( ) , rtoken . token . length ( ) ) ; 
+ diff - - git a / src / java / org / apache / cassandra / dht / RandomPartitioner . java b / src / java / org / apache / cassandra / dht / RandomPartitioner . java 
+ index 129d1ed . . 3b4c1f2 100644 
+ - - - a / src / java / org / apache / cassandra / dht / RandomPartitioner . java 
+ + + + b / src / java / org / apache / cassandra / dht / RandomPartitioner . java 
+ @ @ - 38 , 21 + 38 , 6 @ @ public class RandomPartitioner implements IPartitioner < BigIntegerToken > 
+ public static final BigIntegerToken MINIMUM = new BigIntegerToken ( " 0 " ) ; 
+ 
+ private static final String DELIMITER = " : " ; 
+ - 
+ - private static final Comparator < DecoratedKey < BigIntegerToken > > comparator = 
+ - new Comparator < DecoratedKey < BigIntegerToken > > ( ) { 
+ - public int compare ( DecoratedKey < BigIntegerToken > o1 , DecoratedKey < BigIntegerToken > o2 ) 
+ - { 
+ - / / first , compare on the bigint hash " decoration " . usually this will be enough . 
+ - int v = o1 . token . compareTo ( o2 . token ) ; 
+ - if ( v ! = 0 ) { 
+ - return v ; 
+ - } 
+ - 
+ - / / if the hashes are equal , compare the strings 
+ - return o1 . key . compareTo ( o2 . key ) ; 
+ - } 
+ - } ; 
+ 
+ public DecoratedKey < BigIntegerToken > decorateKey ( String key ) 
+ { 
+ @ @ - 73 , 11 + 58 , 6 @ @ public class RandomPartitioner implements IPartitioner < BigIntegerToken > 
+ return key . token + DELIMITER + key . key ; 
+ } 
+ 
+ - public Comparator < DecoratedKey < BigIntegerToken > > getDecoratedKeyComparator ( ) 
+ - { 
+ - return comparator ; 
+ - } 
+ - 
+ public BigIntegerToken midpoint ( BigIntegerToken ltoken , BigIntegerToken rtoken ) 
+ { 
+ Pair < BigInteger , Boolean > midpair = FBUtilities . midpoint ( ltoken . token , rtoken . token , 127 ) ; 
+ diff - - git a / src / java / org / apache / cassandra / io / IteratingRow . java b / src / java / org / apache / cassandra / io / IteratingRow . java 
+ index 53ff86c . . 7962c79 100644 
+ - - - a / src / java / org / apache / cassandra / io / IteratingRow . java 
+ + + + b / src / java / org / apache / cassandra / io / IteratingRow . java 
+ @ @ - 109 , 6 + 109 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl 
+ 
+ public int compareTo ( IteratingRow o ) 
+ { 
+ - return partitioner . getDecoratedKeyComparator ( ) . compare ( key , o . key ) ; 
+ + return key . compareTo ( o . key ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / SSTable . java b / src / java / org / apache / cassandra / io / SSTable . java 
+ index 58224de . . ab83679 100644 
+ - - - a / src / java / org / apache / cassandra / io / SSTable . java 
+ + + + b / src / java / org / apache / cassandra / io / SSTable . java 
+ @ @ - 179 , 7 + 179 , 7 @ @ public abstract class SSTable 
+ 
+ public int compareTo ( KeyPosition kp ) 
+ { 
+ - return partitioner . getDecoratedKeyComparator ( ) . compare ( key , kp . key ) ; 
+ + return key . compareTo ( kp . key ) ; 
+ } 
+ 
+ public String toString ( ) 
+ diff - - git a / src / java / org / apache / cassandra / io / SSTableReader . java b / src / java / org / apache / cassandra / io / SSTableReader . java 
+ index 33b990b . . 329826f 100644 
+ - - - a / src / java / org / apache / cassandra / io / SSTableReader . java 
+ + + + b / src / java / org / apache / cassandra / io / SSTableReader . java 
+ @ @ - 310 , 7 + 310 , 7 @ @ public class SSTableReader extends SSTable implements Comparable < SSTableReader > 
+ return - 1 ; 
+ } 
+ long position = input . readLong ( ) ; 
+ - int v = partitioner . getDecoratedKeyComparator ( ) . compare ( indexDecoratedKey , decoratedKey ) ; 
+ + int v = indexDecoratedKey . compareTo ( decoratedKey ) ; 
+ if ( v = = 0 ) 
+ { 
+ if ( keyCache ! = null ) 
+ @ @ - 352 , 7 + 352 , 7 @ @ public class SSTableReader extends SSTable implements Comparable < SSTableReader > 
+ return - 1 ; 
+ } 
+ long position = input . readLong ( ) ; 
+ - int v = partitioner . getDecoratedKeyComparator ( ) . compare ( indexDecoratedKey , decoratedKey ) ; 
+ + int v = indexDecoratedKey . compareTo ( decoratedKey ) ; 
+ if ( v > = 0 ) 
+ return position ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / SSTableWriter . java b / src / java / org / apache / cassandra / io / SSTableWriter . java 
+ index 8562461 . . db336c1 100644 
+ - - - a / src / java / org / apache / cassandra / io / SSTableWriter . java 
+ + + + b / src / java / org / apache / cassandra / io / SSTableWriter . java 
+ @ @ - 61 , 8 + 61 , 7 @ @ public class SSTableWriter extends SSTable 
+ { 
+ throw new IOException ( " Keys must not be null . " ) ; 
+ } 
+ - Comparator < DecoratedKey > c = partitioner . getDecoratedKeyComparator ( ) ; 
+ - if ( lastWrittenKey ! = null & & c . compare ( lastWrittenKey , decoratedKey ) > 0 ) 
+ + if ( lastWrittenKey ! = null & & lastWrittenKey . compareTo ( decoratedKey ) > 0 ) 
+ { 
+ logger . info ( " Last written key : " + lastWrittenKey ) ; 
+ logger . info ( " Current key : " + decoratedKey ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index bf62cf1 . . 2543c90 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 78 , 7 + 78 , 7 @ @ public class StorageProxy implements StorageProxyMBean 
+ public int compare ( String o1 , String o2 ) 
+ { 
+ IPartitioner p = StorageService . getPartitioner ( ) ; 
+ - return p . getDecoratedKeyComparator ( ) . compare ( p . decorateKey ( o1 ) , p . decorateKey ( o2 ) ) ; 
+ + return p . decorateKey ( o1 ) . compareTo ( p . decorateKey ( o2 ) ) ; 
+ } 
+ } ; 
+ 
+ diff - - git a / test / unit / org / apache / cassandra / service / ReadResponseResolverTest . java b / test / unit / org / apache / cassandra / service / ReadResponseResolverTest . java 
+ index 6f3bae6 . . 2436427 100644 
+ - - - a / test / unit / org / apache / cassandra / service / ReadResponseResolverTest . java 
+ + + + b / test / unit / org / apache / cassandra / service / ReadResponseResolverTest . java 
+ @ @ - 1 , 4 + 1 , 25 @ @ 
+ package org . apache . cassandra . service ; 
+ + / * 
+ + * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * 
+ + * / 
+ + 
+ 
+ import java . util . Arrays ; 
+

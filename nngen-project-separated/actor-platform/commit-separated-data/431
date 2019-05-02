@@ -1,0 +1,599 @@
+BLEU SCORE: 0.21972813874997157
+
+TEST MSG: fix ( server : activation ) : use same sms code for one transaction
+GENERATED MSG: fix ( server : auth ) : improve activation logic
+
+TEST DIFF (one line): diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala < nl > index 7bbfdfe . . f565f6c 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala < nl > @ @ - 4 , 14 + 4 , 16 @ @ import akka . actor . ActorSystem < nl > import cats . data . Xor < nl > import im . actor . server . activation . common . _ < nl > import im . actor . server . db . DbExtension < nl > - import im . actor . server . model . { ExpirableCode , AuthPhoneTransaction , AuthEmailTransaction , AuthTransactionBase } < nl > + import im . actor . server . model . { AuthEmailTransaction , AuthPhoneTransaction , AuthTransactionBase , ExpirableCode } < nl > + import im . actor . util . cache . CacheHelpers < nl > < nl > import scala . concurrent . Future < nl > < nl > - final class ActivationContext ( implicit system : ActorSystem ) { < nl > + final class ActivationContext ( implicit system : ActorSystem ) extends CodeGen { < nl > < nl > import system . dispatcher < nl > import ActivationProviders . _ < nl > + import CacheHelpers . _ < nl > < nl > private val db = DbExtension ( system ) . db < nl > private val providers = getProviders ( ) < nl > @ @ - 23 , 12 + 25 , 16 @ @ final class ActivationContext ( implicit system : ActorSystem ) { < nl > private val optCallProvider = providers . get ( Call ) < nl > private val optSmtpProvider = providers . get ( Smtp ) < nl > < nl > + private val MaxCacheSize = 1000L < nl > + private implicit val codesCache = createCache [ String , Code ] ( MaxCacheSize ) < nl > + < nl > / * * < nl > * We don ' t care about result of sending internal code . < nl > * But we do care about sending code via external provider . < nl > * We also don ' t show " Try to send code later " warning to end users . < nl > * / < nl > - def send ( txHash : String , code : Code ) : Future [ CodeFailure Xor Unit ] = < nl > + def send ( txHash : String , codeTemplate : Code ) : Future [ CodeFailure Xor Unit ] = { < nl > + val code = getCachedOrElsePut ( txHash , generateCode ( codeTemplate ) ) < nl > ( for { < nl > _ ← trySend ( optInternalProvider , txHash , code , logFailure = false ) < nl > result ← code match { < nl > @ @ - 45 , 6 + 51 , 7 @ @ final class ActivationContext ( implicit system : ActorSystem ) { < nl > error < nl > case result : Xor . Right [ _ ] ⇒ result < nl > } < nl > + } < nl > < nl > / * * < nl > * If internal code validates - we are fine . < nl > @ @ - 77 , 6 + 84 , 7 @ @ final class ActivationContext ( implicit system : ActorSystem ) { < nl > case _ : AuthPhoneTransaction ⇒ tryCleanup ( optSmsProvider , tx . transactionHash ) < nl > } < nl > } yield ( ) < nl > + _ = codesCache . invalidate ( tx . transactionHash ) < nl > } yield ( ) < nl > < nl > private def trySend ( optProvider : Option [ ActivationProvider ] , txHash : String , code : Code , logFailure : Boolean = true ) : Future [ CodeFailure Xor Unit ] = < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / CodeGen . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / CodeGen . scala < nl > new file mode 100644 < nl > index 0000000 . . 0ff62e6 < nl > - - - / dev / null < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / CodeGen . scala < nl > @ @ - 0 , 0 + 1 , 31 @ @ < nl > + package im . actor . server . activation < nl > + < nl > + import im . actor . server . activation . common . { CallCode , Code , EmailCode , SmsCode } < nl > + import im . actor . util . ThreadLocalSecureRandom < nl > + import im . actor . util . misc . EmailUtils . _ < nl > + import im . actor . util . misc . PhoneNumberUtils . _ < nl > + < nl > + import scala . util . Try < nl > + < nl > + trait CodeGen { < nl > + < nl > + def generateCode ( codeTemplate : Code ) : Code = codeTemplate match { < nl > + case s : SmsCode ⇒ s . copy ( code = genPhoneCode ( s . phone ) ) < nl > + case c : CallCode ⇒ c . copy ( code = genPhoneCode ( c . phone ) ) < nl > + case e : EmailCode ⇒ e . copy ( code = genEmailCode ( e . email ) ) < nl > + } < nl > + < nl > + private def genEmailCode ( email : String ) : String = < nl > + if ( isTestEmail ( email ) ) < nl > + ( email replaceAll ( " " " . * acme " " " , " " ) ) replaceAll ( " . com " , " " ) < nl > + else genCode ( ) < nl > + < nl > + protected def genPhoneCode ( phone : Long ) : String = < nl > + if ( isTestPhone ( phone ) ) { < nl > + val strPhone = phone . toString < nl > + Try ( strPhone ( 4 ) . toString * 4 ) getOrElse strPhone < nl > + } else genCode ( ) < nl > + < nl > + private def genCode ( ) = ThreadLocalSecureRandom . current . nextLong ( ) . toString . dropWhile ( c ⇒ c = = ' 0 ' | | c = = ' - ' ) . take ( 5 ) < nl > + < nl > + } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / codes . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / codes . scala < nl > index 79d84df . . 12d3c1f 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / codes . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / codes . scala < nl > @ @ - 3 , 6 + 3 , 6 @ @ package im . actor . server . activation . common < nl > sealed trait Code { < nl > def code : String < nl > } < nl > - final case class SmsCode ( phone : Long , code : String ) extends Code < nl > - final case class CallCode ( phone : Long , code : String , language : String ) extends Code < nl > - final case class EmailCode ( email : String , code : String ) extends Code < nl > \ No newline at end of file < nl > + final case class SmsCode ( phone : Long , code : String = " " ) extends Code < nl > + final case class CallCode ( phone : Long , language : String , code : String = " " ) extends Code < nl > + final case class EmailCode ( email : String , code : String = " " ) extends Code < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthHelpers . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthHelpers . scala < nl > index 2c8a574 . . 1126dab 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthHelpers . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthHelpers . scala < nl > @ @ - 229 , 29 + 229 , 19 @ @ trait AuthHelpers extends Helpers { < nl > } yield userStruct < nl > } < nl > < nl > - protected def sendSmsCode ( phoneNumber : Long , code : String , txHash : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { < nl > - log . info ( " Sending sms code { } to { } " , code , phoneNumber ) < nl > - DBIO . from ( activationContext . send ( txHash , SmsCode ( phoneNumber , code ) ) ) < nl > + protected def sendSmsCode ( phoneNumber : Long , txHash : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { < nl > + log . info ( " Sending sms code to { } " , phoneNumber ) < nl > + DBIO . from ( activationContext . send ( txHash , SmsCode ( phoneNumber ) ) ) < nl > } < nl > < nl > - protected def sendCallCode ( phoneNumber : Long , code : String , txHash : String , language : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { < nl > - log . info ( " Sending call code { } to { } " , code , phoneNumber ) < nl > - DBIO . from ( activationContext . send ( txHash , CallCode ( phoneNumber , code , language ) ) ) < nl > + protected def sendCallCode ( phoneNumber : Long , txHash : String , language : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { < nl > + log . info ( " Sending call code to { } " , phoneNumber ) < nl > + DBIO . from ( activationContext . send ( txHash , CallCode ( phoneNumber , language ) ) ) < nl > } < nl > < nl > - protected def sendEmailCode ( email : String , code : String , txHash : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { < nl > - log . info ( " Sending email code { } to { } " , code , email ) < nl > - DBIO . from ( activationContext . send ( txHash , EmailCode ( email , code ) ) ) < nl > - } < nl > - < nl > - protected def genSmsHash ( ) = ThreadLocalSecureRandom . current . nextLong ( ) . toString < nl > - < nl > - protected def genEmailCode ( email : String ) : String = < nl > - if ( isTestEmail ( email ) ) genTestCode ( email ) else genCode ( ) < nl > - < nl > - protected def genSmsCode ( phone : Long ) : String = phone . toString match { < nl > - case strNumber if isTestPhone ( phone ) ⇒ Try ( strNumber ( 4 ) . toString * 4 ) . getOrElse ( phone . toString ) < nl > - case _ ⇒ genCode ( ) < nl > + protected def sendEmailCode ( email : String , txHash : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { < nl > + log . info ( " Sending email code to { } " , email ) < nl > + DBIO . from ( activationContext . send ( txHash , EmailCode ( email ) ) ) < nl > } < nl > < nl > protected def newUser ( name : String , countryCode : String , optSex : Option [ ApiSex ] , username : Option [ String ] ) : Result [ Xor . Right [ User ] ] = { < nl > @ @ - 299 , 9 + 289 , 4 @ @ trait AuthHelpers extends Helpers { < nl > } yield ( ) < nl > } < nl > < nl > - private def genTestCode ( email : String ) : String = < nl > - ( email replaceAll ( " " " . * acme " " " , " " ) ) replaceAll ( " . com " , " " ) < nl > - < nl > - private def genCode ( ) = ThreadLocalSecureRandom . current . nextLong ( ) . toString . dropWhile ( c ⇒ c = = ' 0 ' | | c = = ' - ' ) . take ( 5 ) < nl > - < nl > } < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala < nl > index dfd7963 . . 12f5c0b 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala < nl > @ @ - 182 , 7 + 182 , 7 @ @ final class AuthServiceImpl ( < nl > _ ← fromDBIO ( AuthPhoneTransactionRepo . create ( phoneAuthTransaction ) ) < nl > } yield transactionHash < nl > } < nl > - _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , transactionHash ) ) < nl > + _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendSmsCode ( normalizedPhone , transactionHash ) ) < nl > isRegistered = optPhone . isDefined < nl > } yield ResponseStartPhoneAuth ( transactionHash , isRegistered , Some ( ApiPhoneActivationType . CODE ) ) < nl > db . run ( action . value ) < nl > @ @ - 266 , 9 + 266 , 8 @ @ final class AuthServiceImpl ( < nl > override def doHandleSendCodeByPhoneCall ( transactionHash : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { < nl > val action = for { < nl > tx ← fromDBIOOption ( AuthErrors . PhoneCodeExpired ) ( AuthPhoneTransactionRepo . find ( transactionHash ) ) < nl > - code ← fromDBIO ( AuthCodeRepo . findByTransactionHash ( tx . transactionHash ) map ( _ map ( _ . code ) getOrElse ( genSmsCode ( tx . phoneNumber ) ) ) ) < nl > lang = PhoneNumberUtils . normalizeWithCountry ( tx . phoneNumber ) . headOption . map ( _ . _ 2 ) . getOrElse ( " en " ) < nl > - _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendCallCode ( tx . phoneNumber , genSmsCode ( tx . phoneNumber ) , transactionHash , lang ) ) < nl > + _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendCallCode ( tx . phoneNumber , transactionHash , lang ) ) < nl > } yield ResponseVoid < nl > < nl > db . run ( action . value ) < nl > @ @ - 332 , 7 + 331 , 7 @ @ final class AuthServiceImpl ( < nl > activationType match { < nl > case CODE ⇒ < nl > for { < nl > - _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendEmailCode ( validEmail , genEmailCode ( validEmail ) , hash ) ) < nl > + _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendEmailCode ( validEmail , hash ) ) < nl > } yield hash < nl > case OAUTH2 ⇒ < nl > point ( hash ) < nl > @ @ - 355 , 7 + 354 , 7 @ @ final class AuthServiceImpl ( < nl > case CODE ⇒ < nl > for { < nl > _ ← fromDBIO ( AuthEmailTransactionRepo . create ( emailAuthTransaction ) ) < nl > - _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendEmailCode ( validEmail , genEmailCode ( validEmail ) , transactionHash ) ) < nl > + _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendEmailCode ( validEmail , transactionHash ) ) < nl > } yield transactionHash < nl > case OAUTH2 ⇒ < nl > for { < nl > diff - - git a / actor - server / actor - runtime / src / main / scala / im / actor / util / cache / CacheHelpers . scala b / actor - server / actor - runtime / src / main / scala / im / actor / util / cache / CacheHelpers . scala < nl > index 531dc63 . . 8da11b7 100644 < nl > - - - a / actor - server / actor - runtime / src / main / scala / im / actor / util / cache / CacheHelpers . scala < nl > + + + b / actor - server / actor - runtime / src / main / scala / im / actor / util / cache / CacheHelpers . scala < nl > @ @ - 1 , 6 + 1 , 7 @ @ < nl > package im . actor . util . cache < nl > < nl > - import com . github . benmanes . caffeine . cache . { Caffeine , Cache } < nl > + import akka . actor . ActorSystem < nl > + import com . github . benmanes . caffeine . cache . { Cache , Caffeine } < nl > < nl > import scala . concurrent . { ExecutionContext , Future } < nl > < nl > @ @ - 26 , 4 + 27 , 13 @ @ object CacheHelpers { < nl > throw e < nl > } < nl > } < nl > + < nl > + def getCachedOrElsePut [ K , V ] ( key : K , default : ⇒ V ) ( implicit cache : Cache [ K , V ] , system : ActorSystem ) : V = < nl > + Option ( cache getIfPresent key ) match { < nl > + case None ⇒ < nl > + val result = default < nl > + cache . put ( key , result ) < nl > + result < nl > + case Some ( v ) ⇒ v < nl > + } < nl > } < nl > diff - - git a / actor - server / project / Dependencies . scala b / actor - server / project / Dependencies . scala < nl > index 54e554a . . b681236 100644 < nl > - - - a / actor - server / project / Dependencies . scala < nl > + + + b / actor - server / project / Dependencies . scala < nl > @ @ - 46 , 8 + 46 , 7 @ @ object Dependencies { < nl > < nl > val betterFiles = " com . github . pathikrit " % % " better - files " % " 2 . 13 . 0 " < nl > < nl > - val concmap = " com . googlecode . concurrentlinkedhashmap " % " concurrentlinkedhashmap - lru " % " 1 . 4 . 2 " < nl > - val caffeine = " com . github . ben - manes . caffeine " % " caffeine " % " 1 . 2 . 0 " < nl > + val caffeine = " com . github . ben - manes . caffeine " % " caffeine " % " 2 . 2 . 7 " < nl > < nl > val cats = " org . spire - math " % % " cats " % V . cats < nl > < nl > @ @ - 206 , 7 + 205 , 7 @ @ object Dependencies { < nl > < nl > val sdk = Seq . empty < nl > < nl > - val runtime = shared + + Seq ( akkaActor , actorConcurrent , akkaHttp , akkaSlf4j , akkaStream , akkaPersistenceJdbc , apacheCommonsCodec , caffeine , cats , concmap , jodaConvert , jodaTime , icu4j , libPhoneNumber , scalapbSer , akkaTestkit % " test " , scalatest % " test " ) < nl > + val runtime = shared + + Seq ( akkaActor , actorConcurrent , akkaHttp , akkaSlf4j , akkaStream , akkaPersistenceJdbc , apacheCommonsCodec , caffeine , cats , jodaConvert , jodaTime , icu4j , libPhoneNumber , scalapbSer , akkaTestkit % " test " , scalatest % " test " ) < nl > < nl > val voximplant = shared + + Seq ( akkaActor , dispatch , playJson )
+NEAREST DIFF (one line): diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala < nl > index 23f1360 . . cd30bde 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala < nl > @ @ - 4 , 7 + 4 , 31 @ @ object Activation { < nl > sealed trait Code { < nl > def code : String < nl > } < nl > - final case class SmsCode ( phone : Long , code : String ) extends Code < nl > - final case class CallCode ( phone : Long , code : String , language : String ) extends Code < nl > - final case class EmailCode ( email : String , code : String ) extends Code < nl > + sealed trait PhoneCode extends Code { < nl > + def phone : Long < nl > + } < nl > + final case class SmsCode ( phone : Long , code : String ) extends PhoneCode { < nl > + override def equals ( that : Any ) : Boolean = < nl > + that match { < nl > + case that : SmsCode ⇒ this . phone = = that . phone < nl > + case _ ⇒ false < nl > + } < nl > + override def hashCode ( ) : Int = phone . hashCode ( ) < nl > + } < nl > + final case class CallCode ( phone : Long , code : String , language : String ) extends PhoneCode { < nl > + override def equals ( that : Any ) : Boolean = < nl > + that match { < nl > + case that : CallCode ⇒ this . phone = = that . phone < nl > + case _ ⇒ false < nl > + } < nl > + override def hashCode ( ) : Int = phone . hashCode ( ) < nl > + } < nl > + final case class EmailCode ( email : String , code : String ) extends Code { < nl > + override def equals ( that : Any ) : Boolean = < nl > + that match { < nl > + case that : EmailCode ⇒ this . email = = that . email < nl > + case _ ⇒ false < nl > + } < nl > + override def hashCode ( ) : Int = email . hashCode ( ) < nl > + } < nl > } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala < nl > index abd0e61 . . 1c6616c 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala < nl > @ @ - 1 , 15 + 1 , 17 @ @ < nl > package im . actor . server . activation . gate < nl > < nl > + import akka . http . scaladsl . marshalling . Marshal < nl > + import de . heikoseeberger . akkahttpplayjson . PlayJsonSupport < nl > + < nl > import scala . concurrent . { ExecutionContext , Future } < nl > import scalaz . { - \ / , \ / , \ / - } < nl > < nl > import akka . actor . ActorSystem < nl > import akka . http . scaladsl . Http < nl > import akka . http . scaladsl . model . HttpMethods . { GET , POST } < nl > - import akka . http . scaladsl . model . { HttpRequest , Uri } < nl > + import akka . http . scaladsl . model . { RequestEntity , HttpRequest , Uri } < nl > import akka . http . scaladsl . unmarshalling . Unmarshal < nl > import akka . stream . Materializer < nl > - import play . api . libs . json . Json < nl > import slick . dbio . DBIO < nl > < nl > import im . actor . server . activation . Activation . Code < nl > @ @ - 22 , 21 + 24 , 18 @ @ class GateCodeActivation ( config : GateConfig ) ( < nl > system : ActorSystem , < nl > val materializer : Materializer , < nl > ec : ExecutionContext < nl > - ) extends CodeActivation with JsonImplicits { < nl > + ) extends CodeActivation with JsonImplicits with PlayJsonSupport { < nl > < nl > private [ this ] val http = Http ( ) < nl > < nl > override def send ( optTransactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = { < nl > - val request = HttpRequest ( < nl > - method = POST , < nl > - uri = s " $ { config . uri } / v1 / codes / send " , < nl > - entity = Json . toJson ( code ) . toString < nl > - ) < nl > - < nl > - system . log . debug ( " Requesting code send with { } " , request ) < nl > - < nl > val codeResponse : Future [ CodeResponse ] = for { < nl > - resp ← http . singleRequest ( request . withHeaders ( ` X - Auth - Token ` ( config . authToken ) ) ) < nl > + entity ← Marshal ( code ) . to [ RequestEntity ] < nl > + request = HttpRequest ( method = POST , uri = s " $ { config . uri } / v1 / codes / send " ) < nl > + . withEntity ( entity ) < nl > + . withHeaders ( ` X - Auth - Token ` ( config . authToken ) ) < nl > + _ = system . log . debug ( " Requesting code send with { } " , request ) < nl > + resp ← http . singleRequest ( request ) < nl > codeResp ← Unmarshal ( resp ) . to [ CodeResponse ] < nl > } yield codeResp < nl > < nl > @ @ - 45 , 7 + 44 , 7 @ @ class GateCodeActivation ( config : GateConfig ) ( < nl > result ← codeResponse match { < nl > case CodeHash ( hash ) ⇒ < nl > optTransactionHash . map { transactionHash ⇒ < nl > - for ( _ ← persist . auth . GateAuthCode . create ( transactionHash , hash ) ) yield \ / - ( ( ) ) < nl > + for ( _ ← persist . auth . GateAuthCode . createOrUpdate ( transactionHash , hash ) ) yield \ / - ( ( ) ) < nl > } getOrElse DBIO . successful ( \ / - ( ( ) ) ) < nl > case CodeError ( message ) ⇒ < nl > DBIO . successful ( - \ / ( message ) ) < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala < nl > index 83c60fe . . 13ec452 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala < nl > @ @ - 4 , 10 + 4 , 11 @ @ import java . time . temporal . ChronoUnit . _ < nl > import java . time . { LocalDateTime , ZoneOffset } < nl > < nl > import akka . actor . _ < nl > + import akka . pattern . ask < nl > import akka . stream . Materializer < nl > + import akka . util . Timeout < nl > import im . actor . server . activation . Activation . { CallCode , Code , EmailCode , SmsCode } < nl > import im . actor . server . activation . _ < nl > - import im . actor . server . activation . internal . InternalCodeActivation . Send < nl > import im . actor . server . email . { EmailSender , Message } < nl > import im . actor . server . models . AuthCode < nl > import im . actor . server . persist < nl > @ @ - 16 , 7 + 17 , 7 @ @ import slick . driver . PostgresDriver . api . _ < nl > < nl > import scala . concurrent . duration . _ < nl > import scala . concurrent . { ExecutionContext , Future } < nl > - import scalaz . { \ / , \ / - } < nl > + import scalaz . { - \ / , \ / , \ / - } < nl > < nl > object InternalCodeActivation { < nl > < nl > @ @ - 24 , 6 + 25 , 8 @ @ object InternalCodeActivation { < nl > < nl > private [ activation ] final case class Send ( code : Code ) < nl > < nl > + private [ activation ] case class SendAck ( result : String \ / Unit ) < nl > + < nl > private [ activation ] final case class ForgetSentCode ( code : Code ) extends Message < nl > < nl > def newContext ( config : ActivationConfig , smsEngine : AuthSmsEngine , callEngine : AuthCallEngine , emailSender : EmailSender ) ( < nl > @ @ - 42 , 16 + 45 , 15 @ @ object InternalCodeActivation { < nl > < nl > private [ activation ] class InternalCodeActivation ( activationActor : ActorRef , config : ActivationConfig ) ( implicit db : Database , ec : ExecutionContext ) extends CodeActivation { < nl > < nl > + import InternalCodeActivation . _ < nl > import im . actor . server . activation . Activation . _ < nl > < nl > - def send ( transactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = transactionHash match { < nl > - case Some ( hash ) ⇒ < nl > - for { < nl > - _ ← persist . AuthCode . createOrUpdate ( hash , code . code ) < nl > - result ← DBIO . from ( send ( code ) ) < nl > - } yield result < nl > - case None ⇒ DBIO . successful ( \ / - ( send ( code ) ) ) < nl > - } < nl > + implicit val timeout : Timeout = Timeout ( 20 . seconds ) < nl > + < nl > + def send ( transactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = ( transactionHash match { < nl > + case Some ( hash ) ⇒ for ( _ ← persist . AuthCode . createOrUpdate ( hash , code . code ) ) yield ( ) < nl > + case None ⇒ DBIO . successful ( ( ) ) < nl > + } ) flatMap ( _ ⇒ DBIO . from ( sendCode ( code ) ) ) < nl > < nl > def validate ( transactionHash : String , code : String ) : DBIO [ ValidationResponse ] = < nl > for { < nl > @ @ - 74 , 14 + 76 , 11 @ @ private [ activation ] class InternalCodeActivation ( activationActor : ActorRef , conf < nl > private def isExpired ( code : AuthCode ) : Boolean = < nl > code . createdAt . plus ( config . expiration . toMillis , MILLIS ) . isBefore ( LocalDateTime . now ( ZoneOffset . UTC ) ) < nl > < nl > - private def send ( code : Code ) : Future [ String \ / Unit ] = { < nl > + private def sendCode ( code : Code ) : Future [ String \ / Unit ] = < nl > code match { < nl > - case SmsCode ( phone , _ ) ⇒ if ( ! isTestPhone ( phone ) ) activationActor ! Send ( code ) < nl > - case CallCode ( phone , _ , _ ) ⇒ if ( ! isTestPhone ( phone ) ) activationActor ! Send ( code ) < nl > - case _ : EmailCode ⇒ activationActor ! Send ( code ) < nl > + case p : PhoneCode if isTestPhone ( p . phone ) ⇒ Future . successful ( \ / - ( ( ) ) ) < nl > + case _ ⇒ ( activationActor ? Send ( code ) ) . mapTo [ SendAck ] . map ( _ . result ) < nl > } < nl > - Future . successful ( \ / - ( ( ) ) ) < nl > - } < nl > < nl > private def isTestPhone ( number : Long ) : Boolean = number . toString . startsWith ( " 7555 " ) < nl > } < nl > @ @ - 105 , 25 + 104 , 29 @ @ class Activation ( repeatLimit : Duration , smsEngine : AuthSmsEngine , callEngine : Au < nl > system . scheduler . scheduleOnce ( repeatLimit . toMillis . millis , self , ForgetSentCode ( code ) ) < nl > < nl > override def receive : Receive = { < nl > - case Send ( code ) ⇒ sendCode ( code ) < nl > + case Send ( code ) ⇒ < nl > + val replyTo = sender ( ) < nl > + sendCode ( code ) foreach { resp ⇒ replyTo ! SendAck ( resp ) } < nl > case ForgetSentCode ( code ) ⇒ forgetSentCode ( code ) < nl > } < nl > < nl > - private def sendCode ( code : Code ) : Unit = { < nl > + private def sendCode ( code : Code ) : Future [ String \ / Unit ] = { < nl > if ( codeWasNotSent ( code ) ) { < nl > log . debug ( s " Sending $ code " ) < nl > < nl > rememberSentCode ( code ) < nl > < nl > - code match { < nl > + ( code match { < nl > case SmsCode ( phone , c ) ⇒ smsEngine . sendCode ( phone , c ) < nl > case CallCode ( phone , c , language ) ⇒ callEngine . sendCode ( phone , c , language ) < nl > case EmailCode ( email , c ) ⇒ emailSender . send ( Message ( email , " Actor activation code " , s " $ c is your Actor code " ) ) < nl > - } < nl > - < nl > - forgetSentCodeAfterDelay ( code ) < nl > + } ) map { _ ⇒ < nl > + forgetSentCodeAfterDelay ( code ) < nl > + \ / - ( ( ) ) < nl > + } recover { case e ⇒ - \ / ( " Unable to send code " ) } < nl > } else { < nl > log . debug ( s " Ignoring send $ code " ) < nl > + Future . successful ( - \ / ( " Attempt to get code later " ) ) < nl > } < nl > } < nl > < nl > diff - - git a / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala b / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala < nl > index b2029b7 . . 06d7e8b 100644 < nl > - - - a / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala < nl > + + + b / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala < nl > @ @ - 28 , 7 + 28 , 7 @ @ abstract class RemoteBot ( token : String , endpoint : String ) extends BotBase with A < nl > def onReceive ( message : Object ) : Unit = { } < nl > < nl > def receive = internalReceive orElse { < nl > - case message = > < nl > + case message ⇒ < nl > onReceive ( message . asInstanceOf [ Object ] ) < nl > } < nl > < nl > @ @ - 37 , 9 + 37 , 9 @ @ abstract class RemoteBot ( token : String , endpoint : String ) extends BotBase with A < nl > val prefix = " Actor will restart . " < nl > < nl > message match { < nl > - case Some ( msg ) = > < nl > + case Some ( msg ) ⇒ < nl > log . error ( reason , prefix + " Last message received : { } " , msg ) < nl > - case None = > < nl > + case None ⇒ < nl > log . error ( reason , prefix ) < nl > } < nl > < nl > diff - - git a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala < nl > index b468bd0 . . 1a38ff7 100644 < nl > - - - a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala < nl > + + + b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala < nl > @ @ - 16 , 8 + 16 , 8 @ @ object GateAuthCode { < nl > < nl > val active = codes . filter ( _ . isDeleted = = = false ) < nl > < nl > - def create ( transactionHash : String , codeHash : String ) = < nl > - codes + = models . auth . GateAuthCode ( transactionHash , codeHash ) < nl > + def createOrUpdate ( transactionHash : String , codeHash : String ) = < nl > + codes . insertOrUpdate ( models . auth . GateAuthCode ( transactionHash , codeHash ) ) < nl > < nl > def find ( transactionHash : String ) = < nl > active . filter ( _ . transactionHash = = = transactionHash ) . result . headOption < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala < nl > index f00e668 . . 73da5be 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala < nl > @ @ - 20 , 4 + 20 , 6 @ @ object AuthErrors { < nl > val OAuthUserIdDoesNotMatch = RpcError ( 400 , " WRONG _ OAUTH2 _ USER _ ID " , " Email does not match one provided on the first step . " , false , None ) < nl > val ActivationServiceError = RpcError ( 500 , " ACTIVATION _ SERVICE _ ERROR " , " Error occured in activation service . Try again later . " , true , None ) < nl > val InvalidAuthCodeHash = RpcError ( 400 , " CODE _ HASH _ INVALID " , " " , false , None ) < nl > + < nl > + def activationFailure ( message : String ) = RpcError ( 500 , " ACTIVATION _ ERROR " , message , false , None ) < nl > } < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala < nl > index f3dca4d . . 8f8a585 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala < nl > @ @ - 150 , 20 + 150 , 16 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) < nl > normalizedPhone ← fromOption ( AuthErrors . PhoneNumberInvalid ) ( normalizeLong ( phoneNumber ) . headOption ) < nl > optAuthTransaction ← fromDBIO ( persist . auth . AuthPhoneTransaction . findByPhoneAndDeviceHash ( normalizedPhone , deviceHash ) ) < nl > transactionHash ← optAuthTransaction match { < nl > - case Some ( transaction ) ⇒ < nl > - val hash = transaction . transactionHash < nl > - for { < nl > - _ ← fromDBIO ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( hash ) ) ) < nl > - } yield hash < nl > + case Some ( transaction ) ⇒ point ( transaction . transactionHash ) < nl > case None ⇒ < nl > val accessSalt = ACLUtils . nextAccessSalt ( ) < nl > val transactionHash = ACLUtils . authTransactionHash ( accessSalt ) < nl > val phoneAuthTransaction = models . AuthPhoneTransaction ( normalizedPhone , transactionHash , appId , apiKey , deviceHash , deviceTitle , accessSalt ) < nl > for { < nl > _ ← fromDBIO ( persist . auth . AuthPhoneTransaction . create ( phoneAuthTransaction ) ) < nl > - _ ← fromDBIO ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( transactionHash ) ) ) < nl > } yield transactionHash < nl > } < nl > + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( transactionHash ) ) ) < nl > isRegistered ← fromDBIO ( persist . UserPhone . exists ( normalizedPhone ) ) < nl > } yield ResponseStartPhoneAuth ( transactionHash , isRegistered ) < nl > db . run ( action . run ) < nl > @ @ - 173 , 7 + 169 , 8 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) < nl > val action = for { < nl > tx ← fromDBIOOption ( AuthErrors . PhoneCodeExpired ) ( persist . auth . AuthPhoneTransaction . find ( transactionHash ) ) < nl > code ← fromDBIO ( persist . AuthCode . findByTransactionHash ( tx . transactionHash ) map ( _ map ( _ . code ) getOrElse ( genSmsCode ( tx . phoneNumber ) ) ) ) < nl > - _ ← fromDBIO ( sendCallCode ( tx . phoneNumber , genSmsCode ( tx . phoneNumber ) , Some ( transactionHash ) , PhoneNumberUtils . normalizeWithCountry ( tx . phoneNumber ) . headOption . map ( _ . _ 2 ) . getOrElse ( " en " ) ) ) < nl > + lang = PhoneNumberUtils . normalizeWithCountry ( tx . phoneNumber ) . headOption . map ( _ . _ 2 ) . getOrElse ( " en " ) < nl > + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendCallCode ( tx . phoneNumber , genSmsCode ( tx . phoneNumber ) , Some ( transactionHash ) , lang ) ) < nl > } yield ResponseVoid < nl > < nl > db . run ( action . run ) < nl > @ @ - 228 , 7 + 225 , 7 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) < nl > activationType match { < nl > case CODE ⇒ < nl > for { < nl > - _ ← fromDBIO ( sendEmailCode ( email , genCode ( ) , hash ) ) < nl > + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendEmailCode ( email , genCode ( ) , hash ) ) < nl > } yield hash < nl > case OAUTH2 ⇒ < nl > point ( hash ) < nl > @ @ - 241 , 7 + 238 , 7 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) < nl > case CODE ⇒ < nl > for { < nl > _ ← fromDBIO ( persist . auth . AuthEmailTransaction . create ( emailAuthTransaction ) ) < nl > - _ ← fromDBIO ( sendEmailCode ( email , genCode ( ) , transactionHash ) ) < nl > + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendEmailCode ( email , genCode ( ) , transactionHash ) ) < nl > } yield transactionHash < nl > case OAUTH2 ⇒ < nl > for { < nl > diff - - git a / actor - server / project / Dependencies . scala b / actor - server / project / Dependencies . scala < nl > index 51af876 . . cf75189 100644 < nl > - - - a / actor - server / project / Dependencies . scala < nl > + + + b / actor - server / project / Dependencies . scala < nl > @ @ - 101 , 7 + 101 , 7 @ @ object Dependencies { < nl > akkaSlf4j , akkaActor , akkaStream < nl > ) < nl > < nl > - val activation = shared + + Seq ( akkaActor , akkaHttp , playJson ) < nl > + val activation = shared + + Seq ( akkaActor , akkaHttp , akkaHttpPlayJson , playJson ) < nl > < nl > val bot = shared + + Seq ( upickle )
+
+TEST DIFF:
+diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala 
+ index 7bbfdfe . . f565f6c 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala 
+ @ @ - 4 , 14 + 4 , 16 @ @ import akka . actor . ActorSystem 
+ import cats . data . Xor 
+ import im . actor . server . activation . common . _ 
+ import im . actor . server . db . DbExtension 
+ - import im . actor . server . model . { ExpirableCode , AuthPhoneTransaction , AuthEmailTransaction , AuthTransactionBase } 
+ + import im . actor . server . model . { AuthEmailTransaction , AuthPhoneTransaction , AuthTransactionBase , ExpirableCode } 
+ + import im . actor . util . cache . CacheHelpers 
+ 
+ import scala . concurrent . Future 
+ 
+ - final class ActivationContext ( implicit system : ActorSystem ) { 
+ + final class ActivationContext ( implicit system : ActorSystem ) extends CodeGen { 
+ 
+ import system . dispatcher 
+ import ActivationProviders . _ 
+ + import CacheHelpers . _ 
+ 
+ private val db = DbExtension ( system ) . db 
+ private val providers = getProviders ( ) 
+ @ @ - 23 , 12 + 25 , 16 @ @ final class ActivationContext ( implicit system : ActorSystem ) { 
+ private val optCallProvider = providers . get ( Call ) 
+ private val optSmtpProvider = providers . get ( Smtp ) 
+ 
+ + private val MaxCacheSize = 1000L 
+ + private implicit val codesCache = createCache [ String , Code ] ( MaxCacheSize ) 
+ + 
+ / * * 
+ * We don ' t care about result of sending internal code . 
+ * But we do care about sending code via external provider . 
+ * We also don ' t show " Try to send code later " warning to end users . 
+ * / 
+ - def send ( txHash : String , code : Code ) : Future [ CodeFailure Xor Unit ] = 
+ + def send ( txHash : String , codeTemplate : Code ) : Future [ CodeFailure Xor Unit ] = { 
+ + val code = getCachedOrElsePut ( txHash , generateCode ( codeTemplate ) ) 
+ ( for { 
+ _ ← trySend ( optInternalProvider , txHash , code , logFailure = false ) 
+ result ← code match { 
+ @ @ - 45 , 6 + 51 , 7 @ @ final class ActivationContext ( implicit system : ActorSystem ) { 
+ error 
+ case result : Xor . Right [ _ ] ⇒ result 
+ } 
+ + } 
+ 
+ / * * 
+ * If internal code validates - we are fine . 
+ @ @ - 77 , 6 + 84 , 7 @ @ final class ActivationContext ( implicit system : ActorSystem ) { 
+ case _ : AuthPhoneTransaction ⇒ tryCleanup ( optSmsProvider , tx . transactionHash ) 
+ } 
+ } yield ( ) 
+ + _ = codesCache . invalidate ( tx . transactionHash ) 
+ } yield ( ) 
+ 
+ private def trySend ( optProvider : Option [ ActivationProvider ] , txHash : String , code : Code , logFailure : Boolean = true ) : Future [ CodeFailure Xor Unit ] = 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / CodeGen . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / CodeGen . scala 
+ new file mode 100644 
+ index 0000000 . . 0ff62e6 
+ - - - / dev / null 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / CodeGen . scala 
+ @ @ - 0 , 0 + 1 , 31 @ @ 
+ + package im . actor . server . activation 
+ + 
+ + import im . actor . server . activation . common . { CallCode , Code , EmailCode , SmsCode } 
+ + import im . actor . util . ThreadLocalSecureRandom 
+ + import im . actor . util . misc . EmailUtils . _ 
+ + import im . actor . util . misc . PhoneNumberUtils . _ 
+ + 
+ + import scala . util . Try 
+ + 
+ + trait CodeGen { 
+ + 
+ + def generateCode ( codeTemplate : Code ) : Code = codeTemplate match { 
+ + case s : SmsCode ⇒ s . copy ( code = genPhoneCode ( s . phone ) ) 
+ + case c : CallCode ⇒ c . copy ( code = genPhoneCode ( c . phone ) ) 
+ + case e : EmailCode ⇒ e . copy ( code = genEmailCode ( e . email ) ) 
+ + } 
+ + 
+ + private def genEmailCode ( email : String ) : String = 
+ + if ( isTestEmail ( email ) ) 
+ + ( email replaceAll ( " " " . * acme " " " , " " ) ) replaceAll ( " . com " , " " ) 
+ + else genCode ( ) 
+ + 
+ + protected def genPhoneCode ( phone : Long ) : String = 
+ + if ( isTestPhone ( phone ) ) { 
+ + val strPhone = phone . toString 
+ + Try ( strPhone ( 4 ) . toString * 4 ) getOrElse strPhone 
+ + } else genCode ( ) 
+ + 
+ + private def genCode ( ) = ThreadLocalSecureRandom . current . nextLong ( ) . toString . dropWhile ( c ⇒ c = = ' 0 ' | | c = = ' - ' ) . take ( 5 ) 
+ + 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / codes . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / codes . scala 
+ index 79d84df . . 12d3c1f 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / codes . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / codes . scala 
+ @ @ - 3 , 6 + 3 , 6 @ @ package im . actor . server . activation . common 
+ sealed trait Code { 
+ def code : String 
+ } 
+ - final case class SmsCode ( phone : Long , code : String ) extends Code 
+ - final case class CallCode ( phone : Long , code : String , language : String ) extends Code 
+ - final case class EmailCode ( email : String , code : String ) extends Code 
+ \ No newline at end of file 
+ + final case class SmsCode ( phone : Long , code : String = " " ) extends Code 
+ + final case class CallCode ( phone : Long , language : String , code : String = " " ) extends Code 
+ + final case class EmailCode ( email : String , code : String = " " ) extends Code 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthHelpers . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthHelpers . scala 
+ index 2c8a574 . . 1126dab 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthHelpers . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthHelpers . scala 
+ @ @ - 229 , 29 + 229 , 19 @ @ trait AuthHelpers extends Helpers { 
+ } yield userStruct 
+ } 
+ 
+ - protected def sendSmsCode ( phoneNumber : Long , code : String , txHash : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { 
+ - log . info ( " Sending sms code { } to { } " , code , phoneNumber ) 
+ - DBIO . from ( activationContext . send ( txHash , SmsCode ( phoneNumber , code ) ) ) 
+ + protected def sendSmsCode ( phoneNumber : Long , txHash : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { 
+ + log . info ( " Sending sms code to { } " , phoneNumber ) 
+ + DBIO . from ( activationContext . send ( txHash , SmsCode ( phoneNumber ) ) ) 
+ } 
+ 
+ - protected def sendCallCode ( phoneNumber : Long , code : String , txHash : String , language : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { 
+ - log . info ( " Sending call code { } to { } " , code , phoneNumber ) 
+ - DBIO . from ( activationContext . send ( txHash , CallCode ( phoneNumber , code , language ) ) ) 
+ + protected def sendCallCode ( phoneNumber : Long , txHash : String , language : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { 
+ + log . info ( " Sending call code to { } " , phoneNumber ) 
+ + DBIO . from ( activationContext . send ( txHash , CallCode ( phoneNumber , language ) ) ) 
+ } 
+ 
+ - protected def sendEmailCode ( email : String , code : String , txHash : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { 
+ - log . info ( " Sending email code { } to { } " , code , email ) 
+ - DBIO . from ( activationContext . send ( txHash , EmailCode ( email , code ) ) ) 
+ - } 
+ - 
+ - protected def genSmsHash ( ) = ThreadLocalSecureRandom . current . nextLong ( ) . toString 
+ - 
+ - protected def genEmailCode ( email : String ) : String = 
+ - if ( isTestEmail ( email ) ) genTestCode ( email ) else genCode ( ) 
+ - 
+ - protected def genSmsCode ( phone : Long ) : String = phone . toString match { 
+ - case strNumber if isTestPhone ( phone ) ⇒ Try ( strNumber ( 4 ) . toString * 4 ) . getOrElse ( phone . toString ) 
+ - case _ ⇒ genCode ( ) 
+ + protected def sendEmailCode ( email : String , txHash : String ) ( implicit system : ActorSystem ) : DBIO [ CodeFailure Xor Unit ] = { 
+ + log . info ( " Sending email code to { } " , email ) 
+ + DBIO . from ( activationContext . send ( txHash , EmailCode ( email ) ) ) 
+ } 
+ 
+ protected def newUser ( name : String , countryCode : String , optSex : Option [ ApiSex ] , username : Option [ String ] ) : Result [ Xor . Right [ User ] ] = { 
+ @ @ - 299 , 9 + 289 , 4 @ @ trait AuthHelpers extends Helpers { 
+ } yield ( ) 
+ } 
+ 
+ - private def genTestCode ( email : String ) : String = 
+ - ( email replaceAll ( " " " . * acme " " " , " " ) ) replaceAll ( " . com " , " " ) 
+ - 
+ - private def genCode ( ) = ThreadLocalSecureRandom . current . nextLong ( ) . toString . dropWhile ( c ⇒ c = = ' 0 ' | | c = = ' - ' ) . take ( 5 ) 
+ - 
+ } 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala 
+ index dfd7963 . . 12f5c0b 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala 
+ @ @ - 182 , 7 + 182 , 7 @ @ final class AuthServiceImpl ( 
+ _ ← fromDBIO ( AuthPhoneTransactionRepo . create ( phoneAuthTransaction ) ) 
+ } yield transactionHash 
+ } 
+ - _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , transactionHash ) ) 
+ + _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendSmsCode ( normalizedPhone , transactionHash ) ) 
+ isRegistered = optPhone . isDefined 
+ } yield ResponseStartPhoneAuth ( transactionHash , isRegistered , Some ( ApiPhoneActivationType . CODE ) ) 
+ db . run ( action . value ) 
+ @ @ - 266 , 9 + 266 , 8 @ @ final class AuthServiceImpl ( 
+ override def doHandleSendCodeByPhoneCall ( transactionHash : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { 
+ val action = for { 
+ tx ← fromDBIOOption ( AuthErrors . PhoneCodeExpired ) ( AuthPhoneTransactionRepo . find ( transactionHash ) ) 
+ - code ← fromDBIO ( AuthCodeRepo . findByTransactionHash ( tx . transactionHash ) map ( _ map ( _ . code ) getOrElse ( genSmsCode ( tx . phoneNumber ) ) ) ) 
+ lang = PhoneNumberUtils . normalizeWithCountry ( tx . phoneNumber ) . headOption . map ( _ . _ 2 ) . getOrElse ( " en " ) 
+ - _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendCallCode ( tx . phoneNumber , genSmsCode ( tx . phoneNumber ) , transactionHash , lang ) ) 
+ + _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendCallCode ( tx . phoneNumber , transactionHash , lang ) ) 
+ } yield ResponseVoid 
+ 
+ db . run ( action . value ) 
+ @ @ - 332 , 7 + 331 , 7 @ @ final class AuthServiceImpl ( 
+ activationType match { 
+ case CODE ⇒ 
+ for { 
+ - _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendEmailCode ( validEmail , genEmailCode ( validEmail ) , hash ) ) 
+ + _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendEmailCode ( validEmail , hash ) ) 
+ } yield hash 
+ case OAUTH2 ⇒ 
+ point ( hash ) 
+ @ @ - 355 , 7 + 354 , 7 @ @ final class AuthServiceImpl ( 
+ case CODE ⇒ 
+ for { 
+ _ ← fromDBIO ( AuthEmailTransactionRepo . create ( emailAuthTransaction ) ) 
+ - _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendEmailCode ( validEmail , genEmailCode ( validEmail ) , transactionHash ) ) 
+ + _ ← fromDBIOEither [ Unit , CodeFailure ] ( AuthErrors . activationFailure ) ( sendEmailCode ( validEmail , transactionHash ) ) 
+ } yield transactionHash 
+ case OAUTH2 ⇒ 
+ for { 
+ diff - - git a / actor - server / actor - runtime / src / main / scala / im / actor / util / cache / CacheHelpers . scala b / actor - server / actor - runtime / src / main / scala / im / actor / util / cache / CacheHelpers . scala 
+ index 531dc63 . . 8da11b7 100644 
+ - - - a / actor - server / actor - runtime / src / main / scala / im / actor / util / cache / CacheHelpers . scala 
+ + + + b / actor - server / actor - runtime / src / main / scala / im / actor / util / cache / CacheHelpers . scala 
+ @ @ - 1 , 6 + 1 , 7 @ @ 
+ package im . actor . util . cache 
+ 
+ - import com . github . benmanes . caffeine . cache . { Caffeine , Cache } 
+ + import akka . actor . ActorSystem 
+ + import com . github . benmanes . caffeine . cache . { Cache , Caffeine } 
+ 
+ import scala . concurrent . { ExecutionContext , Future } 
+ 
+ @ @ - 26 , 4 + 27 , 13 @ @ object CacheHelpers { 
+ throw e 
+ } 
+ } 
+ + 
+ + def getCachedOrElsePut [ K , V ] ( key : K , default : ⇒ V ) ( implicit cache : Cache [ K , V ] , system : ActorSystem ) : V = 
+ + Option ( cache getIfPresent key ) match { 
+ + case None ⇒ 
+ + val result = default 
+ + cache . put ( key , result ) 
+ + result 
+ + case Some ( v ) ⇒ v 
+ + } 
+ } 
+ diff - - git a / actor - server / project / Dependencies . scala b / actor - server / project / Dependencies . scala 
+ index 54e554a . . b681236 100644 
+ - - - a / actor - server / project / Dependencies . scala 
+ + + + b / actor - server / project / Dependencies . scala 
+ @ @ - 46 , 8 + 46 , 7 @ @ object Dependencies { 
+ 
+ val betterFiles = " com . github . pathikrit " % % " better - files " % " 2 . 13 . 0 " 
+ 
+ - val concmap = " com . googlecode . concurrentlinkedhashmap " % " concurrentlinkedhashmap - lru " % " 1 . 4 . 2 " 
+ - val caffeine = " com . github . ben - manes . caffeine " % " caffeine " % " 1 . 2 . 0 " 
+ + val caffeine = " com . github . ben - manes . caffeine " % " caffeine " % " 2 . 2 . 7 " 
+ 
+ val cats = " org . spire - math " % % " cats " % V . cats 
+ 
+ @ @ - 206 , 7 + 205 , 7 @ @ object Dependencies { 
+ 
+ val sdk = Seq . empty 
+ 
+ - val runtime = shared + + Seq ( akkaActor , actorConcurrent , akkaHttp , akkaSlf4j , akkaStream , akkaPersistenceJdbc , apacheCommonsCodec , caffeine , cats , concmap , jodaConvert , jodaTime , icu4j , libPhoneNumber , scalapbSer , akkaTestkit % " test " , scalatest % " test " ) 
+ + val runtime = shared + + Seq ( akkaActor , actorConcurrent , akkaHttp , akkaSlf4j , akkaStream , akkaPersistenceJdbc , apacheCommonsCodec , caffeine , cats , jodaConvert , jodaTime , icu4j , libPhoneNumber , scalapbSer , akkaTestkit % " test " , scalatest % " test " ) 
+ 
+ val voximplant = shared + + Seq ( akkaActor , dispatch , playJson )
+
+NEAREST DIFF:
+diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala 
+ index 23f1360 . . cd30bde 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala 
+ @ @ - 4 , 7 + 4 , 31 @ @ object Activation { 
+ sealed trait Code { 
+ def code : String 
+ } 
+ - final case class SmsCode ( phone : Long , code : String ) extends Code 
+ - final case class CallCode ( phone : Long , code : String , language : String ) extends Code 
+ - final case class EmailCode ( email : String , code : String ) extends Code 
+ + sealed trait PhoneCode extends Code { 
+ + def phone : Long 
+ + } 
+ + final case class SmsCode ( phone : Long , code : String ) extends PhoneCode { 
+ + override def equals ( that : Any ) : Boolean = 
+ + that match { 
+ + case that : SmsCode ⇒ this . phone = = that . phone 
+ + case _ ⇒ false 
+ + } 
+ + override def hashCode ( ) : Int = phone . hashCode ( ) 
+ + } 
+ + final case class CallCode ( phone : Long , code : String , language : String ) extends PhoneCode { 
+ + override def equals ( that : Any ) : Boolean = 
+ + that match { 
+ + case that : CallCode ⇒ this . phone = = that . phone 
+ + case _ ⇒ false 
+ + } 
+ + override def hashCode ( ) : Int = phone . hashCode ( ) 
+ + } 
+ + final case class EmailCode ( email : String , code : String ) extends Code { 
+ + override def equals ( that : Any ) : Boolean = 
+ + that match { 
+ + case that : EmailCode ⇒ this . email = = that . email 
+ + case _ ⇒ false 
+ + } 
+ + override def hashCode ( ) : Int = email . hashCode ( ) 
+ + } 
+ } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala 
+ index abd0e61 . . 1c6616c 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala 
+ @ @ - 1 , 15 + 1 , 17 @ @ 
+ package im . actor . server . activation . gate 
+ 
+ + import akka . http . scaladsl . marshalling . Marshal 
+ + import de . heikoseeberger . akkahttpplayjson . PlayJsonSupport 
+ + 
+ import scala . concurrent . { ExecutionContext , Future } 
+ import scalaz . { - \ / , \ / , \ / - } 
+ 
+ import akka . actor . ActorSystem 
+ import akka . http . scaladsl . Http 
+ import akka . http . scaladsl . model . HttpMethods . { GET , POST } 
+ - import akka . http . scaladsl . model . { HttpRequest , Uri } 
+ + import akka . http . scaladsl . model . { RequestEntity , HttpRequest , Uri } 
+ import akka . http . scaladsl . unmarshalling . Unmarshal 
+ import akka . stream . Materializer 
+ - import play . api . libs . json . Json 
+ import slick . dbio . DBIO 
+ 
+ import im . actor . server . activation . Activation . Code 
+ @ @ - 22 , 21 + 24 , 18 @ @ class GateCodeActivation ( config : GateConfig ) ( 
+ system : ActorSystem , 
+ val materializer : Materializer , 
+ ec : ExecutionContext 
+ - ) extends CodeActivation with JsonImplicits { 
+ + ) extends CodeActivation with JsonImplicits with PlayJsonSupport { 
+ 
+ private [ this ] val http = Http ( ) 
+ 
+ override def send ( optTransactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = { 
+ - val request = HttpRequest ( 
+ - method = POST , 
+ - uri = s " $ { config . uri } / v1 / codes / send " , 
+ - entity = Json . toJson ( code ) . toString 
+ - ) 
+ - 
+ - system . log . debug ( " Requesting code send with { } " , request ) 
+ - 
+ val codeResponse : Future [ CodeResponse ] = for { 
+ - resp ← http . singleRequest ( request . withHeaders ( ` X - Auth - Token ` ( config . authToken ) ) ) 
+ + entity ← Marshal ( code ) . to [ RequestEntity ] 
+ + request = HttpRequest ( method = POST , uri = s " $ { config . uri } / v1 / codes / send " ) 
+ + . withEntity ( entity ) 
+ + . withHeaders ( ` X - Auth - Token ` ( config . authToken ) ) 
+ + _ = system . log . debug ( " Requesting code send with { } " , request ) 
+ + resp ← http . singleRequest ( request ) 
+ codeResp ← Unmarshal ( resp ) . to [ CodeResponse ] 
+ } yield codeResp 
+ 
+ @ @ - 45 , 7 + 44 , 7 @ @ class GateCodeActivation ( config : GateConfig ) ( 
+ result ← codeResponse match { 
+ case CodeHash ( hash ) ⇒ 
+ optTransactionHash . map { transactionHash ⇒ 
+ - for ( _ ← persist . auth . GateAuthCode . create ( transactionHash , hash ) ) yield \ / - ( ( ) ) 
+ + for ( _ ← persist . auth . GateAuthCode . createOrUpdate ( transactionHash , hash ) ) yield \ / - ( ( ) ) 
+ } getOrElse DBIO . successful ( \ / - ( ( ) ) ) 
+ case CodeError ( message ) ⇒ 
+ DBIO . successful ( - \ / ( message ) ) 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala 
+ index 83c60fe . . 13ec452 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala 
+ @ @ - 4 , 10 + 4 , 11 @ @ import java . time . temporal . ChronoUnit . _ 
+ import java . time . { LocalDateTime , ZoneOffset } 
+ 
+ import akka . actor . _ 
+ + import akka . pattern . ask 
+ import akka . stream . Materializer 
+ + import akka . util . Timeout 
+ import im . actor . server . activation . Activation . { CallCode , Code , EmailCode , SmsCode } 
+ import im . actor . server . activation . _ 
+ - import im . actor . server . activation . internal . InternalCodeActivation . Send 
+ import im . actor . server . email . { EmailSender , Message } 
+ import im . actor . server . models . AuthCode 
+ import im . actor . server . persist 
+ @ @ - 16 , 7 + 17 , 7 @ @ import slick . driver . PostgresDriver . api . _ 
+ 
+ import scala . concurrent . duration . _ 
+ import scala . concurrent . { ExecutionContext , Future } 
+ - import scalaz . { \ / , \ / - } 
+ + import scalaz . { - \ / , \ / , \ / - } 
+ 
+ object InternalCodeActivation { 
+ 
+ @ @ - 24 , 6 + 25 , 8 @ @ object InternalCodeActivation { 
+ 
+ private [ activation ] final case class Send ( code : Code ) 
+ 
+ + private [ activation ] case class SendAck ( result : String \ / Unit ) 
+ + 
+ private [ activation ] final case class ForgetSentCode ( code : Code ) extends Message 
+ 
+ def newContext ( config : ActivationConfig , smsEngine : AuthSmsEngine , callEngine : AuthCallEngine , emailSender : EmailSender ) ( 
+ @ @ - 42 , 16 + 45 , 15 @ @ object InternalCodeActivation { 
+ 
+ private [ activation ] class InternalCodeActivation ( activationActor : ActorRef , config : ActivationConfig ) ( implicit db : Database , ec : ExecutionContext ) extends CodeActivation { 
+ 
+ + import InternalCodeActivation . _ 
+ import im . actor . server . activation . Activation . _ 
+ 
+ - def send ( transactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = transactionHash match { 
+ - case Some ( hash ) ⇒ 
+ - for { 
+ - _ ← persist . AuthCode . createOrUpdate ( hash , code . code ) 
+ - result ← DBIO . from ( send ( code ) ) 
+ - } yield result 
+ - case None ⇒ DBIO . successful ( \ / - ( send ( code ) ) ) 
+ - } 
+ + implicit val timeout : Timeout = Timeout ( 20 . seconds ) 
+ + 
+ + def send ( transactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = ( transactionHash match { 
+ + case Some ( hash ) ⇒ for ( _ ← persist . AuthCode . createOrUpdate ( hash , code . code ) ) yield ( ) 
+ + case None ⇒ DBIO . successful ( ( ) ) 
+ + } ) flatMap ( _ ⇒ DBIO . from ( sendCode ( code ) ) ) 
+ 
+ def validate ( transactionHash : String , code : String ) : DBIO [ ValidationResponse ] = 
+ for { 
+ @ @ - 74 , 14 + 76 , 11 @ @ private [ activation ] class InternalCodeActivation ( activationActor : ActorRef , conf 
+ private def isExpired ( code : AuthCode ) : Boolean = 
+ code . createdAt . plus ( config . expiration . toMillis , MILLIS ) . isBefore ( LocalDateTime . now ( ZoneOffset . UTC ) ) 
+ 
+ - private def send ( code : Code ) : Future [ String \ / Unit ] = { 
+ + private def sendCode ( code : Code ) : Future [ String \ / Unit ] = 
+ code match { 
+ - case SmsCode ( phone , _ ) ⇒ if ( ! isTestPhone ( phone ) ) activationActor ! Send ( code ) 
+ - case CallCode ( phone , _ , _ ) ⇒ if ( ! isTestPhone ( phone ) ) activationActor ! Send ( code ) 
+ - case _ : EmailCode ⇒ activationActor ! Send ( code ) 
+ + case p : PhoneCode if isTestPhone ( p . phone ) ⇒ Future . successful ( \ / - ( ( ) ) ) 
+ + case _ ⇒ ( activationActor ? Send ( code ) ) . mapTo [ SendAck ] . map ( _ . result ) 
+ } 
+ - Future . successful ( \ / - ( ( ) ) ) 
+ - } 
+ 
+ private def isTestPhone ( number : Long ) : Boolean = number . toString . startsWith ( " 7555 " ) 
+ } 
+ @ @ - 105 , 25 + 104 , 29 @ @ class Activation ( repeatLimit : Duration , smsEngine : AuthSmsEngine , callEngine : Au 
+ system . scheduler . scheduleOnce ( repeatLimit . toMillis . millis , self , ForgetSentCode ( code ) ) 
+ 
+ override def receive : Receive = { 
+ - case Send ( code ) ⇒ sendCode ( code ) 
+ + case Send ( code ) ⇒ 
+ + val replyTo = sender ( ) 
+ + sendCode ( code ) foreach { resp ⇒ replyTo ! SendAck ( resp ) } 
+ case ForgetSentCode ( code ) ⇒ forgetSentCode ( code ) 
+ } 
+ 
+ - private def sendCode ( code : Code ) : Unit = { 
+ + private def sendCode ( code : Code ) : Future [ String \ / Unit ] = { 
+ if ( codeWasNotSent ( code ) ) { 
+ log . debug ( s " Sending $ code " ) 
+ 
+ rememberSentCode ( code ) 
+ 
+ - code match { 
+ + ( code match { 
+ case SmsCode ( phone , c ) ⇒ smsEngine . sendCode ( phone , c ) 
+ case CallCode ( phone , c , language ) ⇒ callEngine . sendCode ( phone , c , language ) 
+ case EmailCode ( email , c ) ⇒ emailSender . send ( Message ( email , " Actor activation code " , s " $ c is your Actor code " ) ) 
+ - } 
+ - 
+ - forgetSentCodeAfterDelay ( code ) 
+ + } ) map { _ ⇒ 
+ + forgetSentCodeAfterDelay ( code ) 
+ + \ / - ( ( ) ) 
+ + } recover { case e ⇒ - \ / ( " Unable to send code " ) } 
+ } else { 
+ log . debug ( s " Ignoring send $ code " ) 
+ + Future . successful ( - \ / ( " Attempt to get code later " ) ) 
+ } 
+ } 
+ 
+ diff - - git a / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala b / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala 
+ index b2029b7 . . 06d7e8b 100644 
+ - - - a / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala 
+ + + + b / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala 
+ @ @ - 28 , 7 + 28 , 7 @ @ abstract class RemoteBot ( token : String , endpoint : String ) extends BotBase with A 
+ def onReceive ( message : Object ) : Unit = { } 
+ 
+ def receive = internalReceive orElse { 
+ - case message = > 
+ + case message ⇒ 
+ onReceive ( message . asInstanceOf [ Object ] ) 
+ } 
+ 
+ @ @ - 37 , 9 + 37 , 9 @ @ abstract class RemoteBot ( token : String , endpoint : String ) extends BotBase with A 
+ val prefix = " Actor will restart . " 
+ 
+ message match { 
+ - case Some ( msg ) = > 
+ + case Some ( msg ) ⇒ 
+ log . error ( reason , prefix + " Last message received : { } " , msg ) 
+ - case None = > 
+ + case None ⇒ 
+ log . error ( reason , prefix ) 
+ } 
+ 
+ diff - - git a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala 
+ index b468bd0 . . 1a38ff7 100644 
+ - - - a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala 
+ + + + b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala 
+ @ @ - 16 , 8 + 16 , 8 @ @ object GateAuthCode { 
+ 
+ val active = codes . filter ( _ . isDeleted = = = false ) 
+ 
+ - def create ( transactionHash : String , codeHash : String ) = 
+ - codes + = models . auth . GateAuthCode ( transactionHash , codeHash ) 
+ + def createOrUpdate ( transactionHash : String , codeHash : String ) = 
+ + codes . insertOrUpdate ( models . auth . GateAuthCode ( transactionHash , codeHash ) ) 
+ 
+ def find ( transactionHash : String ) = 
+ active . filter ( _ . transactionHash = = = transactionHash ) . result . headOption 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala 
+ index f00e668 . . 73da5be 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala 
+ @ @ - 20 , 4 + 20 , 6 @ @ object AuthErrors { 
+ val OAuthUserIdDoesNotMatch = RpcError ( 400 , " WRONG _ OAUTH2 _ USER _ ID " , " Email does not match one provided on the first step . " , false , None ) 
+ val ActivationServiceError = RpcError ( 500 , " ACTIVATION _ SERVICE _ ERROR " , " Error occured in activation service . Try again later . " , true , None ) 
+ val InvalidAuthCodeHash = RpcError ( 400 , " CODE _ HASH _ INVALID " , " " , false , None ) 
+ + 
+ + def activationFailure ( message : String ) = RpcError ( 500 , " ACTIVATION _ ERROR " , message , false , None ) 
+ } 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala 
+ index f3dca4d . . 8f8a585 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala 
+ @ @ - 150 , 20 + 150 , 16 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) 
+ normalizedPhone ← fromOption ( AuthErrors . PhoneNumberInvalid ) ( normalizeLong ( phoneNumber ) . headOption ) 
+ optAuthTransaction ← fromDBIO ( persist . auth . AuthPhoneTransaction . findByPhoneAndDeviceHash ( normalizedPhone , deviceHash ) ) 
+ transactionHash ← optAuthTransaction match { 
+ - case Some ( transaction ) ⇒ 
+ - val hash = transaction . transactionHash 
+ - for { 
+ - _ ← fromDBIO ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( hash ) ) ) 
+ - } yield hash 
+ + case Some ( transaction ) ⇒ point ( transaction . transactionHash ) 
+ case None ⇒ 
+ val accessSalt = ACLUtils . nextAccessSalt ( ) 
+ val transactionHash = ACLUtils . authTransactionHash ( accessSalt ) 
+ val phoneAuthTransaction = models . AuthPhoneTransaction ( normalizedPhone , transactionHash , appId , apiKey , deviceHash , deviceTitle , accessSalt ) 
+ for { 
+ _ ← fromDBIO ( persist . auth . AuthPhoneTransaction . create ( phoneAuthTransaction ) ) 
+ - _ ← fromDBIO ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( transactionHash ) ) ) 
+ } yield transactionHash 
+ } 
+ + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( transactionHash ) ) ) 
+ isRegistered ← fromDBIO ( persist . UserPhone . exists ( normalizedPhone ) ) 
+ } yield ResponseStartPhoneAuth ( transactionHash , isRegistered ) 
+ db . run ( action . run ) 
+ @ @ - 173 , 7 + 169 , 8 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) 
+ val action = for { 
+ tx ← fromDBIOOption ( AuthErrors . PhoneCodeExpired ) ( persist . auth . AuthPhoneTransaction . find ( transactionHash ) ) 
+ code ← fromDBIO ( persist . AuthCode . findByTransactionHash ( tx . transactionHash ) map ( _ map ( _ . code ) getOrElse ( genSmsCode ( tx . phoneNumber ) ) ) ) 
+ - _ ← fromDBIO ( sendCallCode ( tx . phoneNumber , genSmsCode ( tx . phoneNumber ) , Some ( transactionHash ) , PhoneNumberUtils . normalizeWithCountry ( tx . phoneNumber ) . headOption . map ( _ . _ 2 ) . getOrElse ( " en " ) ) ) 
+ + lang = PhoneNumberUtils . normalizeWithCountry ( tx . phoneNumber ) . headOption . map ( _ . _ 2 ) . getOrElse ( " en " ) 
+ + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendCallCode ( tx . phoneNumber , genSmsCode ( tx . phoneNumber ) , Some ( transactionHash ) , lang ) ) 
+ } yield ResponseVoid 
+ 
+ db . run ( action . run ) 
+ @ @ - 228 , 7 + 225 , 7 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) 
+ activationType match { 
+ case CODE ⇒ 
+ for { 
+ - _ ← fromDBIO ( sendEmailCode ( email , genCode ( ) , hash ) ) 
+ + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendEmailCode ( email , genCode ( ) , hash ) ) 
+ } yield hash 
+ case OAUTH2 ⇒ 
+ point ( hash ) 
+ @ @ - 241 , 7 + 238 , 7 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) 
+ case CODE ⇒ 
+ for { 
+ _ ← fromDBIO ( persist . auth . AuthEmailTransaction . create ( emailAuthTransaction ) ) 
+ - _ ← fromDBIO ( sendEmailCode ( email , genCode ( ) , transactionHash ) ) 
+ + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendEmailCode ( email , genCode ( ) , transactionHash ) ) 
+ } yield transactionHash 
+ case OAUTH2 ⇒ 
+ for { 
+ diff - - git a / actor - server / project / Dependencies . scala b / actor - server / project / Dependencies . scala 
+ index 51af876 . . cf75189 100644 
+ - - - a / actor - server / project / Dependencies . scala 
+ + + + b / actor - server / project / Dependencies . scala 
+ @ @ - 101 , 7 + 101 , 7 @ @ object Dependencies { 
+ akkaSlf4j , akkaActor , akkaStream 
+ ) 
+ 
+ - val activation = shared + + Seq ( akkaActor , akkaHttp , playJson ) 
+ + val activation = shared + + Seq ( akkaActor , akkaHttp , akkaHttpPlayJson , playJson ) 
+ 
+ val bot = shared + + Seq ( upickle )

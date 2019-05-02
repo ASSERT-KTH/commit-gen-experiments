@@ -1,0 +1,822 @@
+BLEU SCORE: 0.0019007116175329825
+
+TEST MSG: Adjust MT depth based on # of partitions validating
+GENERATED MSG: split 2ary index build out from bloom / row index build , and move into stream session post - processing . bloom / row index construction moved into SSTableWriter . Builder and is now run on CompactionManager executor
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 7de31c5 . . b30e9a2 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 6 + 1 , 7 @ @ <nl> 2 . 1 . 1 <nl> * Improve schema merge performance ( CASSANDRA - 7444 ) <nl> * Fix NPE when unknown prepared statement ID is used ( CASSANDRA - 7454 ) <nl> + * Adjust MT depth based on # of partition validating ( CASSANDRA - 5263 ) <nl> <nl> <nl> 2 . 1 . 0 <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> index 227f908 . . fed7ec7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> @ @ - 87 , 6 + 87 , 7 @ @ import org . apache . cassandra . service . ActiveRepairService ; <nl> import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . utils . CloseableIterator ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . apache . cassandra . utils . MerkleTree ; <nl> import org . apache . cassandra . utils . WrappedRunnable ; <nl> import org . apache . cassandra . utils . concurrent . OpOrder ; <nl> <nl> @ @ - 892 , 13 + 893 , 26 @ @ public class CompactionManager implements CompactionManagerMBean <nl> gcBefore = getDefaultGcBefore ( cfs ) ; <nl> } <nl> <nl> + / / Create Merkle tree suitable to hold estimated partitions for given range . <nl> + / / We blindly assume that partition is evenly distributed on all sstables for now . <nl> + long numPartitions = 0 ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + { <nl> + numPartitions + = sstable . estimatedKeysForRanges ( Collections . singleton ( validator . desc . range ) ) ; <nl> + } <nl> + / / determine tree depth from number of partitions , but cap at 20 to prevent large tree . <nl> + int depth = numPartitions > 0 ? ( int ) Math . min ( Math . floor ( Math . log ( numPartitions ) ) , 20 ) : 0 ; <nl> + MerkleTree tree = new MerkleTree ( cfs . partitioner , validator . desc . range , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , depth ) ) ; <nl> + <nl> CompactionIterable ci = new ValidationCompactionIterable ( cfs , sstables , validator . desc . range , gcBefore ) ; <nl> CloseableIterator < AbstractCompactedRow > iter = ci . iterator ( ) ; <nl> + <nl> + long start = System . nanoTime ( ) ; <nl> metrics . beginCompaction ( ci ) ; <nl> try <nl> { <nl> / / validate the CF as we iterate over it <nl> - validator . prepare ( cfs ) ; <nl> + validator . prepare ( cfs , tree ) ; <nl> while ( iter . hasNext ( ) ) <nl> { <nl> if ( ci . isStopRequested ( ) ) <nl> @ @ - 919 , 6 + 933 , 18 @ @ public class CompactionManager implements CompactionManagerMBean <nl> <nl> metrics . finishCompaction ( ci ) ; <nl> } <nl> + <nl> + if ( logger . isDebugEnabled ( ) ) <nl> + { <nl> + / / MT serialize may take time <nl> + long duration = TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) ; <nl> + logger . debug ( " Validation finished in { } msec , depth { } for { } keys , serialized size { } bytes for { } " , <nl> + duration , <nl> + depth , <nl> + numPartitions , <nl> + MerkleTree . serializer . serializedSize ( tree , 0 ) , <nl> + validator . desc ) ; <nl> + } <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / repair / Validator . java b / src / java / org / apache / cassandra / repair / Validator . java <nl> index d93b4a5 . . 641717e 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / Validator . java <nl> + + + b / src / java / org / apache / cassandra / repair / Validator . java <nl> @ @ - 29 , 7 + 29 , 6 @ @ import org . slf4j . LoggerFactory ; <nl> <nl> import org . apache . cassandra . concurrent . Stage ; <nl> import org . apache . cassandra . concurrent . StageManager ; <nl> - import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . db . DecoratedKey ; <nl> import org . apache . cassandra . db . compaction . AbstractCompactedRow ; <nl> @ @ - 52 , 41 + 51 , 32 @ @ public class Validator implements Runnable <nl> <nl> public final RepairJobDesc desc ; <nl> public final InetAddress initiator ; <nl> - public final MerkleTree tree ; <nl> public final int gcBefore ; <nl> <nl> / / null when all rows with the min token have been consumed <nl> - private transient long validated ; <nl> - private transient MerkleTree . TreeRange range ; <nl> - private transient MerkleTree . TreeRangeIterator ranges ; <nl> - private transient DecoratedKey lastKey ; <nl> + private long validated ; <nl> + private MerkleTree tree ; <nl> + / / current range being updated <nl> + private MerkleTree . TreeRange range ; <nl> + / / iterator for iterating sub ranges ( MT ' s leaves ) <nl> + private MerkleTree . TreeRangeIterator ranges ; <nl> + / / last key seen <nl> + private DecoratedKey lastKey ; <nl> <nl> - / * * <nl> - * Create Validator with default size of initial Merkle Tree . <nl> - * / <nl> public Validator ( RepairJobDesc desc , InetAddress initiator , int gcBefore ) <nl> { <nl> - this ( desc , <nl> - initiator , <nl> - / / TODO : memory usage ( maxsize ) should either be tunable per <nl> - / / CF , globally , or as shared for all CFs in a cluster <nl> - new MerkleTree ( DatabaseDescriptor . getPartitioner ( ) , desc . range , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , 15 ) ) , <nl> - gcBefore ) ; <nl> - } <nl> - <nl> - public Validator ( RepairJobDesc desc , InetAddress initiator , MerkleTree tree , int gcBefore ) <nl> - { <nl> this . desc = desc ; <nl> this . initiator = initiator ; <nl> - this . tree = tree ; <nl> this . gcBefore = gcBefore ; <nl> validated = 0 ; <nl> range = null ; <nl> ranges = null ; <nl> } <nl> <nl> - public void prepare ( ColumnFamilyStore cfs ) <nl> + public void prepare ( ColumnFamilyStore cfs , MerkleTree tree ) <nl> { <nl> + this . tree = tree ; <nl> + <nl> if ( ! tree . partitioner ( ) . preservesOrder ( ) ) <nl> { <nl> / / You can ' t beat an even tree distribution for md5 <nl> diff - - git a / test / unit / org / apache / cassandra / repair / ValidatorTest . java b / test / unit / org / apache / cassandra / repair / ValidatorTest . java <nl> index c3ce810 . . 4d65cdb 100644 <nl> - - - a / test / unit / org / apache / cassandra / repair / ValidatorTest . java <nl> + + + b / test / unit / org / apache / cassandra / repair / ValidatorTest . java <nl> @ @ - 46 , 6 + 46 , 7 @ @ import org . apache . cassandra . repair . messages . RepairMessage ; <nl> import org . apache . cassandra . repair . messages . ValidationComplete ; <nl> import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . utils . ByteBufferUtil ; <nl> + import org . apache . cassandra . utils . MerkleTree ; <nl> import org . apache . cassandra . utils . concurrent . SimpleCondition ; <nl> <nl> import static org . junit . Assert . * ; <nl> @ @ - 103 , 10 + 104 , 11 @ @ public class ValidatorTest extends SchemaLoader <nl> ColumnFamilyStore cfs = Keyspace . open ( keyspace ) . getColumnFamilyStore ( columnFamily ) ; <nl> <nl> Validator validator = new Validator ( desc , remote , 0 ) ; <nl> - validator . prepare ( cfs ) ; <nl> + MerkleTree tree = new MerkleTree ( cfs . partitioner , validator . desc . range , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , 15 ) ) ; <nl> + validator . prepare ( cfs , tree ) ; <nl> <nl> / / and confirm that the tree was split <nl> - assertTrue ( validator . tree . size ( ) > 1 ) ; <nl> + assertTrue ( tree . size ( ) > 1 ) ; <nl> <nl> / / add a row <nl> Token mid = partitioner . midpoint ( range . left , range . right ) ; <nl> @ @ - 114 , 8 + 116 , 8 @ @ public class ValidatorTest extends SchemaLoader <nl> validator . complete ( ) ; <nl> <nl> / / confirm that the tree was validated <nl> - Token min = validator . tree . partitioner ( ) . getMinimumToken ( ) ; <nl> - assertNotNull ( validator . tree . hash ( new Range < > ( min , min ) ) ) ; <nl> + Token min = tree . partitioner ( ) . getMinimumToken ( ) ; <nl> + assertNotNull ( tree . hash ( new Range < > ( min , min ) ) ) ; <nl> <nl> if ( ! lock . isSignaled ( ) ) <nl> lock . await ( ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / service / SerializationsTest . java b / test / unit / org / apache / cassandra / service / SerializationsTest . java <nl> index 6937ceb . . 49632f9 100644 <nl> - - - a / test / unit / org / apache / cassandra / service / SerializationsTest . java <nl> + + + b / test / unit / org / apache / cassandra / service / SerializationsTest . java <nl> @ @ - 93 , 17 + 93 , 18 @ @ public class SerializationsTest extends AbstractSerializationsTester <nl> <nl> private void testValidationCompleteWrite ( ) throws IOException <nl> { <nl> + IPartitioner p = new RandomPartitioner ( ) ; <nl> / / empty validation <nl> + MerkleTree mt = new MerkleTree ( p , FULL _ RANGE , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , 15 ) ) ; <nl> Validator v0 = new Validator ( DESC , FBUtilities . getBroadcastAddress ( ) , - 1 ) ; <nl> - ValidationComplete c0 = new ValidationComplete ( DESC , v0 . tree ) ; <nl> + ValidationComplete c0 = new ValidationComplete ( DESC , mt ) ; <nl> <nl> / / validation with a tree <nl> - IPartitioner p = new RandomPartitioner ( ) ; <nl> - MerkleTree mt = new MerkleTree ( p , FULL _ RANGE , MerkleTree . RECOMMENDED _ DEPTH , Integer . MAX _ VALUE ) ; <nl> + mt = new MerkleTree ( p , FULL _ RANGE , MerkleTree . RECOMMENDED _ DEPTH , Integer . MAX _ VALUE ) ; <nl> for ( int i = 0 ; i < 10 ; i + + ) <nl> mt . split ( p . getRandomToken ( ) ) ; <nl> - Validator v1 = new Validator ( DESC , FBUtilities . getBroadcastAddress ( ) , mt , - 1 ) ; <nl> - ValidationComplete c1 = new ValidationComplete ( DESC , v1 . tree ) ; <nl> + Validator v1 = new Validator ( DESC , FBUtilities . getBroadcastAddress ( ) , - 1 ) ; <nl> + ValidationComplete c1 = new ValidationComplete ( DESC , mt ) ; <nl> <nl> / / validation failed <nl> ValidationComplete c3 = new ValidationComplete ( DESC ) ;
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index b9635e8 . . d2fd951 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 33 , 6 + 33 , 7 @ @ import javax . management . ObjectName ; <nl> import com . google . common . collect . Iterables ; <nl> import org . apache . commons . collections . IteratorUtils ; <nl> import org . apache . commons . lang . ArrayUtils ; <nl> + import org . apache . commons . lang . StringUtils ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 205 , 12 + 206 , 9 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> logger . info ( " Creating index { } . { } " , table , indexedCfMetadata . cfName ) ; <nl> Runnable runnable = new WrappedRunnable ( ) <nl> { <nl> - public void runMayThrow ( ) throws IOException , ExecutionException , InterruptedException <nl> + public void runMayThrow ( ) throws IOException <nl> { <nl> - logger . debug ( " Submitting index build to compactionmanager " ) ; <nl> - ReducingKeyIterator iter = new ReducingKeyIterator ( getSSTables ( ) ) ; <nl> - Future future = CompactionManager . instance . submitIndexBuild ( ColumnFamilyStore . this , FBUtilities . getSingleColumnSet ( info . name ) , iter ) ; <nl> - future . get ( ) ; <nl> + buildSecondaryIndexes ( getSSTables ( ) , FBUtilities . getSingleColumnSet ( info . name ) ) ; <nl> logger . info ( " Index { } complete " , indexedCfMetadata . cfName ) ; <nl> SystemTable . setIndexBuilt ( table , indexedCfMetadata . cfName ) ; <nl> } <nl> @ @ - 220 , 6 + 218 , 26 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> indexedColumns . put ( info . name , indexedCfs ) ; <nl> } <nl> <nl> + public void buildSecondaryIndexes ( Collection < SSTableReader > sstables , SortedSet < byte [ ] > columns ) <nl> + { <nl> + logger . debug ( " Submitting index build to compactionmanager " ) ; <nl> + Future future = CompactionManager . instance . submitIndexBuild ( this , columns , new ReducingKeyIterator ( sstables ) ) ; <nl> + try <nl> + { <nl> + future . get ( ) ; <nl> + for ( byte [ ] column : columns ) <nl> + getIndexedColumnFamilyStore ( column ) . forceBlockingFlush ( ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + throw new AssertionError ( e ) ; <nl> + } <nl> + catch ( ExecutionException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> / / called when dropping or renaming a CF . Performs mbean housekeeping . <nl> void unregisterMBean ( ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / db / CompactionManager . java b / src / java / org / apache / cassandra / db / CompactionManager . java <nl> index 64289db . . d5d7444 100644 <nl> - - - a / src / java / org / apache / cassandra / db / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / CompactionManager . java <nl> @ @ - 18 , 38 + 18 , 38 @ @ <nl> <nl> package org . apache . cassandra . db ; <nl> <nl> - import java . io . IOException ; <nl> import java . io . File ; <nl> + import java . io . IOException ; <nl> import java . lang . management . ManagementFactory ; <nl> + import java . net . InetAddress ; <nl> import java . util . * ; <nl> import java . util . Map . Entry ; <nl> import java . util . concurrent . Callable ; <nl> import java . util . concurrent . Future ; <nl> - import javax . management . * ; <nl> + import javax . management . MBeanServer ; <nl> + import javax . management . ObjectName ; <nl> <nl> + import org . apache . commons . collections . PredicateUtils ; <nl> + import org . apache . commons . collections . iterators . CollatingIterator ; <nl> + import org . apache . commons . collections . iterators . FilterIterator ; <nl> + import org . apache . commons . lang . StringUtils ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> - <nl> import org . apache . cassandra . concurrent . DebuggableThreadPoolExecutor ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . dht . Range ; <nl> - import org . apache . cassandra . io . * ; <nl> + import org . apache . cassandra . io . AbstractCompactedRow ; <nl> + import org . apache . cassandra . io . CompactionIterator ; <nl> + import org . apache . cassandra . io . ICompactionInfo ; <nl> import org . apache . cassandra . io . sstable . * ; <nl> - import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - import org . apache . cassandra . service . StorageService ; <nl> - import org . apache . cassandra . service . AntiEntropyService ; <nl> import org . apache . cassandra . io . util . FileUtils ; <nl> + import org . apache . cassandra . service . AntiEntropyService ; <nl> + import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . Pair ; <nl> import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; <nl> <nl> - import java . net . InetAddress ; <nl> - <nl> - import org . apache . commons . lang . StringUtils ; <nl> - import org . apache . commons . collections . iterators . FilterIterator ; <nl> - import org . apache . commons . collections . iterators . CollatingIterator ; <nl> - import org . apache . commons . collections . PredicateUtils ; <nl> - <nl> public class CompactionManager implements CompactionManagerMBean <nl> { <nl> public static final String MBEAN _ OBJECT _ NAME = " org . apache . cassandra . db : type = CompactionManager " ; <nl> @ @ - 508 , 6 + 508 , 20 @ @ public class CompactionManager implements CompactionManagerMBean <nl> return executor . submit ( runnable ) ; <nl> } <nl> <nl> + public Future < SSTableReader > submitSSTableBuild ( Descriptor desc ) <nl> + { <nl> + final SSTableWriter . Builder builder = SSTableWriter . createBuilder ( desc ) ; <nl> + Callable < SSTableReader > callable = new Callable < SSTableReader > ( ) <nl> + { <nl> + public SSTableReader call ( ) throws IOException <nl> + { <nl> + executor . beginCompaction ( builder . cfs , builder ) ; <nl> + return builder . build ( ) ; <nl> + } <nl> + } ; <nl> + return executor . submit ( callable ) ; <nl> + } <nl> + <nl> private static class AntiCompactionIterator extends CompactionIterator <nl> { <nl> private Set < SSTableScanner > scanners ; <nl> @ @ - 550 , 6 + 564 , 11 @ @ public class CompactionManager implements CompactionManagerMBean <nl> } <nl> return scanners ; <nl> } <nl> + <nl> + public String getTaskType ( ) <nl> + { <nl> + return " Anticompaction " ; <nl> + } <nl> } <nl> <nl> public void checkAllColumnFamilies ( ) throws IOException <nl> diff - - git a / src / java / org / apache / cassandra / db / Table . java b / src / java / org / apache / cassandra / db / Table . java <nl> index d96608b . . 82f41c2 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Table . java <nl> + + + b / src / java / org / apache / cassandra / db / Table . java <nl> @ @ - 456 , 7 + 456 , 8 @ @ public class Table <nl> synchronized ( indexLockFor ( key . key ) ) <nl> { <nl> ColumnFamily cf = readCurrentIndexedColumns ( key , cfs , columns ) ; <nl> - applyIndexUpdates ( key . key , memtablesToFlush , cf , cfs , cf . getColumnNames ( ) , null ) ; <nl> + if ( cf ! = null ) <nl> + applyIndexUpdates ( key . key , memtablesToFlush , cf , cfs , cf . getColumnNames ( ) , null ) ; <nl> } <nl> } <nl> finally <nl> diff - - git a / src / java / org / apache / cassandra / io / CompactionIterator . java b / src / java / org / apache / cassandra / io / CompactionIterator . java <nl> index 304e3dd . . a617a26 100644 <nl> - - - a / src / java / org / apache / cassandra / io / CompactionIterator . java <nl> + + + b / src / java / org / apache / cassandra / io / CompactionIterator . java <nl> @ @ - 161 , 4 + 161 , 8 @ @ implements Closeable , ICompactionInfo <nl> return bytesRead ; <nl> } <nl> <nl> + public String getTaskType ( ) <nl> + { <nl> + return " Compaction " ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / ICompactionInfo . java b / src / java / org / apache / cassandra / io / ICompactionInfo . java <nl> index a00c5bb . . 7815c10 100644 <nl> - - - a / src / java / org / apache / cassandra / io / ICompactionInfo . java <nl> + + + b / src / java / org / apache / cassandra / io / ICompactionInfo . java <nl> @ @ - 5 , 4 + 5 , 6 @ @ public interface ICompactionInfo <nl> public long getTotalBytes ( ) ; <nl> <nl> public long getBytesRead ( ) ; <nl> + <nl> + public String getTaskType ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / KeyIterator . java b / src / java / org / apache / cassandra / io / sstable / KeyIterator . java <nl> index b74c675 . . 07e9b23 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / KeyIterator . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / KeyIterator . java <nl> @ @ - 4 , 16 + 4 , 16 @ @ import java . io . Closeable ; <nl> import java . io . File ; <nl> import java . io . IOError ; <nl> import java . io . IOException ; <nl> + import java . util . Iterator ; <nl> <nl> import com . google . common . collect . AbstractIterator ; <nl> <nl> import org . apache . cassandra . db . DecoratedKey ; <nl> - import org . apache . cassandra . io . ICompactionInfo ; <nl> import org . apache . cassandra . io . util . BufferedRandomAccessFile ; <nl> import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> - public class KeyIterator extends AbstractIterator < DecoratedKey > implements IKeyIterator <nl> + public class KeyIterator extends AbstractIterator < DecoratedKey > implements Iterator < DecoratedKey > , Closeable <nl> { <nl> private final BufferedRandomAccessFile in ; <nl> private final Descriptor desc ; <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / ReducingKeyIterator . java b / src / java / org / apache / cassandra / io / sstable / ReducingKeyIterator . java <nl> index e3ebaed . . ed07f5b 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / ReducingKeyIterator . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / ReducingKeyIterator . java <nl> @ @ - 66 , 6 + 66 , 11 @ @ public class ReducingKeyIterator implements IKeyIterator <nl> return m ; <nl> } <nl> <nl> + public String getTaskType ( ) <nl> + { <nl> + return " Secondary index build " ; <nl> + } <nl> + <nl> public boolean hasNext ( ) <nl> { <nl> return iter . hasNext ( ) ; <nl> @ @ - 73 , 7 + 78 , 7 @ @ public class ReducingKeyIterator implements IKeyIterator <nl> <nl> public DecoratedKey next ( ) <nl> { <nl> - return ( DecoratedKey ) iter . next ( ) ; <nl> + return iter . next ( ) ; <nl> } <nl> <nl> public void remove ( ) <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> index 6118339 . . d4bc6b4 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> @ @ - 32 , 6 + 32 , 7 @ @ import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . dht . IPartitioner ; <nl> import org . apache . cassandra . io . AbstractCompactedRow ; <nl> + import org . apache . cassandra . io . ICompactionInfo ; <nl> import org . apache . cassandra . io . util . BufferedRandomAccessFile ; <nl> import org . apache . cassandra . io . util . SegmentedFile ; <nl> import org . apache . cassandra . service . StorageService ; <nl> @ @ - 211 , 62 + 212 , 35 @ @ public class SSTableWriter extends SSTable <nl> return dfile . length ( ) / ( dataPosition / keys ) ; <nl> } <nl> <nl> + public static Builder createBuilder ( Descriptor desc ) <nl> + { <nl> + if ( ! desc . isLatestVersion ) <nl> + / / TODO : streaming between different versions will fail : need support for <nl> + / / recovering other versions to provide a stable streaming api <nl> + throw new RuntimeException ( String . format ( " Cannot recover SSTable with version % s ( current version % s ) . " , <nl> + desc . version , Descriptor . CURRENT _ VERSION ) ) ; <nl> + <nl> + return new Builder ( desc ) ; <nl> + } <nl> + <nl> / * * <nl> - * If either of the index or filter files are missing , rebuilds both . <nl> - * TODO : Builds most of the in - memory state of the sstable , but doesn ' t actually open it . <nl> + * Removes the given SSTable from temporary status and opens it , rebuilding the <nl> + * bloom filter and row index from the data file . <nl> * / <nl> - private static void maybeRecover ( Descriptor desc ) throws IOException <nl> + public static class Builder implements ICompactionInfo <nl> { <nl> - logger . debug ( " In maybeRecover with Descriptor { } " , desc ) ; <nl> - File ifile = new File ( desc . filenameFor ( SSTable . COMPONENT _ INDEX ) ) ; <nl> - File ffile = new File ( desc . filenameFor ( SSTable . COMPONENT _ FILTER ) ) ; <nl> - if ( ifile . exists ( ) & & ffile . exists ( ) ) <nl> - / / nothing to do <nl> - return ; <nl> - <nl> - ColumnFamilyStore cfs = Table . open ( desc . ksname ) . getColumnFamilyStore ( desc . cfname ) ; <nl> - <nl> - / / remove existing files <nl> - ifile . delete ( ) ; <nl> - ffile . delete ( ) ; <nl> - <nl> - / / open the data file for input , and an IndexWriter for output <nl> - BufferedRandomAccessFile dfile = new BufferedRandomAccessFile ( desc . filenameFor ( SSTable . COMPONENT _ DATA ) , " r " , 8 * 1024 * 1024 ) ; <nl> - IndexWriter iwriter ; <nl> - long estimatedRows ; <nl> - try <nl> - { <nl> - estimatedRows = estimateRows ( desc , dfile ) ; <nl> - iwriter = new IndexWriter ( desc , StorageService . getPartitioner ( ) , estimatedRows ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - dfile . close ( ) ; <nl> - throw e ; <nl> - } <nl> + private final Descriptor desc ; <nl> + public final ColumnFamilyStore cfs ; <nl> + private BufferedRandomAccessFile dfile ; <nl> <nl> - / / build the index and filter <nl> - long rows = 0 ; <nl> - try <nl> - { <nl> - DecoratedKey key ; <nl> - long dataPosition = 0 ; <nl> - while ( dataPosition < dfile . length ( ) ) <nl> - { <nl> - key = SSTableReader . decodeKey ( StorageService . getPartitioner ( ) , desc , FBUtilities . readShortByteArray ( dfile ) ) ; <nl> - long dataSize = SSTableReader . readRowSize ( dfile , desc ) ; <nl> - iwriter . afterAppend ( key , dataPosition ) ; <nl> - dataPosition = dfile . getFilePointer ( ) + dataSize ; <nl> - dfile . seek ( dataPosition ) ; <nl> - rows + + ; <nl> - } <nl> - } <nl> - finally <nl> + public Builder ( Descriptor desc ) <nl> { <nl> + <nl> + this . desc = desc ; <nl> + cfs = Table . open ( desc . ksname ) . getColumnFamilyStore ( desc . cfname ) ; <nl> try <nl> { <nl> - dfile . close ( ) ; <nl> - iwriter . close ( ) ; <nl> + dfile = new BufferedRandomAccessFile ( desc . filenameFor ( SSTable . COMPONENT _ DATA ) , " r " , 8 * 1024 * 1024 ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> @ @ - 274 , 44 + 248 , 80 @ @ public class SSTableWriter extends SSTable <nl> } <nl> } <nl> <nl> - if ( ! cfs . getIndexedColumns ( ) . isEmpty ( ) ) <nl> + public SSTableReader build ( ) throws IOException <nl> { <nl> - Future future = CompactionManager . instance . submitIndexBuild ( cfs , cfs . getIndexedColumns ( ) , new KeyIterator ( desc ) ) ; <nl> + File ifile = new File ( desc . filenameFor ( SSTable . COMPONENT _ INDEX ) ) ; <nl> + File ffile = new File ( desc . filenameFor ( SSTable . COMPONENT _ FILTER ) ) ; <nl> + assert ! ifile . exists ( ) ; <nl> + assert ! ffile . exists ( ) ; <nl> + <nl> + IndexWriter iwriter ; <nl> + long estimatedRows ; <nl> try <nl> { <nl> - future . get ( ) ; <nl> - for ( byte [ ] column : cfs . getIndexedColumns ( ) ) <nl> - cfs . getIndexedColumnFamilyStore ( column ) . forceBlockingFlush ( ) ; <nl> + estimatedRows = estimateRows ( desc , dfile ) ; <nl> + iwriter = new IndexWriter ( desc , StorageService . getPartitioner ( ) , estimatedRows ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + dfile . close ( ) ; <nl> + throw e ; <nl> } <nl> - catch ( InterruptedException e ) <nl> + <nl> + / / build the index and filter <nl> + long rows = 0 ; <nl> + try <nl> { <nl> - throw new AssertionError ( e ) ; <nl> + DecoratedKey key ; <nl> + long dataPosition = 0 ; <nl> + while ( dataPosition < dfile . length ( ) ) <nl> + { <nl> + key = SSTableReader . decodeKey ( StorageService . getPartitioner ( ) , desc , FBUtilities . readShortByteArray ( dfile ) ) ; <nl> + long dataSize = SSTableReader . readRowSize ( dfile , desc ) ; <nl> + iwriter . afterAppend ( key , dataPosition ) ; <nl> + dataPosition = dfile . getFilePointer ( ) + dataSize ; <nl> + dfile . seek ( dataPosition ) ; <nl> + rows + + ; <nl> + } <nl> } <nl> - catch ( ExecutionException e ) <nl> + finally <nl> { <nl> - throw new RuntimeException ( e ) ; <nl> + try <nl> + { <nl> + dfile . close ( ) ; <nl> + iwriter . close ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> } <nl> + <nl> + logger . debug ( " estimated row count was % s of real count " , ( ( double ) estimatedRows ) / rows ) ; <nl> + return SSTableReader . open ( rename ( desc , SSTable . componentsFor ( desc ) ) ) ; <nl> } <nl> <nl> - logger . debug ( " estimated row count was % s of real count " , ( ( double ) estimatedRows ) / rows ) ; <nl> - } <nl> + public long getTotalBytes ( ) <nl> + { <nl> + try <nl> + { <nl> + return dfile . length ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + } <nl> <nl> - / * * <nl> - * Removes the given SSTable from temporary status and opens it , rebuilding the non - essential portions of the <nl> - * file if necessary . <nl> - * / <nl> - public static SSTableReader recoverAndOpen ( Descriptor desc ) throws IOException <nl> - { <nl> - if ( ! desc . isLatestVersion ) <nl> - / / TODO : streaming between different versions will fail : need support for <nl> - / / recovering other versions to provide a stable streaming api <nl> - throw new RuntimeException ( String . format ( " Cannot recover SSTable with version % s ( current version % s ) . " , <nl> - desc . version , Descriptor . CURRENT _ VERSION ) ) ; <nl> + public long getBytesRead ( ) <nl> + { <nl> + return dfile . getFilePointer ( ) ; <nl> + } <nl> <nl> - / / FIXME : once maybeRecover is recovering BMIs , it should return the recovered <nl> - / / components <nl> - maybeRecover ( desc ) ; <nl> - return SSTableReader . open ( rename ( desc , SSTable . componentsFor ( desc ) ) ) ; <nl> + public String getTaskType ( ) <nl> + { <nl> + return " SSTable rebuild " ; <nl> + } <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / streaming / IncomingStreamReader . java b / src / java / org / apache / cassandra / streaming / IncomingStreamReader . java <nl> index 3c3c233 . . 0eafae9 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / IncomingStreamReader . java <nl> + + + b / src / java / org / apache / cassandra / streaming / IncomingStreamReader . java <nl> @ @ - 100 , 24 + 100 , 6 @ @ public class IncomingStreamReader <nl> fc . close ( ) ; <nl> } <nl> <nl> - addSSTable ( localFile ) ; <nl> - session . finished ( remoteFile ) ; <nl> - } <nl> - <nl> - public static void addSSTable ( PendingFile pendingFile ) <nl> - { <nl> - / / file was successfully streamed <nl> - Descriptor desc = pendingFile . desc ; <nl> - try <nl> - { <nl> - SSTableReader sstable = SSTableWriter . recoverAndOpen ( pendingFile . desc ) ; <nl> - Table . open ( desc . ksname ) . getColumnFamilyStore ( desc . cfname ) . addSSTable ( sstable ) ; <nl> - logger . info ( " Streaming added " + sstable ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - logger . error ( " Failed adding { } " , pendingFile , e ) ; <nl> - throw new RuntimeException ( " Not able to add streamed file " + pendingFile . getFilename ( ) , e ) ; <nl> - } <nl> + session . finished ( remoteFile , localFile ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamInSession . java b / src / java / org / apache / cassandra / streaming / StreamInSession . java <nl> index f535146 . . dab9f8c 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamInSession . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamInSession . java <nl> @ @ - 22 , 7 + 22 , 13 @ @ import java . io . IOException ; <nl> import java . net . InetAddress ; <nl> import java . util . * ; <nl> import java . util . concurrent . ConcurrentMap ; <nl> + import java . util . concurrent . ExecutionException ; <nl> + import java . util . concurrent . Future ; <nl> <nl> + import org . apache . cassandra . db . ColumnFamilyStore ; <nl> + import org . apache . cassandra . db . CompactionManager ; <nl> + import org . apache . cassandra . db . Table ; <nl> + import org . apache . cassandra . io . sstable . * ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; <nl> import org . apache . cassandra . utils . Pair ; <nl> @ @ - 41 , 6 + 47 , 8 @ @ public class StreamInSession <nl> private final Pair < InetAddress , Long > context ; <nl> private final Runnable callback ; <nl> private String table ; <nl> + private final List < Future < SSTableReader > > buildFutures = new ArrayList < Future < SSTableReader > > ( ) ; <nl> + private ColumnFamilyStore cfs ; <nl> <nl> private StreamInSession ( Pair < InetAddress , Long > context , Runnable callback ) <nl> { <nl> @ @ - 84 , 13 + 92 , 19 @ @ public class StreamInSession <nl> if ( logger . isDebugEnabled ( ) ) <nl> logger . debug ( " Adding file { } to Stream Request queue " , file . getFilename ( ) ) ; <nl> this . files . add ( file ) ; <nl> + if ( cfs = = null ) <nl> + cfs = Table . open ( file . desc . ksname ) . getColumnFamilyStore ( file . desc . cfname ) ; <nl> } <nl> } <nl> <nl> - public void finished ( PendingFile remoteFile ) throws IOException <nl> + public void finished ( PendingFile remoteFile , PendingFile localFile ) throws IOException <nl> { <nl> if ( logger . isDebugEnabled ( ) ) <nl> logger . debug ( " Finished { } . Sending ack to { } " , remoteFile , this ) ; <nl> + <nl> + Future future = CompactionManager . instance . submitSSTableBuild ( localFile . desc ) ; <nl> + buildFutures . add ( future ) ; <nl> + <nl> files . remove ( remoteFile ) ; <nl> StreamReply reply = new StreamReply ( remoteFile . getFilename ( ) , getSessionId ( ) , StreamReply . Status . FILE _ FINISHED ) ; <nl> / / send a StreamStatus message telling the source node it can delete this file <nl> @ @ - 108 , 6 + 122 , 31 @ @ public class StreamInSession <nl> { <nl> if ( files . isEmpty ( ) ) <nl> { <nl> + / / wait for bloom filters and row indexes to finish building <nl> + List < SSTableReader > sstables = new ArrayList < SSTableReader > ( buildFutures . size ( ) ) ; <nl> + for ( Future < SSTableReader > future : buildFutures ) <nl> + { <nl> + try <nl> + { <nl> + SSTableReader sstable = future . get ( ) ; <nl> + cfs . addSSTable ( sstable ) ; <nl> + sstables . add ( sstable ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + throw new AssertionError ( e ) ; <nl> + } <nl> + catch ( ExecutionException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + / / build secondary indexes <nl> + if ( cfs ! = null & & ! cfs . getIndexedColumns ( ) . isEmpty ( ) ) <nl> + cfs . buildSecondaryIndexes ( sstables , cfs . getIndexedColumns ( ) ) ; <nl> + <nl> + / / send reply to source that we ' re done <nl> StreamReply reply = new StreamReply ( " " , getSessionId ( ) , StreamReply . Status . SESSION _ FINISHED ) ; <nl> logger . info ( " Finished streaming session { } from { } " , getSessionId ( ) , getHost ( ) ) ; <nl> MessagingService . instance . sendOneWay ( reply . createMessage ( ) , getHost ( ) ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / io / sstable / SSTableWriterTest . java b / test / unit / org / apache / cassandra / io / sstable / SSTableWriterTest . java <nl> index 052199e . . 570c5e1 100644 <nl> - - - a / test / unit / org / apache / cassandra / io / sstable / SSTableWriterTest . java <nl> + + + b / test / unit / org / apache / cassandra / io / sstable / SSTableWriterTest . java <nl> @ @ - 29 , 21 + 29 , 17 @ @ import java . util . Arrays ; <nl> import java . util . HashMap ; <nl> import java . util . List ; <nl> import java . util . Map ; <nl> + import java . util . concurrent . ExecutionException ; <nl> <nl> import org . apache . cassandra . CleanupHelper ; <nl> - import org . apache . cassandra . db . Column ; <nl> - import org . apache . cassandra . db . ColumnFamily ; <nl> - import org . apache . cassandra . db . ColumnFamilyStore ; <nl> - import org . apache . cassandra . db . Row ; <nl> - import org . apache . cassandra . db . RowMutation ; <nl> - import org . apache . cassandra . db . Table ; <nl> - import org . apache . cassandra . db . TimestampClock ; <nl> + import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . db . filter . IFilter ; <nl> import org . apache . cassandra . db . columniterator . IdentityQueryFilter ; <nl> import org . apache . cassandra . db . filter . QueryPath ; <nl> import org . apache . cassandra . dht . IPartitioner ; <nl> import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . io . util . DataOutputBuffer ; <nl> + import org . apache . cassandra . io . util . FileUtils ; <nl> import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . thrift . IndexClause ; <nl> import org . apache . cassandra . thrift . IndexExpression ; <nl> @ @ - 54 , 7 + 50 , 7 @ @ import org . junit . Test ; <nl> public class SSTableWriterTest extends CleanupHelper { <nl> <nl> @ Test <nl> - public void testRecoverAndOpen ( ) throws IOException <nl> + public void testRecoverAndOpen ( ) throws IOException , ExecutionException , InterruptedException <nl> { <nl> RowMutation rm ; <nl> <nl> @ @ - 80 , 13 + 76 , 13 @ @ public class SSTableWriterTest extends CleanupHelper { <nl> <nl> SSTableReader orig = SSTableUtils . writeRawSSTable ( " Keyspace1 " , " Indexed1 " , entries ) ; <nl> / / whack the index to trigger the recover <nl> - new File ( orig . desc . filenameFor ( Component . PRIMARY _ INDEX ) ) . delete ( ) ; <nl> - new File ( orig . desc . filenameFor ( Component . FILTER ) ) . delete ( ) ; <nl> - <nl> - SSTableReader sstr = SSTableWriter . recoverAndOpen ( orig . desc ) ; <nl> - <nl> + FileUtils . deleteWithConfirm ( orig . desc . filenameFor ( Component . PRIMARY _ INDEX ) ) ; <nl> + FileUtils . deleteWithConfirm ( orig . desc . filenameFor ( Component . FILTER ) ) ; <nl> + <nl> + SSTableReader sstr = CompactionManager . instance . submitSSTableBuild ( orig . desc ) . get ( ) ; <nl> ColumnFamilyStore cfs = Table . open ( " Keyspace1 " ) . getColumnFamilyStore ( " Indexed1 " ) ; <nl> cfs . addSSTable ( sstr ) ; <nl> + cfs . buildSecondaryIndexes ( cfs . getSSTables ( ) , cfs . getIndexedColumns ( ) ) ; <nl> <nl> IndexExpression expr = new IndexExpression ( " birthdate " . getBytes ( " UTF8 " ) , IndexOperator . EQ , FBUtilities . toByteArray ( 1L ) ) ; <nl> IndexClause clause = new IndexClause ( Arrays . asList ( expr ) , " " . getBytes ( ) , 100 ) ; <nl> @ @ - 95 , 7 + 91 , 7 @ @ public class SSTableWriterTest extends CleanupHelper { <nl> Range range = new Range ( p . getMinimumToken ( ) , p . getMinimumToken ( ) ) ; <nl> List < Row > rows = cfs . scan ( clause , range , filter ) ; <nl> <nl> - assertEquals ( " IndexExpression should return two rows on recoverAndOpen " , 2 , rows . size ( ) ) ; <nl> + assertEquals ( " IndexExpression should return two rows on recoverAndOpen " , 2 , rows . size ( ) ) ; <nl> assertTrue ( " First result should be ' k1 ' " , Arrays . equals ( " k1 " . getBytes ( ) , rows . get ( 0 ) . key . key ) ) ; <nl> } <nl> }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 7de31c5 . . b30e9a2 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 6 + 1 , 7 @ @ 
+ 2 . 1 . 1 
+ * Improve schema merge performance ( CASSANDRA - 7444 ) 
+ * Fix NPE when unknown prepared statement ID is used ( CASSANDRA - 7454 ) 
+ + * Adjust MT depth based on # of partition validating ( CASSANDRA - 5263 ) 
+ 
+ 
+ 2 . 1 . 0 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ index 227f908 . . fed7ec7 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ @ @ - 87 , 6 + 87 , 7 @ @ import org . apache . cassandra . service . ActiveRepairService ; 
+ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . utils . CloseableIterator ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . apache . cassandra . utils . MerkleTree ; 
+ import org . apache . cassandra . utils . WrappedRunnable ; 
+ import org . apache . cassandra . utils . concurrent . OpOrder ; 
+ 
+ @ @ - 892 , 13 + 893 , 26 @ @ public class CompactionManager implements CompactionManagerMBean 
+ gcBefore = getDefaultGcBefore ( cfs ) ; 
+ } 
+ 
+ + / / Create Merkle tree suitable to hold estimated partitions for given range . 
+ + / / We blindly assume that partition is evenly distributed on all sstables for now . 
+ + long numPartitions = 0 ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + { 
+ + numPartitions + = sstable . estimatedKeysForRanges ( Collections . singleton ( validator . desc . range ) ) ; 
+ + } 
+ + / / determine tree depth from number of partitions , but cap at 20 to prevent large tree . 
+ + int depth = numPartitions > 0 ? ( int ) Math . min ( Math . floor ( Math . log ( numPartitions ) ) , 20 ) : 0 ; 
+ + MerkleTree tree = new MerkleTree ( cfs . partitioner , validator . desc . range , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , depth ) ) ; 
+ + 
+ CompactionIterable ci = new ValidationCompactionIterable ( cfs , sstables , validator . desc . range , gcBefore ) ; 
+ CloseableIterator < AbstractCompactedRow > iter = ci . iterator ( ) ; 
+ + 
+ + long start = System . nanoTime ( ) ; 
+ metrics . beginCompaction ( ci ) ; 
+ try 
+ { 
+ / / validate the CF as we iterate over it 
+ - validator . prepare ( cfs ) ; 
+ + validator . prepare ( cfs , tree ) ; 
+ while ( iter . hasNext ( ) ) 
+ { 
+ if ( ci . isStopRequested ( ) ) 
+ @ @ - 919 , 6 + 933 , 18 @ @ public class CompactionManager implements CompactionManagerMBean 
+ 
+ metrics . finishCompaction ( ci ) ; 
+ } 
+ + 
+ + if ( logger . isDebugEnabled ( ) ) 
+ + { 
+ + / / MT serialize may take time 
+ + long duration = TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) ; 
+ + logger . debug ( " Validation finished in { } msec , depth { } for { } keys , serialized size { } bytes for { } " , 
+ + duration , 
+ + depth , 
+ + numPartitions , 
+ + MerkleTree . serializer . serializedSize ( tree , 0 ) , 
+ + validator . desc ) ; 
+ + } 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / repair / Validator . java b / src / java / org / apache / cassandra / repair / Validator . java 
+ index d93b4a5 . . 641717e 100644 
+ - - - a / src / java / org / apache / cassandra / repair / Validator . java 
+ + + + b / src / java / org / apache / cassandra / repair / Validator . java 
+ @ @ - 29 , 7 + 29 , 6 @ @ import org . slf4j . LoggerFactory ; 
+ 
+ import org . apache . cassandra . concurrent . Stage ; 
+ import org . apache . cassandra . concurrent . StageManager ; 
+ - import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . db . DecoratedKey ; 
+ import org . apache . cassandra . db . compaction . AbstractCompactedRow ; 
+ @ @ - 52 , 41 + 51 , 32 @ @ public class Validator implements Runnable 
+ 
+ public final RepairJobDesc desc ; 
+ public final InetAddress initiator ; 
+ - public final MerkleTree tree ; 
+ public final int gcBefore ; 
+ 
+ / / null when all rows with the min token have been consumed 
+ - private transient long validated ; 
+ - private transient MerkleTree . TreeRange range ; 
+ - private transient MerkleTree . TreeRangeIterator ranges ; 
+ - private transient DecoratedKey lastKey ; 
+ + private long validated ; 
+ + private MerkleTree tree ; 
+ + / / current range being updated 
+ + private MerkleTree . TreeRange range ; 
+ + / / iterator for iterating sub ranges ( MT ' s leaves ) 
+ + private MerkleTree . TreeRangeIterator ranges ; 
+ + / / last key seen 
+ + private DecoratedKey lastKey ; 
+ 
+ - / * * 
+ - * Create Validator with default size of initial Merkle Tree . 
+ - * / 
+ public Validator ( RepairJobDesc desc , InetAddress initiator , int gcBefore ) 
+ { 
+ - this ( desc , 
+ - initiator , 
+ - / / TODO : memory usage ( maxsize ) should either be tunable per 
+ - / / CF , globally , or as shared for all CFs in a cluster 
+ - new MerkleTree ( DatabaseDescriptor . getPartitioner ( ) , desc . range , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , 15 ) ) , 
+ - gcBefore ) ; 
+ - } 
+ - 
+ - public Validator ( RepairJobDesc desc , InetAddress initiator , MerkleTree tree , int gcBefore ) 
+ - { 
+ this . desc = desc ; 
+ this . initiator = initiator ; 
+ - this . tree = tree ; 
+ this . gcBefore = gcBefore ; 
+ validated = 0 ; 
+ range = null ; 
+ ranges = null ; 
+ } 
+ 
+ - public void prepare ( ColumnFamilyStore cfs ) 
+ + public void prepare ( ColumnFamilyStore cfs , MerkleTree tree ) 
+ { 
+ + this . tree = tree ; 
+ + 
+ if ( ! tree . partitioner ( ) . preservesOrder ( ) ) 
+ { 
+ / / You can ' t beat an even tree distribution for md5 
+ diff - - git a / test / unit / org / apache / cassandra / repair / ValidatorTest . java b / test / unit / org / apache / cassandra / repair / ValidatorTest . java 
+ index c3ce810 . . 4d65cdb 100644 
+ - - - a / test / unit / org / apache / cassandra / repair / ValidatorTest . java 
+ + + + b / test / unit / org / apache / cassandra / repair / ValidatorTest . java 
+ @ @ - 46 , 6 + 46 , 7 @ @ import org . apache . cassandra . repair . messages . RepairMessage ; 
+ import org . apache . cassandra . repair . messages . ValidationComplete ; 
+ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ + import org . apache . cassandra . utils . MerkleTree ; 
+ import org . apache . cassandra . utils . concurrent . SimpleCondition ; 
+ 
+ import static org . junit . Assert . * ; 
+ @ @ - 103 , 10 + 104 , 11 @ @ public class ValidatorTest extends SchemaLoader 
+ ColumnFamilyStore cfs = Keyspace . open ( keyspace ) . getColumnFamilyStore ( columnFamily ) ; 
+ 
+ Validator validator = new Validator ( desc , remote , 0 ) ; 
+ - validator . prepare ( cfs ) ; 
+ + MerkleTree tree = new MerkleTree ( cfs . partitioner , validator . desc . range , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , 15 ) ) ; 
+ + validator . prepare ( cfs , tree ) ; 
+ 
+ / / and confirm that the tree was split 
+ - assertTrue ( validator . tree . size ( ) > 1 ) ; 
+ + assertTrue ( tree . size ( ) > 1 ) ; 
+ 
+ / / add a row 
+ Token mid = partitioner . midpoint ( range . left , range . right ) ; 
+ @ @ - 114 , 8 + 116 , 8 @ @ public class ValidatorTest extends SchemaLoader 
+ validator . complete ( ) ; 
+ 
+ / / confirm that the tree was validated 
+ - Token min = validator . tree . partitioner ( ) . getMinimumToken ( ) ; 
+ - assertNotNull ( validator . tree . hash ( new Range < > ( min , min ) ) ) ; 
+ + Token min = tree . partitioner ( ) . getMinimumToken ( ) ; 
+ + assertNotNull ( tree . hash ( new Range < > ( min , min ) ) ) ; 
+ 
+ if ( ! lock . isSignaled ( ) ) 
+ lock . await ( ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / service / SerializationsTest . java b / test / unit / org / apache / cassandra / service / SerializationsTest . java 
+ index 6937ceb . . 49632f9 100644 
+ - - - a / test / unit / org / apache / cassandra / service / SerializationsTest . java 
+ + + + b / test / unit / org / apache / cassandra / service / SerializationsTest . java 
+ @ @ - 93 , 17 + 93 , 18 @ @ public class SerializationsTest extends AbstractSerializationsTester 
+ 
+ private void testValidationCompleteWrite ( ) throws IOException 
+ { 
+ + IPartitioner p = new RandomPartitioner ( ) ; 
+ / / empty validation 
+ + MerkleTree mt = new MerkleTree ( p , FULL _ RANGE , MerkleTree . RECOMMENDED _ DEPTH , ( int ) Math . pow ( 2 , 15 ) ) ; 
+ Validator v0 = new Validator ( DESC , FBUtilities . getBroadcastAddress ( ) , - 1 ) ; 
+ - ValidationComplete c0 = new ValidationComplete ( DESC , v0 . tree ) ; 
+ + ValidationComplete c0 = new ValidationComplete ( DESC , mt ) ; 
+ 
+ / / validation with a tree 
+ - IPartitioner p = new RandomPartitioner ( ) ; 
+ - MerkleTree mt = new MerkleTree ( p , FULL _ RANGE , MerkleTree . RECOMMENDED _ DEPTH , Integer . MAX _ VALUE ) ; 
+ + mt = new MerkleTree ( p , FULL _ RANGE , MerkleTree . RECOMMENDED _ DEPTH , Integer . MAX _ VALUE ) ; 
+ for ( int i = 0 ; i < 10 ; i + + ) 
+ mt . split ( p . getRandomToken ( ) ) ; 
+ - Validator v1 = new Validator ( DESC , FBUtilities . getBroadcastAddress ( ) , mt , - 1 ) ; 
+ - ValidationComplete c1 = new ValidationComplete ( DESC , v1 . tree ) ; 
+ + Validator v1 = new Validator ( DESC , FBUtilities . getBroadcastAddress ( ) , - 1 ) ; 
+ + ValidationComplete c1 = new ValidationComplete ( DESC , mt ) ; 
+ 
+ / / validation failed 
+ ValidationComplete c3 = new ValidationComplete ( DESC ) ;
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index b9635e8 . . d2fd951 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 33 , 6 + 33 , 7 @ @ import javax . management . ObjectName ; 
+ import com . google . common . collect . Iterables ; 
+ import org . apache . commons . collections . IteratorUtils ; 
+ import org . apache . commons . lang . ArrayUtils ; 
+ + import org . apache . commons . lang . StringUtils ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 205 , 12 + 206 , 9 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ logger . info ( " Creating index { } . { } " , table , indexedCfMetadata . cfName ) ; 
+ Runnable runnable = new WrappedRunnable ( ) 
+ { 
+ - public void runMayThrow ( ) throws IOException , ExecutionException , InterruptedException 
+ + public void runMayThrow ( ) throws IOException 
+ { 
+ - logger . debug ( " Submitting index build to compactionmanager " ) ; 
+ - ReducingKeyIterator iter = new ReducingKeyIterator ( getSSTables ( ) ) ; 
+ - Future future = CompactionManager . instance . submitIndexBuild ( ColumnFamilyStore . this , FBUtilities . getSingleColumnSet ( info . name ) , iter ) ; 
+ - future . get ( ) ; 
+ + buildSecondaryIndexes ( getSSTables ( ) , FBUtilities . getSingleColumnSet ( info . name ) ) ; 
+ logger . info ( " Index { } complete " , indexedCfMetadata . cfName ) ; 
+ SystemTable . setIndexBuilt ( table , indexedCfMetadata . cfName ) ; 
+ } 
+ @ @ - 220 , 6 + 218 , 26 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ indexedColumns . put ( info . name , indexedCfs ) ; 
+ } 
+ 
+ + public void buildSecondaryIndexes ( Collection < SSTableReader > sstables , SortedSet < byte [ ] > columns ) 
+ + { 
+ + logger . debug ( " Submitting index build to compactionmanager " ) ; 
+ + Future future = CompactionManager . instance . submitIndexBuild ( this , columns , new ReducingKeyIterator ( sstables ) ) ; 
+ + try 
+ + { 
+ + future . get ( ) ; 
+ + for ( byte [ ] column : columns ) 
+ + getIndexedColumnFamilyStore ( column ) . forceBlockingFlush ( ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + throw new AssertionError ( e ) ; 
+ + } 
+ + catch ( ExecutionException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ / / called when dropping or renaming a CF . Performs mbean housekeeping . 
+ void unregisterMBean ( ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / db / CompactionManager . java b / src / java / org / apache / cassandra / db / CompactionManager . java 
+ index 64289db . . d5d7444 100644 
+ - - - a / src / java / org / apache / cassandra / db / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / CompactionManager . java 
+ @ @ - 18 , 38 + 18 , 38 @ @ 
+ 
+ package org . apache . cassandra . db ; 
+ 
+ - import java . io . IOException ; 
+ import java . io . File ; 
+ + import java . io . IOException ; 
+ import java . lang . management . ManagementFactory ; 
+ + import java . net . InetAddress ; 
+ import java . util . * ; 
+ import java . util . Map . Entry ; 
+ import java . util . concurrent . Callable ; 
+ import java . util . concurrent . Future ; 
+ - import javax . management . * ; 
+ + import javax . management . MBeanServer ; 
+ + import javax . management . ObjectName ; 
+ 
+ + import org . apache . commons . collections . PredicateUtils ; 
+ + import org . apache . commons . collections . iterators . CollatingIterator ; 
+ + import org . apache . commons . collections . iterators . FilterIterator ; 
+ + import org . apache . commons . lang . StringUtils ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ - 
+ import org . apache . cassandra . concurrent . DebuggableThreadPoolExecutor ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . dht . Range ; 
+ - import org . apache . cassandra . io . * ; 
+ + import org . apache . cassandra . io . AbstractCompactedRow ; 
+ + import org . apache . cassandra . io . CompactionIterator ; 
+ + import org . apache . cassandra . io . ICompactionInfo ; 
+ import org . apache . cassandra . io . sstable . * ; 
+ - import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - import org . apache . cassandra . service . StorageService ; 
+ - import org . apache . cassandra . service . AntiEntropyService ; 
+ import org . apache . cassandra . io . util . FileUtils ; 
+ + import org . apache . cassandra . service . AntiEntropyService ; 
+ + import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . Pair ; 
+ import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; 
+ 
+ - import java . net . InetAddress ; 
+ - 
+ - import org . apache . commons . lang . StringUtils ; 
+ - import org . apache . commons . collections . iterators . FilterIterator ; 
+ - import org . apache . commons . collections . iterators . CollatingIterator ; 
+ - import org . apache . commons . collections . PredicateUtils ; 
+ - 
+ public class CompactionManager implements CompactionManagerMBean 
+ { 
+ public static final String MBEAN _ OBJECT _ NAME = " org . apache . cassandra . db : type = CompactionManager " ; 
+ @ @ - 508 , 6 + 508 , 20 @ @ public class CompactionManager implements CompactionManagerMBean 
+ return executor . submit ( runnable ) ; 
+ } 
+ 
+ + public Future < SSTableReader > submitSSTableBuild ( Descriptor desc ) 
+ + { 
+ + final SSTableWriter . Builder builder = SSTableWriter . createBuilder ( desc ) ; 
+ + Callable < SSTableReader > callable = new Callable < SSTableReader > ( ) 
+ + { 
+ + public SSTableReader call ( ) throws IOException 
+ + { 
+ + executor . beginCompaction ( builder . cfs , builder ) ; 
+ + return builder . build ( ) ; 
+ + } 
+ + } ; 
+ + return executor . submit ( callable ) ; 
+ + } 
+ + 
+ private static class AntiCompactionIterator extends CompactionIterator 
+ { 
+ private Set < SSTableScanner > scanners ; 
+ @ @ - 550 , 6 + 564 , 11 @ @ public class CompactionManager implements CompactionManagerMBean 
+ } 
+ return scanners ; 
+ } 
+ + 
+ + public String getTaskType ( ) 
+ + { 
+ + return " Anticompaction " ; 
+ + } 
+ } 
+ 
+ public void checkAllColumnFamilies ( ) throws IOException 
+ diff - - git a / src / java / org / apache / cassandra / db / Table . java b / src / java / org / apache / cassandra / db / Table . java 
+ index d96608b . . 82f41c2 100644 
+ - - - a / src / java / org / apache / cassandra / db / Table . java 
+ + + + b / src / java / org / apache / cassandra / db / Table . java 
+ @ @ - 456 , 7 + 456 , 8 @ @ public class Table 
+ synchronized ( indexLockFor ( key . key ) ) 
+ { 
+ ColumnFamily cf = readCurrentIndexedColumns ( key , cfs , columns ) ; 
+ - applyIndexUpdates ( key . key , memtablesToFlush , cf , cfs , cf . getColumnNames ( ) , null ) ; 
+ + if ( cf ! = null ) 
+ + applyIndexUpdates ( key . key , memtablesToFlush , cf , cfs , cf . getColumnNames ( ) , null ) ; 
+ } 
+ } 
+ finally 
+ diff - - git a / src / java / org / apache / cassandra / io / CompactionIterator . java b / src / java / org / apache / cassandra / io / CompactionIterator . java 
+ index 304e3dd . . a617a26 100644 
+ - - - a / src / java / org / apache / cassandra / io / CompactionIterator . java 
+ + + + b / src / java / org / apache / cassandra / io / CompactionIterator . java 
+ @ @ - 161 , 4 + 161 , 8 @ @ implements Closeable , ICompactionInfo 
+ return bytesRead ; 
+ } 
+ 
+ + public String getTaskType ( ) 
+ + { 
+ + return " Compaction " ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / ICompactionInfo . java b / src / java / org / apache / cassandra / io / ICompactionInfo . java 
+ index a00c5bb . . 7815c10 100644 
+ - - - a / src / java / org / apache / cassandra / io / ICompactionInfo . java 
+ + + + b / src / java / org / apache / cassandra / io / ICompactionInfo . java 
+ @ @ - 5 , 4 + 5 , 6 @ @ public interface ICompactionInfo 
+ public long getTotalBytes ( ) ; 
+ 
+ public long getBytesRead ( ) ; 
+ + 
+ + public String getTaskType ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / KeyIterator . java b / src / java / org / apache / cassandra / io / sstable / KeyIterator . java 
+ index b74c675 . . 07e9b23 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / KeyIterator . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / KeyIterator . java 
+ @ @ - 4 , 16 + 4 , 16 @ @ import java . io . Closeable ; 
+ import java . io . File ; 
+ import java . io . IOError ; 
+ import java . io . IOException ; 
+ + import java . util . Iterator ; 
+ 
+ import com . google . common . collect . AbstractIterator ; 
+ 
+ import org . apache . cassandra . db . DecoratedKey ; 
+ - import org . apache . cassandra . io . ICompactionInfo ; 
+ import org . apache . cassandra . io . util . BufferedRandomAccessFile ; 
+ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ - public class KeyIterator extends AbstractIterator < DecoratedKey > implements IKeyIterator 
+ + public class KeyIterator extends AbstractIterator < DecoratedKey > implements Iterator < DecoratedKey > , Closeable 
+ { 
+ private final BufferedRandomAccessFile in ; 
+ private final Descriptor desc ; 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / ReducingKeyIterator . java b / src / java / org / apache / cassandra / io / sstable / ReducingKeyIterator . java 
+ index e3ebaed . . ed07f5b 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / ReducingKeyIterator . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / ReducingKeyIterator . java 
+ @ @ - 66 , 6 + 66 , 11 @ @ public class ReducingKeyIterator implements IKeyIterator 
+ return m ; 
+ } 
+ 
+ + public String getTaskType ( ) 
+ + { 
+ + return " Secondary index build " ; 
+ + } 
+ + 
+ public boolean hasNext ( ) 
+ { 
+ return iter . hasNext ( ) ; 
+ @ @ - 73 , 7 + 78 , 7 @ @ public class ReducingKeyIterator implements IKeyIterator 
+ 
+ public DecoratedKey next ( ) 
+ { 
+ - return ( DecoratedKey ) iter . next ( ) ; 
+ + return iter . next ( ) ; 
+ } 
+ 
+ public void remove ( ) 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ index 6118339 . . d4bc6b4 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ @ @ - 32 , 6 + 32 , 7 @ @ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . dht . IPartitioner ; 
+ import org . apache . cassandra . io . AbstractCompactedRow ; 
+ + import org . apache . cassandra . io . ICompactionInfo ; 
+ import org . apache . cassandra . io . util . BufferedRandomAccessFile ; 
+ import org . apache . cassandra . io . util . SegmentedFile ; 
+ import org . apache . cassandra . service . StorageService ; 
+ @ @ - 211 , 62 + 212 , 35 @ @ public class SSTableWriter extends SSTable 
+ return dfile . length ( ) / ( dataPosition / keys ) ; 
+ } 
+ 
+ + public static Builder createBuilder ( Descriptor desc ) 
+ + { 
+ + if ( ! desc . isLatestVersion ) 
+ + / / TODO : streaming between different versions will fail : need support for 
+ + / / recovering other versions to provide a stable streaming api 
+ + throw new RuntimeException ( String . format ( " Cannot recover SSTable with version % s ( current version % s ) . " , 
+ + desc . version , Descriptor . CURRENT _ VERSION ) ) ; 
+ + 
+ + return new Builder ( desc ) ; 
+ + } 
+ + 
+ / * * 
+ - * If either of the index or filter files are missing , rebuilds both . 
+ - * TODO : Builds most of the in - memory state of the sstable , but doesn ' t actually open it . 
+ + * Removes the given SSTable from temporary status and opens it , rebuilding the 
+ + * bloom filter and row index from the data file . 
+ * / 
+ - private static void maybeRecover ( Descriptor desc ) throws IOException 
+ + public static class Builder implements ICompactionInfo 
+ { 
+ - logger . debug ( " In maybeRecover with Descriptor { } " , desc ) ; 
+ - File ifile = new File ( desc . filenameFor ( SSTable . COMPONENT _ INDEX ) ) ; 
+ - File ffile = new File ( desc . filenameFor ( SSTable . COMPONENT _ FILTER ) ) ; 
+ - if ( ifile . exists ( ) & & ffile . exists ( ) ) 
+ - / / nothing to do 
+ - return ; 
+ - 
+ - ColumnFamilyStore cfs = Table . open ( desc . ksname ) . getColumnFamilyStore ( desc . cfname ) ; 
+ - 
+ - / / remove existing files 
+ - ifile . delete ( ) ; 
+ - ffile . delete ( ) ; 
+ - 
+ - / / open the data file for input , and an IndexWriter for output 
+ - BufferedRandomAccessFile dfile = new BufferedRandomAccessFile ( desc . filenameFor ( SSTable . COMPONENT _ DATA ) , " r " , 8 * 1024 * 1024 ) ; 
+ - IndexWriter iwriter ; 
+ - long estimatedRows ; 
+ - try 
+ - { 
+ - estimatedRows = estimateRows ( desc , dfile ) ; 
+ - iwriter = new IndexWriter ( desc , StorageService . getPartitioner ( ) , estimatedRows ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - dfile . close ( ) ; 
+ - throw e ; 
+ - } 
+ + private final Descriptor desc ; 
+ + public final ColumnFamilyStore cfs ; 
+ + private BufferedRandomAccessFile dfile ; 
+ 
+ - / / build the index and filter 
+ - long rows = 0 ; 
+ - try 
+ - { 
+ - DecoratedKey key ; 
+ - long dataPosition = 0 ; 
+ - while ( dataPosition < dfile . length ( ) ) 
+ - { 
+ - key = SSTableReader . decodeKey ( StorageService . getPartitioner ( ) , desc , FBUtilities . readShortByteArray ( dfile ) ) ; 
+ - long dataSize = SSTableReader . readRowSize ( dfile , desc ) ; 
+ - iwriter . afterAppend ( key , dataPosition ) ; 
+ - dataPosition = dfile . getFilePointer ( ) + dataSize ; 
+ - dfile . seek ( dataPosition ) ; 
+ - rows + + ; 
+ - } 
+ - } 
+ - finally 
+ + public Builder ( Descriptor desc ) 
+ { 
+ + 
+ + this . desc = desc ; 
+ + cfs = Table . open ( desc . ksname ) . getColumnFamilyStore ( desc . cfname ) ; 
+ try 
+ { 
+ - dfile . close ( ) ; 
+ - iwriter . close ( ) ; 
+ + dfile = new BufferedRandomAccessFile ( desc . filenameFor ( SSTable . COMPONENT _ DATA ) , " r " , 8 * 1024 * 1024 ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ @ @ - 274 , 44 + 248 , 80 @ @ public class SSTableWriter extends SSTable 
+ } 
+ } 
+ 
+ - if ( ! cfs . getIndexedColumns ( ) . isEmpty ( ) ) 
+ + public SSTableReader build ( ) throws IOException 
+ { 
+ - Future future = CompactionManager . instance . submitIndexBuild ( cfs , cfs . getIndexedColumns ( ) , new KeyIterator ( desc ) ) ; 
+ + File ifile = new File ( desc . filenameFor ( SSTable . COMPONENT _ INDEX ) ) ; 
+ + File ffile = new File ( desc . filenameFor ( SSTable . COMPONENT _ FILTER ) ) ; 
+ + assert ! ifile . exists ( ) ; 
+ + assert ! ffile . exists ( ) ; 
+ + 
+ + IndexWriter iwriter ; 
+ + long estimatedRows ; 
+ try 
+ { 
+ - future . get ( ) ; 
+ - for ( byte [ ] column : cfs . getIndexedColumns ( ) ) 
+ - cfs . getIndexedColumnFamilyStore ( column ) . forceBlockingFlush ( ) ; 
+ + estimatedRows = estimateRows ( desc , dfile ) ; 
+ + iwriter = new IndexWriter ( desc , StorageService . getPartitioner ( ) , estimatedRows ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + dfile . close ( ) ; 
+ + throw e ; 
+ } 
+ - catch ( InterruptedException e ) 
+ + 
+ + / / build the index and filter 
+ + long rows = 0 ; 
+ + try 
+ { 
+ - throw new AssertionError ( e ) ; 
+ + DecoratedKey key ; 
+ + long dataPosition = 0 ; 
+ + while ( dataPosition < dfile . length ( ) ) 
+ + { 
+ + key = SSTableReader . decodeKey ( StorageService . getPartitioner ( ) , desc , FBUtilities . readShortByteArray ( dfile ) ) ; 
+ + long dataSize = SSTableReader . readRowSize ( dfile , desc ) ; 
+ + iwriter . afterAppend ( key , dataPosition ) ; 
+ + dataPosition = dfile . getFilePointer ( ) + dataSize ; 
+ + dfile . seek ( dataPosition ) ; 
+ + rows + + ; 
+ + } 
+ } 
+ - catch ( ExecutionException e ) 
+ + finally 
+ { 
+ - throw new RuntimeException ( e ) ; 
+ + try 
+ + { 
+ + dfile . close ( ) ; 
+ + iwriter . close ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ } 
+ + 
+ + logger . debug ( " estimated row count was % s of real count " , ( ( double ) estimatedRows ) / rows ) ; 
+ + return SSTableReader . open ( rename ( desc , SSTable . componentsFor ( desc ) ) ) ; 
+ } 
+ 
+ - logger . debug ( " estimated row count was % s of real count " , ( ( double ) estimatedRows ) / rows ) ; 
+ - } 
+ + public long getTotalBytes ( ) 
+ + { 
+ + try 
+ + { 
+ + return dfile . length ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + } 
+ 
+ - / * * 
+ - * Removes the given SSTable from temporary status and opens it , rebuilding the non - essential portions of the 
+ - * file if necessary . 
+ - * / 
+ - public static SSTableReader recoverAndOpen ( Descriptor desc ) throws IOException 
+ - { 
+ - if ( ! desc . isLatestVersion ) 
+ - / / TODO : streaming between different versions will fail : need support for 
+ - / / recovering other versions to provide a stable streaming api 
+ - throw new RuntimeException ( String . format ( " Cannot recover SSTable with version % s ( current version % s ) . " , 
+ - desc . version , Descriptor . CURRENT _ VERSION ) ) ; 
+ + public long getBytesRead ( ) 
+ + { 
+ + return dfile . getFilePointer ( ) ; 
+ + } 
+ 
+ - / / FIXME : once maybeRecover is recovering BMIs , it should return the recovered 
+ - / / components 
+ - maybeRecover ( desc ) ; 
+ - return SSTableReader . open ( rename ( desc , SSTable . componentsFor ( desc ) ) ) ; 
+ + public String getTaskType ( ) 
+ + { 
+ + return " SSTable rebuild " ; 
+ + } 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / streaming / IncomingStreamReader . java b / src / java / org / apache / cassandra / streaming / IncomingStreamReader . java 
+ index 3c3c233 . . 0eafae9 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / IncomingStreamReader . java 
+ + + + b / src / java / org / apache / cassandra / streaming / IncomingStreamReader . java 
+ @ @ - 100 , 24 + 100 , 6 @ @ public class IncomingStreamReader 
+ fc . close ( ) ; 
+ } 
+ 
+ - addSSTable ( localFile ) ; 
+ - session . finished ( remoteFile ) ; 
+ - } 
+ - 
+ - public static void addSSTable ( PendingFile pendingFile ) 
+ - { 
+ - / / file was successfully streamed 
+ - Descriptor desc = pendingFile . desc ; 
+ - try 
+ - { 
+ - SSTableReader sstable = SSTableWriter . recoverAndOpen ( pendingFile . desc ) ; 
+ - Table . open ( desc . ksname ) . getColumnFamilyStore ( desc . cfname ) . addSSTable ( sstable ) ; 
+ - logger . info ( " Streaming added " + sstable ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - logger . error ( " Failed adding { } " , pendingFile , e ) ; 
+ - throw new RuntimeException ( " Not able to add streamed file " + pendingFile . getFilename ( ) , e ) ; 
+ - } 
+ + session . finished ( remoteFile , localFile ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamInSession . java b / src / java / org / apache / cassandra / streaming / StreamInSession . java 
+ index f535146 . . dab9f8c 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamInSession . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamInSession . java 
+ @ @ - 22 , 7 + 22 , 13 @ @ import java . io . IOException ; 
+ import java . net . InetAddress ; 
+ import java . util . * ; 
+ import java . util . concurrent . ConcurrentMap ; 
+ + import java . util . concurrent . ExecutionException ; 
+ + import java . util . concurrent . Future ; 
+ 
+ + import org . apache . cassandra . db . ColumnFamilyStore ; 
+ + import org . apache . cassandra . db . CompactionManager ; 
+ + import org . apache . cassandra . db . Table ; 
+ + import org . apache . cassandra . io . sstable . * ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; 
+ import org . apache . cassandra . utils . Pair ; 
+ @ @ - 41 , 6 + 47 , 8 @ @ public class StreamInSession 
+ private final Pair < InetAddress , Long > context ; 
+ private final Runnable callback ; 
+ private String table ; 
+ + private final List < Future < SSTableReader > > buildFutures = new ArrayList < Future < SSTableReader > > ( ) ; 
+ + private ColumnFamilyStore cfs ; 
+ 
+ private StreamInSession ( Pair < InetAddress , Long > context , Runnable callback ) 
+ { 
+ @ @ - 84 , 13 + 92 , 19 @ @ public class StreamInSession 
+ if ( logger . isDebugEnabled ( ) ) 
+ logger . debug ( " Adding file { } to Stream Request queue " , file . getFilename ( ) ) ; 
+ this . files . add ( file ) ; 
+ + if ( cfs = = null ) 
+ + cfs = Table . open ( file . desc . ksname ) . getColumnFamilyStore ( file . desc . cfname ) ; 
+ } 
+ } 
+ 
+ - public void finished ( PendingFile remoteFile ) throws IOException 
+ + public void finished ( PendingFile remoteFile , PendingFile localFile ) throws IOException 
+ { 
+ if ( logger . isDebugEnabled ( ) ) 
+ logger . debug ( " Finished { } . Sending ack to { } " , remoteFile , this ) ; 
+ + 
+ + Future future = CompactionManager . instance . submitSSTableBuild ( localFile . desc ) ; 
+ + buildFutures . add ( future ) ; 
+ + 
+ files . remove ( remoteFile ) ; 
+ StreamReply reply = new StreamReply ( remoteFile . getFilename ( ) , getSessionId ( ) , StreamReply . Status . FILE _ FINISHED ) ; 
+ / / send a StreamStatus message telling the source node it can delete this file 
+ @ @ - 108 , 6 + 122 , 31 @ @ public class StreamInSession 
+ { 
+ if ( files . isEmpty ( ) ) 
+ { 
+ + / / wait for bloom filters and row indexes to finish building 
+ + List < SSTableReader > sstables = new ArrayList < SSTableReader > ( buildFutures . size ( ) ) ; 
+ + for ( Future < SSTableReader > future : buildFutures ) 
+ + { 
+ + try 
+ + { 
+ + SSTableReader sstable = future . get ( ) ; 
+ + cfs . addSSTable ( sstable ) ; 
+ + sstables . add ( sstable ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + throw new AssertionError ( e ) ; 
+ + } 
+ + catch ( ExecutionException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + / / build secondary indexes 
+ + if ( cfs ! = null & & ! cfs . getIndexedColumns ( ) . isEmpty ( ) ) 
+ + cfs . buildSecondaryIndexes ( sstables , cfs . getIndexedColumns ( ) ) ; 
+ + 
+ + / / send reply to source that we ' re done 
+ StreamReply reply = new StreamReply ( " " , getSessionId ( ) , StreamReply . Status . SESSION _ FINISHED ) ; 
+ logger . info ( " Finished streaming session { } from { } " , getSessionId ( ) , getHost ( ) ) ; 
+ MessagingService . instance . sendOneWay ( reply . createMessage ( ) , getHost ( ) ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / io / sstable / SSTableWriterTest . java b / test / unit / org / apache / cassandra / io / sstable / SSTableWriterTest . java 
+ index 052199e . . 570c5e1 100644 
+ - - - a / test / unit / org / apache / cassandra / io / sstable / SSTableWriterTest . java 
+ + + + b / test / unit / org / apache / cassandra / io / sstable / SSTableWriterTest . java 
+ @ @ - 29 , 21 + 29 , 17 @ @ import java . util . Arrays ; 
+ import java . util . HashMap ; 
+ import java . util . List ; 
+ import java . util . Map ; 
+ + import java . util . concurrent . ExecutionException ; 
+ 
+ import org . apache . cassandra . CleanupHelper ; 
+ - import org . apache . cassandra . db . Column ; 
+ - import org . apache . cassandra . db . ColumnFamily ; 
+ - import org . apache . cassandra . db . ColumnFamilyStore ; 
+ - import org . apache . cassandra . db . Row ; 
+ - import org . apache . cassandra . db . RowMutation ; 
+ - import org . apache . cassandra . db . Table ; 
+ - import org . apache . cassandra . db . TimestampClock ; 
+ + import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . db . filter . IFilter ; 
+ import org . apache . cassandra . db . columniterator . IdentityQueryFilter ; 
+ import org . apache . cassandra . db . filter . QueryPath ; 
+ import org . apache . cassandra . dht . IPartitioner ; 
+ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . io . util . DataOutputBuffer ; 
+ + import org . apache . cassandra . io . util . FileUtils ; 
+ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . thrift . IndexClause ; 
+ import org . apache . cassandra . thrift . IndexExpression ; 
+ @ @ - 54 , 7 + 50 , 7 @ @ import org . junit . Test ; 
+ public class SSTableWriterTest extends CleanupHelper { 
+ 
+ @ Test 
+ - public void testRecoverAndOpen ( ) throws IOException 
+ + public void testRecoverAndOpen ( ) throws IOException , ExecutionException , InterruptedException 
+ { 
+ RowMutation rm ; 
+ 
+ @ @ - 80 , 13 + 76 , 13 @ @ public class SSTableWriterTest extends CleanupHelper { 
+ 
+ SSTableReader orig = SSTableUtils . writeRawSSTable ( " Keyspace1 " , " Indexed1 " , entries ) ; 
+ / / whack the index to trigger the recover 
+ - new File ( orig . desc . filenameFor ( Component . PRIMARY _ INDEX ) ) . delete ( ) ; 
+ - new File ( orig . desc . filenameFor ( Component . FILTER ) ) . delete ( ) ; 
+ - 
+ - SSTableReader sstr = SSTableWriter . recoverAndOpen ( orig . desc ) ; 
+ - 
+ + FileUtils . deleteWithConfirm ( orig . desc . filenameFor ( Component . PRIMARY _ INDEX ) ) ; 
+ + FileUtils . deleteWithConfirm ( orig . desc . filenameFor ( Component . FILTER ) ) ; 
+ + 
+ + SSTableReader sstr = CompactionManager . instance . submitSSTableBuild ( orig . desc ) . get ( ) ; 
+ ColumnFamilyStore cfs = Table . open ( " Keyspace1 " ) . getColumnFamilyStore ( " Indexed1 " ) ; 
+ cfs . addSSTable ( sstr ) ; 
+ + cfs . buildSecondaryIndexes ( cfs . getSSTables ( ) , cfs . getIndexedColumns ( ) ) ; 
+ 
+ IndexExpression expr = new IndexExpression ( " birthdate " . getBytes ( " UTF8 " ) , IndexOperator . EQ , FBUtilities . toByteArray ( 1L ) ) ; 
+ IndexClause clause = new IndexClause ( Arrays . asList ( expr ) , " " . getBytes ( ) , 100 ) ; 
+ @ @ - 95 , 7 + 91 , 7 @ @ public class SSTableWriterTest extends CleanupHelper { 
+ Range range = new Range ( p . getMinimumToken ( ) , p . getMinimumToken ( ) ) ; 
+ List < Row > rows = cfs . scan ( clause , range , filter ) ; 
+ 
+ - assertEquals ( " IndexExpression should return two rows on recoverAndOpen " , 2 , rows . size ( ) ) ; 
+ + assertEquals ( " IndexExpression should return two rows on recoverAndOpen " , 2 , rows . size ( ) ) ; 
+ assertTrue ( " First result should be ' k1 ' " , Arrays . equals ( " k1 " . getBytes ( ) , rows . get ( 0 ) . key . key ) ) ; 
+ } 
+ }

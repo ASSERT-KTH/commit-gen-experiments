@@ -1,0 +1,184 @@
+BLEU SCORE: 0.010738456044579523
+
+TEST MSG: Stop CommitLogSegment . close ( ) from unnecessarily calling sync ( ) prior to cleaning the buffer .
+GENERATED MSG: Unify hadoop support for accept CDL for initial thrift address
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index b98dec7 . . 93552ef 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 8 , 6 + 8 , 7 @ @ <nl> * Correctly handle null with IF conditions and TTL ( CASSANDRA - 6623 ) <nl> * Account for range / row tombstones in tombstone drop <nl> time histogram ( CASSANDRA - 6522 ) <nl> + * Stop CommitLogSegment . close ( ) from calling sync ( ) ( CASSANDRA - 6652 ) <nl> Merged from 1 . 2 : <nl> * Fix upgradesstables NPE for non - CF - based indexes ( CASSANDRA - 6645 ) <nl> * Fix partition and range deletes not triggering flush ( CASSANDRA - 6655 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLog . java b / src / java / org / apache / cassandra / db / commitlog / CommitLog . java <nl> index 0e9a3f1 . . e9507da 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLog . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLog . java <nl> @ @ - 56 , 7 + 56 , 7 @ @ public class CommitLog implements CommitLogMBean <nl> public static final int END _ OF _ SEGMENT _ MARKER = 0 ; / / this is written out at the end of a segment <nl> public static final int END _ OF _ SEGMENT _ MARKER _ SIZE = 4 ; / / number of bytes of ^ ^ ^ <nl> <nl> - public CommitLogSegment activeSegment ; <nl> + public volatile CommitLogSegment activeSegment ; <nl> <nl> private final CommitLogMetrics metrics ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> index df3d257 . . 25658ed 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> @ @ - 19 , 8 + 19 , 10 @ @ package org . apache . cassandra . db . commitlog ; <nl> <nl> import java . io . DataOutputStream ; <nl> import java . io . File ; <nl> + import java . io . FileOutputStream ; <nl> import java . io . IOException ; <nl> import java . io . RandomAccessFile ; <nl> + import java . nio . ByteBuffer ; <nl> import java . nio . MappedByteBuffer ; <nl> import java . nio . channels . FileChannel ; <nl> import java . util . Collection ; <nl> @ @ - 130 , 8 + 132 , 8 @ @ public class CommitLogSegment <nl> bufferStream = new DataOutputStream ( new ChecksummedOutputStream ( new ByteBufferOutputStream ( buffer ) , checksum ) ) ; <nl> buffer . putInt ( CommitLog . END _ OF _ SEGMENT _ MARKER ) ; <nl> buffer . position ( 0 ) ; <nl> - <nl> needsSync = true ; <nl> + sync ( ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> @ @ - 146 , 8 + 148 , 54 @ @ public class CommitLogSegment <nl> { <nl> / / TODO shouldn ' t we close the file when we ' re done writing to it , which comes ( potentially ) much earlier than it ' s eligible for recyling ? <nl> close ( ) ; <nl> + / / it ' s safe to simply try ( and maybe fail ) to delete the log file because we should only ever close ( ) / discard ( ) once <nl> + / / the global ReplayPosition is past the current log file position , so we will never replay it ; however to be on the <nl> + / / safe side we attempt to rename / zero it if delete fails <nl> if ( deleteFile ) <nl> - FileUtils . deleteWithConfirm ( logFile ) ; <nl> + { <nl> + try <nl> + { <nl> + FileUtils . deleteWithConfirm ( logFile ) ; <nl> + } <nl> + catch ( FSWriteError e ) <nl> + { <nl> + / / attempt to rename the file and zero its start , if possible , before throwing the error <nl> + File file = logFile ; <nl> + try <nl> + { <nl> + File newFile = new File ( file . getPath ( ) + " . discarded " ) ; <nl> + FileUtils . renameWithConfirm ( file , newFile ) ; <nl> + file = newFile ; <nl> + } <nl> + catch ( Throwable t ) <nl> + { <nl> + } <nl> + <nl> + try <nl> + { <nl> + RandomAccessFile raf = new RandomAccessFile ( file , " rw " ) ; <nl> + ByteBuffer write = ByteBuffer . allocate ( 8 ) ; <nl> + write . putInt ( CommitLog . END _ OF _ SEGMENT _ MARKER ) ; <nl> + write . position ( 0 ) ; <nl> + raf . getChannel ( ) . write ( write ) ; <nl> + raf . close ( ) ; <nl> + logger . error ( " { } { } , as we failed to delete it . " , file = = logFile ? " Zeroed " : " Renamed and zeroed " , file ) ; <nl> + } <nl> + catch ( Throwable t ) <nl> + { <nl> + if ( logFile = = file ) <nl> + { <nl> + logger . error ( " Could not rename or zero { } , which we also failed to delete . In the face of other issues this could result in unnecessary log replay . " , t , file ) ; <nl> + } <nl> + else <nl> + { <nl> + logger . error ( " Renamed { } to { } , as we failed to delete it , however we failed to zero its header . " , t , logFile , file ) ; <nl> + } <nl> + } <nl> + throw e ; <nl> + } <nl> + <nl> + } <nl> } <nl> <nl> / * * <nl> @ @ - 157 , 23 + 205 , 7 @ @ public class CommitLogSegment <nl> * / <nl> public CommitLogSegment recycle ( ) <nl> { <nl> - / / writes an end - of - segment marker at the very beginning of the file and closes it <nl> - buffer . position ( 0 ) ; <nl> - buffer . putInt ( CommitLog . END _ OF _ SEGMENT _ MARKER ) ; <nl> - buffer . position ( 0 ) ; <nl> - <nl> - try <nl> - { <nl> - sync ( ) ; <nl> - } <nl> - catch ( FSWriteError e ) <nl> - { <nl> - logger . error ( " I / O error flushing " + this + " " + e ) ; <nl> - throw e ; <nl> - } <nl> - <nl> close ( ) ; <nl> - <nl> return new CommitLogSegment ( getPath ( ) ) ; <nl> } <nl> <nl> @ @ - 243 , 7 + 275 , 7 @ @ public class CommitLogSegment <nl> / * * <nl> * Forces a disk flush for this segment file . <nl> * / <nl> - public void sync ( ) <nl> + public synchronized void sync ( ) <nl> { <nl> if ( needsSync ) <nl> { <nl> @ @ - 286 , 11 + 318 , 12 @ @ public class CommitLogSegment <nl> / * * <nl> * Close the segment file . <nl> * / <nl> - public void close ( ) <nl> + public synchronized void close ( ) <nl> { <nl> if ( closed ) <nl> return ; <nl> <nl> + needsSync = false ; <nl> try <nl> { <nl> FileUtils . clean ( buffer ) ; <nl> @ @ - 382 , 7 + 415 , 6 @ @ public class CommitLogSegment <nl> return buffer . position ( ) ; <nl> } <nl> <nl> - <nl> public static class CommitLogSegmentFileComparator implements Comparator < File > <nl> { <nl> public int compare ( File f , File f2 )
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index 9ee8d69 . . 2f2c12e 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 169 , 6 + 169 , 7 @ @ public class StorageProxy implements StorageProxyMBean <nl> * / <nl> public static void mutate ( List < ? extends IMutation > mutations , ConsistencyLevel consistency _ level ) throws UnavailableException , TimeoutException <nl> { <nl> + logger . debug ( " Mutations / ConsistencyLevel are { } / { } " , mutations , consistency _ level ) ; <nl> final String localDataCenter = DatabaseDescriptor . getEndpointSnitch ( ) . getDatacenter ( FBUtilities . getBroadcastAddress ( ) ) ; <nl> <nl> long startTime = System . nanoTime ( ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index b98dec7 . . 93552ef 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 8 , 6 + 8 , 7 @ @ 
+ * Correctly handle null with IF conditions and TTL ( CASSANDRA - 6623 ) 
+ * Account for range / row tombstones in tombstone drop 
+ time histogram ( CASSANDRA - 6522 ) 
+ + * Stop CommitLogSegment . close ( ) from calling sync ( ) ( CASSANDRA - 6652 ) 
+ Merged from 1 . 2 : 
+ * Fix upgradesstables NPE for non - CF - based indexes ( CASSANDRA - 6645 ) 
+ * Fix partition and range deletes not triggering flush ( CASSANDRA - 6655 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLog . java b / src / java / org / apache / cassandra / db / commitlog / CommitLog . java 
+ index 0e9a3f1 . . e9507da 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLog . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLog . java 
+ @ @ - 56 , 7 + 56 , 7 @ @ public class CommitLog implements CommitLogMBean 
+ public static final int END _ OF _ SEGMENT _ MARKER = 0 ; / / this is written out at the end of a segment 
+ public static final int END _ OF _ SEGMENT _ MARKER _ SIZE = 4 ; / / number of bytes of ^ ^ ^ 
+ 
+ - public CommitLogSegment activeSegment ; 
+ + public volatile CommitLogSegment activeSegment ; 
+ 
+ private final CommitLogMetrics metrics ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ index df3d257 . . 25658ed 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ @ @ - 19 , 8 + 19 , 10 @ @ package org . apache . cassandra . db . commitlog ; 
+ 
+ import java . io . DataOutputStream ; 
+ import java . io . File ; 
+ + import java . io . FileOutputStream ; 
+ import java . io . IOException ; 
+ import java . io . RandomAccessFile ; 
+ + import java . nio . ByteBuffer ; 
+ import java . nio . MappedByteBuffer ; 
+ import java . nio . channels . FileChannel ; 
+ import java . util . Collection ; 
+ @ @ - 130 , 8 + 132 , 8 @ @ public class CommitLogSegment 
+ bufferStream = new DataOutputStream ( new ChecksummedOutputStream ( new ByteBufferOutputStream ( buffer ) , checksum ) ) ; 
+ buffer . putInt ( CommitLog . END _ OF _ SEGMENT _ MARKER ) ; 
+ buffer . position ( 0 ) ; 
+ - 
+ needsSync = true ; 
+ + sync ( ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ @ @ - 146 , 8 + 148 , 54 @ @ public class CommitLogSegment 
+ { 
+ / / TODO shouldn ' t we close the file when we ' re done writing to it , which comes ( potentially ) much earlier than it ' s eligible for recyling ? 
+ close ( ) ; 
+ + / / it ' s safe to simply try ( and maybe fail ) to delete the log file because we should only ever close ( ) / discard ( ) once 
+ + / / the global ReplayPosition is past the current log file position , so we will never replay it ; however to be on the 
+ + / / safe side we attempt to rename / zero it if delete fails 
+ if ( deleteFile ) 
+ - FileUtils . deleteWithConfirm ( logFile ) ; 
+ + { 
+ + try 
+ + { 
+ + FileUtils . deleteWithConfirm ( logFile ) ; 
+ + } 
+ + catch ( FSWriteError e ) 
+ + { 
+ + / / attempt to rename the file and zero its start , if possible , before throwing the error 
+ + File file = logFile ; 
+ + try 
+ + { 
+ + File newFile = new File ( file . getPath ( ) + " . discarded " ) ; 
+ + FileUtils . renameWithConfirm ( file , newFile ) ; 
+ + file = newFile ; 
+ + } 
+ + catch ( Throwable t ) 
+ + { 
+ + } 
+ + 
+ + try 
+ + { 
+ + RandomAccessFile raf = new RandomAccessFile ( file , " rw " ) ; 
+ + ByteBuffer write = ByteBuffer . allocate ( 8 ) ; 
+ + write . putInt ( CommitLog . END _ OF _ SEGMENT _ MARKER ) ; 
+ + write . position ( 0 ) ; 
+ + raf . getChannel ( ) . write ( write ) ; 
+ + raf . close ( ) ; 
+ + logger . error ( " { } { } , as we failed to delete it . " , file = = logFile ? " Zeroed " : " Renamed and zeroed " , file ) ; 
+ + } 
+ + catch ( Throwable t ) 
+ + { 
+ + if ( logFile = = file ) 
+ + { 
+ + logger . error ( " Could not rename or zero { } , which we also failed to delete . In the face of other issues this could result in unnecessary log replay . " , t , file ) ; 
+ + } 
+ + else 
+ + { 
+ + logger . error ( " Renamed { } to { } , as we failed to delete it , however we failed to zero its header . " , t , logFile , file ) ; 
+ + } 
+ + } 
+ + throw e ; 
+ + } 
+ + 
+ + } 
+ } 
+ 
+ / * * 
+ @ @ - 157 , 23 + 205 , 7 @ @ public class CommitLogSegment 
+ * / 
+ public CommitLogSegment recycle ( ) 
+ { 
+ - / / writes an end - of - segment marker at the very beginning of the file and closes it 
+ - buffer . position ( 0 ) ; 
+ - buffer . putInt ( CommitLog . END _ OF _ SEGMENT _ MARKER ) ; 
+ - buffer . position ( 0 ) ; 
+ - 
+ - try 
+ - { 
+ - sync ( ) ; 
+ - } 
+ - catch ( FSWriteError e ) 
+ - { 
+ - logger . error ( " I / O error flushing " + this + " " + e ) ; 
+ - throw e ; 
+ - } 
+ - 
+ close ( ) ; 
+ - 
+ return new CommitLogSegment ( getPath ( ) ) ; 
+ } 
+ 
+ @ @ - 243 , 7 + 275 , 7 @ @ public class CommitLogSegment 
+ / * * 
+ * Forces a disk flush for this segment file . 
+ * / 
+ - public void sync ( ) 
+ + public synchronized void sync ( ) 
+ { 
+ if ( needsSync ) 
+ { 
+ @ @ - 286 , 11 + 318 , 12 @ @ public class CommitLogSegment 
+ / * * 
+ * Close the segment file . 
+ * / 
+ - public void close ( ) 
+ + public synchronized void close ( ) 
+ { 
+ if ( closed ) 
+ return ; 
+ 
+ + needsSync = false ; 
+ try 
+ { 
+ FileUtils . clean ( buffer ) ; 
+ @ @ - 382 , 7 + 415 , 6 @ @ public class CommitLogSegment 
+ return buffer . position ( ) ; 
+ } 
+ 
+ - 
+ public static class CommitLogSegmentFileComparator implements Comparator < File > 
+ { 
+ public int compare ( File f , File f2 )
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index 9ee8d69 . . 2f2c12e 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 169 , 6 + 169 , 7 @ @ public class StorageProxy implements StorageProxyMBean 
+ * / 
+ public static void mutate ( List < ? extends IMutation > mutations , ConsistencyLevel consistency _ level ) throws UnavailableException , TimeoutException 
+ { 
+ + logger . debug ( " Mutations / ConsistencyLevel are { } / { } " , mutations , consistency _ level ) ; 
+ final String localDataCenter = DatabaseDescriptor . getEndpointSnitch ( ) . getDatacenter ( FBUtilities . getBroadcastAddress ( ) ) ; 
+ 
+ long startTime = System . nanoTime ( ) ;

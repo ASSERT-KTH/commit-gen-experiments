@@ -2404,7 +2404,7 @@ merge from 0 . 6
 show ttl / let on assertion failure
 fix capitalization , underscores in AE , request JMX names
 emphasize that unframed mode is going away sooner than later
-
+EMPTY
 r / m mis - merge of 0 . 6 . 8 version marker
 fix add / remove index bugs in CFMetadata . patch by gdusbabek , reviewed by tjake . CASSANDRA - 1768
 fix add / remove bugs in CFMetadata . patch by gdusbabek , reviewed by tjake . CASSANDRA - 1768

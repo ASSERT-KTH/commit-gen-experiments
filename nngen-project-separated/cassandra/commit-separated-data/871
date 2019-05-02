@@ -1,0 +1,550 @@
+BLEU SCORE: 0.024455939372403628
+
+TEST MSG: Use a CAS loop in UUIDGen instead of a sychronized block to improve performance under contention
+GENERATED MSG: do timed sync if we ' re not doing it in the executor process ( )
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / utils / UUIDGen . java b / src / java / org / apache / cassandra / utils / UUIDGen . java <nl> index bb15eae . . ac73a47 100644 <nl> - - - a / src / java / org / apache / cassandra / utils / UUIDGen . java <nl> + + + b / src / java / org / apache / cassandra / utils / UUIDGen . java <nl> @ @ - 25 , 10 + 25 , 9 @ @ import java . security . SecureRandom ; <nl> import java . util . Collection ; <nl> import java . util . Random ; <nl> import java . util . UUID ; <nl> + import java . util . concurrent . atomic . AtomicLong ; <nl> <nl> import com . google . common . annotations . VisibleForTesting ; <nl> - import com . google . common . base . Charsets ; <nl> - <nl> <nl> / * * <nl> * The goods are here : www . ietf . org / rfc / rfc4122 . txt . <nl> @ @ - 56 , 7 + 55 , 7 @ @ public class UUIDGen <nl> / / placement of this singleton is important . It needs to be instantiated * AFTER * the other statics . <nl> private static final UUIDGen instance = new UUIDGen ( ) ; <nl> <nl> - private long lastNanos ; <nl> + private AtomicLong lastNanos = new AtomicLong ( ) ; <nl> <nl> private UUIDGen ( ) <nl> { <nl> @ @ - 260 , 15 + 259 , 31 @ @ public class UUIDGen <nl> <nl> / / needs to return two different values for the same when . <nl> / / we can generate at most 10k UUIDs per ms . <nl> - private synchronized long createTimeSafe ( ) <nl> + private long createTimeSafe ( ) <nl> { <nl> - long nanosSince = ( System . currentTimeMillis ( ) - START _ EPOCH ) * 10000 ; <nl> - if ( nanosSince > lastNanos ) <nl> - lastNanos = nanosSince ; <nl> - else <nl> - nanosSince = + + lastNanos ; <nl> - <nl> - return createTime ( nanosSince ) ; <nl> + long newLastNanos ; <nl> + while ( true ) <nl> + { <nl> + / / Generate a candidate value for new lastNanos <nl> + newLastNanos = ( System . currentTimeMillis ( ) - START _ EPOCH ) * 10000 ; <nl> + long originalLastNanos = lastNanos . get ( ) ; <nl> + if ( newLastNanos > originalLastNanos ) <nl> + { <nl> + / / Slow path once per millisecond do a CAS <nl> + if ( lastNanos . compareAndSet ( originalLastNanos , newLastNanos ) ) <nl> + { <nl> + break ; <nl> + } <nl> + } <nl> + else <nl> + { <nl> + / / Fast path do an atomic increment <nl> + / / Or when falling behind this will move time forward past the clock if necessary <nl> + newLastNanos = lastNanos . incrementAndGet ( ) ; <nl> + break ; <nl> + } <nl> + } <nl> + return createTime ( newLastNanos ) ; <nl> } <nl> <nl> private long createTimeUnsafe ( long when , int nanos ) <nl> diff - - git a / test / unit / org / apache / cassandra / utils / UUIDTests . java b / test / unit / org / apache / cassandra / utils / UUIDTests . java <nl> index ebe5fd1 . . 0d57c47 100644 <nl> - - - a / test / unit / org / apache / cassandra / utils / UUIDTests . java <nl> + + + b / test / unit / org / apache / cassandra / utils / UUIDTests . java <nl> @ @ - 22 , 12 + 22 , 20 @ @ package org . apache . cassandra . utils ; <nl> <nl> <nl> import java . nio . ByteBuffer ; <nl> + import java . util . Set ; <nl> import java . util . UUID ; <nl> + import java . util . concurrent . ExecutorService ; <nl> + import java . util . concurrent . Executors ; <nl> + import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . atomic . AtomicBoolean ; <nl> <nl> import org . junit . Test ; <nl> <nl> + import com . google . common . collect . Sets ; <nl> + <nl> import org . apache . cassandra . db . marshal . TimeUUIDType ; <nl> import org . apache . cassandra . utils . UUIDGen ; <nl> + import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; <nl> <nl> <nl> public class UUIDTests <nl> @ @ - 88 , 4 + 96 , 53 @ @ public class UUIDTests <nl> / / I ' ll be damn is the uuid timestamp is more than 10ms after now <nl> assert now < = tstamp & & now > = tstamp - 10 : " now = " + now + " , timestamp = " + tstamp ; <nl> } <nl> + <nl> + / * <nl> + * Don ' t ignore spurious failures of this test since it is testing concurrent access <nl> + * and might not fail reliably . <nl> + * / <nl> + @ Test <nl> + public void verifyConcurrentUUIDGeneration ( ) throws Throwable <nl> + { <nl> + long iterations = 250000 ; <nl> + int threads = 4 ; <nl> + ExecutorService es = Executors . newFixedThreadPool ( threads ) ; <nl> + try <nl> + { <nl> + AtomicBoolean failedOrdering = new AtomicBoolean ( false ) ; <nl> + AtomicBoolean failedDuplicate = new AtomicBoolean ( false ) ; <nl> + Set < UUID > generated = Sets . newSetFromMap ( new NonBlockingHashMap < > ( ) ) ; <nl> + Runnable task = ( ) - > { <nl> + long lastTimestamp = 0 ; <nl> + long newTimestamp = 0 ; <nl> + <nl> + for ( long i = 0 ; i < iterations ; i + + ) <nl> + { <nl> + UUID uuid = UUIDGen . getTimeUUID ( ) ; <nl> + newTimestamp = uuid . timestamp ( ) ; <nl> + <nl> + if ( lastTimestamp > = newTimestamp ) <nl> + failedOrdering . set ( true ) ; <nl> + if ( ! generated . add ( uuid ) ) <nl> + failedDuplicate . set ( true ) ; <nl> + <nl> + lastTimestamp = newTimestamp ; <nl> + } <nl> + } ; <nl> + <nl> + for ( int i = 0 ; i < threads ; i + + ) <nl> + { <nl> + es . execute ( task ) ; <nl> + } <nl> + es . shutdown ( ) ; <nl> + es . awaitTermination ( 10 , TimeUnit . MINUTES ) ; <nl> + <nl> + assert ! failedOrdering . get ( ) ; <nl> + assert ! failedDuplicate . get ( ) ; <nl> + } <nl> + finally <nl> + { <nl> + es . shutdown ( ) ; <nl> + } <nl> + } <nl> }
+NEAREST DIFF (one line): diff - - git a / conf / storage - conf . xml b / conf / storage - conf . xml <nl> index fdda823 . . 3865f84 100644 <nl> - - - a / conf / storage - conf . xml <nl> + + + b / conf / storage - conf . xml <nl> @ @ - 245 , 25 + 245 , 36 @ @ <nl> < ConcurrentReads > 8 < / ConcurrentReads > <nl> < ConcurrentWrites > 32 < / ConcurrentWrites > <nl> <nl> - < ! - - Turn on CommitLogSync to improve durability . <nl> - When enabled , Cassandra won ' t ack writes until the commit log <nl> - has been synced to disk . This is less necessary in Cassandra <nl> + < ! - - CommitLogSync may be either " periodic " or " batch . " <nl> + When in batch mode , Cassandra won ' t ack writes until the commit log <nl> + has been fsynced to disk . It will wait up to CommitLogSyncBatchWindowInMS <nl> + milliseconds for other writes , before performing the sync . <nl> + <nl> + This is less necessary in Cassandra <nl> than in traditional databases since replication reduces the <nl> odds of losing data from a failure after writing the log <nl> - entry but before it actually reaches the disk . <nl> + entry but before it actually reaches the disk . So the other <nl> + option is " timed , " where wirtes may be acked immediately <nl> + and the CommitLog is simply synced every CommitLogSyncPeriodInMS <nl> + milliseconds . <nl> + - - > <nl> + < CommitLogSync > periodic < / CommitLogSync > <nl> + < ! - - Interval at which to perform syncs of the CommitLog in periodic <nl> + mode . Usually the default of 1000ms is fine ; increase it <nl> + only if the CommitLog PendingTasks backlog in jmx shows that <nl> + you are frequently scheduling a second sync while the first <nl> + has not yet been processed . <nl> - - > <nl> - < CommitLogSync > false < / CommitLogSync > <nl> + < CommitLogSyncPeriodInMS > 1000 < / CommitLogSyncPeriodInMS > <nl> < ! - - Delay ( in microseconds ) during which additional commit log <nl> - entries may be written before fsync . This will increase <nl> + entries may be written before fsync in batch mode . This will increase <nl> latency slightly , but can vastly improve throughput where <nl> there are many writers . Set to zero to disable <nl> ( each entry will be synced individually ) . <nl> - 	 Reasonable values range from a minimal 100 to even 10000 <nl> - if throughput matters more than latency . ( 10000us = 10ms <nl> - write latency isn ' t even that bad by traditional db <nl> - standards . ) <nl> + 	 Reasonable values range from a minimal 0 . 1 to 10 or even more <nl> + if throughput matters more than latency . <nl> - - > <nl> - < CommitLogSyncDelay > 1000 < / CommitLogSyncDelay > <nl> + < ! - - < CommitLogSyncBatchWindowInMS > 1 < / CommitLogSyncBatchWindowInMS > - - > <nl> <nl> <nl> < ! - - Time to wait before garbage - collection deletion markers . <nl> diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> index b446ac5 . . 9899c3c 100644 <nl> - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> @ @ - 18 , 26 + 18 , 25 @ @ <nl> <nl> package org . apache . cassandra . config ; <nl> <nl> - import java . util . * ; <nl> - import java . io . * ; <nl> - import java . lang . reflect . InvocationTargetException ; <nl> - <nl> - import javax . xml . transform . TransformerException ; <nl> - <nl> - import org . apache . log4j . Logger ; <nl> - <nl> import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . db . marshal . AbstractType ; <nl> import org . apache . cassandra . db . marshal . AsciiType ; <nl> - import org . apache . cassandra . db . marshal . UTF8Type ; <nl> import org . apache . cassandra . db . marshal . BytesType ; <nl> + import org . apache . cassandra . db . marshal . UTF8Type ; <nl> import org . apache . cassandra . dht . IPartitioner ; <nl> import org . apache . cassandra . locator . IEndPointSnitch ; <nl> import org . apache . cassandra . utils . FileUtils ; <nl> import org . apache . cassandra . utils . XMLUtils ; <nl> + import org . apache . log4j . Logger ; <nl> import org . w3c . dom . Node ; <nl> import org . w3c . dom . NodeList ; <nl> <nl> + import javax . xml . transform . TransformerException ; <nl> + import java . io . File ; <nl> + import java . io . IOException ; <nl> + import java . lang . reflect . InvocationTargetException ; <nl> + import java . util . * ; <nl> + <nl> <nl> / * * <nl> * Author : Avinash Lakshman ( alakshman @ facebook . com ) & Prashant Malik ( pmalik @ facebook . com ) <nl> @ @ - 47 , 6 + 46 , 12 @ @ public class DatabaseDescriptor <nl> { <nl> private static Logger logger _ = Logger . getLogger ( DatabaseDescriptor . class ) ; <nl> <nl> + / / don ' t capitalize these ; we need them to match what ' s in the config file for CLS . valueOf to parse <nl> + public static enum CommitLogSync { <nl> + periodic , <nl> + batch <nl> + } ; <nl> + <nl> public static final String random _ = " RANDOM " ; <nl> public static final String ophf _ = " OPHF " ; <nl> private static int storagePort _ = 7000 ; <nl> @ @ - 127 , 9 + 132 , 9 @ @ public class DatabaseDescriptor <nl> / * initial token in the ring * / <nl> private static String initialToken _ = null ; <nl> <nl> - private static boolean commitLogSync _ ; <nl> - <nl> - private static int commitLogSyncDelay _ ; <nl> + private static CommitLogSync commitLogSync _ ; <nl> + private static double commitLogSyncBatchMS _ ; <nl> + private static int commitLogSyncPeriodMS _ ; <nl> <nl> static <nl> { <nl> @ @ - 144 , 20 + 149 , 50 @ @ public class DatabaseDescriptor <nl> clusterName _ = xmlUtils . getNodeValue ( " / Storage / ClusterName " ) ; <nl> <nl> String syncRaw = xmlUtils . getNodeValue ( " / Storage / CommitLogSync " ) ; <nl> - if ( ! " false " . equals ( syncRaw ) & & ! " true " . equals ( syncRaw ) ) <nl> + try <nl> { <nl> - / / Bool . valueOf will silently assume false for values it doesn ' t recognize <nl> - throw new ConfigurationException ( " Unrecognized value for CommitLogSync . Use ' true ' or ' false ' . " ) ; <nl> + commitLogSync _ = CommitLogSync . valueOf ( syncRaw ) ; <nl> } <nl> - commitLogSync _ = Boolean . valueOf ( syncRaw ) ; <nl> - <nl> - try <nl> + catch ( IllegalArgumentException e ) <nl> { <nl> - commitLogSyncDelay _ = Integer . valueOf ( xmlUtils . getNodeValue ( " / Storage / CommitLogSyncDelay " ) ) ; <nl> + throw new ConfigurationException ( " CommitLogSync must be either ' periodic ' or ' batch ' " ) ; <nl> } <nl> - catch ( Exception e ) <nl> + if ( commitLogSync _ = = null ) <nl> { <nl> - throw new ConfigurationException ( " Unrecognized value for CommitLogSyncDelay . Integer expected . " ) ; <nl> + throw new ConfigurationException ( " Missing required directive CommitLogSync " ) ; <nl> + } <nl> + else if ( commitLogSync _ = = CommitLogSync . batch ) <nl> + { <nl> + try <nl> + { <nl> + commitLogSyncBatchMS _ = Double . valueOf ( xmlUtils . getNodeValue ( " / Storage / CommitLogSyncBatchWindowInMS " ) ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new ConfigurationException ( " Unrecognized value for CommitLogSyncBatchWindowInMS . Double expected . " ) ; <nl> + } <nl> + if ( xmlUtils . getNodeValue ( " / Storage / CommitLogSyncPeriodInMS " ) ! = null ) <nl> + { <nl> + throw new ConfigurationException ( " Batch sync specified , but CommitLogSyncPeriodInMS found . Only specify CommitLogSyncBatchWindowInMS when using batch sync . " ) ; <nl> + } <nl> + logger _ . debug ( " Syncing log with a batch window of " + commitLogSyncBatchMS _ ) ; <nl> + } <nl> + else <nl> + { <nl> + assert commitLogSync _ = = CommitLogSync . periodic ; <nl> + try <nl> + { <nl> + commitLogSyncBatchMS _ = Double . valueOf ( xmlUtils . getNodeValue ( " / Storage / CommitLogSyncPeriodInMS " ) ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new ConfigurationException ( " Unrecognized value for CommitLogSyncPeriodInMS . Integer expected . " ) ; <nl> + } <nl> + if ( xmlUtils . getNodeValue ( " / Storage / CommitLogSyncBatchWindowInMS " ) ! = null ) <nl> + { <nl> + throw new ConfigurationException ( " Periodic sync specified , but CommitLogSyncBatchWindowInMS found . Only specify CommitLogSyncPeriodInMS when using periodic sync . " ) ; <nl> + } <nl> + logger _ . debug ( " Syncing log with a period of " + commitLogSyncPeriodMS _ ) ; <nl> } <nl> <nl> / * Hashing strategy * / <nl> @ @ - 946 , 12 + 981 , 16 @ @ public class DatabaseDescriptor <nl> return thriftAddress _ ; <nl> } <nl> <nl> - public static int getCommitLogSyncDelay ( ) <nl> + public static double getCommitLogSyncBatchWindow ( ) <nl> { <nl> - return commitLogSyncDelay _ ; <nl> + return commitLogSyncBatchMS _ ; <nl> + } <nl> + <nl> + public static int getCommitLogSyncPeriod ( ) { <nl> + return commitLogSyncPeriodMS _ ; <nl> } <nl> <nl> - public static boolean isCommitLogSyncEnabled ( ) <nl> + public static CommitLogSync getCommitLogSync ( ) <nl> { <nl> return commitLogSync _ ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / CommitLog . java b / src / java / org / apache / cassandra / db / CommitLog . java <nl> index 1774f4c . . 5869fda 100644 <nl> - - - a / src / java / org / apache / cassandra / db / CommitLog . java <nl> + + + b / src / java / org / apache / cassandra / db / CommitLog . java <nl> @ @ - 18 , 20 + 18 , 21 @ @ <nl> <nl> package org . apache . cassandra . db ; <nl> <nl> - import java . io . * ; <nl> - import java . util . * ; <nl> - <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - import org . apache . cassandra . io . * ; <nl> + import org . apache . cassandra . io . BufferedRandomAccessFile ; <nl> + import org . apache . cassandra . io . DataInputBuffer ; <nl> + import org . apache . cassandra . io . DataOutputBuffer ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . FileUtils ; <nl> - <nl> import org . apache . log4j . Logger ; <nl> - import java . util . concurrent . locks . Lock ; <nl> - import java . util . concurrent . locks . ReentrantLock ; <nl> - import java . util . concurrent . ExecutorService ; <nl> + <nl> + import java . io . * ; <nl> + import java . util . * ; <nl> import java . util . concurrent . Callable ; <nl> import java . util . concurrent . ExecutionException ; <nl> + import java . util . concurrent . ExecutorService ; <nl> + import java . util . concurrent . locks . Lock ; <nl> + import java . util . concurrent . locks . ReentrantLock ; <nl> <nl> / * <nl> * Commit Log tracks every write operation into the system . The aim <nl> @ @ - 169 , 12 + 170 , 46 @ @ public class CommitLog <nl> * / <nl> CommitLog ( boolean recoveryMode ) throws IOException <nl> { <nl> - if ( ! recoveryMode ) <nl> + if ( ! recoveryMode ) <nl> { <nl> executor = new CommitLogExecutorService ( ) ; <nl> - setNextFileName ( ) ; <nl> + setNextFileName ( ) ; <nl> logWriter _ = CommitLog . createWriter ( logFile _ ) ; <nl> writeCommitLogHeader ( ) ; <nl> + <nl> + if ( DatabaseDescriptor . getCommitLogSync ( ) = = DatabaseDescriptor . CommitLogSync . periodic ) <nl> + { <nl> + final Runnable syncer = new Runnable ( ) <nl> + { <nl> + public void run ( ) <nl> + { <nl> + try <nl> + { <nl> + sync ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + } ; <nl> + <nl> + new Thread ( new Runnable ( ) <nl> + { <nl> + public void run ( ) <nl> + { <nl> + executor . submit ( syncer ) ; <nl> + try <nl> + { <nl> + Thread . sleep ( DatabaseDescriptor . getCommitLogSyncPeriod ( ) ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + } ) . start ( ) ; <nl> + } <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / CommitLogExecutorService . java b / src / java / org / apache / cassandra / db / CommitLogExecutorService . java <nl> index d40668c . . 2cfb72f 100644 <nl> - - - a / src / java / org / apache / cassandra / db / CommitLogExecutorService . java <nl> + + + b / src / java / org / apache / cassandra / db / CommitLogExecutorService . java <nl> @ @ - 21 , 13 + 21 , 13 @ @ package org . apache . cassandra . db ; <nl> * / <nl> <nl> <nl> - import java . util . concurrent . * ; <nl> - import java . util . List ; <nl> - import java . util . ArrayList ; <nl> - import java . io . IOException ; <nl> - <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> <nl> + import java . io . IOException ; <nl> + import java . util . ArrayList ; <nl> + import java . util . List ; <nl> + import java . util . concurrent . * ; <nl> + <nl> public class CommitLogExecutorService extends AbstractExecutorService <nl> { <nl> BlockingQueue < CheaterFutureTask > queue ; <nl> @ @ - 41 , 11 + 41 , 11 @ @ public class CommitLogExecutorService extends AbstractExecutorService <nl> { <nl> try <nl> { <nl> - if ( DatabaseDescriptor . isCommitLogSyncEnabled ( ) ) <nl> + if ( DatabaseDescriptor . getCommitLogSync ( ) = = DatabaseDescriptor . CommitLogSync . batch ) <nl> { <nl> while ( true ) <nl> { <nl> - processWithSyncDelay ( ) ; <nl> + processWithSyncBatch ( ) ; <nl> } <nl> } <nl> else <nl> @ @ - 72 , 7 + 72 , 7 @ @ public class CommitLogExecutorService extends AbstractExecutorService <nl> <nl> private ArrayList < CheaterFutureTask > incompleteTasks = new ArrayList < CheaterFutureTask > ( ) ; <nl> private ArrayList taskValues = new ArrayList ( ) ; / / TODO not sure how to generify this <nl> - private void processWithSyncDelay ( ) throws Exception <nl> + private void processWithSyncBatch ( ) throws Exception <nl> { <nl> CheaterFutureTask firstTask = queue . take ( ) ; <nl> if ( ! ( firstTask . getRawCallable ( ) instanceof CommitLog . LogRecordAdder ) ) <nl> @ @ - 86 , 7 + 86 , 7 @ @ public class CommitLogExecutorService extends AbstractExecutorService <nl> / / so we have to break it into firstTask / extra tasks ) <nl> incompleteTasks . clear ( ) ; <nl> taskValues . clear ( ) ; <nl> - long end = System . nanoTime ( ) + 1000 * DatabaseDescriptor . getCommitLogSyncDelay ( ) ; <nl> + long end = System . nanoTime ( ) + ( long ) ( 1000000 * DatabaseDescriptor . getCommitLogSyncBatchWindow ( ) ) ; <nl> <nl> / / it doesn ' t seem worth bothering future - izing the exception <nl> / / since if a commitlog op throws , we ' re probably screwed anyway <nl> diff - - git a / src / java / org / apache / cassandra / io / BufferedRandomAccessFile . java b / src / java / org / apache / cassandra / io / BufferedRandomAccessFile . java <nl> index fcc3a8c . . 866b5c3 100644 <nl> - - - a / src / java / org / apache / cassandra / io / BufferedRandomAccessFile . java <nl> + + + b / src / java / org / apache / cassandra / io / BufferedRandomAccessFile . java <nl> @ @ - 50 , 6 + 50 , 7 @ @ public final class BufferedRandomAccessFile extends RandomAccessFile <nl> * " Rd " , " Wr " , " RdClass " , and " WrClass " interfaces . <nl> * / <nl> private boolean dirty _ ; / / true iff unflushed bytes exist <nl> + private boolean syncNeeded _ ; / / dirty _ can be cleared by e . g . seek , so track sync separately <nl> private long curr _ ; / / current position in file <nl> private long lo _ , hi _ ; / / bounds on characters in " buff " <nl> private byte [ ] buff _ ; / / local buffer <nl> @ @ - 161 , 8 + 162 , 12 @ @ public final class BufferedRandomAccessFile extends RandomAccessFile <nl> <nl> public void sync ( ) throws IOException <nl> { <nl> - flush ( ) ; <nl> - getChannel ( ) . force ( true ) ; <nl> + if ( syncNeeded _ ) <nl> + { <nl> + flush ( ) ; <nl> + getChannel ( ) . force ( true ) ; <nl> + syncNeeded _ = false ; <nl> + } <nl> } <nl> <nl> public boolean isEOF ( ) throws IOException <nl> @ @ - 343 , 6 + 348 , 7 @ @ public final class BufferedRandomAccessFile extends RandomAccessFile <nl> this . buff _ [ ( int ) ( this . curr _ - this . lo _ ) ] = ( byte ) b ; <nl> this . curr _ + + ; <nl> this . dirty _ = true ; <nl> + syncNeeded _ = true ; <nl> } <nl> <nl> public void write ( byte [ ] b ) throws IOException <nl> @ @ - 358 , 7 + 364 , 8 @ @ public final class BufferedRandomAccessFile extends RandomAccessFile <nl> off + = n ; <nl> len - = n ; <nl> this . dirty _ = true ; <nl> - } <nl> + syncNeeded _ = true ; <nl> + } <nl> } <nl> <nl> / * <nl> diff - - git a / test / conf / storage - conf . xml b / test / conf / storage - conf . xml <nl> index 6783091 . . e0ac28f 100644 <nl> - - - a / test / conf / storage - conf . xml <nl> + + + b / test / conf / storage - conf . xml <nl> @ @ - 20 , 8 + 20 , 8 @ @ <nl> < ClusterName > Test Cluster < / ClusterName > <nl> < FlushDataBufferSizeInMB > 1 < / FlushDataBufferSizeInMB > <nl> < FlushIndexBufferSizeInMB > 0 . 1 < / FlushIndexBufferSizeInMB > <nl> - < CommitLogSync > true < / CommitLogSync > <nl> - < CommitLogSyncDelay > 1000 < / CommitLogSyncDelay > <nl> + < CommitLogSync > batch < / CommitLogSync > <nl> + < CommitLogSyncBatchWindowInMS > 1 . 0 < / CommitLogSyncBatchWindowInMS > <nl> < Partitioner > org . apache . cassandra . dht . CollatingOrderPreservingPartitioner < / Partitioner > <nl> < EndPointSnitch > org . apache . cassandra . locator . EndPointSnitch < / EndPointSnitch > <nl> < ReplicaPlacementStrategy > org . apache . cassandra . locator . RackUnawareStrategy < / ReplicaPlacementStrategy >
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / utils / UUIDGen . java b / src / java / org / apache / cassandra / utils / UUIDGen . java 
+ index bb15eae . . ac73a47 100644 
+ - - - a / src / java / org / apache / cassandra / utils / UUIDGen . java 
+ + + + b / src / java / org / apache / cassandra / utils / UUIDGen . java 
+ @ @ - 25 , 10 + 25 , 9 @ @ import java . security . SecureRandom ; 
+ import java . util . Collection ; 
+ import java . util . Random ; 
+ import java . util . UUID ; 
+ + import java . util . concurrent . atomic . AtomicLong ; 
+ 
+ import com . google . common . annotations . VisibleForTesting ; 
+ - import com . google . common . base . Charsets ; 
+ - 
+ 
+ / * * 
+ * The goods are here : www . ietf . org / rfc / rfc4122 . txt . 
+ @ @ - 56 , 7 + 55 , 7 @ @ public class UUIDGen 
+ / / placement of this singleton is important . It needs to be instantiated * AFTER * the other statics . 
+ private static final UUIDGen instance = new UUIDGen ( ) ; 
+ 
+ - private long lastNanos ; 
+ + private AtomicLong lastNanos = new AtomicLong ( ) ; 
+ 
+ private UUIDGen ( ) 
+ { 
+ @ @ - 260 , 15 + 259 , 31 @ @ public class UUIDGen 
+ 
+ / / needs to return two different values for the same when . 
+ / / we can generate at most 10k UUIDs per ms . 
+ - private synchronized long createTimeSafe ( ) 
+ + private long createTimeSafe ( ) 
+ { 
+ - long nanosSince = ( System . currentTimeMillis ( ) - START _ EPOCH ) * 10000 ; 
+ - if ( nanosSince > lastNanos ) 
+ - lastNanos = nanosSince ; 
+ - else 
+ - nanosSince = + + lastNanos ; 
+ - 
+ - return createTime ( nanosSince ) ; 
+ + long newLastNanos ; 
+ + while ( true ) 
+ + { 
+ + / / Generate a candidate value for new lastNanos 
+ + newLastNanos = ( System . currentTimeMillis ( ) - START _ EPOCH ) * 10000 ; 
+ + long originalLastNanos = lastNanos . get ( ) ; 
+ + if ( newLastNanos > originalLastNanos ) 
+ + { 
+ + / / Slow path once per millisecond do a CAS 
+ + if ( lastNanos . compareAndSet ( originalLastNanos , newLastNanos ) ) 
+ + { 
+ + break ; 
+ + } 
+ + } 
+ + else 
+ + { 
+ + / / Fast path do an atomic increment 
+ + / / Or when falling behind this will move time forward past the clock if necessary 
+ + newLastNanos = lastNanos . incrementAndGet ( ) ; 
+ + break ; 
+ + } 
+ + } 
+ + return createTime ( newLastNanos ) ; 
+ } 
+ 
+ private long createTimeUnsafe ( long when , int nanos ) 
+ diff - - git a / test / unit / org / apache / cassandra / utils / UUIDTests . java b / test / unit / org / apache / cassandra / utils / UUIDTests . java 
+ index ebe5fd1 . . 0d57c47 100644 
+ - - - a / test / unit / org / apache / cassandra / utils / UUIDTests . java 
+ + + + b / test / unit / org / apache / cassandra / utils / UUIDTests . java 
+ @ @ - 22 , 12 + 22 , 20 @ @ package org . apache . cassandra . utils ; 
+ 
+ 
+ import java . nio . ByteBuffer ; 
+ + import java . util . Set ; 
+ import java . util . UUID ; 
+ + import java . util . concurrent . ExecutorService ; 
+ + import java . util . concurrent . Executors ; 
+ + import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . atomic . AtomicBoolean ; 
+ 
+ import org . junit . Test ; 
+ 
+ + import com . google . common . collect . Sets ; 
+ + 
+ import org . apache . cassandra . db . marshal . TimeUUIDType ; 
+ import org . apache . cassandra . utils . UUIDGen ; 
+ + import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; 
+ 
+ 
+ public class UUIDTests 
+ @ @ - 88 , 4 + 96 , 53 @ @ public class UUIDTests 
+ / / I ' ll be damn is the uuid timestamp is more than 10ms after now 
+ assert now < = tstamp & & now > = tstamp - 10 : " now = " + now + " , timestamp = " + tstamp ; 
+ } 
+ + 
+ + / * 
+ + * Don ' t ignore spurious failures of this test since it is testing concurrent access 
+ + * and might not fail reliably . 
+ + * / 
+ + @ Test 
+ + public void verifyConcurrentUUIDGeneration ( ) throws Throwable 
+ + { 
+ + long iterations = 250000 ; 
+ + int threads = 4 ; 
+ + ExecutorService es = Executors . newFixedThreadPool ( threads ) ; 
+ + try 
+ + { 
+ + AtomicBoolean failedOrdering = new AtomicBoolean ( false ) ; 
+ + AtomicBoolean failedDuplicate = new AtomicBoolean ( false ) ; 
+ + Set < UUID > generated = Sets . newSetFromMap ( new NonBlockingHashMap < > ( ) ) ; 
+ + Runnable task = ( ) - > { 
+ + long lastTimestamp = 0 ; 
+ + long newTimestamp = 0 ; 
+ + 
+ + for ( long i = 0 ; i < iterations ; i + + ) 
+ + { 
+ + UUID uuid = UUIDGen . getTimeUUID ( ) ; 
+ + newTimestamp = uuid . timestamp ( ) ; 
+ + 
+ + if ( lastTimestamp > = newTimestamp ) 
+ + failedOrdering . set ( true ) ; 
+ + if ( ! generated . add ( uuid ) ) 
+ + failedDuplicate . set ( true ) ; 
+ + 
+ + lastTimestamp = newTimestamp ; 
+ + } 
+ + } ; 
+ + 
+ + for ( int i = 0 ; i < threads ; i + + ) 
+ + { 
+ + es . execute ( task ) ; 
+ + } 
+ + es . shutdown ( ) ; 
+ + es . awaitTermination ( 10 , TimeUnit . MINUTES ) ; 
+ + 
+ + assert ! failedOrdering . get ( ) ; 
+ + assert ! failedDuplicate . get ( ) ; 
+ + } 
+ + finally 
+ + { 
+ + es . shutdown ( ) ; 
+ + } 
+ + } 
+ }
+
+NEAREST DIFF:
+diff - - git a / conf / storage - conf . xml b / conf / storage - conf . xml 
+ index fdda823 . . 3865f84 100644 
+ - - - a / conf / storage - conf . xml 
+ + + + b / conf / storage - conf . xml 
+ @ @ - 245 , 25 + 245 , 36 @ @ 
+ < ConcurrentReads > 8 < / ConcurrentReads > 
+ < ConcurrentWrites > 32 < / ConcurrentWrites > 
+ 
+ - < ! - - Turn on CommitLogSync to improve durability . 
+ - When enabled , Cassandra won ' t ack writes until the commit log 
+ - has been synced to disk . This is less necessary in Cassandra 
+ + < ! - - CommitLogSync may be either " periodic " or " batch . " 
+ + When in batch mode , Cassandra won ' t ack writes until the commit log 
+ + has been fsynced to disk . It will wait up to CommitLogSyncBatchWindowInMS 
+ + milliseconds for other writes , before performing the sync . 
+ + 
+ + This is less necessary in Cassandra 
+ than in traditional databases since replication reduces the 
+ odds of losing data from a failure after writing the log 
+ - entry but before it actually reaches the disk . 
+ + entry but before it actually reaches the disk . So the other 
+ + option is " timed , " where wirtes may be acked immediately 
+ + and the CommitLog is simply synced every CommitLogSyncPeriodInMS 
+ + milliseconds . 
+ + - - > 
+ + < CommitLogSync > periodic < / CommitLogSync > 
+ + < ! - - Interval at which to perform syncs of the CommitLog in periodic 
+ + mode . Usually the default of 1000ms is fine ; increase it 
+ + only if the CommitLog PendingTasks backlog in jmx shows that 
+ + you are frequently scheduling a second sync while the first 
+ + has not yet been processed . 
+ - - > 
+ - < CommitLogSync > false < / CommitLogSync > 
+ + < CommitLogSyncPeriodInMS > 1000 < / CommitLogSyncPeriodInMS > 
+ < ! - - Delay ( in microseconds ) during which additional commit log 
+ - entries may be written before fsync . This will increase 
+ + entries may be written before fsync in batch mode . This will increase 
+ latency slightly , but can vastly improve throughput where 
+ there are many writers . Set to zero to disable 
+ ( each entry will be synced individually ) . 
+ - 	 Reasonable values range from a minimal 100 to even 10000 
+ - if throughput matters more than latency . ( 10000us = 10ms 
+ - write latency isn ' t even that bad by traditional db 
+ - standards . ) 
+ + 	 Reasonable values range from a minimal 0 . 1 to 10 or even more 
+ + if throughput matters more than latency . 
+ - - > 
+ - < CommitLogSyncDelay > 1000 < / CommitLogSyncDelay > 
+ + < ! - - < CommitLogSyncBatchWindowInMS > 1 < / CommitLogSyncBatchWindowInMS > - - > 
+ 
+ 
+ < ! - - Time to wait before garbage - collection deletion markers . 
+ diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ index b446ac5 . . 9899c3c 100644 
+ - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ @ @ - 18 , 26 + 18 , 25 @ @ 
+ 
+ package org . apache . cassandra . config ; 
+ 
+ - import java . util . * ; 
+ - import java . io . * ; 
+ - import java . lang . reflect . InvocationTargetException ; 
+ - 
+ - import javax . xml . transform . TransformerException ; 
+ - 
+ - import org . apache . log4j . Logger ; 
+ - 
+ import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . db . marshal . AbstractType ; 
+ import org . apache . cassandra . db . marshal . AsciiType ; 
+ - import org . apache . cassandra . db . marshal . UTF8Type ; 
+ import org . apache . cassandra . db . marshal . BytesType ; 
+ + import org . apache . cassandra . db . marshal . UTF8Type ; 
+ import org . apache . cassandra . dht . IPartitioner ; 
+ import org . apache . cassandra . locator . IEndPointSnitch ; 
+ import org . apache . cassandra . utils . FileUtils ; 
+ import org . apache . cassandra . utils . XMLUtils ; 
+ + import org . apache . log4j . Logger ; 
+ import org . w3c . dom . Node ; 
+ import org . w3c . dom . NodeList ; 
+ 
+ + import javax . xml . transform . TransformerException ; 
+ + import java . io . File ; 
+ + import java . io . IOException ; 
+ + import java . lang . reflect . InvocationTargetException ; 
+ + import java . util . * ; 
+ + 
+ 
+ / * * 
+ * Author : Avinash Lakshman ( alakshman @ facebook . com ) & Prashant Malik ( pmalik @ facebook . com ) 
+ @ @ - 47 , 6 + 46 , 12 @ @ public class DatabaseDescriptor 
+ { 
+ private static Logger logger _ = Logger . getLogger ( DatabaseDescriptor . class ) ; 
+ 
+ + / / don ' t capitalize these ; we need them to match what ' s in the config file for CLS . valueOf to parse 
+ + public static enum CommitLogSync { 
+ + periodic , 
+ + batch 
+ + } ; 
+ + 
+ public static final String random _ = " RANDOM " ; 
+ public static final String ophf _ = " OPHF " ; 
+ private static int storagePort _ = 7000 ; 
+ @ @ - 127 , 9 + 132 , 9 @ @ public class DatabaseDescriptor 
+ / * initial token in the ring * / 
+ private static String initialToken _ = null ; 
+ 
+ - private static boolean commitLogSync _ ; 
+ - 
+ - private static int commitLogSyncDelay _ ; 
+ + private static CommitLogSync commitLogSync _ ; 
+ + private static double commitLogSyncBatchMS _ ; 
+ + private static int commitLogSyncPeriodMS _ ; 
+ 
+ static 
+ { 
+ @ @ - 144 , 20 + 149 , 50 @ @ public class DatabaseDescriptor 
+ clusterName _ = xmlUtils . getNodeValue ( " / Storage / ClusterName " ) ; 
+ 
+ String syncRaw = xmlUtils . getNodeValue ( " / Storage / CommitLogSync " ) ; 
+ - if ( ! " false " . equals ( syncRaw ) & & ! " true " . equals ( syncRaw ) ) 
+ + try 
+ { 
+ - / / Bool . valueOf will silently assume false for values it doesn ' t recognize 
+ - throw new ConfigurationException ( " Unrecognized value for CommitLogSync . Use ' true ' or ' false ' . " ) ; 
+ + commitLogSync _ = CommitLogSync . valueOf ( syncRaw ) ; 
+ } 
+ - commitLogSync _ = Boolean . valueOf ( syncRaw ) ; 
+ - 
+ - try 
+ + catch ( IllegalArgumentException e ) 
+ { 
+ - commitLogSyncDelay _ = Integer . valueOf ( xmlUtils . getNodeValue ( " / Storage / CommitLogSyncDelay " ) ) ; 
+ + throw new ConfigurationException ( " CommitLogSync must be either ' periodic ' or ' batch ' " ) ; 
+ } 
+ - catch ( Exception e ) 
+ + if ( commitLogSync _ = = null ) 
+ { 
+ - throw new ConfigurationException ( " Unrecognized value for CommitLogSyncDelay . Integer expected . " ) ; 
+ + throw new ConfigurationException ( " Missing required directive CommitLogSync " ) ; 
+ + } 
+ + else if ( commitLogSync _ = = CommitLogSync . batch ) 
+ + { 
+ + try 
+ + { 
+ + commitLogSyncBatchMS _ = Double . valueOf ( xmlUtils . getNodeValue ( " / Storage / CommitLogSyncBatchWindowInMS " ) ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new ConfigurationException ( " Unrecognized value for CommitLogSyncBatchWindowInMS . Double expected . " ) ; 
+ + } 
+ + if ( xmlUtils . getNodeValue ( " / Storage / CommitLogSyncPeriodInMS " ) ! = null ) 
+ + { 
+ + throw new ConfigurationException ( " Batch sync specified , but CommitLogSyncPeriodInMS found . Only specify CommitLogSyncBatchWindowInMS when using batch sync . " ) ; 
+ + } 
+ + logger _ . debug ( " Syncing log with a batch window of " + commitLogSyncBatchMS _ ) ; 
+ + } 
+ + else 
+ + { 
+ + assert commitLogSync _ = = CommitLogSync . periodic ; 
+ + try 
+ + { 
+ + commitLogSyncBatchMS _ = Double . valueOf ( xmlUtils . getNodeValue ( " / Storage / CommitLogSyncPeriodInMS " ) ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new ConfigurationException ( " Unrecognized value for CommitLogSyncPeriodInMS . Integer expected . " ) ; 
+ + } 
+ + if ( xmlUtils . getNodeValue ( " / Storage / CommitLogSyncBatchWindowInMS " ) ! = null ) 
+ + { 
+ + throw new ConfigurationException ( " Periodic sync specified , but CommitLogSyncBatchWindowInMS found . Only specify CommitLogSyncPeriodInMS when using periodic sync . " ) ; 
+ + } 
+ + logger _ . debug ( " Syncing log with a period of " + commitLogSyncPeriodMS _ ) ; 
+ } 
+ 
+ / * Hashing strategy * / 
+ @ @ - 946 , 12 + 981 , 16 @ @ public class DatabaseDescriptor 
+ return thriftAddress _ ; 
+ } 
+ 
+ - public static int getCommitLogSyncDelay ( ) 
+ + public static double getCommitLogSyncBatchWindow ( ) 
+ { 
+ - return commitLogSyncDelay _ ; 
+ + return commitLogSyncBatchMS _ ; 
+ + } 
+ + 
+ + public static int getCommitLogSyncPeriod ( ) { 
+ + return commitLogSyncPeriodMS _ ; 
+ } 
+ 
+ - public static boolean isCommitLogSyncEnabled ( ) 
+ + public static CommitLogSync getCommitLogSync ( ) 
+ { 
+ return commitLogSync _ ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / CommitLog . java b / src / java / org / apache / cassandra / db / CommitLog . java 
+ index 1774f4c . . 5869fda 100644 
+ - - - a / src / java / org / apache / cassandra / db / CommitLog . java 
+ + + + b / src / java / org / apache / cassandra / db / CommitLog . java 
+ @ @ - 18 , 20 + 18 , 21 @ @ 
+ 
+ package org . apache . cassandra . db ; 
+ 
+ - import java . io . * ; 
+ - import java . util . * ; 
+ - 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - import org . apache . cassandra . io . * ; 
+ + import org . apache . cassandra . io . BufferedRandomAccessFile ; 
+ + import org . apache . cassandra . io . DataInputBuffer ; 
+ + import org . apache . cassandra . io . DataOutputBuffer ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . FileUtils ; 
+ - 
+ import org . apache . log4j . Logger ; 
+ - import java . util . concurrent . locks . Lock ; 
+ - import java . util . concurrent . locks . ReentrantLock ; 
+ - import java . util . concurrent . ExecutorService ; 
+ + 
+ + import java . io . * ; 
+ + import java . util . * ; 
+ import java . util . concurrent . Callable ; 
+ import java . util . concurrent . ExecutionException ; 
+ + import java . util . concurrent . ExecutorService ; 
+ + import java . util . concurrent . locks . Lock ; 
+ + import java . util . concurrent . locks . ReentrantLock ; 
+ 
+ / * 
+ * Commit Log tracks every write operation into the system . The aim 
+ @ @ - 169 , 12 + 170 , 46 @ @ public class CommitLog 
+ * / 
+ CommitLog ( boolean recoveryMode ) throws IOException 
+ { 
+ - if ( ! recoveryMode ) 
+ + if ( ! recoveryMode ) 
+ { 
+ executor = new CommitLogExecutorService ( ) ; 
+ - setNextFileName ( ) ; 
+ + setNextFileName ( ) ; 
+ logWriter _ = CommitLog . createWriter ( logFile _ ) ; 
+ writeCommitLogHeader ( ) ; 
+ + 
+ + if ( DatabaseDescriptor . getCommitLogSync ( ) = = DatabaseDescriptor . CommitLogSync . periodic ) 
+ + { 
+ + final Runnable syncer = new Runnable ( ) 
+ + { 
+ + public void run ( ) 
+ + { 
+ + try 
+ + { 
+ + sync ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + } ; 
+ + 
+ + new Thread ( new Runnable ( ) 
+ + { 
+ + public void run ( ) 
+ + { 
+ + executor . submit ( syncer ) ; 
+ + try 
+ + { 
+ + Thread . sleep ( DatabaseDescriptor . getCommitLogSyncPeriod ( ) ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + } ) . start ( ) ; 
+ + } 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / CommitLogExecutorService . java b / src / java / org / apache / cassandra / db / CommitLogExecutorService . java 
+ index d40668c . . 2cfb72f 100644 
+ - - - a / src / java / org / apache / cassandra / db / CommitLogExecutorService . java 
+ + + + b / src / java / org / apache / cassandra / db / CommitLogExecutorService . java 
+ @ @ - 21 , 13 + 21 , 13 @ @ package org . apache . cassandra . db ; 
+ * / 
+ 
+ 
+ - import java . util . concurrent . * ; 
+ - import java . util . List ; 
+ - import java . util . ArrayList ; 
+ - import java . io . IOException ; 
+ - 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ 
+ + import java . io . IOException ; 
+ + import java . util . ArrayList ; 
+ + import java . util . List ; 
+ + import java . util . concurrent . * ; 
+ + 
+ public class CommitLogExecutorService extends AbstractExecutorService 
+ { 
+ BlockingQueue < CheaterFutureTask > queue ; 
+ @ @ - 41 , 11 + 41 , 11 @ @ public class CommitLogExecutorService extends AbstractExecutorService 
+ { 
+ try 
+ { 
+ - if ( DatabaseDescriptor . isCommitLogSyncEnabled ( ) ) 
+ + if ( DatabaseDescriptor . getCommitLogSync ( ) = = DatabaseDescriptor . CommitLogSync . batch ) 
+ { 
+ while ( true ) 
+ { 
+ - processWithSyncDelay ( ) ; 
+ + processWithSyncBatch ( ) ; 
+ } 
+ } 
+ else 
+ @ @ - 72 , 7 + 72 , 7 @ @ public class CommitLogExecutorService extends AbstractExecutorService 
+ 
+ private ArrayList < CheaterFutureTask > incompleteTasks = new ArrayList < CheaterFutureTask > ( ) ; 
+ private ArrayList taskValues = new ArrayList ( ) ; / / TODO not sure how to generify this 
+ - private void processWithSyncDelay ( ) throws Exception 
+ + private void processWithSyncBatch ( ) throws Exception 
+ { 
+ CheaterFutureTask firstTask = queue . take ( ) ; 
+ if ( ! ( firstTask . getRawCallable ( ) instanceof CommitLog . LogRecordAdder ) ) 
+ @ @ - 86 , 7 + 86 , 7 @ @ public class CommitLogExecutorService extends AbstractExecutorService 
+ / / so we have to break it into firstTask / extra tasks ) 
+ incompleteTasks . clear ( ) ; 
+ taskValues . clear ( ) ; 
+ - long end = System . nanoTime ( ) + 1000 * DatabaseDescriptor . getCommitLogSyncDelay ( ) ; 
+ + long end = System . nanoTime ( ) + ( long ) ( 1000000 * DatabaseDescriptor . getCommitLogSyncBatchWindow ( ) ) ; 
+ 
+ / / it doesn ' t seem worth bothering future - izing the exception 
+ / / since if a commitlog op throws , we ' re probably screwed anyway 
+ diff - - git a / src / java / org / apache / cassandra / io / BufferedRandomAccessFile . java b / src / java / org / apache / cassandra / io / BufferedRandomAccessFile . java 
+ index fcc3a8c . . 866b5c3 100644 
+ - - - a / src / java / org / apache / cassandra / io / BufferedRandomAccessFile . java 
+ + + + b / src / java / org / apache / cassandra / io / BufferedRandomAccessFile . java 
+ @ @ - 50 , 6 + 50 , 7 @ @ public final class BufferedRandomAccessFile extends RandomAccessFile 
+ * " Rd " , " Wr " , " RdClass " , and " WrClass " interfaces . 
+ * / 
+ private boolean dirty _ ; / / true iff unflushed bytes exist 
+ + private boolean syncNeeded _ ; / / dirty _ can be cleared by e . g . seek , so track sync separately 
+ private long curr _ ; / / current position in file 
+ private long lo _ , hi _ ; / / bounds on characters in " buff " 
+ private byte [ ] buff _ ; / / local buffer 
+ @ @ - 161 , 8 + 162 , 12 @ @ public final class BufferedRandomAccessFile extends RandomAccessFile 
+ 
+ public void sync ( ) throws IOException 
+ { 
+ - flush ( ) ; 
+ - getChannel ( ) . force ( true ) ; 
+ + if ( syncNeeded _ ) 
+ + { 
+ + flush ( ) ; 
+ + getChannel ( ) . force ( true ) ; 
+ + syncNeeded _ = false ; 
+ + } 
+ } 
+ 
+ public boolean isEOF ( ) throws IOException 
+ @ @ - 343 , 6 + 348 , 7 @ @ public final class BufferedRandomAccessFile extends RandomAccessFile 
+ this . buff _ [ ( int ) ( this . curr _ - this . lo _ ) ] = ( byte ) b ; 
+ this . curr _ + + ; 
+ this . dirty _ = true ; 
+ + syncNeeded _ = true ; 
+ } 
+ 
+ public void write ( byte [ ] b ) throws IOException 
+ @ @ - 358 , 7 + 364 , 8 @ @ public final class BufferedRandomAccessFile extends RandomAccessFile 
+ off + = n ; 
+ len - = n ; 
+ this . dirty _ = true ; 
+ - } 
+ + syncNeeded _ = true ; 
+ + } 
+ } 
+ 
+ / * 
+ diff - - git a / test / conf / storage - conf . xml b / test / conf / storage - conf . xml 
+ index 6783091 . . e0ac28f 100644 
+ - - - a / test / conf / storage - conf . xml 
+ + + + b / test / conf / storage - conf . xml 
+ @ @ - 20 , 8 + 20 , 8 @ @ 
+ < ClusterName > Test Cluster < / ClusterName > 
+ < FlushDataBufferSizeInMB > 1 < / FlushDataBufferSizeInMB > 
+ < FlushIndexBufferSizeInMB > 0 . 1 < / FlushIndexBufferSizeInMB > 
+ - < CommitLogSync > true < / CommitLogSync > 
+ - < CommitLogSyncDelay > 1000 < / CommitLogSyncDelay > 
+ + < CommitLogSync > batch < / CommitLogSync > 
+ + < CommitLogSyncBatchWindowInMS > 1 . 0 < / CommitLogSyncBatchWindowInMS > 
+ < Partitioner > org . apache . cassandra . dht . CollatingOrderPreservingPartitioner < / Partitioner > 
+ < EndPointSnitch > org . apache . cassandra . locator . EndPointSnitch < / EndPointSnitch > 
+ < ReplicaPlacementStrategy > org . apache . cassandra . locator . RackUnawareStrategy < / ReplicaPlacementStrategy >

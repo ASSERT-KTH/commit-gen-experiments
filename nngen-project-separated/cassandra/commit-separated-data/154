@@ -1,0 +1,921 @@
+BLEU SCORE: 0.044568827606990644
+
+TEST MSG: Use standard Amazon naming for datacenter and rack in Ec2Snitch .
+GENERATED MSG: move per - datacenter replication factor into datacenters . properties
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 0362d01 . . 71d947a 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 4 . 0 <nl> + * Use standard Amazon naming for datacenter and rack in Ec2Snitch ( CASSANDRA - 7839 ) <nl> * Fix junit failure for SSTableReaderTest ( CASSANDRA - 14387 ) <nl> * Abstract write path for pluggable storage ( CASSANDRA - 14118 ) <nl> * nodetool describecluster should be more informative ( CASSANDRA - 13853 ) <nl> diff - - git a / NEWS . txt b / NEWS . txt <nl> index df4c32a . . 3be52dc 100644 <nl> - - - a / NEWS . txt <nl> + + + b / NEWS . txt <nl> @ @ - 141 , 6 + 141 , 10 @ @ Upgrading <nl> storage port or native port at nodes you must first upgrade the entire cluster <nl> and clients to 4 . 0 so they can handle the port not being consistent across <nl> the cluster . <nl> + - Names of AWS regions / availability zones have been cleaned up to more correctly <nl> + match the Amazon names . There is now a new option in conf / cassandra - rackdc . properties <nl> + that lets users enable the correct names for new clusters , or use the legacy <nl> + names for existing clusters . See conf / cassandra - rackdc . properties for details . <nl> <nl> Materialized Views <nl> - - - - - - - - - - - - - - - - - - - <nl> diff - - git a / conf / cassandra - rackdc . properties b / conf / cassandra - rackdc . properties <nl> index 2ea6043 . . cc472b4 100644 <nl> - - - a / conf / cassandra - rackdc . properties <nl> + + + b / conf / cassandra - rackdc . properties <nl> @ @ - 25 , 3 + 25 , 15 @ @ rack = rack1 <nl> <nl> # Uncomment the following line to make this snitch prefer the internal ip when possible , as the Ec2MultiRegionSnitch does . <nl> # prefer _ local = true <nl> + <nl> + # Datacenter and rack naming convention used by the Ec2Snitch and Ec2MultiRegionSnitch . <nl> + # Options are : <nl> + # legacy : datacenter name is the part of the availability zone name preceding the last " - " <nl> + # when the zone ends in - 1 and includes the number if not - 1 . Rack is the portion of <nl> + # the availability zone name following the last " - " . <nl> + # Examples : us - west - 1a = > dc : us - west , rack : 1a ; us - west - 2b = > dc : us - west - 2 , rack : 2b ; <nl> + # YOU MUST USE THIS VALUE IF YOU ARE UPGRADING A PRE - 4 . 0 CLUSTER <nl> + # standard : Default value . datacenter name is the standard AWS region name , including the number . <nl> + # rack name is the region plus the availability zone letter . <nl> + # Examples : us - west - 1a = > dc : us - west - 1 , rack : us - west - 1a ; us - west - 2b = > dc : us - west - 2 , rack : us - west - 2b ; <nl> + # ec2 _ naming _ scheme = standard <nl> diff - - git a / src / java / org / apache / cassandra / locator / DynamicEndpointSnitch . java b / src / java / org / apache / cassandra / locator / DynamicEndpointSnitch . java <nl> index 9ea7e05 . . 010c892 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / DynamicEndpointSnitch . java <nl> + + + b / src / java / org / apache / cassandra / locator / DynamicEndpointSnitch . java <nl> @ @ - 448 , 4 + 448 , 9 @ @ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa <nl> } <nl> return maxScore ; <nl> } <nl> + <nl> + public boolean validate ( Set < String > datacenters , Set < String > racks ) <nl> + { <nl> + return subsnitch . validate ( datacenters , racks ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / locator / Ec2Snitch . java b / src / java / org / apache / cassandra / locator / Ec2Snitch . java <nl> index c7324c8 . . b6aafd3 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / Ec2Snitch . java <nl> + + + b / src / java / org / apache / cassandra / locator / Ec2Snitch . java <nl> @ @ - 24 , 7 + 24 , 9 @ @ import java . net . HttpURLConnection ; <nl> import java . net . URL ; <nl> import java . nio . charset . StandardCharsets ; <nl> import java . util . Map ; <nl> + import java . util . Set ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> import org . apache . cassandra . db . SystemKeyspace ; <nl> @ @ - 42 , 30 + 44 , 63 @ @ import org . apache . cassandra . utils . FBUtilities ; <nl> public class Ec2Snitch extends AbstractNetworkTopologySnitch <nl> { <nl> protected static final Logger logger = LoggerFactory . getLogger ( Ec2Snitch . class ) ; <nl> - protected static final String ZONE _ NAME _ QUERY _ URL = " http : / / 169 . 254 . 169 . 254 / latest / meta - data / placement / availability - zone " ; <nl> + <nl> + private static final String SNITCH _ PROP _ NAMING _ SCHEME = " ec2 _ naming _ scheme " ; <nl> + static final String EC2 _ NAMING _ LEGACY = " legacy " ; <nl> + private static final String EC2 _ NAMING _ STANDARD = " standard " ; <nl> + <nl> + private static final String ZONE _ NAME _ QUERY _ URL = " http : / / 169 . 254 . 169 . 254 / latest / meta - data / placement / availability - zone " ; <nl> private static final String DEFAULT _ DC = " UNKNOWN - DC " ; <nl> private static final String DEFAULT _ RACK = " UNKNOWN - RACK " ; <nl> + <nl> + final String ec2region ; <nl> + private final String ec2zone ; <nl> + private final boolean usingLegacyNaming ; <nl> + <nl> private Map < InetAddressAndPort , Map < String , String > > savedEndpoints ; <nl> - protected String ec2zone ; <nl> - protected String ec2region ; <nl> <nl> public Ec2Snitch ( ) throws IOException , ConfigurationException <nl> { <nl> + this ( new SnitchProperties ( ) ) ; <nl> + } <nl> + <nl> + public Ec2Snitch ( SnitchProperties props ) throws IOException , ConfigurationException <nl> + { <nl> String az = awsApiCall ( ZONE _ NAME _ QUERY _ URL ) ; <nl> - / / Split " us - east - 1a " or " asia - 1a " into " us - east " / " 1a " and " asia " / " 1a " . <nl> - String [ ] splits = az . split ( " - " ) ; <nl> - ec2zone = splits [ splits . length - 1 ] ; <nl> <nl> - / / hack for CASSANDRA - 4026 <nl> - ec2region = az . substring ( 0 , az . length ( ) - 1 ) ; <nl> - if ( ec2region . endsWith ( " 1 " ) ) <nl> - ec2region = az . substring ( 0 , az . length ( ) - 3 ) ; <nl> + / / if using the full naming scheme , region name is created by removing letters from the <nl> + / / end of the availability zone and zone is the full zone name <nl> + usingLegacyNaming = isUsingLegacyNaming ( props ) ; <nl> + String region ; <nl> + if ( usingLegacyNaming ) <nl> + { <nl> + / / Split " us - east - 1a " or " asia - 1a " into " us - east " / " 1a " and " asia " / " 1a " . <nl> + String [ ] splits = az . split ( " - " ) ; <nl> + ec2zone = splits [ splits . length - 1 ] ; <nl> + <nl> + / / hack for CASSANDRA - 4026 <nl> + region = az . substring ( 0 , az . length ( ) - 1 ) ; <nl> + if ( region . endsWith ( " 1 " ) ) <nl> + region = az . substring ( 0 , az . length ( ) - 3 ) ; <nl> + } <nl> + else <nl> + { <nl> + / / grab the region name , which is embedded in the availability zone name . <nl> + / / thus an AZ of " us - east - 1a " yields the region name " us - east - 1 " <nl> + region = az . replaceFirst ( " [ a - z ] + $ " , " " ) ; <nl> + ec2zone = az ; <nl> + } <nl> <nl> - String datacenterSuffix = ( new SnitchProperties ( ) ) . get ( " dc _ suffix " , " " ) ; <nl> - ec2region = ec2region . concat ( datacenterSuffix ) ; <nl> + String datacenterSuffix = props . get ( " dc _ suffix " , " " ) ; <nl> + ec2region = region . concat ( datacenterSuffix ) ; <nl> logger . info ( " EC2Snitch using region : { } , zone : { } . " , ec2region , ec2zone ) ; <nl> } <nl> <nl> + private static boolean isUsingLegacyNaming ( SnitchProperties props ) <nl> + { <nl> + return props . get ( SNITCH _ PROP _ NAMING _ SCHEME , EC2 _ NAMING _ STANDARD ) . equalsIgnoreCase ( EC2 _ NAMING _ LEGACY ) ; <nl> + } <nl> + <nl> String awsApiCall ( String url ) throws IOException , ConfigurationException <nl> { <nl> / / Populate the region and zone by introspection , fail if 404 on metadata <nl> @ @ - 122 , 4 + 157 , 54 @ @ public class Ec2Snitch extends AbstractNetworkTopologySnitch <nl> } <nl> return state . getApplicationState ( ApplicationState . DC ) . value ; <nl> } <nl> + <nl> + @ Override <nl> + public boolean validate ( Set < String > datacenters , Set < String > racks ) <nl> + { <nl> + return validate ( datacenters , racks , usingLegacyNaming ) ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + static boolean validate ( Set < String > datacenters , Set < String > racks , boolean usingLegacyNaming ) <nl> + { <nl> + boolean valid = true ; <nl> + <nl> + for ( String dc : datacenters ) <nl> + { <nl> + / / predicated on the late - 2017 AWS naming ' convention ' that all region names end with a digit . <nl> + / / Unfortunately , life isn ' t that simple . Since we allow custom datacenter suffixes ( CASSANDRA - 5155 ) , <nl> + / / an operator could conceiveably make the suffix " a " , and thus create a region name that looks just like <nl> + / / one of the region ' s availability zones . ( for example , " us - east - 1a " ) . <nl> + / / Further , we can ' t make any assumptions of what that suffix might be by looking at this node ' s <nl> + / / datacenterSuffix as conceivably their could be many different suffixes in play for a given region . <nl> + / / <nl> + / / Thus , the best we can do is make sure the region name follows <nl> + / / the basic region naming pattern : " us - east - 1 < custom - suffix > " <nl> + boolean dcUsesLegacyFormat = ! dc . matches ( " [ a - z ] + - [ a - z ] . + - [ \ \ d ] . * " ) ; <nl> + if ( dcUsesLegacyFormat ! = usingLegacyNaming ) <nl> + valid = false ; <nl> + } <nl> + <nl> + for ( String rack : racks ) <nl> + { <nl> + / / predicated on late - 2017 AWS naming ' convention ' that AZs do not have a digit as the first char - <nl> + / / we had that in our legacy AZ ( rack ) names . Thus we test to see if the rack is in the legacy format . <nl> + / / <nl> + / / NOTE : the allowed custom suffix only applies to datacenter ( region ) names , not availability zones . <nl> + boolean rackUsesLegacyFormat = rack . matches ( " [ \ \ d ] [ a - z ] " ) ; <nl> + if ( rackUsesLegacyFormat ! = usingLegacyNaming ) <nl> + valid = false ; <nl> + } <nl> + <nl> + if ( ! valid ) <nl> + { <nl> + logger . error ( " This ec2 - enabled snitch appears to be using the { } naming scheme for regions , " + <nl> + " but existing nodes in cluster are using the opposite : region ( s ) = { } , availability zone ( s ) = { } . " + <nl> + " Please check the { } property in the { } configuration file for more details . " , <nl> + usingLegacyNaming ? " legacy " : " standard " , datacenters , racks , <nl> + SNITCH _ PROP _ NAMING _ SCHEME , SnitchProperties . RACKDC _ PROPERTY _ FILENAME ) ; <nl> + } <nl> + <nl> + return valid ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / locator / IEndpointSnitch . java b / src / java / org / apache / cassandra / locator / IEndpointSnitch . java <nl> index 00a1543 . . 63d333b 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / IEndpointSnitch . java <nl> + + + b / src / java / org / apache / cassandra / locator / IEndpointSnitch . java <nl> @ @ - 19 , 6 + 19 , 7 @ @ package org . apache . cassandra . locator ; <nl> <nl> import java . util . Collection ; <nl> import java . util . List ; <nl> + import java . util . Set ; <nl> <nl> / * * <nl> * This interface helps determine location of node in the datacenter relative to another node . <nl> @ @ - 63 , 4 + 64 , 12 @ @ public interface IEndpointSnitch <nl> * to be faster than 2 sequential queries , one against l1 followed by one against l2 . <nl> * / <nl> public boolean isWorthMergingForRangeQuery ( List < InetAddressAndPort > merged , List < InetAddressAndPort > l1 , List < InetAddressAndPort > l2 ) ; <nl> + <nl> + / * * <nl> + * Determine if the datacenter or rack values in the current node ' s snitch conflict with those passed in parameters . <nl> + * / <nl> + default boolean validate ( Set < String > datacenters , Set < String > racks ) <nl> + { <nl> + return true ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / locator / SnitchProperties . java b / src / java / org / apache / cassandra / locator / SnitchProperties . java <nl> index 158feef . . afb6804 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / SnitchProperties . java <nl> + + + b / src / java / org / apache / cassandra / locator / SnitchProperties . java <nl> @ @ - 30 , 7 + 30 , 7 @ @ public class SnitchProperties <nl> private static final Logger logger = LoggerFactory . getLogger ( SnitchProperties . class ) ; <nl> public static final String RACKDC _ PROPERTY _ FILENAME = " cassandra - rackdc . properties " ; <nl> <nl> - private Properties properties ; <nl> + private final Properties properties ; <nl> <nl> public SnitchProperties ( ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index e5911f3 . . 400ab75 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 482 , 6 + 482 , 8 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> if ( epStates . get ( replaceAddress ) = = null ) <nl> throw new RuntimeException ( String . format ( " Cannot replace _ address % s because it doesn ' t exist in gossip " , replaceAddress ) ) ; <nl> <nl> + validateEndpointSnitch ( epStates . values ( ) . iterator ( ) ) ; <nl> + <nl> try <nl> { <nl> VersionedValue tokensVersionedValue = epStates . get ( replaceAddress ) . getApplicationState ( ApplicationState . TOKENS ) ; <nl> @ @ - 527 , 6 + 529 , 8 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> FBUtilities . getBroadcastAddressAndPort ( ) ) ) ; <nl> } <nl> <nl> + validateEndpointSnitch ( epStates . values ( ) . iterator ( ) ) ; <nl> + <nl> if ( shouldBootstrap ( ) & & useStrictConsistency & & ! allowSimultaneousMoves ( ) ) <nl> { <nl> for ( Map . Entry < InetAddressAndPort , EndpointState > entry : epStates . entrySet ( ) ) <nl> @ @ - 550 , 6 + 554 , 28 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> } <nl> } <nl> <nl> + private static void validateEndpointSnitch ( Iterator < EndpointState > endpointStates ) <nl> + { <nl> + Set < String > datacenters = new HashSet < > ( ) ; <nl> + Set < String > racks = new HashSet < > ( ) ; <nl> + while ( endpointStates . hasNext ( ) ) <nl> + { <nl> + EndpointState state = endpointStates . next ( ) ; <nl> + VersionedValue val = state . getApplicationState ( ApplicationState . DC ) ; <nl> + if ( val ! = null ) <nl> + datacenters . add ( val . value ) ; <nl> + val = state . getApplicationState ( ApplicationState . RACK ) ; <nl> + if ( val ! = null ) <nl> + racks . add ( val . value ) ; <nl> + } <nl> + <nl> + IEndpointSnitch snitch = DatabaseDescriptor . getEndpointSnitch ( ) ; <nl> + if ( ! snitch . validate ( datacenters , racks ) ) <nl> + { <nl> + throw new IllegalStateException ( ) ; <nl> + } <nl> + } <nl> + <nl> private boolean allowSimultaneousMoves ( ) <nl> { <nl> return allowSimultaneousMoves & & DatabaseDescriptor . getNumTokens ( ) = = 1 ; <nl> diff - - git a / test / conf / cassandra - rackdc . properties b / test / conf / cassandra - rackdc . properties <nl> index be2e7d2 . . 742def3 100644 <nl> - - - a / test / conf / cassandra - rackdc . properties <nl> + + + b / test / conf / cassandra - rackdc . properties <nl> @ @ - 22 , 3 + 22 , 15 @ @ rack = RAC1 <nl> # Add a suffix to a datacenter name . Used by the Ec2Snitch and Ec2MultiRegionSnitch <nl> # to append a string to the EC2 region name . <nl> # dc _ suffix = <nl> + <nl> + # Datacenter and rack naming convention used by the Ec2Snitch and Ec2MultiRegionSnitch . <nl> + # Options are : <nl> + # legacy : datacenter name is the part of the availability zone name preceding the last " - " <nl> + # when the zone ends in - 1 and includes the number if not - 1 . Rack is the portion of <nl> + # the availability zone name following the last " - " . <nl> + # Examples : us - west - 1a = > dc : us - west , rack : 1a ; us - west - 2b = > dc : us - west - 2 , rack : 2b ; <nl> + # standard : datacenter name is the standard AWS region name , including the number . rack name is the <nl> + # region plus the availability zone letter . <nl> + # Examples : us - west - 1a = > dc : us - west - 1 , rack : us - west - 1a ; us - west - 2b = > dc : us - west - 2 , rack : us - west - 2b ; <nl> + # default : standard <nl> + ec2 _ naming _ scheme = standard <nl> diff - - git a / test / unit / org / apache / cassandra / locator / EC2SnitchTest . java b / test / unit / org / apache / cassandra / locator / EC2SnitchTest . java <nl> index 182ff1a . . 062bf69 100644 <nl> - - - a / test / unit / org / apache / cassandra / locator / EC2SnitchTest . java <nl> + + + b / test / unit / org / apache / cassandra / locator / EC2SnitchTest . java <nl> @ @ - 20 , 11 + 20 , 14 @ @ package org . apache . cassandra . locator ; <nl> <nl> <nl> import java . io . IOException ; <nl> - import java . net . UnknownHostException ; <nl> + import java . util . Collections ; <nl> import java . util . EnumMap ; <nl> + import java . util . HashSet ; <nl> import java . util . Map ; <nl> + import java . util . Set ; <nl> <nl> import org . junit . AfterClass ; <nl> + import org . junit . Assert ; <nl> import org . junit . BeforeClass ; <nl> import org . junit . Test ; <nl> <nl> @ @ - 37 , 12 + 40 , 21 @ @ import org . apache . cassandra . gms . Gossiper ; <nl> import org . apache . cassandra . gms . VersionedValue ; <nl> import org . apache . cassandra . service . StorageService ; <nl> <nl> + import static org . apache . cassandra . locator . Ec2Snitch . EC2 _ NAMING _ LEGACY ; <nl> import static org . junit . Assert . assertEquals ; <nl> <nl> public class EC2SnitchTest <nl> { <nl> private static String az ; <nl> <nl> + private final SnitchProperties legacySnitchProps = new SnitchProperties ( ) <nl> + { <nl> + public String get ( String propertyName , String defaultValue ) <nl> + { <nl> + return propertyName . equals ( " ec2 _ naming _ scheme " ) ? EC2 _ NAMING _ LEGACY : super . get ( propertyName , defaultValue ) ; <nl> + } <nl> + } ; <nl> + <nl> @ BeforeClass <nl> public static void setup ( ) throws Exception <nl> { <nl> @ @ - 60 , 6 + 72 , 11 @ @ public class EC2SnitchTest <nl> super ( ) ; <nl> } <nl> <nl> + public TestEC2Snitch ( SnitchProperties props ) throws IOException , ConfigurationException <nl> + { <nl> + super ( props ) ; <nl> + } <nl> + <nl> @ Override <nl> String awsApiCall ( String url ) throws IOException , ConfigurationException <nl> { <nl> @ @ - 68 , 10 + 85 , 10 @ @ public class EC2SnitchTest <nl> } <nl> <nl> @ Test <nl> - public void testRac ( ) throws IOException , ConfigurationException <nl> + public void testLegacyRac ( ) throws IOException , ConfigurationException <nl> { <nl> az = " us - east - 1d " ; <nl> - Ec2Snitch snitch = new TestEC2Snitch ( ) ; <nl> + Ec2Snitch snitch = new TestEC2Snitch ( legacySnitchProps ) ; <nl> InetAddressAndPort local = InetAddressAndPort . getByName ( " 127 . 0 . 0 . 1 " ) ; <nl> InetAddressAndPort nonlocal = InetAddressAndPort . getByName ( " 127 . 0 . 0 . 7 " ) ; <nl> <nl> @ @ - 87 , 17 + 104 , 106 @ @ public class EC2SnitchTest <nl> assertEquals ( " us - east " , snitch . getDatacenter ( local ) ) ; <nl> assertEquals ( " 1d " , snitch . getRack ( local ) ) ; <nl> } <nl> - <nl> + <nl> @ Test <nl> - public void testNewRegions ( ) throws IOException , ConfigurationException <nl> + public void testLegacyNewRegions ( ) throws IOException , ConfigurationException <nl> { <nl> az = " us - east - 2d " ; <nl> - Ec2Snitch snitch = new TestEC2Snitch ( ) ; <nl> + Ec2Snitch snitch = new TestEC2Snitch ( legacySnitchProps ) ; <nl> InetAddressAndPort local = InetAddressAndPort . getByName ( " 127 . 0 . 0 . 1 " ) ; <nl> assertEquals ( " us - east - 2 " , snitch . getDatacenter ( local ) ) ; <nl> assertEquals ( " 2d " , snitch . getRack ( local ) ) ; <nl> } <nl> <nl> + @ Test <nl> + public void testFullNamingScheme ( ) throws IOException , ConfigurationException <nl> + { <nl> + InetAddressAndPort local = InetAddressAndPort . getByName ( " 127 . 0 . 0 . 1 " ) ; <nl> + az = " us - east - 2d " ; <nl> + Ec2Snitch snitch = new TestEC2Snitch ( ) ; <nl> + <nl> + assertEquals ( " us - east - 2 " , snitch . getDatacenter ( local ) ) ; <nl> + assertEquals ( " us - east - 2d " , snitch . getRack ( local ) ) ; <nl> + <nl> + az = " us - west - 1a " ; <nl> + snitch = new TestEC2Snitch ( ) ; <nl> + <nl> + assertEquals ( " us - west - 1 " , snitch . getDatacenter ( local ) ) ; <nl> + assertEquals ( " us - west - 1a " , snitch . getRack ( local ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void validateDatacenter _ RequiresLegacy _ CorrectAmazonName ( ) <nl> + { <nl> + Set < String > datacenters = new HashSet < > ( ) ; <nl> + datacenters . add ( " us - east - 1 " ) ; <nl> + Assert . assertFalse ( Ec2Snitch . validate ( datacenters , Collections . emptySet ( ) , true ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void validateDatacenter _ RequiresLegacy _ LegacyName ( ) <nl> + { <nl> + Set < String > datacenters = new HashSet < > ( ) ; <nl> + datacenters . add ( " us - east " ) ; <nl> + Assert . assertTrue ( Ec2Snitch . validate ( datacenters , Collections . emptySet ( ) , true ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void validate _ RequiresLegacy _ HappyPath ( ) <nl> + { <nl> + Set < String > datacenters = new HashSet < > ( ) ; <nl> + datacenters . add ( " us - east " ) ; <nl> + Set < String > racks = new HashSet < > ( ) ; <nl> + racks . add ( " 1a " ) ; <nl> + Assert . assertTrue ( Ec2Snitch . validate ( datacenters , racks , true ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void validate _ RequiresLegacy _ HappyPathWithDCSuffix ( ) <nl> + { <nl> + Set < String > datacenters = new HashSet < > ( ) ; <nl> + datacenters . add ( " us - east _ CUSTOM _ SUFFIX " ) ; <nl> + Set < String > racks = new HashSet < > ( ) ; <nl> + racks . add ( " 1a " ) ; <nl> + Assert . assertTrue ( Ec2Snitch . validate ( datacenters , racks , true ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void validateRack _ RequiresAmazonName _ CorrectAmazonName ( ) <nl> + { <nl> + Set < String > racks = new HashSet < > ( ) ; <nl> + racks . add ( " us - east - 1a " ) ; <nl> + Assert . assertTrue ( Ec2Snitch . validate ( Collections . emptySet ( ) , racks , false ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void validateRack _ RequiresAmazonName _ LegacyName ( ) <nl> + { <nl> + Set < String > racks = new HashSet < > ( ) ; <nl> + racks . add ( " 1a " ) ; <nl> + Assert . assertFalse ( Ec2Snitch . validate ( Collections . emptySet ( ) , racks , false ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void validate _ RequiresAmazonName _ HappyPath ( ) <nl> + { <nl> + Set < String > datacenters = new HashSet < > ( ) ; <nl> + datacenters . add ( " us - east - 1 " ) ; <nl> + Set < String > racks = new HashSet < > ( ) ; <nl> + racks . add ( " us - east - 1a " ) ; <nl> + Assert . assertTrue ( Ec2Snitch . validate ( datacenters , racks , false ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void validate _ RequiresAmazonName _ HappyPathWithDCSuffix ( ) <nl> + { <nl> + Set < String > datacenters = new HashSet < > ( ) ; <nl> + datacenters . add ( " us - east - 1 _ CUSTOM _ SUFFIX " ) ; <nl> + Set < String > racks = new HashSet < > ( ) ; <nl> + racks . add ( " us - east - 1a " ) ; <nl> + Assert . assertTrue ( Ec2Snitch . validate ( datacenters , racks , false ) ) ; <nl> + } <nl> + <nl> @ AfterClass <nl> public static void tearDown ( ) <nl> {
+NEAREST DIFF (one line): diff - - git a / conf / datacenters . properties b / conf / datacenters . properties <nl> new file mode 100644 <nl> index 0000000 . . b186cb1 <nl> - - - / dev / null <nl> + + + b / conf / datacenters . properties <nl> @ @ - 0 , 0 + 1 , 20 @ @ <nl> + # Licensed to the Apache Software Foundation ( ASF ) under one <nl> + # or more contributor license agreements . See the NOTICE file <nl> + # distributed with this work for additional information <nl> + # regarding copyright ownership . The ASF licenses this file <nl> + # to you under the Apache License , Version 2 . 0 ( the <nl> + # " License " ) ; you may not use this file except in compliance <nl> + # with the License . You may obtain a copy of the License at <nl> + # <nl> + # http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + # <nl> + # Unless required by applicable law or agreed to in writing , software <nl> + # distributed under the License is distributed on an " AS IS " BASIS , <nl> + # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + # See the License for the specific language governing permissions and <nl> + # limitations under the License . <nl> + <nl> + # datacenter = replication factor <nl> + dc1 = 3 <nl> + dc2 = 5 <nl> + dc3 = 1 <nl> diff - - git a / src / java / org / apache / cassandra / locator / DatacenterEndpointSnitch . java b / src / java / org / apache / cassandra / locator / DatacenterEndpointSnitch . java <nl> deleted file mode 100644 <nl> index 6e507cc . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / locator / DatacenterEndpointSnitch . java <nl> + + + / dev / null <nl> @ @ - 1 , 173 + 0 , 0 @ @ <nl> - package org . apache . cassandra . locator ; <nl> - / * <nl> - * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , <nl> - * software distributed under the License is distributed on an <nl> - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> - * KIND , either express or implied . See the License for the <nl> - * specific language governing permissions and limitations <nl> - * under the License . <nl> - * <nl> - * / <nl> - <nl> - <nl> - import java . io . IOException ; <nl> - import java . net . InetAddress ; <nl> - import java . net . UnknownHostException ; <nl> - import java . util . * ; <nl> - import javax . xml . parsers . ParserConfigurationException ; <nl> - <nl> - import org . slf4j . Logger ; <nl> - import org . slf4j . LoggerFactory ; <nl> - <nl> - import org . apache . cassandra . utils . XMLUtils ; <nl> - import org . xml . sax . SAXException ; <nl> - <nl> - / * * <nl> - * DataCenterEndpointSnitch <nl> - * < p / > <nl> - * This class basically reads the configuration and sets the IP Ranges to a <nl> - * hashMap which can be read later . this class also provides a way to compare 2 <nl> - * Endpoints and also get details from the same . <nl> - * / <nl> - <nl> - public class DatacenterEndpointSnitch extends AbstractRackAwareSnitch <nl> - { <nl> - / * * <nl> - * This Map will contain the information of the Endpoints and its Location <nl> - * ( Datacenter and RAC ) <nl> - * / <nl> - private Map < Byte , Map < Byte , String > > ipDC = new HashMap < Byte , Map < Byte , String > > ( ) ; <nl> - private Map < Byte , Map < Byte , String > > ipRAC = new HashMap < Byte , Map < Byte , String > > ( ) ; <nl> - private Map < String , Integer > dcRepFactor = new HashMap < String , Integer > ( ) ; <nl> - <nl> - private XMLUtils xmlUtils ; <nl> - private Map < String , Integer > quorumDCMap = new HashMap < String , Integer > ( ) ; <nl> - / * * <nl> - * The default rack property file to be read . <nl> - * / <nl> - private static String DEFAULT _ RACK _ CONFIG _ FILE = " / etc / cassandra / DC - Config . xml " ; <nl> - <nl> - / * * <nl> - * Reference to the logger . <nl> - * / <nl> - private static Logger logger _ = LoggerFactory . getLogger ( DatacenterEndpointSnitch . class ) ; <nl> - <nl> - / * * <nl> - * Constructor , intialize XML config and read the config in . . . <nl> - * / <nl> - public DatacenterEndpointSnitch ( ) throws IOException , ParserConfigurationException , SAXException <nl> - { <nl> - xmlUtils = new XMLUtils ( DEFAULT _ RACK _ CONFIG _ FILE ) ; <nl> - reloadConfiguration ( ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Return the rack for which an endpoint resides in <nl> - * / <nl> - public String getRack ( InetAddress endpoint ) throws UnknownHostException <nl> - { <nl> - byte [ ] ip = getIPAddress ( endpoint . getHostAddress ( ) ) ; <nl> - return ipRAC . get ( ip [ 1 ] ) . get ( ip [ 2 ] ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Return the datacenter for which an endpoint resides in <nl> - * / <nl> - public String getDatacenter ( InetAddress endpoint ) throws UnknownHostException <nl> - { <nl> - byte [ ] ip = getIPAddress ( endpoint . getHostAddress ( ) ) ; <nl> - return ipDC . get ( ip [ 1 ] ) . get ( ip [ 2 ] ) ; <nl> - } <nl> - <nl> - / * * <nl> - * This method will load the configuration from the xml file . Mandatory <nl> - * fields are Atleast 1 DC and 1RAC configurations . Name of the DC / RAC , IP <nl> - * Quadrents for RAC and DC . <nl> - * < p / > <nl> - * This method will not be called everytime <nl> - * / <nl> - public void reloadConfiguration ( ) throws IOException <nl> - { <nl> - try <nl> - { <nl> - String [ ] dcNames = xmlUtils . getNodeValues ( " / Endpoints / DataCenter / name " ) ; <nl> - for ( String dcName : dcNames ) <nl> - { <nl> - / / Parse the Datacenter Quaderant . <nl> - String dcXPath = " / Endpoints / DataCenter [ name = ' " + dcName + " ' ] " ; <nl> - String dcIPQuad = xmlUtils . getNodeValue ( dcXPath + " / ip2ndQuad " ) ; <nl> - String replicationFactor = xmlUtils . getNodeValue ( dcXPath + " / replicationFactor " ) ; <nl> - byte dcByte = intToByte ( Integer . parseInt ( dcIPQuad ) ) ; <nl> - / / Parse the replication factor for a DC <nl> - int dcReF = Integer . parseInt ( replicationFactor ) ; <nl> - dcRepFactor . put ( dcName , dcReF ) ; <nl> - quorumDCMap . put ( dcName , ( dcReF / 2 + 1 ) ) ; <nl> - String [ ] racNames = xmlUtils . getNodeValues ( dcXPath + " / rack / name " ) ; <nl> - Map < Byte , String > dcRackMap = ipDC . get ( dcByte ) ; <nl> - if ( null = = dcRackMap ) <nl> - { <nl> - dcRackMap = new HashMap < Byte , String > ( ) ; <nl> - } <nl> - Map < Byte , String > rackDcMap = ipRAC . get ( dcByte ) ; <nl> - if ( null = = rackDcMap ) <nl> - { <nl> - rackDcMap = new HashMap < Byte , String > ( ) ; <nl> - } <nl> - for ( String racName : racNames ) <nl> - { <nl> - / / Parse the RAC ip Quaderant . <nl> - String racIPQuad = xmlUtils . getNodeValue ( dcXPath + " / rack [ name = ' " + racName + " ' ] / ip3rdQuad " ) ; <nl> - byte racByte = intToByte ( Integer . parseInt ( racIPQuad ) ) ; <nl> - dcRackMap . put ( racByte , dcName ) ; <nl> - rackDcMap . put ( racByte , racName ) ; <nl> - } <nl> - ipDC . put ( dcByte , dcRackMap ) ; <nl> - ipRAC . put ( dcByte , rackDcMap ) ; <nl> - } <nl> - } <nl> - catch ( Exception ioe ) <nl> - { <nl> - throw new IOException ( " Could not process " + DEFAULT _ RACK _ CONFIG _ FILE , ioe ) ; <nl> - } <nl> - } <nl> - <nl> - / * * <nl> - * Returns a DC replication map , the key will be the dc name and the value <nl> - * will be the replication factor of that Datacenter . <nl> - * / <nl> - public HashMap < String , Integer > getMapReplicationFactor ( ) <nl> - { <nl> - return new HashMap < String , Integer > ( dcRepFactor ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Returns a DC replication map , the key will be the dc name and the value <nl> - * will be the replication factor of that Datacenter . <nl> - * / <nl> - public HashMap < String , Integer > getMapQuorumFactor ( ) <nl> - { <nl> - return new HashMap < String , Integer > ( quorumDCMap ) ; <nl> - } <nl> - <nl> - private byte [ ] getIPAddress ( String host ) throws UnknownHostException <nl> - { <nl> - InetAddress ia = InetAddress . getByName ( host ) ; <nl> - return ia . getAddress ( ) ; <nl> - } <nl> - <nl> - public static byte intToByte ( int n ) <nl> - { <nl> - return ( byte ) ( n & 0x000000ff ) ; <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / locator / DatacenterShardStrategy . java b / src / java / org / apache / cassandra / locator / DatacenterShardStrategy . java <nl> index 8f1009a . . 321f45b 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / DatacenterShardStrategy . java <nl> + + + b / src / java / org / apache / cassandra / locator / DatacenterShardStrategy . java <nl> @ @ - 21 , 13 + 21 , 16 @ @ package org . apache . cassandra . locator ; <nl> * / <nl> <nl> <nl> + import java . io . FileReader ; <nl> import java . io . IOException ; <nl> import java . io . IOError ; <nl> import java . net . InetAddress ; <nl> + import java . net . URL ; <nl> import java . net . UnknownHostException ; <nl> import java . util . * ; <nl> import java . util . Map . Entry ; <nl> <nl> + import org . apache . cassandra . config . ConfigurationException ; <nl> import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . service . * ; <nl> import org . apache . cassandra . thrift . ConsistencyLevel ; <nl> @ @ - 50 , 6 + 53 , 7 @ @ public class DatacenterShardStrategy extends AbstractReplicationStrategy <nl> ArrayList < Token > tokens ; <nl> <nl> private List < InetAddress > localEndpoints = new ArrayList < InetAddress > ( ) ; <nl> + private static final String DATACENTER _ PROPERTIES _ FILENAME = " datacenters . properties " ; <nl> <nl> private List < InetAddress > getLocalEndpoints ( ) <nl> { <nl> @ @ - 65 , 15 + 69 , 15 @ @ public class DatacenterShardStrategy extends AbstractReplicationStrategy <nl> * This Method will get the required information of the Endpoint from the <nl> * DataCenterEndpointSnitch and poopulates this singleton class . <nl> * / <nl> - private synchronized void loadEndpoints ( TokenMetadata metadata ) throws IOException <nl> + private synchronized void loadEndpoints ( TokenMetadata metadata ) throws UnknownHostException <nl> { <nl> this . tokens = new ArrayList < Token > ( metadata . sortedTokens ( ) ) ; <nl> - String localDC = ( ( DatacenterEndpointSnitch ) snitch _ ) . getDatacenter ( InetAddress . getLocalHost ( ) ) ; <nl> + String localDC = ( ( AbstractRackAwareSnitch ) snitch _ ) . getDatacenter ( InetAddress . getLocalHost ( ) ) ; <nl> dcMap = new HashMap < String , List < Token > > ( ) ; <nl> for ( Token token : this . tokens ) <nl> { <nl> InetAddress endpoint = metadata . getEndpoint ( token ) ; <nl> - String dataCenter = ( ( DatacenterEndpointSnitch ) snitch _ ) . getDatacenter ( endpoint ) ; <nl> + String dataCenter = ( ( AbstractRackAwareSnitch ) snitch _ ) . getDatacenter ( endpoint ) ; <nl> if ( dataCenter . equals ( localDC ) ) <nl> { <nl> localEndpoints . add ( endpoint ) ; <nl> @ @ - 92 , 7 + 96 , 6 @ @ public class DatacenterShardStrategy extends AbstractReplicationStrategy <nl> Collections . sort ( valueList ) ; <nl> dcMap . put ( entry . getKey ( ) , valueList ) ; <nl> } <nl> - dcReplicationFactor = ( ( DatacenterEndpointSnitch ) snitch _ ) . getMapReplicationFactor ( ) ; <nl> for ( Entry < String , Integer > entry : dcReplicationFactor . entrySet ( ) ) <nl> { <nl> String datacenter = entry . getKey ( ) ; <nl> @ @ - 105 , 13 + 108 , 33 @ @ public class DatacenterShardStrategy extends AbstractReplicationStrategy <nl> } <nl> } <nl> <nl> - public DatacenterShardStrategy ( TokenMetadata tokenMetadata , IEndpointSnitch snitch ) <nl> - throws UnknownHostException <nl> + public DatacenterShardStrategy ( TokenMetadata tokenMetadata , IEndpointSnitch snitch ) throws ConfigurationException <nl> { <nl> super ( tokenMetadata , snitch ) ; <nl> - if ( ( ! ( snitch instanceof DatacenterEndpointSnitch ) ) ) <nl> + if ( ! ( snitch instanceof AbstractRackAwareSnitch ) ) <nl> { <nl> - throw new IllegalArgumentException ( " DatacenterShardStrategy requires DatacenterEndpointSnitch " ) ; <nl> + throw new IllegalArgumentException ( " DatacenterShardStrategy requires a rack - aware endpointsnitch " ) ; <nl> + } <nl> + <nl> + / / load replication factors for each DC <nl> + ClassLoader loader = PropertyFileSnitch . class . getClassLoader ( ) ; <nl> + URL scpurl = loader . getResource ( DATACENTER _ PROPERTIES _ FILENAME ) ; <nl> + if ( scpurl = = null ) <nl> + throw new ConfigurationException ( " unable to locate " + DATACENTER _ PROPERTIES _ FILENAME ) ; <nl> + <nl> + String rackPropertyFilename = scpurl . getFile ( ) ; <nl> + try <nl> + { <nl> + Properties p = new Properties ( ) ; <nl> + p . load ( new FileReader ( rackPropertyFilename ) ) ; <nl> + for ( Entry < Object , Object > entry : p . entrySet ( ) ) <nl> + { <nl> + dcReplicationFactor . put ( ( String ) entry . getKey ( ) , Integer . valueOf ( ( String ) entry . getValue ( ) ) ) ; <nl> + } <nl> + } <nl> + catch ( IOException ioe ) <nl> + { <nl> + throw new ConfigurationException ( " Could not process " + rackPropertyFilename , ioe ) ; <nl> } <nl> } <nl> <nl> @ @ - 224 , 4 + 247 , 9 @ @ public class DatacenterShardStrategy extends AbstractReplicationStrategy <nl> } <nl> return super . getWriteResponseHandler ( blockFor , consistency _ level , table ) ; <nl> } <nl> + <nl> + int getReplicationFactor ( String datacenter ) <nl> + { <nl> + return dcReplicationFactor . get ( datacenter ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / DatacenterSyncWriteResponseHandler . java b / src / java / org / apache / cassandra / service / DatacenterSyncWriteResponseHandler . java <nl> index cc11877 . . 44c5a5a 100644 <nl> - - - a / src / java / org / apache / cassandra / service / DatacenterSyncWriteResponseHandler . java <nl> + + + b / src / java / org / apache / cassandra / service / DatacenterSyncWriteResponseHandler . java <nl> @ @ - 29 , 7 + 29 , 7 @ @ import java . util . HashMap ; <nl> import java . util . Map ; <nl> <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - import org . apache . cassandra . locator . DatacenterEndpointSnitch ; <nl> + import org . apache . cassandra . locator . AbstractRackAwareSnitch ; <nl> import org . apache . cassandra . net . Message ; <nl> <nl> / * * <nl> @ @ - 41 , 14 + 41 , 14 @ @ public class DatacenterSyncWriteResponseHandler extends WriteResponseHandler <nl> { <nl> private final Map < String , Integer > dcResponses = new HashMap < String , Integer > ( ) ; <nl> private final Map < String , Integer > responseCounts ; <nl> - private final DatacenterEndpointSnitch endpointSnitch ; <nl> + private final AbstractRackAwareSnitch endpointSnitch ; <nl> <nl> public DatacenterSyncWriteResponseHandler ( Map < String , Integer > responseCounts , String table ) <nl> { <nl> / / Response is been managed by the map so make it 1 for the superclass . <nl> super ( 1 , table ) ; <nl> this . responseCounts = responseCounts ; <nl> - endpointSnitch = ( DatacenterEndpointSnitch ) DatabaseDescriptor . getEndpointSnitch ( ) ; <nl> + endpointSnitch = ( AbstractRackAwareSnitch ) DatabaseDescriptor . getEndpointSnitch ( ) ; <nl> } <nl> <nl> @ Override <nl> diff - - git a / src / java / org / apache / cassandra / service / DatacenterWriteResponseHandler . java b / src / java / org / apache / cassandra / service / DatacenterWriteResponseHandler . java <nl> index 8fb7749 . . 3256483 100644 <nl> - - - a / src / java / org / apache / cassandra / service / DatacenterWriteResponseHandler . java <nl> + + + b / src / java / org / apache / cassandra / service / DatacenterWriteResponseHandler . java <nl> @ @ - 29 , 7 + 29 , 7 @ @ import java . net . UnknownHostException ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - import org . apache . cassandra . locator . DatacenterEndpointSnitch ; <nl> + import org . apache . cassandra . locator . AbstractRackAwareSnitch ; <nl> import org . apache . cassandra . net . Message ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> @ @ - 41 , 7 + 41 , 7 @ @ import org . apache . cassandra . utils . FBUtilities ; <nl> public class DatacenterWriteResponseHandler extends WriteResponseHandler <nl> { <nl> private final AtomicInteger blockFor ; <nl> - private final DatacenterEndpointSnitch endpointsnitch ; <nl> + private final AbstractRackAwareSnitch endpointsnitch ; <nl> private final InetAddress localEndpoint ; <nl> <nl> public DatacenterWriteResponseHandler ( int blockFor , String table ) <nl> @ @ - 49 , 7 + 49 , 7 @ @ public class DatacenterWriteResponseHandler extends WriteResponseHandler <nl> / / Response is been managed by the map so the waitlist size really doesnt matter . <nl> super ( blockFor , table ) ; <nl> this . blockFor = new AtomicInteger ( blockFor ) ; <nl> - endpointsnitch = ( DatacenterEndpointSnitch ) DatabaseDescriptor . getEndpointSnitch ( ) ; <nl> + endpointsnitch = ( AbstractRackAwareSnitch ) DatabaseDescriptor . getEndpointSnitch ( ) ; <nl> localEndpoint = FBUtilities . getLocalAddress ( ) ; <nl> } <nl> <nl> diff - - git a / test / conf / datacenters . properties b / test / conf / datacenters . properties <nl> new file mode 100644 <nl> index 0000000 . . b186cb1 <nl> - - - / dev / null <nl> + + + b / test / conf / datacenters . properties <nl> @ @ - 0 , 0 + 1 , 20 @ @ <nl> + # Licensed to the Apache Software Foundation ( ASF ) under one <nl> + # or more contributor license agreements . See the NOTICE file <nl> + # distributed with this work for additional information <nl> + # regarding copyright ownership . The ASF licenses this file <nl> + # to you under the Apache License , Version 2 . 0 ( the <nl> + # " License " ) ; you may not use this file except in compliance <nl> + # with the License . You may obtain a copy of the License at <nl> + # <nl> + # http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + # <nl> + # Unless required by applicable law or agreed to in writing , software <nl> + # distributed under the License is distributed on an " AS IS " BASIS , <nl> + # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + # See the License for the specific language governing permissions and <nl> + # limitations under the License . <nl> + <nl> + # datacenter = replication factor <nl> + dc1 = 3 <nl> + dc2 = 5 <nl> + dc3 = 1 <nl> diff - - git a / test / unit / org / apache / cassandra / locator / DatacenterStrategyTest . java b / test / unit / org / apache / cassandra / locator / DatacenterStrategyTest . java <nl> new file mode 100644 <nl> index 0000000 . . c53c2f6 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / locator / DatacenterStrategyTest . java <nl> @ @ - 0 , 0 + 1 , 18 @ @ <nl> + package org . apache . cassandra . locator ; <nl> + <nl> + import org . junit . Test ; <nl> + <nl> + import org . apache . cassandra . config . ConfigurationException ; <nl> + <nl> + public class DatacenterStrategyTest <nl> + { <nl> + @ Test <nl> + public void testProperties ( ) throws ConfigurationException <nl> + { <nl> + DatacenterShardStrategy strategy = new DatacenterShardStrategy ( new TokenMetadata ( ) , new RackInferringSnitch ( ) ) ; <nl> + assert strategy . getReplicationFactor ( " dc1 " ) = = 3 ; <nl> + assert strategy . getReplicationFactor ( " dc2 " ) = = 5 ; <nl> + assert strategy . getReplicationFactor ( " dc3 " ) = = 1 ; <nl> + } <nl> + <nl> + }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 0362d01 . . 71d947a 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 4 . 0 
+ + * Use standard Amazon naming for datacenter and rack in Ec2Snitch ( CASSANDRA - 7839 ) 
+ * Fix junit failure for SSTableReaderTest ( CASSANDRA - 14387 ) 
+ * Abstract write path for pluggable storage ( CASSANDRA - 14118 ) 
+ * nodetool describecluster should be more informative ( CASSANDRA - 13853 ) 
+ diff - - git a / NEWS . txt b / NEWS . txt 
+ index df4c32a . . 3be52dc 100644 
+ - - - a / NEWS . txt 
+ + + + b / NEWS . txt 
+ @ @ - 141 , 6 + 141 , 10 @ @ Upgrading 
+ storage port or native port at nodes you must first upgrade the entire cluster 
+ and clients to 4 . 0 so they can handle the port not being consistent across 
+ the cluster . 
+ + - Names of AWS regions / availability zones have been cleaned up to more correctly 
+ + match the Amazon names . There is now a new option in conf / cassandra - rackdc . properties 
+ + that lets users enable the correct names for new clusters , or use the legacy 
+ + names for existing clusters . See conf / cassandra - rackdc . properties for details . 
+ 
+ Materialized Views 
+ - - - - - - - - - - - - - - - - - - - 
+ diff - - git a / conf / cassandra - rackdc . properties b / conf / cassandra - rackdc . properties 
+ index 2ea6043 . . cc472b4 100644 
+ - - - a / conf / cassandra - rackdc . properties 
+ + + + b / conf / cassandra - rackdc . properties 
+ @ @ - 25 , 3 + 25 , 15 @ @ rack = rack1 
+ 
+ # Uncomment the following line to make this snitch prefer the internal ip when possible , as the Ec2MultiRegionSnitch does . 
+ # prefer _ local = true 
+ + 
+ + # Datacenter and rack naming convention used by the Ec2Snitch and Ec2MultiRegionSnitch . 
+ + # Options are : 
+ + # legacy : datacenter name is the part of the availability zone name preceding the last " - " 
+ + # when the zone ends in - 1 and includes the number if not - 1 . Rack is the portion of 
+ + # the availability zone name following the last " - " . 
+ + # Examples : us - west - 1a = > dc : us - west , rack : 1a ; us - west - 2b = > dc : us - west - 2 , rack : 2b ; 
+ + # YOU MUST USE THIS VALUE IF YOU ARE UPGRADING A PRE - 4 . 0 CLUSTER 
+ + # standard : Default value . datacenter name is the standard AWS region name , including the number . 
+ + # rack name is the region plus the availability zone letter . 
+ + # Examples : us - west - 1a = > dc : us - west - 1 , rack : us - west - 1a ; us - west - 2b = > dc : us - west - 2 , rack : us - west - 2b ; 
+ + # ec2 _ naming _ scheme = standard 
+ diff - - git a / src / java / org / apache / cassandra / locator / DynamicEndpointSnitch . java b / src / java / org / apache / cassandra / locator / DynamicEndpointSnitch . java 
+ index 9ea7e05 . . 010c892 100644 
+ - - - a / src / java / org / apache / cassandra / locator / DynamicEndpointSnitch . java 
+ + + + b / src / java / org / apache / cassandra / locator / DynamicEndpointSnitch . java 
+ @ @ - 448 , 4 + 448 , 9 @ @ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa 
+ } 
+ return maxScore ; 
+ } 
+ + 
+ + public boolean validate ( Set < String > datacenters , Set < String > racks ) 
+ + { 
+ + return subsnitch . validate ( datacenters , racks ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / locator / Ec2Snitch . java b / src / java / org / apache / cassandra / locator / Ec2Snitch . java 
+ index c7324c8 . . b6aafd3 100644 
+ - - - a / src / java / org / apache / cassandra / locator / Ec2Snitch . java 
+ + + + b / src / java / org / apache / cassandra / locator / Ec2Snitch . java 
+ @ @ - 24 , 7 + 24 , 9 @ @ import java . net . HttpURLConnection ; 
+ import java . net . URL ; 
+ import java . nio . charset . StandardCharsets ; 
+ import java . util . Map ; 
+ + import java . util . Set ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ import org . apache . cassandra . db . SystemKeyspace ; 
+ @ @ - 42 , 30 + 44 , 63 @ @ import org . apache . cassandra . utils . FBUtilities ; 
+ public class Ec2Snitch extends AbstractNetworkTopologySnitch 
+ { 
+ protected static final Logger logger = LoggerFactory . getLogger ( Ec2Snitch . class ) ; 
+ - protected static final String ZONE _ NAME _ QUERY _ URL = " http : / / 169 . 254 . 169 . 254 / latest / meta - data / placement / availability - zone " ; 
+ + 
+ + private static final String SNITCH _ PROP _ NAMING _ SCHEME = " ec2 _ naming _ scheme " ; 
+ + static final String EC2 _ NAMING _ LEGACY = " legacy " ; 
+ + private static final String EC2 _ NAMING _ STANDARD = " standard " ; 
+ + 
+ + private static final String ZONE _ NAME _ QUERY _ URL = " http : / / 169 . 254 . 169 . 254 / latest / meta - data / placement / availability - zone " ; 
+ private static final String DEFAULT _ DC = " UNKNOWN - DC " ; 
+ private static final String DEFAULT _ RACK = " UNKNOWN - RACK " ; 
+ + 
+ + final String ec2region ; 
+ + private final String ec2zone ; 
+ + private final boolean usingLegacyNaming ; 
+ + 
+ private Map < InetAddressAndPort , Map < String , String > > savedEndpoints ; 
+ - protected String ec2zone ; 
+ - protected String ec2region ; 
+ 
+ public Ec2Snitch ( ) throws IOException , ConfigurationException 
+ { 
+ + this ( new SnitchProperties ( ) ) ; 
+ + } 
+ + 
+ + public Ec2Snitch ( SnitchProperties props ) throws IOException , ConfigurationException 
+ + { 
+ String az = awsApiCall ( ZONE _ NAME _ QUERY _ URL ) ; 
+ - / / Split " us - east - 1a " or " asia - 1a " into " us - east " / " 1a " and " asia " / " 1a " . 
+ - String [ ] splits = az . split ( " - " ) ; 
+ - ec2zone = splits [ splits . length - 1 ] ; 
+ 
+ - / / hack for CASSANDRA - 4026 
+ - ec2region = az . substring ( 0 , az . length ( ) - 1 ) ; 
+ - if ( ec2region . endsWith ( " 1 " ) ) 
+ - ec2region = az . substring ( 0 , az . length ( ) - 3 ) ; 
+ + / / if using the full naming scheme , region name is created by removing letters from the 
+ + / / end of the availability zone and zone is the full zone name 
+ + usingLegacyNaming = isUsingLegacyNaming ( props ) ; 
+ + String region ; 
+ + if ( usingLegacyNaming ) 
+ + { 
+ + / / Split " us - east - 1a " or " asia - 1a " into " us - east " / " 1a " and " asia " / " 1a " . 
+ + String [ ] splits = az . split ( " - " ) ; 
+ + ec2zone = splits [ splits . length - 1 ] ; 
+ + 
+ + / / hack for CASSANDRA - 4026 
+ + region = az . substring ( 0 , az . length ( ) - 1 ) ; 
+ + if ( region . endsWith ( " 1 " ) ) 
+ + region = az . substring ( 0 , az . length ( ) - 3 ) ; 
+ + } 
+ + else 
+ + { 
+ + / / grab the region name , which is embedded in the availability zone name . 
+ + / / thus an AZ of " us - east - 1a " yields the region name " us - east - 1 " 
+ + region = az . replaceFirst ( " [ a - z ] + $ " , " " ) ; 
+ + ec2zone = az ; 
+ + } 
+ 
+ - String datacenterSuffix = ( new SnitchProperties ( ) ) . get ( " dc _ suffix " , " " ) ; 
+ - ec2region = ec2region . concat ( datacenterSuffix ) ; 
+ + String datacenterSuffix = props . get ( " dc _ suffix " , " " ) ; 
+ + ec2region = region . concat ( datacenterSuffix ) ; 
+ logger . info ( " EC2Snitch using region : { } , zone : { } . " , ec2region , ec2zone ) ; 
+ } 
+ 
+ + private static boolean isUsingLegacyNaming ( SnitchProperties props ) 
+ + { 
+ + return props . get ( SNITCH _ PROP _ NAMING _ SCHEME , EC2 _ NAMING _ STANDARD ) . equalsIgnoreCase ( EC2 _ NAMING _ LEGACY ) ; 
+ + } 
+ + 
+ String awsApiCall ( String url ) throws IOException , ConfigurationException 
+ { 
+ / / Populate the region and zone by introspection , fail if 404 on metadata 
+ @ @ - 122 , 4 + 157 , 54 @ @ public class Ec2Snitch extends AbstractNetworkTopologySnitch 
+ } 
+ return state . getApplicationState ( ApplicationState . DC ) . value ; 
+ } 
+ + 
+ + @ Override 
+ + public boolean validate ( Set < String > datacenters , Set < String > racks ) 
+ + { 
+ + return validate ( datacenters , racks , usingLegacyNaming ) ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + static boolean validate ( Set < String > datacenters , Set < String > racks , boolean usingLegacyNaming ) 
+ + { 
+ + boolean valid = true ; 
+ + 
+ + for ( String dc : datacenters ) 
+ + { 
+ + / / predicated on the late - 2017 AWS naming ' convention ' that all region names end with a digit . 
+ + / / Unfortunately , life isn ' t that simple . Since we allow custom datacenter suffixes ( CASSANDRA - 5155 ) , 
+ + / / an operator could conceiveably make the suffix " a " , and thus create a region name that looks just like 
+ + / / one of the region ' s availability zones . ( for example , " us - east - 1a " ) . 
+ + / / Further , we can ' t make any assumptions of what that suffix might be by looking at this node ' s 
+ + / / datacenterSuffix as conceivably their could be many different suffixes in play for a given region . 
+ + / / 
+ + / / Thus , the best we can do is make sure the region name follows 
+ + / / the basic region naming pattern : " us - east - 1 < custom - suffix > " 
+ + boolean dcUsesLegacyFormat = ! dc . matches ( " [ a - z ] + - [ a - z ] . + - [ \ \ d ] . * " ) ; 
+ + if ( dcUsesLegacyFormat ! = usingLegacyNaming ) 
+ + valid = false ; 
+ + } 
+ + 
+ + for ( String rack : racks ) 
+ + { 
+ + / / predicated on late - 2017 AWS naming ' convention ' that AZs do not have a digit as the first char - 
+ + / / we had that in our legacy AZ ( rack ) names . Thus we test to see if the rack is in the legacy format . 
+ + / / 
+ + / / NOTE : the allowed custom suffix only applies to datacenter ( region ) names , not availability zones . 
+ + boolean rackUsesLegacyFormat = rack . matches ( " [ \ \ d ] [ a - z ] " ) ; 
+ + if ( rackUsesLegacyFormat ! = usingLegacyNaming ) 
+ + valid = false ; 
+ + } 
+ + 
+ + if ( ! valid ) 
+ + { 
+ + logger . error ( " This ec2 - enabled snitch appears to be using the { } naming scheme for regions , " + 
+ + " but existing nodes in cluster are using the opposite : region ( s ) = { } , availability zone ( s ) = { } . " + 
+ + " Please check the { } property in the { } configuration file for more details . " , 
+ + usingLegacyNaming ? " legacy " : " standard " , datacenters , racks , 
+ + SNITCH _ PROP _ NAMING _ SCHEME , SnitchProperties . RACKDC _ PROPERTY _ FILENAME ) ; 
+ + } 
+ + 
+ + return valid ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / locator / IEndpointSnitch . java b / src / java / org / apache / cassandra / locator / IEndpointSnitch . java 
+ index 00a1543 . . 63d333b 100644 
+ - - - a / src / java / org / apache / cassandra / locator / IEndpointSnitch . java 
+ + + + b / src / java / org / apache / cassandra / locator / IEndpointSnitch . java 
+ @ @ - 19 , 6 + 19 , 7 @ @ package org . apache . cassandra . locator ; 
+ 
+ import java . util . Collection ; 
+ import java . util . List ; 
+ + import java . util . Set ; 
+ 
+ / * * 
+ * This interface helps determine location of node in the datacenter relative to another node . 
+ @ @ - 63 , 4 + 64 , 12 @ @ public interface IEndpointSnitch 
+ * to be faster than 2 sequential queries , one against l1 followed by one against l2 . 
+ * / 
+ public boolean isWorthMergingForRangeQuery ( List < InetAddressAndPort > merged , List < InetAddressAndPort > l1 , List < InetAddressAndPort > l2 ) ; 
+ + 
+ + / * * 
+ + * Determine if the datacenter or rack values in the current node ' s snitch conflict with those passed in parameters . 
+ + * / 
+ + default boolean validate ( Set < String > datacenters , Set < String > racks ) 
+ + { 
+ + return true ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / locator / SnitchProperties . java b / src / java / org / apache / cassandra / locator / SnitchProperties . java 
+ index 158feef . . afb6804 100644 
+ - - - a / src / java / org / apache / cassandra / locator / SnitchProperties . java 
+ + + + b / src / java / org / apache / cassandra / locator / SnitchProperties . java 
+ @ @ - 30 , 7 + 30 , 7 @ @ public class SnitchProperties 
+ private static final Logger logger = LoggerFactory . getLogger ( SnitchProperties . class ) ; 
+ public static final String RACKDC _ PROPERTY _ FILENAME = " cassandra - rackdc . properties " ; 
+ 
+ - private Properties properties ; 
+ + private final Properties properties ; 
+ 
+ public SnitchProperties ( ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index e5911f3 . . 400ab75 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 482 , 6 + 482 , 8 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ if ( epStates . get ( replaceAddress ) = = null ) 
+ throw new RuntimeException ( String . format ( " Cannot replace _ address % s because it doesn ' t exist in gossip " , replaceAddress ) ) ; 
+ 
+ + validateEndpointSnitch ( epStates . values ( ) . iterator ( ) ) ; 
+ + 
+ try 
+ { 
+ VersionedValue tokensVersionedValue = epStates . get ( replaceAddress ) . getApplicationState ( ApplicationState . TOKENS ) ; 
+ @ @ - 527 , 6 + 529 , 8 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ FBUtilities . getBroadcastAddressAndPort ( ) ) ) ; 
+ } 
+ 
+ + validateEndpointSnitch ( epStates . values ( ) . iterator ( ) ) ; 
+ + 
+ if ( shouldBootstrap ( ) & & useStrictConsistency & & ! allowSimultaneousMoves ( ) ) 
+ { 
+ for ( Map . Entry < InetAddressAndPort , EndpointState > entry : epStates . entrySet ( ) ) 
+ @ @ - 550 , 6 + 554 , 28 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ } 
+ } 
+ 
+ + private static void validateEndpointSnitch ( Iterator < EndpointState > endpointStates ) 
+ + { 
+ + Set < String > datacenters = new HashSet < > ( ) ; 
+ + Set < String > racks = new HashSet < > ( ) ; 
+ + while ( endpointStates . hasNext ( ) ) 
+ + { 
+ + EndpointState state = endpointStates . next ( ) ; 
+ + VersionedValue val = state . getApplicationState ( ApplicationState . DC ) ; 
+ + if ( val ! = null ) 
+ + datacenters . add ( val . value ) ; 
+ + val = state . getApplicationState ( ApplicationState . RACK ) ; 
+ + if ( val ! = null ) 
+ + racks . add ( val . value ) ; 
+ + } 
+ + 
+ + IEndpointSnitch snitch = DatabaseDescriptor . getEndpointSnitch ( ) ; 
+ + if ( ! snitch . validate ( datacenters , racks ) ) 
+ + { 
+ + throw new IllegalStateException ( ) ; 
+ + } 
+ + } 
+ + 
+ private boolean allowSimultaneousMoves ( ) 
+ { 
+ return allowSimultaneousMoves & & DatabaseDescriptor . getNumTokens ( ) = = 1 ; 
+ diff - - git a / test / conf / cassandra - rackdc . properties b / test / conf / cassandra - rackdc . properties 
+ index be2e7d2 . . 742def3 100644 
+ - - - a / test / conf / cassandra - rackdc . properties 
+ + + + b / test / conf / cassandra - rackdc . properties 
+ @ @ - 22 , 3 + 22 , 15 @ @ rack = RAC1 
+ # Add a suffix to a datacenter name . Used by the Ec2Snitch and Ec2MultiRegionSnitch 
+ # to append a string to the EC2 region name . 
+ # dc _ suffix = 
+ + 
+ + # Datacenter and rack naming convention used by the Ec2Snitch and Ec2MultiRegionSnitch . 
+ + # Options are : 
+ + # legacy : datacenter name is the part of the availability zone name preceding the last " - " 
+ + # when the zone ends in - 1 and includes the number if not - 1 . Rack is the portion of 
+ + # the availability zone name following the last " - " . 
+ + # Examples : us - west - 1a = > dc : us - west , rack : 1a ; us - west - 2b = > dc : us - west - 2 , rack : 2b ; 
+ + # standard : datacenter name is the standard AWS region name , including the number . rack name is the 
+ + # region plus the availability zone letter . 
+ + # Examples : us - west - 1a = > dc : us - west - 1 , rack : us - west - 1a ; us - west - 2b = > dc : us - west - 2 , rack : us - west - 2b ; 
+ + # default : standard 
+ + ec2 _ naming _ scheme = standard 
+ diff - - git a / test / unit / org / apache / cassandra / locator / EC2SnitchTest . java b / test / unit / org / apache / cassandra / locator / EC2SnitchTest . java 
+ index 182ff1a . . 062bf69 100644 
+ - - - a / test / unit / org / apache / cassandra / locator / EC2SnitchTest . java 
+ + + + b / test / unit / org / apache / cassandra / locator / EC2SnitchTest . java 
+ @ @ - 20 , 11 + 20 , 14 @ @ package org . apache . cassandra . locator ; 
+ 
+ 
+ import java . io . IOException ; 
+ - import java . net . UnknownHostException ; 
+ + import java . util . Collections ; 
+ import java . util . EnumMap ; 
+ + import java . util . HashSet ; 
+ import java . util . Map ; 
+ + import java . util . Set ; 
+ 
+ import org . junit . AfterClass ; 
+ + import org . junit . Assert ; 
+ import org . junit . BeforeClass ; 
+ import org . junit . Test ; 
+ 
+ @ @ - 37 , 12 + 40 , 21 @ @ import org . apache . cassandra . gms . Gossiper ; 
+ import org . apache . cassandra . gms . VersionedValue ; 
+ import org . apache . cassandra . service . StorageService ; 
+ 
+ + import static org . apache . cassandra . locator . Ec2Snitch . EC2 _ NAMING _ LEGACY ; 
+ import static org . junit . Assert . assertEquals ; 
+ 
+ public class EC2SnitchTest 
+ { 
+ private static String az ; 
+ 
+ + private final SnitchProperties legacySnitchProps = new SnitchProperties ( ) 
+ + { 
+ + public String get ( String propertyName , String defaultValue ) 
+ + { 
+ + return propertyName . equals ( " ec2 _ naming _ scheme " ) ? EC2 _ NAMING _ LEGACY : super . get ( propertyName , defaultValue ) ; 
+ + } 
+ + } ; 
+ + 
+ @ BeforeClass 
+ public static void setup ( ) throws Exception 
+ { 
+ @ @ - 60 , 6 + 72 , 11 @ @ public class EC2SnitchTest 
+ super ( ) ; 
+ } 
+ 
+ + public TestEC2Snitch ( SnitchProperties props ) throws IOException , ConfigurationException 
+ + { 
+ + super ( props ) ; 
+ + } 
+ + 
+ @ Override 
+ String awsApiCall ( String url ) throws IOException , ConfigurationException 
+ { 
+ @ @ - 68 , 10 + 85 , 10 @ @ public class EC2SnitchTest 
+ } 
+ 
+ @ Test 
+ - public void testRac ( ) throws IOException , ConfigurationException 
+ + public void testLegacyRac ( ) throws IOException , ConfigurationException 
+ { 
+ az = " us - east - 1d " ; 
+ - Ec2Snitch snitch = new TestEC2Snitch ( ) ; 
+ + Ec2Snitch snitch = new TestEC2Snitch ( legacySnitchProps ) ; 
+ InetAddressAndPort local = InetAddressAndPort . getByName ( " 127 . 0 . 0 . 1 " ) ; 
+ InetAddressAndPort nonlocal = InetAddressAndPort . getByName ( " 127 . 0 . 0 . 7 " ) ; 
+ 
+ @ @ - 87 , 17 + 104 , 106 @ @ public class EC2SnitchTest 
+ assertEquals ( " us - east " , snitch . getDatacenter ( local ) ) ; 
+ assertEquals ( " 1d " , snitch . getRack ( local ) ) ; 
+ } 
+ - 
+ + 
+ @ Test 
+ - public void testNewRegions ( ) throws IOException , ConfigurationException 
+ + public void testLegacyNewRegions ( ) throws IOException , ConfigurationException 
+ { 
+ az = " us - east - 2d " ; 
+ - Ec2Snitch snitch = new TestEC2Snitch ( ) ; 
+ + Ec2Snitch snitch = new TestEC2Snitch ( legacySnitchProps ) ; 
+ InetAddressAndPort local = InetAddressAndPort . getByName ( " 127 . 0 . 0 . 1 " ) ; 
+ assertEquals ( " us - east - 2 " , snitch . getDatacenter ( local ) ) ; 
+ assertEquals ( " 2d " , snitch . getRack ( local ) ) ; 
+ } 
+ 
+ + @ Test 
+ + public void testFullNamingScheme ( ) throws IOException , ConfigurationException 
+ + { 
+ + InetAddressAndPort local = InetAddressAndPort . getByName ( " 127 . 0 . 0 . 1 " ) ; 
+ + az = " us - east - 2d " ; 
+ + Ec2Snitch snitch = new TestEC2Snitch ( ) ; 
+ + 
+ + assertEquals ( " us - east - 2 " , snitch . getDatacenter ( local ) ) ; 
+ + assertEquals ( " us - east - 2d " , snitch . getRack ( local ) ) ; 
+ + 
+ + az = " us - west - 1a " ; 
+ + snitch = new TestEC2Snitch ( ) ; 
+ + 
+ + assertEquals ( " us - west - 1 " , snitch . getDatacenter ( local ) ) ; 
+ + assertEquals ( " us - west - 1a " , snitch . getRack ( local ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void validateDatacenter _ RequiresLegacy _ CorrectAmazonName ( ) 
+ + { 
+ + Set < String > datacenters = new HashSet < > ( ) ; 
+ + datacenters . add ( " us - east - 1 " ) ; 
+ + Assert . assertFalse ( Ec2Snitch . validate ( datacenters , Collections . emptySet ( ) , true ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void validateDatacenter _ RequiresLegacy _ LegacyName ( ) 
+ + { 
+ + Set < String > datacenters = new HashSet < > ( ) ; 
+ + datacenters . add ( " us - east " ) ; 
+ + Assert . assertTrue ( Ec2Snitch . validate ( datacenters , Collections . emptySet ( ) , true ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void validate _ RequiresLegacy _ HappyPath ( ) 
+ + { 
+ + Set < String > datacenters = new HashSet < > ( ) ; 
+ + datacenters . add ( " us - east " ) ; 
+ + Set < String > racks = new HashSet < > ( ) ; 
+ + racks . add ( " 1a " ) ; 
+ + Assert . assertTrue ( Ec2Snitch . validate ( datacenters , racks , true ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void validate _ RequiresLegacy _ HappyPathWithDCSuffix ( ) 
+ + { 
+ + Set < String > datacenters = new HashSet < > ( ) ; 
+ + datacenters . add ( " us - east _ CUSTOM _ SUFFIX " ) ; 
+ + Set < String > racks = new HashSet < > ( ) ; 
+ + racks . add ( " 1a " ) ; 
+ + Assert . assertTrue ( Ec2Snitch . validate ( datacenters , racks , true ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void validateRack _ RequiresAmazonName _ CorrectAmazonName ( ) 
+ + { 
+ + Set < String > racks = new HashSet < > ( ) ; 
+ + racks . add ( " us - east - 1a " ) ; 
+ + Assert . assertTrue ( Ec2Snitch . validate ( Collections . emptySet ( ) , racks , false ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void validateRack _ RequiresAmazonName _ LegacyName ( ) 
+ + { 
+ + Set < String > racks = new HashSet < > ( ) ; 
+ + racks . add ( " 1a " ) ; 
+ + Assert . assertFalse ( Ec2Snitch . validate ( Collections . emptySet ( ) , racks , false ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void validate _ RequiresAmazonName _ HappyPath ( ) 
+ + { 
+ + Set < String > datacenters = new HashSet < > ( ) ; 
+ + datacenters . add ( " us - east - 1 " ) ; 
+ + Set < String > racks = new HashSet < > ( ) ; 
+ + racks . add ( " us - east - 1a " ) ; 
+ + Assert . assertTrue ( Ec2Snitch . validate ( datacenters , racks , false ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void validate _ RequiresAmazonName _ HappyPathWithDCSuffix ( ) 
+ + { 
+ + Set < String > datacenters = new HashSet < > ( ) ; 
+ + datacenters . add ( " us - east - 1 _ CUSTOM _ SUFFIX " ) ; 
+ + Set < String > racks = new HashSet < > ( ) ; 
+ + racks . add ( " us - east - 1a " ) ; 
+ + Assert . assertTrue ( Ec2Snitch . validate ( datacenters , racks , false ) ) ; 
+ + } 
+ + 
+ @ AfterClass 
+ public static void tearDown ( ) 
+ {
+
+NEAREST DIFF:
+diff - - git a / conf / datacenters . properties b / conf / datacenters . properties 
+ new file mode 100644 
+ index 0000000 . . b186cb1 
+ - - - / dev / null 
+ + + + b / conf / datacenters . properties 
+ @ @ - 0 , 0 + 1 , 20 @ @ 
+ + # Licensed to the Apache Software Foundation ( ASF ) under one 
+ + # or more contributor license agreements . See the NOTICE file 
+ + # distributed with this work for additional information 
+ + # regarding copyright ownership . The ASF licenses this file 
+ + # to you under the Apache License , Version 2 . 0 ( the 
+ + # " License " ) ; you may not use this file except in compliance 
+ + # with the License . You may obtain a copy of the License at 
+ + # 
+ + # http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + # 
+ + # Unless required by applicable law or agreed to in writing , software 
+ + # distributed under the License is distributed on an " AS IS " BASIS , 
+ + # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + # See the License for the specific language governing permissions and 
+ + # limitations under the License . 
+ + 
+ + # datacenter = replication factor 
+ + dc1 = 3 
+ + dc2 = 5 
+ + dc3 = 1 
+ diff - - git a / src / java / org / apache / cassandra / locator / DatacenterEndpointSnitch . java b / src / java / org / apache / cassandra / locator / DatacenterEndpointSnitch . java 
+ deleted file mode 100644 
+ index 6e507cc . . 0000000 
+ - - - a / src / java / org / apache / cassandra / locator / DatacenterEndpointSnitch . java 
+ + + + / dev / null 
+ @ @ - 1 , 173 + 0 , 0 @ @ 
+ - package org . apache . cassandra . locator ; 
+ - / * 
+ - * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , 
+ - * software distributed under the License is distributed on an 
+ - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ - * KIND , either express or implied . See the License for the 
+ - * specific language governing permissions and limitations 
+ - * under the License . 
+ - * 
+ - * / 
+ - 
+ - 
+ - import java . io . IOException ; 
+ - import java . net . InetAddress ; 
+ - import java . net . UnknownHostException ; 
+ - import java . util . * ; 
+ - import javax . xml . parsers . ParserConfigurationException ; 
+ - 
+ - import org . slf4j . Logger ; 
+ - import org . slf4j . LoggerFactory ; 
+ - 
+ - import org . apache . cassandra . utils . XMLUtils ; 
+ - import org . xml . sax . SAXException ; 
+ - 
+ - / * * 
+ - * DataCenterEndpointSnitch 
+ - * < p / > 
+ - * This class basically reads the configuration and sets the IP Ranges to a 
+ - * hashMap which can be read later . this class also provides a way to compare 2 
+ - * Endpoints and also get details from the same . 
+ - * / 
+ - 
+ - public class DatacenterEndpointSnitch extends AbstractRackAwareSnitch 
+ - { 
+ - / * * 
+ - * This Map will contain the information of the Endpoints and its Location 
+ - * ( Datacenter and RAC ) 
+ - * / 
+ - private Map < Byte , Map < Byte , String > > ipDC = new HashMap < Byte , Map < Byte , String > > ( ) ; 
+ - private Map < Byte , Map < Byte , String > > ipRAC = new HashMap < Byte , Map < Byte , String > > ( ) ; 
+ - private Map < String , Integer > dcRepFactor = new HashMap < String , Integer > ( ) ; 
+ - 
+ - private XMLUtils xmlUtils ; 
+ - private Map < String , Integer > quorumDCMap = new HashMap < String , Integer > ( ) ; 
+ - / * * 
+ - * The default rack property file to be read . 
+ - * / 
+ - private static String DEFAULT _ RACK _ CONFIG _ FILE = " / etc / cassandra / DC - Config . xml " ; 
+ - 
+ - / * * 
+ - * Reference to the logger . 
+ - * / 
+ - private static Logger logger _ = LoggerFactory . getLogger ( DatacenterEndpointSnitch . class ) ; 
+ - 
+ - / * * 
+ - * Constructor , intialize XML config and read the config in . . . 
+ - * / 
+ - public DatacenterEndpointSnitch ( ) throws IOException , ParserConfigurationException , SAXException 
+ - { 
+ - xmlUtils = new XMLUtils ( DEFAULT _ RACK _ CONFIG _ FILE ) ; 
+ - reloadConfiguration ( ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Return the rack for which an endpoint resides in 
+ - * / 
+ - public String getRack ( InetAddress endpoint ) throws UnknownHostException 
+ - { 
+ - byte [ ] ip = getIPAddress ( endpoint . getHostAddress ( ) ) ; 
+ - return ipRAC . get ( ip [ 1 ] ) . get ( ip [ 2 ] ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Return the datacenter for which an endpoint resides in 
+ - * / 
+ - public String getDatacenter ( InetAddress endpoint ) throws UnknownHostException 
+ - { 
+ - byte [ ] ip = getIPAddress ( endpoint . getHostAddress ( ) ) ; 
+ - return ipDC . get ( ip [ 1 ] ) . get ( ip [ 2 ] ) ; 
+ - } 
+ - 
+ - / * * 
+ - * This method will load the configuration from the xml file . Mandatory 
+ - * fields are Atleast 1 DC and 1RAC configurations . Name of the DC / RAC , IP 
+ - * Quadrents for RAC and DC . 
+ - * < p / > 
+ - * This method will not be called everytime 
+ - * / 
+ - public void reloadConfiguration ( ) throws IOException 
+ - { 
+ - try 
+ - { 
+ - String [ ] dcNames = xmlUtils . getNodeValues ( " / Endpoints / DataCenter / name " ) ; 
+ - for ( String dcName : dcNames ) 
+ - { 
+ - / / Parse the Datacenter Quaderant . 
+ - String dcXPath = " / Endpoints / DataCenter [ name = ' " + dcName + " ' ] " ; 
+ - String dcIPQuad = xmlUtils . getNodeValue ( dcXPath + " / ip2ndQuad " ) ; 
+ - String replicationFactor = xmlUtils . getNodeValue ( dcXPath + " / replicationFactor " ) ; 
+ - byte dcByte = intToByte ( Integer . parseInt ( dcIPQuad ) ) ; 
+ - / / Parse the replication factor for a DC 
+ - int dcReF = Integer . parseInt ( replicationFactor ) ; 
+ - dcRepFactor . put ( dcName , dcReF ) ; 
+ - quorumDCMap . put ( dcName , ( dcReF / 2 + 1 ) ) ; 
+ - String [ ] racNames = xmlUtils . getNodeValues ( dcXPath + " / rack / name " ) ; 
+ - Map < Byte , String > dcRackMap = ipDC . get ( dcByte ) ; 
+ - if ( null = = dcRackMap ) 
+ - { 
+ - dcRackMap = new HashMap < Byte , String > ( ) ; 
+ - } 
+ - Map < Byte , String > rackDcMap = ipRAC . get ( dcByte ) ; 
+ - if ( null = = rackDcMap ) 
+ - { 
+ - rackDcMap = new HashMap < Byte , String > ( ) ; 
+ - } 
+ - for ( String racName : racNames ) 
+ - { 
+ - / / Parse the RAC ip Quaderant . 
+ - String racIPQuad = xmlUtils . getNodeValue ( dcXPath + " / rack [ name = ' " + racName + " ' ] / ip3rdQuad " ) ; 
+ - byte racByte = intToByte ( Integer . parseInt ( racIPQuad ) ) ; 
+ - dcRackMap . put ( racByte , dcName ) ; 
+ - rackDcMap . put ( racByte , racName ) ; 
+ - } 
+ - ipDC . put ( dcByte , dcRackMap ) ; 
+ - ipRAC . put ( dcByte , rackDcMap ) ; 
+ - } 
+ - } 
+ - catch ( Exception ioe ) 
+ - { 
+ - throw new IOException ( " Could not process " + DEFAULT _ RACK _ CONFIG _ FILE , ioe ) ; 
+ - } 
+ - } 
+ - 
+ - / * * 
+ - * Returns a DC replication map , the key will be the dc name and the value 
+ - * will be the replication factor of that Datacenter . 
+ - * / 
+ - public HashMap < String , Integer > getMapReplicationFactor ( ) 
+ - { 
+ - return new HashMap < String , Integer > ( dcRepFactor ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Returns a DC replication map , the key will be the dc name and the value 
+ - * will be the replication factor of that Datacenter . 
+ - * / 
+ - public HashMap < String , Integer > getMapQuorumFactor ( ) 
+ - { 
+ - return new HashMap < String , Integer > ( quorumDCMap ) ; 
+ - } 
+ - 
+ - private byte [ ] getIPAddress ( String host ) throws UnknownHostException 
+ - { 
+ - InetAddress ia = InetAddress . getByName ( host ) ; 
+ - return ia . getAddress ( ) ; 
+ - } 
+ - 
+ - public static byte intToByte ( int n ) 
+ - { 
+ - return ( byte ) ( n & 0x000000ff ) ; 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / locator / DatacenterShardStrategy . java b / src / java / org / apache / cassandra / locator / DatacenterShardStrategy . java 
+ index 8f1009a . . 321f45b 100644 
+ - - - a / src / java / org / apache / cassandra / locator / DatacenterShardStrategy . java 
+ + + + b / src / java / org / apache / cassandra / locator / DatacenterShardStrategy . java 
+ @ @ - 21 , 13 + 21 , 16 @ @ package org . apache . cassandra . locator ; 
+ * / 
+ 
+ 
+ + import java . io . FileReader ; 
+ import java . io . IOException ; 
+ import java . io . IOError ; 
+ import java . net . InetAddress ; 
+ + import java . net . URL ; 
+ import java . net . UnknownHostException ; 
+ import java . util . * ; 
+ import java . util . Map . Entry ; 
+ 
+ + import org . apache . cassandra . config . ConfigurationException ; 
+ import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . service . * ; 
+ import org . apache . cassandra . thrift . ConsistencyLevel ; 
+ @ @ - 50 , 6 + 53 , 7 @ @ public class DatacenterShardStrategy extends AbstractReplicationStrategy 
+ ArrayList < Token > tokens ; 
+ 
+ private List < InetAddress > localEndpoints = new ArrayList < InetAddress > ( ) ; 
+ + private static final String DATACENTER _ PROPERTIES _ FILENAME = " datacenters . properties " ; 
+ 
+ private List < InetAddress > getLocalEndpoints ( ) 
+ { 
+ @ @ - 65 , 15 + 69 , 15 @ @ public class DatacenterShardStrategy extends AbstractReplicationStrategy 
+ * This Method will get the required information of the Endpoint from the 
+ * DataCenterEndpointSnitch and poopulates this singleton class . 
+ * / 
+ - private synchronized void loadEndpoints ( TokenMetadata metadata ) throws IOException 
+ + private synchronized void loadEndpoints ( TokenMetadata metadata ) throws UnknownHostException 
+ { 
+ this . tokens = new ArrayList < Token > ( metadata . sortedTokens ( ) ) ; 
+ - String localDC = ( ( DatacenterEndpointSnitch ) snitch _ ) . getDatacenter ( InetAddress . getLocalHost ( ) ) ; 
+ + String localDC = ( ( AbstractRackAwareSnitch ) snitch _ ) . getDatacenter ( InetAddress . getLocalHost ( ) ) ; 
+ dcMap = new HashMap < String , List < Token > > ( ) ; 
+ for ( Token token : this . tokens ) 
+ { 
+ InetAddress endpoint = metadata . getEndpoint ( token ) ; 
+ - String dataCenter = ( ( DatacenterEndpointSnitch ) snitch _ ) . getDatacenter ( endpoint ) ; 
+ + String dataCenter = ( ( AbstractRackAwareSnitch ) snitch _ ) . getDatacenter ( endpoint ) ; 
+ if ( dataCenter . equals ( localDC ) ) 
+ { 
+ localEndpoints . add ( endpoint ) ; 
+ @ @ - 92 , 7 + 96 , 6 @ @ public class DatacenterShardStrategy extends AbstractReplicationStrategy 
+ Collections . sort ( valueList ) ; 
+ dcMap . put ( entry . getKey ( ) , valueList ) ; 
+ } 
+ - dcReplicationFactor = ( ( DatacenterEndpointSnitch ) snitch _ ) . getMapReplicationFactor ( ) ; 
+ for ( Entry < String , Integer > entry : dcReplicationFactor . entrySet ( ) ) 
+ { 
+ String datacenter = entry . getKey ( ) ; 
+ @ @ - 105 , 13 + 108 , 33 @ @ public class DatacenterShardStrategy extends AbstractReplicationStrategy 
+ } 
+ } 
+ 
+ - public DatacenterShardStrategy ( TokenMetadata tokenMetadata , IEndpointSnitch snitch ) 
+ - throws UnknownHostException 
+ + public DatacenterShardStrategy ( TokenMetadata tokenMetadata , IEndpointSnitch snitch ) throws ConfigurationException 
+ { 
+ super ( tokenMetadata , snitch ) ; 
+ - if ( ( ! ( snitch instanceof DatacenterEndpointSnitch ) ) ) 
+ + if ( ! ( snitch instanceof AbstractRackAwareSnitch ) ) 
+ { 
+ - throw new IllegalArgumentException ( " DatacenterShardStrategy requires DatacenterEndpointSnitch " ) ; 
+ + throw new IllegalArgumentException ( " DatacenterShardStrategy requires a rack - aware endpointsnitch " ) ; 
+ + } 
+ + 
+ + / / load replication factors for each DC 
+ + ClassLoader loader = PropertyFileSnitch . class . getClassLoader ( ) ; 
+ + URL scpurl = loader . getResource ( DATACENTER _ PROPERTIES _ FILENAME ) ; 
+ + if ( scpurl = = null ) 
+ + throw new ConfigurationException ( " unable to locate " + DATACENTER _ PROPERTIES _ FILENAME ) ; 
+ + 
+ + String rackPropertyFilename = scpurl . getFile ( ) ; 
+ + try 
+ + { 
+ + Properties p = new Properties ( ) ; 
+ + p . load ( new FileReader ( rackPropertyFilename ) ) ; 
+ + for ( Entry < Object , Object > entry : p . entrySet ( ) ) 
+ + { 
+ + dcReplicationFactor . put ( ( String ) entry . getKey ( ) , Integer . valueOf ( ( String ) entry . getValue ( ) ) ) ; 
+ + } 
+ + } 
+ + catch ( IOException ioe ) 
+ + { 
+ + throw new ConfigurationException ( " Could not process " + rackPropertyFilename , ioe ) ; 
+ } 
+ } 
+ 
+ @ @ - 224 , 4 + 247 , 9 @ @ public class DatacenterShardStrategy extends AbstractReplicationStrategy 
+ } 
+ return super . getWriteResponseHandler ( blockFor , consistency _ level , table ) ; 
+ } 
+ + 
+ + int getReplicationFactor ( String datacenter ) 
+ + { 
+ + return dcReplicationFactor . get ( datacenter ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / DatacenterSyncWriteResponseHandler . java b / src / java / org / apache / cassandra / service / DatacenterSyncWriteResponseHandler . java 
+ index cc11877 . . 44c5a5a 100644 
+ - - - a / src / java / org / apache / cassandra / service / DatacenterSyncWriteResponseHandler . java 
+ + + + b / src / java / org / apache / cassandra / service / DatacenterSyncWriteResponseHandler . java 
+ @ @ - 29 , 7 + 29 , 7 @ @ import java . util . HashMap ; 
+ import java . util . Map ; 
+ 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - import org . apache . cassandra . locator . DatacenterEndpointSnitch ; 
+ + import org . apache . cassandra . locator . AbstractRackAwareSnitch ; 
+ import org . apache . cassandra . net . Message ; 
+ 
+ / * * 
+ @ @ - 41 , 14 + 41 , 14 @ @ public class DatacenterSyncWriteResponseHandler extends WriteResponseHandler 
+ { 
+ private final Map < String , Integer > dcResponses = new HashMap < String , Integer > ( ) ; 
+ private final Map < String , Integer > responseCounts ; 
+ - private final DatacenterEndpointSnitch endpointSnitch ; 
+ + private final AbstractRackAwareSnitch endpointSnitch ; 
+ 
+ public DatacenterSyncWriteResponseHandler ( Map < String , Integer > responseCounts , String table ) 
+ { 
+ / / Response is been managed by the map so make it 1 for the superclass . 
+ super ( 1 , table ) ; 
+ this . responseCounts = responseCounts ; 
+ - endpointSnitch = ( DatacenterEndpointSnitch ) DatabaseDescriptor . getEndpointSnitch ( ) ; 
+ + endpointSnitch = ( AbstractRackAwareSnitch ) DatabaseDescriptor . getEndpointSnitch ( ) ; 
+ } 
+ 
+ @ Override 
+ diff - - git a / src / java / org / apache / cassandra / service / DatacenterWriteResponseHandler . java b / src / java / org / apache / cassandra / service / DatacenterWriteResponseHandler . java 
+ index 8fb7749 . . 3256483 100644 
+ - - - a / src / java / org / apache / cassandra / service / DatacenterWriteResponseHandler . java 
+ + + + b / src / java / org / apache / cassandra / service / DatacenterWriteResponseHandler . java 
+ @ @ - 29 , 7 + 29 , 7 @ @ import java . net . UnknownHostException ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - import org . apache . cassandra . locator . DatacenterEndpointSnitch ; 
+ + import org . apache . cassandra . locator . AbstractRackAwareSnitch ; 
+ import org . apache . cassandra . net . Message ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ @ @ - 41 , 7 + 41 , 7 @ @ import org . apache . cassandra . utils . FBUtilities ; 
+ public class DatacenterWriteResponseHandler extends WriteResponseHandler 
+ { 
+ private final AtomicInteger blockFor ; 
+ - private final DatacenterEndpointSnitch endpointsnitch ; 
+ + private final AbstractRackAwareSnitch endpointsnitch ; 
+ private final InetAddress localEndpoint ; 
+ 
+ public DatacenterWriteResponseHandler ( int blockFor , String table ) 
+ @ @ - 49 , 7 + 49 , 7 @ @ public class DatacenterWriteResponseHandler extends WriteResponseHandler 
+ / / Response is been managed by the map so the waitlist size really doesnt matter . 
+ super ( blockFor , table ) ; 
+ this . blockFor = new AtomicInteger ( blockFor ) ; 
+ - endpointsnitch = ( DatacenterEndpointSnitch ) DatabaseDescriptor . getEndpointSnitch ( ) ; 
+ + endpointsnitch = ( AbstractRackAwareSnitch ) DatabaseDescriptor . getEndpointSnitch ( ) ; 
+ localEndpoint = FBUtilities . getLocalAddress ( ) ; 
+ } 
+ 
+ diff - - git a / test / conf / datacenters . properties b / test / conf / datacenters . properties 
+ new file mode 100644 
+ index 0000000 . . b186cb1 
+ - - - / dev / null 
+ + + + b / test / conf / datacenters . properties 
+ @ @ - 0 , 0 + 1 , 20 @ @ 
+ + # Licensed to the Apache Software Foundation ( ASF ) under one 
+ + # or more contributor license agreements . See the NOTICE file 
+ + # distributed with this work for additional information 
+ + # regarding copyright ownership . The ASF licenses this file 
+ + # to you under the Apache License , Version 2 . 0 ( the 
+ + # " License " ) ; you may not use this file except in compliance 
+ + # with the License . You may obtain a copy of the License at 
+ + # 
+ + # http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + # 
+ + # Unless required by applicable law or agreed to in writing , software 
+ + # distributed under the License is distributed on an " AS IS " BASIS , 
+ + # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + # See the License for the specific language governing permissions and 
+ + # limitations under the License . 
+ + 
+ + # datacenter = replication factor 
+ + dc1 = 3 
+ + dc2 = 5 
+ + dc3 = 1 
+ diff - - git a / test / unit / org / apache / cassandra / locator / DatacenterStrategyTest . java b / test / unit / org / apache / cassandra / locator / DatacenterStrategyTest . java 
+ new file mode 100644 
+ index 0000000 . . c53c2f6 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / locator / DatacenterStrategyTest . java 
+ @ @ - 0 , 0 + 1 , 18 @ @ 
+ + package org . apache . cassandra . locator ; 
+ + 
+ + import org . junit . Test ; 
+ + 
+ + import org . apache . cassandra . config . ConfigurationException ; 
+ + 
+ + public class DatacenterStrategyTest 
+ + { 
+ + @ Test 
+ + public void testProperties ( ) throws ConfigurationException 
+ + { 
+ + DatacenterShardStrategy strategy = new DatacenterShardStrategy ( new TokenMetadata ( ) , new RackInferringSnitch ( ) ) ; 
+ + assert strategy . getReplicationFactor ( " dc1 " ) = = 3 ; 
+ + assert strategy . getReplicationFactor ( " dc2 " ) = = 5 ; 
+ + assert strategy . getReplicationFactor ( " dc3 " ) = = 1 ; 
+ + } 
+ + 
+ + }

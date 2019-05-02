@@ -1,0 +1,235 @@
+BLEU SCORE: 0.03635358866852297
+
+TEST MSG: Split materialized view mutations on build to prevent OOM
+GENERATED MSG: Fix AssertionError while flushing memtable due to materialized views incorrectly inserting empty rows
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index d797288 . . 13800da 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 10 <nl> + * Split materialized view mutations on build to prevent OOM ( CASSANDRA - 12268 ) <nl> * mx4j does not work in 3 . 0 . 8 ( CASSANDRA - 12274 ) <nl> * Abort cqlsh copy - from in case of no answer after prolonged period of time ( CASSANDRA - 12740 ) <nl> * Avoid sstable corrupt exception due to dropped static column ( CASSANDRA - 12582 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / view / TableViews . java b / src / java / org / apache / cassandra / db / view / TableViews . java <nl> index 7feb67c . . 1a3cbb1 100644 <nl> - - - a / src / java / org / apache / cassandra / db / view / TableViews . java <nl> + + + b / src / java / org / apache / cassandra / db / view / TableViews . java <nl> @ @ - 46 , 7 + 46 , 8 @ @ public class TableViews extends AbstractCollection < View > <nl> private final CFMetaData baseTableMetadata ; <nl> <nl> / / We need this to be thread - safe , but the number of times this is changed ( when a view is created in the keyspace ) <nl> - / / massively exceeds the number of time it ' s read ( for every mutation on the keyspace ) , so a copy - on - write list is the best option . <nl> + / / is massively exceeded by the number of times it ' s read ( for every mutation on the keyspace ) , so a copy - on - write <nl> + / / list is the best option . <nl> private final List < View > views = new CopyOnWriteArrayList ( ) ; <nl> <nl> public TableViews ( CFMetaData baseTableMetadata ) <nl> @ @ - 137 , 7 + 138 , 7 @ @ public class TableViews extends AbstractCollection < View > <nl> UnfilteredRowIterator existings = UnfilteredPartitionIterators . getOnlyElement ( command . executeLocally ( orderGroup ) , command ) ; <nl> UnfilteredRowIterator updates = update . unfilteredIterator ( ) ) <nl> { <nl> - mutations = generateViewUpdates ( views , updates , existings , nowInSec ) ; <nl> + mutations = Iterators . getOnlyElement ( generateViewUpdates ( views , updates , existings , nowInSec , false ) ) ; <nl> } <nl> Keyspace . openAndGetStore ( update . metadata ( ) ) . metric . viewReadTime . update ( System . nanoTime ( ) - start , TimeUnit . NANOSECONDS ) ; <nl> <nl> @ @ - 145 , 6 + 146 , 7 @ @ public class TableViews extends AbstractCollection < View > <nl> StorageProxy . mutateMV ( update . partitionKey ( ) . getKey ( ) , mutations , writeCommitLog , baseComplete ) ; <nl> } <nl> <nl> + <nl> / * * <nl> * Given some updates on the base table of this object and the existing values for the rows affected by that update , generates the <nl> * mutation to be applied to the provided views . <nl> @ @ - 159 , 7 + 161 , 11 @ @ public class TableViews extends AbstractCollection < View > <nl> * @ param nowInSec the current time in seconds . <nl> * @ return the mutations to apply to the { @ code views } . This can be empty . <nl> * / <nl> - public Collection < Mutation > generateViewUpdates ( Collection < View > views , UnfilteredRowIterator updates , UnfilteredRowIterator existings , int nowInSec ) <nl> + public Iterator < Collection < Mutation > > generateViewUpdates ( Collection < View > views , <nl> + UnfilteredRowIterator updates , <nl> + UnfilteredRowIterator existings , <nl> + int nowInSec , <nl> + boolean separateUpdates ) <nl> { <nl> assert updates . metadata ( ) . cfId . equals ( baseTableMetadata . cfId ) ; <nl> <nl> @ @ - 251 , 18 + 257 , 75 @ @ public class TableViews extends AbstractCollection < View > <nl> addToViewUpdateGenerators ( existingRow , emptyRow ( existingRow . clustering ( ) , updatesDeletion . currentDeletion ( ) ) , generators , nowInSec ) ; <nl> } <nl> } <nl> - while ( updatesIter . hasNext ( ) ) <nl> + <nl> + if ( separateUpdates ) <nl> { <nl> - Unfiltered update = updatesIter . next ( ) ; <nl> - / / If it ' s a range tombstone , it removes nothing pre - exisiting , so we can ignore it for view updates <nl> - if ( update . isRangeTombstoneMarker ( ) ) <nl> - continue ; <nl> + final Collection < Mutation > firstBuild = buildMutations ( baseTableMetadata , generators ) ; <nl> + <nl> + return new Iterator < Collection < Mutation > > ( ) <nl> + { <nl> + / / If the previous values are already empty , this update must be either empty or exclusively appending . <nl> + / / In the case we are exclusively appending , we need to drop the build that was passed in and try to build a <nl> + / / new first update instead . <nl> + / / If there are no other updates , next will be null and the iterator will be empty . <nl> + Collection < Mutation > next = firstBuild . isEmpty ( ) <nl> + ? buildNext ( ) <nl> + : firstBuild ; <nl> + <nl> + private Collection < Mutation > buildNext ( ) <nl> + { <nl> + while ( updatesIter . hasNext ( ) ) <nl> + { <nl> + Unfiltered update = updatesIter . next ( ) ; <nl> + / / If it ' s a range tombstone , it removes nothing pre - exisiting , so we can ignore it for view updates <nl> + if ( update . isRangeTombstoneMarker ( ) ) <nl> + continue ; <nl> + <nl> + Row updateRow = ( Row ) update ; <nl> + addToViewUpdateGenerators ( emptyRow ( updateRow . clustering ( ) , DeletionTime . LIVE ) , updateRow , generators , nowInSec ) ; <nl> + <nl> + / / If the updates have been filtered , then we won ' t have any mutations ; we need to make sure that we <nl> + / / only return if the mutations are empty . Otherwise , we continue to search for an update which is <nl> + / / not filtered <nl> + Collection < Mutation > mutations = buildMutations ( baseTableMetadata , generators ) ; <nl> + if ( ! mutations . isEmpty ( ) ) <nl> + return mutations ; <nl> + } <nl> + <nl> + return null ; <nl> + } <nl> + <nl> + public boolean hasNext ( ) <nl> + { <nl> + return next ! = null ; <nl> + } <nl> + <nl> + public Collection < Mutation > next ( ) <nl> + { <nl> + Collection < Mutation > mutations = next ; <nl> + <nl> + next = buildNext ( ) ; <nl> <nl> - Row updateRow = ( Row ) update ; <nl> - addToViewUpdateGenerators ( emptyRow ( updateRow . clustering ( ) , DeletionTime . LIVE ) , updateRow , generators , nowInSec ) ; <nl> + assert ! mutations . isEmpty ( ) : " Expected mutations to be non - empty " ; <nl> + return mutations ; <nl> + } <nl> + } ; <nl> } <nl> + else <nl> + { <nl> + while ( updatesIter . hasNext ( ) ) <nl> + { <nl> + Unfiltered update = updatesIter . next ( ) ; <nl> + / / If it ' s a range tombstone , it removes nothing pre - exisiting , so we can ignore it for view updates <nl> + if ( update . isRangeTombstoneMarker ( ) ) <nl> + continue ; <nl> + <nl> + Row updateRow = ( Row ) update ; <nl> + addToViewUpdateGenerators ( emptyRow ( updateRow . clustering ( ) , DeletionTime . LIVE ) , updateRow , generators , nowInSec ) ; <nl> + } <nl> <nl> - return buildMutations ( baseTableMetadata , generators ) ; <nl> + return Iterators . singletonIterator ( buildMutations ( baseTableMetadata , generators ) ) ; <nl> + } <nl> } <nl> <nl> / * * <nl> @ @ - 425 , 10 + 488 , 13 @ @ public class TableViews extends AbstractCollection < View > <nl> / / One view is probably common enough and we can optimize a bit easily <nl> if ( generators . size ( ) = = 1 ) <nl> { <nl> - Collection < PartitionUpdate > updates = generators . get ( 0 ) . generateViewUpdates ( ) ; <nl> + ViewUpdateGenerator generator = generators . get ( 0 ) ; <nl> + Collection < PartitionUpdate > updates = generator . generateViewUpdates ( ) ; <nl> List < Mutation > mutations = new ArrayList < > ( updates . size ( ) ) ; <nl> for ( PartitionUpdate update : updates ) <nl> mutations . add ( new Mutation ( update ) ) ; <nl> + <nl> + generator . clear ( ) ; <nl> return mutations ; <nl> } <nl> <nl> @ @ - 446 , 6 + 512 , 7 @ @ public class TableViews extends AbstractCollection < View > <nl> } <nl> mutation . add ( update ) ; <nl> } <nl> + generator . clear ( ) ; <nl> } <nl> return mutations . values ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / view / ViewBuilder . java b / src / java / org / apache / cassandra / db / view / ViewBuilder . java <nl> index b55eda0 . . 37c0e7b 100644 <nl> - - - a / src / java / org / apache / cassandra / db / view / ViewBuilder . java <nl> + + + b / src / java / org / apache / cassandra / db / view / ViewBuilder . java <nl> @ @ - 20 , 6 + 20 , 7 @ @ package org . apache . cassandra . db . view ; <nl> <nl> import java . util . Collection ; <nl> import java . util . Collections ; <nl> + import java . util . Iterator ; <nl> import java . util . UUID ; <nl> import java . util . concurrent . TimeUnit ; <nl> import java . util . concurrent . atomic . AtomicLong ; <nl> @ @ - 83 , 15 + 84 , 15 @ @ public class ViewBuilder extends CompactionInfo . Holder <nl> / / and pretend that there is nothing pre - existing . <nl> UnfilteredRowIterator empty = UnfilteredRowIterators . noRowsIterator ( baseCfs . metadata , key , Rows . EMPTY _ STATIC _ ROW , DeletionTime . LIVE , false ) ; <nl> <nl> - Collection < Mutation > mutations ; <nl> try ( ReadOrderGroup orderGroup = command . startOrderGroup ( ) ; <nl> UnfilteredRowIterator data = UnfilteredPartitionIterators . getOnlyElement ( command . executeLocally ( orderGroup ) , command ) ) <nl> { <nl> - mutations = baseCfs . keyspace . viewManager . forTable ( baseCfs . metadata ) . generateViewUpdates ( Collections . singleton ( view ) , data , empty , nowInSec ) ; <nl> - } <nl> + Iterator < Collection < Mutation > > mutations = baseCfs . keyspace . viewManager <nl> + . forTable ( baseCfs . metadata ) <nl> + . generateViewUpdates ( Collections . singleton ( view ) , data , empty , nowInSec , true ) ; <nl> <nl> - if ( ! mutations . isEmpty ( ) ) <nl> - StorageProxy . mutateMV ( key . getKey ( ) , mutations , true , noBase ) ; <nl> + mutations . forEachRemaining ( m - > StorageProxy . mutateMV ( key . getKey ( ) , m , true , noBase ) ) ; <nl> + } <nl> } <nl> <nl> public void run ( ) <nl> @ @ - 166 , 8 + 167 , 7 @ @ public class ViewBuilder extends CompactionInfo . Holder <nl> } <nl> <nl> if ( ! isStopped ) <nl> - SystemKeyspace . finishViewBuildStatus ( ksname , viewName ) ; <nl> - <nl> + SystemKeyspace . finishViewBuildStatus ( ksname , viewName ) ; <nl> } <nl> catch ( Exception e ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / db / view / ViewUpdateGenerator . java b / src / java / org / apache / cassandra / db / view / ViewUpdateGenerator . java <nl> index 3bdc380 . . edb88d0 100644 <nl> - - - a / src / java / org / apache / cassandra / db / view / ViewUpdateGenerator . java <nl> + + + b / src / java / org / apache / cassandra / db / view / ViewUpdateGenerator . java <nl> @ @ - 145 , 6 + 145 , 14 @ @ public class ViewUpdateGenerator <nl> } <nl> <nl> / * * <nl> + * Clears the current state so that the generator may be reused . <nl> + * / <nl> + public void clear ( ) <nl> + { <nl> + updates . clear ( ) ; <nl> + } <nl> + <nl> + / * * <nl> * Compute which type of action needs to be performed to the view for a base table row <nl> * before and after an update . <nl> * /
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index d797288 . . 13800da 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 10 
+ + * Split materialized view mutations on build to prevent OOM ( CASSANDRA - 12268 ) 
+ * mx4j does not work in 3 . 0 . 8 ( CASSANDRA - 12274 ) 
+ * Abort cqlsh copy - from in case of no answer after prolonged period of time ( CASSANDRA - 12740 ) 
+ * Avoid sstable corrupt exception due to dropped static column ( CASSANDRA - 12582 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / view / TableViews . java b / src / java / org / apache / cassandra / db / view / TableViews . java 
+ index 7feb67c . . 1a3cbb1 100644 
+ - - - a / src / java / org / apache / cassandra / db / view / TableViews . java 
+ + + + b / src / java / org / apache / cassandra / db / view / TableViews . java 
+ @ @ - 46 , 7 + 46 , 8 @ @ public class TableViews extends AbstractCollection < View > 
+ private final CFMetaData baseTableMetadata ; 
+ 
+ / / We need this to be thread - safe , but the number of times this is changed ( when a view is created in the keyspace ) 
+ - / / massively exceeds the number of time it ' s read ( for every mutation on the keyspace ) , so a copy - on - write list is the best option . 
+ + / / is massively exceeded by the number of times it ' s read ( for every mutation on the keyspace ) , so a copy - on - write 
+ + / / list is the best option . 
+ private final List < View > views = new CopyOnWriteArrayList ( ) ; 
+ 
+ public TableViews ( CFMetaData baseTableMetadata ) 
+ @ @ - 137 , 7 + 138 , 7 @ @ public class TableViews extends AbstractCollection < View > 
+ UnfilteredRowIterator existings = UnfilteredPartitionIterators . getOnlyElement ( command . executeLocally ( orderGroup ) , command ) ; 
+ UnfilteredRowIterator updates = update . unfilteredIterator ( ) ) 
+ { 
+ - mutations = generateViewUpdates ( views , updates , existings , nowInSec ) ; 
+ + mutations = Iterators . getOnlyElement ( generateViewUpdates ( views , updates , existings , nowInSec , false ) ) ; 
+ } 
+ Keyspace . openAndGetStore ( update . metadata ( ) ) . metric . viewReadTime . update ( System . nanoTime ( ) - start , TimeUnit . NANOSECONDS ) ; 
+ 
+ @ @ - 145 , 6 + 146 , 7 @ @ public class TableViews extends AbstractCollection < View > 
+ StorageProxy . mutateMV ( update . partitionKey ( ) . getKey ( ) , mutations , writeCommitLog , baseComplete ) ; 
+ } 
+ 
+ + 
+ / * * 
+ * Given some updates on the base table of this object and the existing values for the rows affected by that update , generates the 
+ * mutation to be applied to the provided views . 
+ @ @ - 159 , 7 + 161 , 11 @ @ public class TableViews extends AbstractCollection < View > 
+ * @ param nowInSec the current time in seconds . 
+ * @ return the mutations to apply to the { @ code views } . This can be empty . 
+ * / 
+ - public Collection < Mutation > generateViewUpdates ( Collection < View > views , UnfilteredRowIterator updates , UnfilteredRowIterator existings , int nowInSec ) 
+ + public Iterator < Collection < Mutation > > generateViewUpdates ( Collection < View > views , 
+ + UnfilteredRowIterator updates , 
+ + UnfilteredRowIterator existings , 
+ + int nowInSec , 
+ + boolean separateUpdates ) 
+ { 
+ assert updates . metadata ( ) . cfId . equals ( baseTableMetadata . cfId ) ; 
+ 
+ @ @ - 251 , 18 + 257 , 75 @ @ public class TableViews extends AbstractCollection < View > 
+ addToViewUpdateGenerators ( existingRow , emptyRow ( existingRow . clustering ( ) , updatesDeletion . currentDeletion ( ) ) , generators , nowInSec ) ; 
+ } 
+ } 
+ - while ( updatesIter . hasNext ( ) ) 
+ + 
+ + if ( separateUpdates ) 
+ { 
+ - Unfiltered update = updatesIter . next ( ) ; 
+ - / / If it ' s a range tombstone , it removes nothing pre - exisiting , so we can ignore it for view updates 
+ - if ( update . isRangeTombstoneMarker ( ) ) 
+ - continue ; 
+ + final Collection < Mutation > firstBuild = buildMutations ( baseTableMetadata , generators ) ; 
+ + 
+ + return new Iterator < Collection < Mutation > > ( ) 
+ + { 
+ + / / If the previous values are already empty , this update must be either empty or exclusively appending . 
+ + / / In the case we are exclusively appending , we need to drop the build that was passed in and try to build a 
+ + / / new first update instead . 
+ + / / If there are no other updates , next will be null and the iterator will be empty . 
+ + Collection < Mutation > next = firstBuild . isEmpty ( ) 
+ + ? buildNext ( ) 
+ + : firstBuild ; 
+ + 
+ + private Collection < Mutation > buildNext ( ) 
+ + { 
+ + while ( updatesIter . hasNext ( ) ) 
+ + { 
+ + Unfiltered update = updatesIter . next ( ) ; 
+ + / / If it ' s a range tombstone , it removes nothing pre - exisiting , so we can ignore it for view updates 
+ + if ( update . isRangeTombstoneMarker ( ) ) 
+ + continue ; 
+ + 
+ + Row updateRow = ( Row ) update ; 
+ + addToViewUpdateGenerators ( emptyRow ( updateRow . clustering ( ) , DeletionTime . LIVE ) , updateRow , generators , nowInSec ) ; 
+ + 
+ + / / If the updates have been filtered , then we won ' t have any mutations ; we need to make sure that we 
+ + / / only return if the mutations are empty . Otherwise , we continue to search for an update which is 
+ + / / not filtered 
+ + Collection < Mutation > mutations = buildMutations ( baseTableMetadata , generators ) ; 
+ + if ( ! mutations . isEmpty ( ) ) 
+ + return mutations ; 
+ + } 
+ + 
+ + return null ; 
+ + } 
+ + 
+ + public boolean hasNext ( ) 
+ + { 
+ + return next ! = null ; 
+ + } 
+ + 
+ + public Collection < Mutation > next ( ) 
+ + { 
+ + Collection < Mutation > mutations = next ; 
+ + 
+ + next = buildNext ( ) ; 
+ 
+ - Row updateRow = ( Row ) update ; 
+ - addToViewUpdateGenerators ( emptyRow ( updateRow . clustering ( ) , DeletionTime . LIVE ) , updateRow , generators , nowInSec ) ; 
+ + assert ! mutations . isEmpty ( ) : " Expected mutations to be non - empty " ; 
+ + return mutations ; 
+ + } 
+ + } ; 
+ } 
+ + else 
+ + { 
+ + while ( updatesIter . hasNext ( ) ) 
+ + { 
+ + Unfiltered update = updatesIter . next ( ) ; 
+ + / / If it ' s a range tombstone , it removes nothing pre - exisiting , so we can ignore it for view updates 
+ + if ( update . isRangeTombstoneMarker ( ) ) 
+ + continue ; 
+ + 
+ + Row updateRow = ( Row ) update ; 
+ + addToViewUpdateGenerators ( emptyRow ( updateRow . clustering ( ) , DeletionTime . LIVE ) , updateRow , generators , nowInSec ) ; 
+ + } 
+ 
+ - return buildMutations ( baseTableMetadata , generators ) ; 
+ + return Iterators . singletonIterator ( buildMutations ( baseTableMetadata , generators ) ) ; 
+ + } 
+ } 
+ 
+ / * * 
+ @ @ - 425 , 10 + 488 , 13 @ @ public class TableViews extends AbstractCollection < View > 
+ / / One view is probably common enough and we can optimize a bit easily 
+ if ( generators . size ( ) = = 1 ) 
+ { 
+ - Collection < PartitionUpdate > updates = generators . get ( 0 ) . generateViewUpdates ( ) ; 
+ + ViewUpdateGenerator generator = generators . get ( 0 ) ; 
+ + Collection < PartitionUpdate > updates = generator . generateViewUpdates ( ) ; 
+ List < Mutation > mutations = new ArrayList < > ( updates . size ( ) ) ; 
+ for ( PartitionUpdate update : updates ) 
+ mutations . add ( new Mutation ( update ) ) ; 
+ + 
+ + generator . clear ( ) ; 
+ return mutations ; 
+ } 
+ 
+ @ @ - 446 , 6 + 512 , 7 @ @ public class TableViews extends AbstractCollection < View > 
+ } 
+ mutation . add ( update ) ; 
+ } 
+ + generator . clear ( ) ; 
+ } 
+ return mutations . values ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / view / ViewBuilder . java b / src / java / org / apache / cassandra / db / view / ViewBuilder . java 
+ index b55eda0 . . 37c0e7b 100644 
+ - - - a / src / java / org / apache / cassandra / db / view / ViewBuilder . java 
+ + + + b / src / java / org / apache / cassandra / db / view / ViewBuilder . java 
+ @ @ - 20 , 6 + 20 , 7 @ @ package org . apache . cassandra . db . view ; 
+ 
+ import java . util . Collection ; 
+ import java . util . Collections ; 
+ + import java . util . Iterator ; 
+ import java . util . UUID ; 
+ import java . util . concurrent . TimeUnit ; 
+ import java . util . concurrent . atomic . AtomicLong ; 
+ @ @ - 83 , 15 + 84 , 15 @ @ public class ViewBuilder extends CompactionInfo . Holder 
+ / / and pretend that there is nothing pre - existing . 
+ UnfilteredRowIterator empty = UnfilteredRowIterators . noRowsIterator ( baseCfs . metadata , key , Rows . EMPTY _ STATIC _ ROW , DeletionTime . LIVE , false ) ; 
+ 
+ - Collection < Mutation > mutations ; 
+ try ( ReadOrderGroup orderGroup = command . startOrderGroup ( ) ; 
+ UnfilteredRowIterator data = UnfilteredPartitionIterators . getOnlyElement ( command . executeLocally ( orderGroup ) , command ) ) 
+ { 
+ - mutations = baseCfs . keyspace . viewManager . forTable ( baseCfs . metadata ) . generateViewUpdates ( Collections . singleton ( view ) , data , empty , nowInSec ) ; 
+ - } 
+ + Iterator < Collection < Mutation > > mutations = baseCfs . keyspace . viewManager 
+ + . forTable ( baseCfs . metadata ) 
+ + . generateViewUpdates ( Collections . singleton ( view ) , data , empty , nowInSec , true ) ; 
+ 
+ - if ( ! mutations . isEmpty ( ) ) 
+ - StorageProxy . mutateMV ( key . getKey ( ) , mutations , true , noBase ) ; 
+ + mutations . forEachRemaining ( m - > StorageProxy . mutateMV ( key . getKey ( ) , m , true , noBase ) ) ; 
+ + } 
+ } 
+ 
+ public void run ( ) 
+ @ @ - 166 , 8 + 167 , 7 @ @ public class ViewBuilder extends CompactionInfo . Holder 
+ } 
+ 
+ if ( ! isStopped ) 
+ - SystemKeyspace . finishViewBuildStatus ( ksname , viewName ) ; 
+ - 
+ + SystemKeyspace . finishViewBuildStatus ( ksname , viewName ) ; 
+ } 
+ catch ( Exception e ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / db / view / ViewUpdateGenerator . java b / src / java / org / apache / cassandra / db / view / ViewUpdateGenerator . java 
+ index 3bdc380 . . edb88d0 100644 
+ - - - a / src / java / org / apache / cassandra / db / view / ViewUpdateGenerator . java 
+ + + + b / src / java / org / apache / cassandra / db / view / ViewUpdateGenerator . java 
+ @ @ - 145 , 6 + 145 , 14 @ @ public class ViewUpdateGenerator 
+ } 
+ 
+ / * * 
+ + * Clears the current state so that the generator may be reused . 
+ + * / 
+ + public void clear ( ) 
+ + { 
+ + updates . clear ( ) ; 
+ + } 
+ + 
+ + / * * 
+ * Compute which type of action needs to be performed to the view for a base table row 
+ * before and after an update . 
+ * /
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

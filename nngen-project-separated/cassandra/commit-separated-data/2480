@@ -1,0 +1,627 @@
+BLEU SCORE: 0.03283637368030199
+
+TEST MSG: Make commitlog archive + restore more robust
+GENERATED MSG: merge from 1 . 0
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 6d80937 . . 1ebc050 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 0 - rc1 <nl> + * Make commitlog archive + restore more robust ( CASSANDRA - 6974 ) <nl> * Fix marking commitlogsegments clean ( CASSANDRA - 6959 ) <nl> * Add snapshot " manifest " describing files included ( CASSANDRA - 6326 ) <nl> * Parallel streaming for sstableloader ( CASSANDRA - 3668 ) <nl> @ @ - 24 , 6 + 25 , 7 @ @ Merged from 1 . 2 : <nl> * remove duplicate query for local tokens ( CASSANDRA - 7182 ) <nl> * exit CQLSH with error status code if script fails ( CASSANDRA - 6344 ) <nl> <nl> + <nl> 2 . 1 . 0 - beta2 <nl> * Increase default CL space to 8GB ( CASSANDRA - 7031 ) <nl> * Add range tombstones to read repair digests ( CASSANDRA - 6863 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLog . java b / src / java / org / apache / cassandra / db / commitlog / CommitLog . java <nl> index a230e35 . . eaa1b3c 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLog . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLog . java <nl> @ @ - 216 , 13 + 216 , 13 @ @ public class CommitLog implements CommitLogMBean <nl> / / checksummed length <nl> dos . writeInt ( ( int ) size ) ; <nl> checksum . update ( buffer , buffer . position ( ) - 4 , 4 ) ; <nl> - buffer . putLong ( checksum . getValue ( ) ) ; <nl> + buffer . putInt ( checksum . getCrc ( ) ) ; <nl> <nl> int start = buffer . position ( ) ; <nl> / / checksummed mutation <nl> Mutation . serializer . serialize ( mutation , dos , MessagingService . current _ version ) ; <nl> checksum . update ( buffer , start , ( int ) size ) ; <nl> - buffer . putLong ( checksum . getValue ( ) ) ; <nl> + buffer . putInt ( checksum . getCrc ( ) ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogArchiver . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogArchiver . java <nl> index 6161435 . . d715fcc 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogArchiver . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogArchiver . java <nl> @ @ - 103 , 17 + 103 , 18 @ @ public class CommitLogArchiver <nl> } <nl> } <nl> <nl> - public void maybeArchive ( final String path , final String name ) <nl> + public void maybeArchive ( final CommitLogSegment segment ) <nl> { <nl> if ( Strings . isNullOrEmpty ( archiveCommand ) ) <nl> return ; <nl> <nl> - archivePending . put ( name , executor . submit ( new WrappedRunnable ( ) <nl> + archivePending . put ( segment . getName ( ) , executor . submit ( new WrappedRunnable ( ) <nl> { <nl> protected void runMayThrow ( ) throws IOException <nl> { <nl> - String command = archiveCommand . replace ( " % name " , name ) ; <nl> - command = command . replace ( " % path " , path ) ; <nl> + segment . waitForFinalSync ( ) ; <nl> + String command = archiveCommand . replace ( " % name " , segment . getName ( ) ) ; <nl> + command = command . replace ( " % path " , segment . getPath ( ) ) ; <nl> exec ( command ) ; <nl> } <nl> } ) ) ; <nl> @ @ - 160 , 7 + 161 , 26 @ @ public class CommitLogArchiver <nl> } <nl> for ( File fromFile : files ) <nl> { <nl> - File toFile = new File ( DatabaseDescriptor . getCommitLogLocation ( ) , new CommitLogDescriptor ( CommitLogSegment . getNextId ( ) ) . fileName ( ) ) ; <nl> + CommitLogDescriptor fromHeader = CommitLogDescriptor . fromHeader ( fromFile ) ; <nl> + CommitLogDescriptor fromName = CommitLogDescriptor . isValid ( fromFile . getName ( ) ) ? CommitLogDescriptor . fromFileName ( fromFile . getName ( ) ) : null ; <nl> + CommitLogDescriptor descriptor ; <nl> + if ( fromHeader = = null & & fromName = = null ) <nl> + throw new IllegalStateException ( " Cannot safely construct descriptor for segment , either from its name or its header : " + fromFile . getPath ( ) ) ; <nl> + else if ( fromHeader ! = null & & fromName ! = null & & ! fromHeader . equals ( fromName ) ) <nl> + throw new IllegalStateException ( String . format ( " Cannot safely construct descriptor for segment , as name and header descriptors do not match ( % s vs % s ) : % s " , fromHeader , fromName , fromFile . getPath ( ) ) ) ; <nl> + else if ( fromName ! = null & & fromHeader = = null & & fromName . getVersion ( ) > = CommitLogDescriptor . VERSION _ 21 ) <nl> + throw new IllegalStateException ( " Cannot safely construct descriptor for segment , as name descriptor implies a version that should contain a header descriptor , but that descriptor could not be read : " + fromFile . getPath ( ) ) ; <nl> + else if ( fromHeader ! = null ) <nl> + descriptor = fromHeader ; <nl> + else descriptor = fromName ; <nl> + <nl> + if ( descriptor . getVersion ( ) > CommitLogDescriptor . VERSION _ 21 ) <nl> + throw new IllegalStateException ( " Unsupported commit log version : " + descriptor . getVersion ( ) ) ; <nl> + <nl> + File toFile = new File ( DatabaseDescriptor . getCommitLogLocation ( ) , descriptor . fileName ( ) ) ; <nl> + if ( toFile . exists ( ) ) <nl> + throw new IllegalStateException ( " Trying to restore archive " + fromFile . getPath ( ) + " , but the same segment already exists in the restore location : " + toFile . getPath ( ) ) ; <nl> + <nl> String command = restoreCommand . replace ( " % from " , fromFile . getPath ( ) ) ; <nl> command = command . replace ( " % to " , toFile . getPath ( ) ) ; <nl> try <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogDescriptor . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogDescriptor . java <nl> index 0c8ed61 . . b11da94 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogDescriptor . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogDescriptor . java <nl> @ @ - 20 , 10 + 20 , 18 @ @ <nl> * / <nl> package org . apache . cassandra . db . commitlog ; <nl> <nl> + import java . io . EOFException ; <nl> + import java . io . File ; <nl> + import java . io . IOException ; <nl> + import java . io . RandomAccessFile ; <nl> + import java . nio . ByteBuffer ; <nl> import java . util . regex . Matcher ; <nl> import java . util . regex . Pattern ; <nl> <nl> + import org . apache . cassandra . io . FSReadError ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . apache . cassandra . utils . PureJavaCrc32 ; <nl> <nl> public class CommitLogDescriptor <nl> { <nl> @ @ - 42 , 6 + 50 , 9 @ @ public class CommitLogDescriptor <nl> * / <nl> public static final int current _ version = VERSION _ 21 ; <nl> <nl> + / / [ version , id , checksum ] <nl> + static final int HEADER _ SIZE = 4 + 8 + 4 ; <nl> + <nl> private final int version ; <nl> public final long id ; <nl> <nl> @ @ - 56 , 6 + 67 , 43 @ @ public class CommitLogDescriptor <nl> this ( current _ version , id ) ; <nl> } <nl> <nl> + static void writeHeader ( ByteBuffer out , CommitLogDescriptor descriptor ) <nl> + { <nl> + out . putInt ( 0 , descriptor . version ) ; <nl> + out . putLong ( 4 , descriptor . id ) ; <nl> + PureJavaCrc32 crc = new PureJavaCrc32 ( ) ; <nl> + crc . updateInt ( descriptor . version ) ; <nl> + crc . updateInt ( ( int ) ( descriptor . id & 0xFFFFFFFFL ) ) ; <nl> + crc . updateInt ( ( int ) ( descriptor . id > > > 32 ) ) ; <nl> + out . putInt ( 12 , crc . getCrc ( ) ) ; <nl> + } <nl> + <nl> + public static CommitLogDescriptor fromHeader ( File file ) <nl> + { <nl> + try ( RandomAccessFile raf = new RandomAccessFile ( file , " r " ) ) <nl> + { <nl> + assert raf . getFilePointer ( ) = = 0 ; <nl> + int version = raf . readInt ( ) ; <nl> + long id = raf . readLong ( ) ; <nl> + int crc = raf . readInt ( ) ; <nl> + PureJavaCrc32 checkcrc = new PureJavaCrc32 ( ) ; <nl> + checkcrc . updateInt ( version ) ; <nl> + checkcrc . updateInt ( ( int ) ( id & 0xFFFFFFFFL ) ) ; <nl> + checkcrc . updateInt ( ( int ) ( id > > > 32 ) ) ; <nl> + if ( crc = = checkcrc . getCrc ( ) ) <nl> + return new CommitLogDescriptor ( version , id ) ; <nl> + return null ; <nl> + } <nl> + catch ( EOFException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new FSReadError ( e , file ) ; <nl> + } <nl> + } <nl> + <nl> public static CommitLogDescriptor fromFileName ( String name ) <nl> { <nl> Matcher matcher ; <nl> @ @ - 102 , 4 + 150 , 20 @ @ public class CommitLogDescriptor <nl> { <nl> return COMMIT _ LOG _ FILE _ PATTERN . matcher ( filename ) . matches ( ) ; <nl> } <nl> + <nl> + public String toString ( ) <nl> + { <nl> + return " ( " + version + " , " + id + " ) " ; <nl> + } <nl> + <nl> + public boolean equals ( Object that ) <nl> + { <nl> + return that instanceof CommitLogDescriptor & & equals ( ( CommitLogDescriptor ) that ) ; <nl> + } <nl> + <nl> + public boolean equals ( CommitLogDescriptor that ) <nl> + { <nl> + return this . version = = that . version & & this . id = = that . id ; <nl> + } <nl> + <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java <nl> index fb33187 . . 59ae4e4 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java <nl> @ @ - 56 , 7 + 56 , 7 @ @ public class CommitLogReplayer <nl> private final AtomicInteger replayedCount ; <nl> private final Map < UUID , ReplayPosition > cfPositions ; <nl> private final ReplayPosition globalPosition ; <nl> - private final Checksum checksum ; <nl> + private final PureJavaCrc32 checksum ; <nl> private byte [ ] buffer ; <nl> <nl> public CommitLogReplayer ( ) <nl> @ @ - 113 , 22 + 113 , 26 @ @ public class CommitLogReplayer <nl> return replayedCount . get ( ) ; <nl> } <nl> <nl> - private int readHeader ( long segmentId , int offset , RandomAccessReader reader ) throws IOException <nl> + private int readSyncMarker ( CommitLogDescriptor descriptor , int offset , RandomAccessReader reader ) throws IOException <nl> { <nl> if ( offset > reader . length ( ) - CommitLogSegment . SYNC _ MARKER _ SIZE ) <nl> { <nl> if ( offset ! = reader . length ( ) & & offset ! = Integer . MAX _ VALUE ) <nl> - logger . warn ( " Encountered bad header at position { } of Commit log { } ; not enough room for a header " ) ; <nl> + logger . warn ( " Encountered bad header at position { } of Commit log { } ; not enough room for a header " , offset , reader . getPath ( ) ) ; <nl> / / cannot possibly be a header here . if we ' re = = length ( ) , assume it ' s a correctly written final segment <nl> return - 1 ; <nl> } <nl> reader . seek ( offset ) ; <nl> PureJavaCrc32 crc = new PureJavaCrc32 ( ) ; <nl> - crc . update ( ( int ) ( segmentId & 0xFFFFFFFFL ) ) ; <nl> - crc . update ( ( int ) ( segmentId > > > 32 ) ) ; <nl> - crc . update ( ( int ) reader . getPosition ( ) ) ; <nl> + crc . updateInt ( ( int ) ( descriptor . id & 0xFFFFFFFFL ) ) ; <nl> + crc . updateInt ( ( int ) ( descriptor . id > > > 32 ) ) ; <nl> + crc . updateInt ( ( int ) reader . getPosition ( ) ) ; <nl> int end = reader . readInt ( ) ; <nl> - long filecrc = reader . readLong ( ) ; <nl> + long filecrc ; <nl> + if ( descriptor . getVersion ( ) < CommitLogDescriptor . VERSION _ 21 ) <nl> + filecrc = reader . readLong ( ) ; <nl> + else <nl> + filecrc = reader . readInt ( ) & 0xffffffffL ; <nl> if ( crc . getValue ( ) ! = filecrc ) <nl> { <nl> if ( end ! = 0 | | filecrc ! = 0 ) <nl> @ @ - 150 , 7 + 154 , 7 @ @ public class CommitLogReplayer <nl> if ( globalPosition . segment < segmentId ) <nl> { <nl> if ( version > = CommitLogDescriptor . VERSION _ 21 ) <nl> - return CommitLogSegment . SYNC _ MARKER _ SIZE ; <nl> + return CommitLogDescriptor . HEADER _ SIZE + CommitLogSegment . SYNC _ MARKER _ SIZE ; <nl> else <nl> return 0 ; <nl> } <nl> @ @ - 244 , 7 + 248 , 7 @ @ public class CommitLogReplayer <nl> return ; <nl> } <nl> <nl> - int prevEnd = 0 ; <nl> + int prevEnd = CommitLogDescriptor . HEADER _ SIZE ; <nl> main : while ( true ) <nl> { <nl> <nl> @ @ - 253 , 7 + 257 , 7 @ @ public class CommitLogReplayer <nl> end = Integer . MAX _ VALUE ; <nl> else <nl> { <nl> - do { end = readHeader ( segmentId , end , reader ) ; } <nl> + do { end = readSyncMarker ( desc , end , reader ) ; } <nl> while ( end < offset & & end > prevEnd ) ; <nl> } <nl> <nl> @ @ - 290 , 12 + 294 , 16 @ @ public class CommitLogReplayer <nl> if ( serializedSize < 10 ) <nl> break main ; <nl> <nl> - long claimedSizeChecksum = reader . readLong ( ) ; <nl> + long claimedSizeChecksum ; <nl> + if ( desc . getVersion ( ) < CommitLogDescriptor . VERSION _ 21 ) <nl> + claimedSizeChecksum = reader . readLong ( ) ; <nl> + else <nl> + claimedSizeChecksum = reader . readInt ( ) & 0xffffffffL ; <nl> checksum . reset ( ) ; <nl> if ( desc . getVersion ( ) < CommitLogDescriptor . VERSION _ 20 ) <nl> checksum . update ( serializedSize ) ; <nl> else <nl> - FBUtilities . updateChecksumInt ( checksum , serializedSize ) ; <nl> + checksum . updateInt ( serializedSize ) ; <nl> <nl> if ( checksum . getValue ( ) ! = claimedSizeChecksum ) <nl> break main ; / / entry wasn ' t synced correctly / fully . that ' s <nl> @ @ - 304 , 7 + 312 , 10 @ @ public class CommitLogReplayer <nl> if ( serializedSize > buffer . length ) <nl> buffer = new byte [ ( int ) ( 1 . 2 * serializedSize ) ] ; <nl> reader . readFully ( buffer , 0 , serializedSize ) ; <nl> - claimedCRC32 = reader . readLong ( ) ; <nl> + if ( desc . getVersion ( ) < CommitLogDescriptor . VERSION _ 21 ) <nl> + claimedCRC32 = reader . readLong ( ) ; <nl> + else <nl> + claimedCRC32 = reader . readInt ( ) & 0xffffffffL ; <nl> } <nl> catch ( EOFException eof ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> index 3830966 . . 2120d3e 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> @ @ - 43 , 6 + 43 , 7 @ @ import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . config . Schema ; <nl> import org . apache . cassandra . db . ColumnFamily ; <nl> import org . apache . cassandra . db . Mutation ; <nl> + import org . apache . cassandra . io . FSReadError ; <nl> import org . apache . cassandra . io . FSWriteError ; <nl> import org . apache . cassandra . io . util . FileUtils ; <nl> import org . apache . cassandra . utils . CLibrary ; <nl> @ @ - 59 , 14 + 60 , 24 @ @ public class CommitLogSegment <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( CommitLogSegment . class ) ; <nl> <nl> - private final static long idBase = System . currentTimeMillis ( ) ; <nl> + private final static long idBase ; <nl> private final static AtomicInteger nextId = new AtomicInteger ( 1 ) ; <nl> + static <nl> + { <nl> + long maxId = Long . MIN _ VALUE ; <nl> + for ( File file : new File ( DatabaseDescriptor . getCommitLogLocation ( ) ) . listFiles ( ) ) <nl> + { <nl> + if ( CommitLogDescriptor . isValid ( file . getName ( ) ) ) <nl> + maxId = Math . max ( CommitLogDescriptor . fromFileName ( file . getName ( ) ) . id , maxId ) ; <nl> + } <nl> + idBase = Math . max ( System . currentTimeMillis ( ) , maxId + 1 ) ; <nl> + } <nl> <nl> - / / The commit log entry overhead in bytes ( int : length + long : head checksum + long : tail checksum ) <nl> - static final int ENTRY _ OVERHEAD _ SIZE = 4 + 8 + 8 ; <nl> + / / The commit log entry overhead in bytes ( int : length + int : head checksum + int : tail checksum ) <nl> + static final int ENTRY _ OVERHEAD _ SIZE = 4 + 4 + 4 ; <nl> <nl> - / / The commit log ( chained ) sync marker / header size in bytes ( int : length + long : checksum [ segmentId , position ] ) <nl> - static final int SYNC _ MARKER _ SIZE = 4 + 8 ; <nl> + / / The commit log ( chained ) sync marker / header size in bytes ( int : length + int : checksum [ segmentId , position ] ) <nl> + static final int SYNC _ MARKER _ SIZE = 4 + 4 ; <nl> <nl> / / The OpOrder used to order appends wrt sync <nl> private final OpOrder appendOrder = new OpOrder ( ) ; <nl> @ @ - 154 , 10 + 165 , 13 @ @ public class CommitLogSegment <nl> fd = CLibrary . getfd ( logFileAccessor . getFD ( ) ) ; <nl> <nl> buffer = logFileAccessor . getChannel ( ) . map ( FileChannel . MapMode . READ _ WRITE , 0 , DatabaseDescriptor . getCommitLogSegmentSize ( ) ) ; <nl> - / / mark the initial header as uninitialised <nl> - buffer . putInt ( 0 , 0 ) ; <nl> - buffer . putLong ( 4 , 0 ) ; <nl> - allocatePosition . set ( SYNC _ MARKER _ SIZE ) ; <nl> + / / write the header <nl> + CommitLogDescriptor . writeHeader ( buffer , descriptor ) ; <nl> + / / mark the initial sync marker as uninitialised <nl> + buffer . putInt ( CommitLogDescriptor . HEADER _ SIZE , 0 ) ; <nl> + buffer . putLong ( CommitLogDescriptor . HEADER _ SIZE + 4 , 0 ) ; <nl> + allocatePosition . set ( CommitLogDescriptor . HEADER _ SIZE + SYNC _ MARKER _ SIZE ) ; <nl> + lastSyncedOffset = CommitLogDescriptor . HEADER _ SIZE ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> @ @ - 292 , 11 + 306 , 11 @ @ public class CommitLogSegment <nl> / / we don ' t chain the crcs here to ensure this method is idempotent if it fails <nl> int offset = lastSyncedOffset ; <nl> final PureJavaCrc32 crc = new PureJavaCrc32 ( ) ; <nl> - crc . update ( ( int ) ( id & 0xFFFFFFFFL ) ) ; <nl> - crc . update ( ( int ) ( id > > > 32 ) ) ; <nl> - crc . update ( offset ) ; <nl> + crc . updateInt ( ( int ) ( id & 0xFFFFFFFFL ) ) ; <nl> + crc . updateInt ( ( int ) ( id > > > 32 ) ) ; <nl> + crc . updateInt ( offset ) ; <nl> buffer . putInt ( offset , nextMarker ) ; <nl> - buffer . putLong ( offset + 4 , crc . getValue ( ) ) ; <nl> + buffer . putInt ( offset + 4 , crc . getCrc ( ) ) ; <nl> <nl> / / zero out the next sync marker so replayer can cleanly exit <nl> if ( nextMarker < buffer . capacity ( ) ) <nl> @ @ - 383 , 6 + 397 , 23 @ @ public class CommitLogSegment <nl> return logFile . getName ( ) ; <nl> } <nl> <nl> + void waitForFinalSync ( ) <nl> + { <nl> + while ( true ) <nl> + { <nl> + WaitQueue . Signal signal = syncComplete . register ( ) ; <nl> + if ( lastSyncedOffset < buffer . capacity ( ) ) <nl> + { <nl> + signal . awaitUninterruptibly ( ) ; <nl> + } <nl> + else <nl> + { <nl> + signal . cancel ( ) ; <nl> + break ; <nl> + } <nl> + } <nl> + } <nl> + <nl> / * * <nl> * Close the segment file . <nl> * / <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManager . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManager . java <nl> index b0be42c . . 5802e8a 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManager . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManager . java <nl> @ @ - 21 , 7 + 21 , 6 @ @ import java . io . File ; <nl> import java . util . ArrayList ; <nl> import java . util . Collection ; <nl> import java . util . Collections ; <nl> - import java . util . Iterator ; <nl> import java . util . LinkedHashMap ; <nl> import java . util . List ; <nl> import java . util . Map ; <nl> @ @ - 32 , 7 + 31 , 6 @ @ import java . util . concurrent . ConcurrentLinkedQueue ; <nl> import java . util . concurrent . Future ; <nl> import java . util . concurrent . LinkedBlockingQueue ; <nl> import java . util . concurrent . atomic . AtomicLong ; <nl> - import java . util . concurrent . atomic . AtomicReferenceFieldUpdater ; <nl> <nl> import com . google . common . collect . Iterables ; <nl> import com . google . common . util . concurrent . * ; <nl> @ @ - 222 , 7 + 220 , 7 @ @ public class CommitLogSegmentManager <nl> { <nl> / / Now we can run the user defined command just after switching to the new commit log . <nl> / / ( Do this here instead of in the recycle call so we can get a head start on the archive . ) <nl> - CommitLog . instance . archiver . maybeArchive ( old . getPath ( ) , old . getName ( ) ) ; <nl> + CommitLog . instance . archiver . maybeArchive ( old ) ; <nl> <nl> / / ensure we don ' t continue to use the old file ; not strictly necessary , but cleaner to enforce it <nl> old . discardUnusedTail ( ) ; <nl> @ @ - 314 , 8 + 312 , 9 @ @ public class CommitLogSegmentManager <nl> * / <nl> void recycleSegment ( final CommitLogSegment segment ) <nl> { <nl> + boolean archiveSuccess = CommitLog . instance . archiver . maybeWaitForArchiving ( segment . getName ( ) ) ; <nl> activeSegments . remove ( segment ) ; <nl> - if ( ! CommitLog . instance . archiver . maybeWaitForArchiving ( segment . getName ( ) ) ) <nl> + if ( ! archiveSuccess ) <nl> { <nl> / / if archiving ( command ) was not successful then leave the file alone . don ' t delete or recycle . <nl> discardSegment ( segment , false ) ; <nl> diff - - git a / src / java / org / apache / cassandra / utils / PureJavaCrc32 . java b / src / java / org / apache / cassandra / utils / PureJavaCrc32 . java <nl> index 041652f . . 9a1ac02 100644 <nl> - - - a / src / java / org / apache / cassandra / utils / PureJavaCrc32 . java <nl> + + + b / src / java / org / apache / cassandra / utils / PureJavaCrc32 . java <nl> @ @ - 31 , 7 + 31 , 7 @ @ import java . util . zip . Checksum ; <nl> * <nl> * @ see java . util . zip . CRC32 <nl> * <nl> - * This class is copied from hadoop - commons project . <nl> + * This class is copied from hadoop - commons project and retains that formatting . <nl> * ( The initial patch added PureJavaCrc32 was HADOOP - 6148 ) <nl> * / <nl> public class PureJavaCrc32 implements Checksum { <nl> @ @ - 49 , 7 + 49 , 11 @ @ public class PureJavaCrc32 implements Checksum { <nl> return ( ~ crc ) & 0xffffffffL ; <nl> } <nl> <nl> - @ Override <nl> + public int getCrc ( ) { <nl> + return ~ crc ; <nl> + } <nl> + <nl> + @ Override <nl> public void reset ( ) { <nl> crc = 0xffffffff ; <nl> } <nl> @ @ - 172 , 7 + 176 , 14 @ @ public class PureJavaCrc32 implements Checksum { <nl> crc = ( crc > > > 8 ) ^ T [ T8 _ 0 _ start + ( ( crc ^ b ) & 0xff ) ] ; <nl> } <nl> <nl> - / * <nl> + final public void updateInt ( int v ) { <nl> + update ( ( v > > > 24 ) & 0xFF ) ; <nl> + update ( ( v > > > 16 ) & 0xFF ) ; <nl> + update ( ( v > > > 8 ) & 0xFF ) ; <nl> + update ( ( v > > > 0 ) & 0xFF ) ; <nl> + } <nl> + <nl> + / * <nl> * CRC - 32 lookup tables generated by the polynomial 0xEDB88320 . <nl> * See also TestPureJavaCrc32 . Table . <nl> * /
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index d518830 . . 52cc2c1 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 29 , 7 + 29 , 7 @ @ <nl> * add scheduler JMX metrics ( CASSANDRA - 2962 ) <nl> * add block level checksum for compressed data ( CASSANDRA - 1717 ) <nl> * make column family backed column map pluggable and introduce unsynchronized <nl> - ArrayList backed one to speedup reads ( CASSANDRA - 2843 ) <nl> + ArrayList backed one to speedup reads ( CASSANDRA - 2843 , 3165 ) <nl> * refactoring of the secondary index api ( CASSANDRA - 2982 ) <nl> * make CL > ONE reads wait for digest reconciliation before returning <nl> ( CASSANDRA - 2494 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> index c316a85 . . 71c7213 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> @ @ - 67 , 6 + 67 , 11 @ @ public class ArrayBackedSortedColumns extends ArrayList < IColumn > implements ISor <nl> this . reversed = reversed ; <nl> } <nl> <nl> + public ISortedColumns . Factory getFactory ( ) <nl> + { <nl> + return factory ( ) ; <nl> + } <nl> + <nl> public AbstractType < ? > getComparator ( ) <nl> { <nl> return comparator ; <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> index 1239d1c . . 38bc0d7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> @ @ - 81 , 14 + 81 , 19 @ @ public class ColumnFamily extends AbstractColumnContainer <nl> this . cfm = cfm ; <nl> } <nl> <nl> - public ColumnFamily cloneMeShallow ( ) <nl> + public ColumnFamily cloneMeShallow ( ISortedColumns . Factory factory ) <nl> { <nl> - ColumnFamily cf = ColumnFamily . create ( cfm ) ; <nl> + ColumnFamily cf = ColumnFamily . create ( cfm , factory ) ; <nl> / / since deletion info is immutable , aliasing it is fine <nl> cf . deletionInfo . set ( deletionInfo . get ( ) ) ; <nl> return cf ; <nl> } <nl> <nl> + public ColumnFamily cloneMeShallow ( ) <nl> + { <nl> + return cloneMeShallow ( columns . getFactory ( ) ) ; <nl> + } <nl> + <nl> public AbstractType getSubComparator ( ) <nl> { <nl> IColumnSerializer s = getColumnSerializer ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 0bfd1c5 . . 552d3e9 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1162 , 8 + 1162 , 11 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> } <nl> } <nl> <nl> - / * * filter a cached row , which will not be modified by the filter , but may be modified by throwing out <nl> - * tombstones that are no longer relevant . * / <nl> + / * * <nl> + * Filter a cached row , which will not be modified by the filter , but may be modified by throwing out <nl> + * tombstones that are no longer relevant . <nl> + * The returned column family won ' t be thread safe . <nl> + * / <nl> ColumnFamily filterColumnFamily ( ColumnFamily cached , QueryFilter filter , int gcBefore ) <nl> { <nl> / / special case slicing the entire row : <nl> @ @ - 1184 , 7 + 1187 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> IColumn sc = cached . getColumn ( filter . path . superColumnName ) ; <nl> if ( sc = = null | | sliceFilter . count > = sc . getSubColumns ( ) . size ( ) ) <nl> { <nl> - ColumnFamily cf = cached . cloneMeShallow ( ) ; <nl> + ColumnFamily cf = cached . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; <nl> if ( sc ! = null ) <nl> cf . addColumn ( sc , HeapAllocator . instance ) ; <nl> return removeDeleted ( cf , gcBefore ) ; <nl> @ @ - 1203 , 7 + 1206 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> } <nl> <nl> IColumnIterator ci = filter . getMemtableColumnIterator ( cached , null , getComparator ( ) ) ; <nl> - ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ) ; <nl> + ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; <nl> filter . collateColumns ( cf , Collections . singletonList ( ci ) , getComparator ( ) , gcBefore ) ; <nl> / / TODO this is necessary because when we collate supercolumns together , we don ' t check <nl> / / their subcolumns for relevance , so we need to do a second prune post facto here . <nl> diff - - git a / src / java / org / apache / cassandra / db / ISortedColumns . java b / src / java / org / apache / cassandra / db / ISortedColumns . java <nl> index 37f5a60 . . 624dec7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ISortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / ISortedColumns . java <nl> @ @ - 42 , 6 + 42 , 11 @ @ public interface ISortedColumns extends IIterableColumns <nl> public ISortedColumns cloneMe ( ) ; <nl> <nl> / * * <nl> + * Returns the factory used for this ISortedColumns implementation . <nl> + * / <nl> + public Factory getFactory ( ) ; <nl> + <nl> + / * * <nl> * Adds a column to this column map . <nl> * If a column with the same name is already present in the map , it will <nl> * be replaced by the newly added column . <nl> diff - - git a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java <nl> index cd2488a . . 13a111a 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java <nl> @ @ - 62 , 6 + 62 , 11 @ @ public class ThreadSafeSortedColumns extends ConcurrentSkipListMap < ByteBuffer , I <nl> super ( columns ) ; <nl> } <nl> <nl> + public ISortedColumns . Factory getFactory ( ) <nl> + { <nl> + return factory ( ) ; <nl> + } <nl> + <nl> public ISortedColumns cloneMe ( ) <nl> { <nl> return new ThreadSafeSortedColumns ( this ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java <nl> index 34e83dc . . 6c3fc42 100644 <nl> - - - a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java <nl> @ @ - 62 , 6 + 62 , 11 @ @ public class TreeMapBackedSortedColumns extends TreeMap < ByteBuffer , IColumn > imp <nl> super ( columns ) ; <nl> } <nl> <nl> + public ISortedColumns . Factory getFactory ( ) <nl> + { <nl> + return factory ( ) ; <nl> + } <nl> + <nl> public ISortedColumns cloneMe ( ) <nl> { <nl> return new TreeMapBackedSortedColumns ( this ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 6d80937 . . 1ebc050 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 0 - rc1 
+ + * Make commitlog archive + restore more robust ( CASSANDRA - 6974 ) 
+ * Fix marking commitlogsegments clean ( CASSANDRA - 6959 ) 
+ * Add snapshot " manifest " describing files included ( CASSANDRA - 6326 ) 
+ * Parallel streaming for sstableloader ( CASSANDRA - 3668 ) 
+ @ @ - 24 , 6 + 25 , 7 @ @ Merged from 1 . 2 : 
+ * remove duplicate query for local tokens ( CASSANDRA - 7182 ) 
+ * exit CQLSH with error status code if script fails ( CASSANDRA - 6344 ) 
+ 
+ + 
+ 2 . 1 . 0 - beta2 
+ * Increase default CL space to 8GB ( CASSANDRA - 7031 ) 
+ * Add range tombstones to read repair digests ( CASSANDRA - 6863 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLog . java b / src / java / org / apache / cassandra / db / commitlog / CommitLog . java 
+ index a230e35 . . eaa1b3c 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLog . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLog . java 
+ @ @ - 216 , 13 + 216 , 13 @ @ public class CommitLog implements CommitLogMBean 
+ / / checksummed length 
+ dos . writeInt ( ( int ) size ) ; 
+ checksum . update ( buffer , buffer . position ( ) - 4 , 4 ) ; 
+ - buffer . putLong ( checksum . getValue ( ) ) ; 
+ + buffer . putInt ( checksum . getCrc ( ) ) ; 
+ 
+ int start = buffer . position ( ) ; 
+ / / checksummed mutation 
+ Mutation . serializer . serialize ( mutation , dos , MessagingService . current _ version ) ; 
+ checksum . update ( buffer , start , ( int ) size ) ; 
+ - buffer . putLong ( checksum . getValue ( ) ) ; 
+ + buffer . putInt ( checksum . getCrc ( ) ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogArchiver . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogArchiver . java 
+ index 6161435 . . d715fcc 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogArchiver . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogArchiver . java 
+ @ @ - 103 , 17 + 103 , 18 @ @ public class CommitLogArchiver 
+ } 
+ } 
+ 
+ - public void maybeArchive ( final String path , final String name ) 
+ + public void maybeArchive ( final CommitLogSegment segment ) 
+ { 
+ if ( Strings . isNullOrEmpty ( archiveCommand ) ) 
+ return ; 
+ 
+ - archivePending . put ( name , executor . submit ( new WrappedRunnable ( ) 
+ + archivePending . put ( segment . getName ( ) , executor . submit ( new WrappedRunnable ( ) 
+ { 
+ protected void runMayThrow ( ) throws IOException 
+ { 
+ - String command = archiveCommand . replace ( " % name " , name ) ; 
+ - command = command . replace ( " % path " , path ) ; 
+ + segment . waitForFinalSync ( ) ; 
+ + String command = archiveCommand . replace ( " % name " , segment . getName ( ) ) ; 
+ + command = command . replace ( " % path " , segment . getPath ( ) ) ; 
+ exec ( command ) ; 
+ } 
+ } ) ) ; 
+ @ @ - 160 , 7 + 161 , 26 @ @ public class CommitLogArchiver 
+ } 
+ for ( File fromFile : files ) 
+ { 
+ - File toFile = new File ( DatabaseDescriptor . getCommitLogLocation ( ) , new CommitLogDescriptor ( CommitLogSegment . getNextId ( ) ) . fileName ( ) ) ; 
+ + CommitLogDescriptor fromHeader = CommitLogDescriptor . fromHeader ( fromFile ) ; 
+ + CommitLogDescriptor fromName = CommitLogDescriptor . isValid ( fromFile . getName ( ) ) ? CommitLogDescriptor . fromFileName ( fromFile . getName ( ) ) : null ; 
+ + CommitLogDescriptor descriptor ; 
+ + if ( fromHeader = = null & & fromName = = null ) 
+ + throw new IllegalStateException ( " Cannot safely construct descriptor for segment , either from its name or its header : " + fromFile . getPath ( ) ) ; 
+ + else if ( fromHeader ! = null & & fromName ! = null & & ! fromHeader . equals ( fromName ) ) 
+ + throw new IllegalStateException ( String . format ( " Cannot safely construct descriptor for segment , as name and header descriptors do not match ( % s vs % s ) : % s " , fromHeader , fromName , fromFile . getPath ( ) ) ) ; 
+ + else if ( fromName ! = null & & fromHeader = = null & & fromName . getVersion ( ) > = CommitLogDescriptor . VERSION _ 21 ) 
+ + throw new IllegalStateException ( " Cannot safely construct descriptor for segment , as name descriptor implies a version that should contain a header descriptor , but that descriptor could not be read : " + fromFile . getPath ( ) ) ; 
+ + else if ( fromHeader ! = null ) 
+ + descriptor = fromHeader ; 
+ + else descriptor = fromName ; 
+ + 
+ + if ( descriptor . getVersion ( ) > CommitLogDescriptor . VERSION _ 21 ) 
+ + throw new IllegalStateException ( " Unsupported commit log version : " + descriptor . getVersion ( ) ) ; 
+ + 
+ + File toFile = new File ( DatabaseDescriptor . getCommitLogLocation ( ) , descriptor . fileName ( ) ) ; 
+ + if ( toFile . exists ( ) ) 
+ + throw new IllegalStateException ( " Trying to restore archive " + fromFile . getPath ( ) + " , but the same segment already exists in the restore location : " + toFile . getPath ( ) ) ; 
+ + 
+ String command = restoreCommand . replace ( " % from " , fromFile . getPath ( ) ) ; 
+ command = command . replace ( " % to " , toFile . getPath ( ) ) ; 
+ try 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogDescriptor . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogDescriptor . java 
+ index 0c8ed61 . . b11da94 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogDescriptor . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogDescriptor . java 
+ @ @ - 20 , 10 + 20 , 18 @ @ 
+ * / 
+ package org . apache . cassandra . db . commitlog ; 
+ 
+ + import java . io . EOFException ; 
+ + import java . io . File ; 
+ + import java . io . IOException ; 
+ + import java . io . RandomAccessFile ; 
+ + import java . nio . ByteBuffer ; 
+ import java . util . regex . Matcher ; 
+ import java . util . regex . Pattern ; 
+ 
+ + import org . apache . cassandra . io . FSReadError ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . apache . cassandra . utils . PureJavaCrc32 ; 
+ 
+ public class CommitLogDescriptor 
+ { 
+ @ @ - 42 , 6 + 50 , 9 @ @ public class CommitLogDescriptor 
+ * / 
+ public static final int current _ version = VERSION _ 21 ; 
+ 
+ + / / [ version , id , checksum ] 
+ + static final int HEADER _ SIZE = 4 + 8 + 4 ; 
+ + 
+ private final int version ; 
+ public final long id ; 
+ 
+ @ @ - 56 , 6 + 67 , 43 @ @ public class CommitLogDescriptor 
+ this ( current _ version , id ) ; 
+ } 
+ 
+ + static void writeHeader ( ByteBuffer out , CommitLogDescriptor descriptor ) 
+ + { 
+ + out . putInt ( 0 , descriptor . version ) ; 
+ + out . putLong ( 4 , descriptor . id ) ; 
+ + PureJavaCrc32 crc = new PureJavaCrc32 ( ) ; 
+ + crc . updateInt ( descriptor . version ) ; 
+ + crc . updateInt ( ( int ) ( descriptor . id & 0xFFFFFFFFL ) ) ; 
+ + crc . updateInt ( ( int ) ( descriptor . id > > > 32 ) ) ; 
+ + out . putInt ( 12 , crc . getCrc ( ) ) ; 
+ + } 
+ + 
+ + public static CommitLogDescriptor fromHeader ( File file ) 
+ + { 
+ + try ( RandomAccessFile raf = new RandomAccessFile ( file , " r " ) ) 
+ + { 
+ + assert raf . getFilePointer ( ) = = 0 ; 
+ + int version = raf . readInt ( ) ; 
+ + long id = raf . readLong ( ) ; 
+ + int crc = raf . readInt ( ) ; 
+ + PureJavaCrc32 checkcrc = new PureJavaCrc32 ( ) ; 
+ + checkcrc . updateInt ( version ) ; 
+ + checkcrc . updateInt ( ( int ) ( id & 0xFFFFFFFFL ) ) ; 
+ + checkcrc . updateInt ( ( int ) ( id > > > 32 ) ) ; 
+ + if ( crc = = checkcrc . getCrc ( ) ) 
+ + return new CommitLogDescriptor ( version , id ) ; 
+ + return null ; 
+ + } 
+ + catch ( EOFException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new FSReadError ( e , file ) ; 
+ + } 
+ + } 
+ + 
+ public static CommitLogDescriptor fromFileName ( String name ) 
+ { 
+ Matcher matcher ; 
+ @ @ - 102 , 4 + 150 , 20 @ @ public class CommitLogDescriptor 
+ { 
+ return COMMIT _ LOG _ FILE _ PATTERN . matcher ( filename ) . matches ( ) ; 
+ } 
+ + 
+ + public String toString ( ) 
+ + { 
+ + return " ( " + version + " , " + id + " ) " ; 
+ + } 
+ + 
+ + public boolean equals ( Object that ) 
+ + { 
+ + return that instanceof CommitLogDescriptor & & equals ( ( CommitLogDescriptor ) that ) ; 
+ + } 
+ + 
+ + public boolean equals ( CommitLogDescriptor that ) 
+ + { 
+ + return this . version = = that . version & & this . id = = that . id ; 
+ + } 
+ + 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java 
+ index fb33187 . . 59ae4e4 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java 
+ @ @ - 56 , 7 + 56 , 7 @ @ public class CommitLogReplayer 
+ private final AtomicInteger replayedCount ; 
+ private final Map < UUID , ReplayPosition > cfPositions ; 
+ private final ReplayPosition globalPosition ; 
+ - private final Checksum checksum ; 
+ + private final PureJavaCrc32 checksum ; 
+ private byte [ ] buffer ; 
+ 
+ public CommitLogReplayer ( ) 
+ @ @ - 113 , 22 + 113 , 26 @ @ public class CommitLogReplayer 
+ return replayedCount . get ( ) ; 
+ } 
+ 
+ - private int readHeader ( long segmentId , int offset , RandomAccessReader reader ) throws IOException 
+ + private int readSyncMarker ( CommitLogDescriptor descriptor , int offset , RandomAccessReader reader ) throws IOException 
+ { 
+ if ( offset > reader . length ( ) - CommitLogSegment . SYNC _ MARKER _ SIZE ) 
+ { 
+ if ( offset ! = reader . length ( ) & & offset ! = Integer . MAX _ VALUE ) 
+ - logger . warn ( " Encountered bad header at position { } of Commit log { } ; not enough room for a header " ) ; 
+ + logger . warn ( " Encountered bad header at position { } of Commit log { } ; not enough room for a header " , offset , reader . getPath ( ) ) ; 
+ / / cannot possibly be a header here . if we ' re = = length ( ) , assume it ' s a correctly written final segment 
+ return - 1 ; 
+ } 
+ reader . seek ( offset ) ; 
+ PureJavaCrc32 crc = new PureJavaCrc32 ( ) ; 
+ - crc . update ( ( int ) ( segmentId & 0xFFFFFFFFL ) ) ; 
+ - crc . update ( ( int ) ( segmentId > > > 32 ) ) ; 
+ - crc . update ( ( int ) reader . getPosition ( ) ) ; 
+ + crc . updateInt ( ( int ) ( descriptor . id & 0xFFFFFFFFL ) ) ; 
+ + crc . updateInt ( ( int ) ( descriptor . id > > > 32 ) ) ; 
+ + crc . updateInt ( ( int ) reader . getPosition ( ) ) ; 
+ int end = reader . readInt ( ) ; 
+ - long filecrc = reader . readLong ( ) ; 
+ + long filecrc ; 
+ + if ( descriptor . getVersion ( ) < CommitLogDescriptor . VERSION _ 21 ) 
+ + filecrc = reader . readLong ( ) ; 
+ + else 
+ + filecrc = reader . readInt ( ) & 0xffffffffL ; 
+ if ( crc . getValue ( ) ! = filecrc ) 
+ { 
+ if ( end ! = 0 | | filecrc ! = 0 ) 
+ @ @ - 150 , 7 + 154 , 7 @ @ public class CommitLogReplayer 
+ if ( globalPosition . segment < segmentId ) 
+ { 
+ if ( version > = CommitLogDescriptor . VERSION _ 21 ) 
+ - return CommitLogSegment . SYNC _ MARKER _ SIZE ; 
+ + return CommitLogDescriptor . HEADER _ SIZE + CommitLogSegment . SYNC _ MARKER _ SIZE ; 
+ else 
+ return 0 ; 
+ } 
+ @ @ - 244 , 7 + 248 , 7 @ @ public class CommitLogReplayer 
+ return ; 
+ } 
+ 
+ - int prevEnd = 0 ; 
+ + int prevEnd = CommitLogDescriptor . HEADER _ SIZE ; 
+ main : while ( true ) 
+ { 
+ 
+ @ @ - 253 , 7 + 257 , 7 @ @ public class CommitLogReplayer 
+ end = Integer . MAX _ VALUE ; 
+ else 
+ { 
+ - do { end = readHeader ( segmentId , end , reader ) ; } 
+ + do { end = readSyncMarker ( desc , end , reader ) ; } 
+ while ( end < offset & & end > prevEnd ) ; 
+ } 
+ 
+ @ @ - 290 , 12 + 294 , 16 @ @ public class CommitLogReplayer 
+ if ( serializedSize < 10 ) 
+ break main ; 
+ 
+ - long claimedSizeChecksum = reader . readLong ( ) ; 
+ + long claimedSizeChecksum ; 
+ + if ( desc . getVersion ( ) < CommitLogDescriptor . VERSION _ 21 ) 
+ + claimedSizeChecksum = reader . readLong ( ) ; 
+ + else 
+ + claimedSizeChecksum = reader . readInt ( ) & 0xffffffffL ; 
+ checksum . reset ( ) ; 
+ if ( desc . getVersion ( ) < CommitLogDescriptor . VERSION _ 20 ) 
+ checksum . update ( serializedSize ) ; 
+ else 
+ - FBUtilities . updateChecksumInt ( checksum , serializedSize ) ; 
+ + checksum . updateInt ( serializedSize ) ; 
+ 
+ if ( checksum . getValue ( ) ! = claimedSizeChecksum ) 
+ break main ; / / entry wasn ' t synced correctly / fully . that ' s 
+ @ @ - 304 , 7 + 312 , 10 @ @ public class CommitLogReplayer 
+ if ( serializedSize > buffer . length ) 
+ buffer = new byte [ ( int ) ( 1 . 2 * serializedSize ) ] ; 
+ reader . readFully ( buffer , 0 , serializedSize ) ; 
+ - claimedCRC32 = reader . readLong ( ) ; 
+ + if ( desc . getVersion ( ) < CommitLogDescriptor . VERSION _ 21 ) 
+ + claimedCRC32 = reader . readLong ( ) ; 
+ + else 
+ + claimedCRC32 = reader . readInt ( ) & 0xffffffffL ; 
+ } 
+ catch ( EOFException eof ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ index 3830966 . . 2120d3e 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ @ @ - 43 , 6 + 43 , 7 @ @ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . config . Schema ; 
+ import org . apache . cassandra . db . ColumnFamily ; 
+ import org . apache . cassandra . db . Mutation ; 
+ + import org . apache . cassandra . io . FSReadError ; 
+ import org . apache . cassandra . io . FSWriteError ; 
+ import org . apache . cassandra . io . util . FileUtils ; 
+ import org . apache . cassandra . utils . CLibrary ; 
+ @ @ - 59 , 14 + 60 , 24 @ @ public class CommitLogSegment 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( CommitLogSegment . class ) ; 
+ 
+ - private final static long idBase = System . currentTimeMillis ( ) ; 
+ + private final static long idBase ; 
+ private final static AtomicInteger nextId = new AtomicInteger ( 1 ) ; 
+ + static 
+ + { 
+ + long maxId = Long . MIN _ VALUE ; 
+ + for ( File file : new File ( DatabaseDescriptor . getCommitLogLocation ( ) ) . listFiles ( ) ) 
+ + { 
+ + if ( CommitLogDescriptor . isValid ( file . getName ( ) ) ) 
+ + maxId = Math . max ( CommitLogDescriptor . fromFileName ( file . getName ( ) ) . id , maxId ) ; 
+ + } 
+ + idBase = Math . max ( System . currentTimeMillis ( ) , maxId + 1 ) ; 
+ + } 
+ 
+ - / / The commit log entry overhead in bytes ( int : length + long : head checksum + long : tail checksum ) 
+ - static final int ENTRY _ OVERHEAD _ SIZE = 4 + 8 + 8 ; 
+ + / / The commit log entry overhead in bytes ( int : length + int : head checksum + int : tail checksum ) 
+ + static final int ENTRY _ OVERHEAD _ SIZE = 4 + 4 + 4 ; 
+ 
+ - / / The commit log ( chained ) sync marker / header size in bytes ( int : length + long : checksum [ segmentId , position ] ) 
+ - static final int SYNC _ MARKER _ SIZE = 4 + 8 ; 
+ + / / The commit log ( chained ) sync marker / header size in bytes ( int : length + int : checksum [ segmentId , position ] ) 
+ + static final int SYNC _ MARKER _ SIZE = 4 + 4 ; 
+ 
+ / / The OpOrder used to order appends wrt sync 
+ private final OpOrder appendOrder = new OpOrder ( ) ; 
+ @ @ - 154 , 10 + 165 , 13 @ @ public class CommitLogSegment 
+ fd = CLibrary . getfd ( logFileAccessor . getFD ( ) ) ; 
+ 
+ buffer = logFileAccessor . getChannel ( ) . map ( FileChannel . MapMode . READ _ WRITE , 0 , DatabaseDescriptor . getCommitLogSegmentSize ( ) ) ; 
+ - / / mark the initial header as uninitialised 
+ - buffer . putInt ( 0 , 0 ) ; 
+ - buffer . putLong ( 4 , 0 ) ; 
+ - allocatePosition . set ( SYNC _ MARKER _ SIZE ) ; 
+ + / / write the header 
+ + CommitLogDescriptor . writeHeader ( buffer , descriptor ) ; 
+ + / / mark the initial sync marker as uninitialised 
+ + buffer . putInt ( CommitLogDescriptor . HEADER _ SIZE , 0 ) ; 
+ + buffer . putLong ( CommitLogDescriptor . HEADER _ SIZE + 4 , 0 ) ; 
+ + allocatePosition . set ( CommitLogDescriptor . HEADER _ SIZE + SYNC _ MARKER _ SIZE ) ; 
+ + lastSyncedOffset = CommitLogDescriptor . HEADER _ SIZE ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ @ @ - 292 , 11 + 306 , 11 @ @ public class CommitLogSegment 
+ / / we don ' t chain the crcs here to ensure this method is idempotent if it fails 
+ int offset = lastSyncedOffset ; 
+ final PureJavaCrc32 crc = new PureJavaCrc32 ( ) ; 
+ - crc . update ( ( int ) ( id & 0xFFFFFFFFL ) ) ; 
+ - crc . update ( ( int ) ( id > > > 32 ) ) ; 
+ - crc . update ( offset ) ; 
+ + crc . updateInt ( ( int ) ( id & 0xFFFFFFFFL ) ) ; 
+ + crc . updateInt ( ( int ) ( id > > > 32 ) ) ; 
+ + crc . updateInt ( offset ) ; 
+ buffer . putInt ( offset , nextMarker ) ; 
+ - buffer . putLong ( offset + 4 , crc . getValue ( ) ) ; 
+ + buffer . putInt ( offset + 4 , crc . getCrc ( ) ) ; 
+ 
+ / / zero out the next sync marker so replayer can cleanly exit 
+ if ( nextMarker < buffer . capacity ( ) ) 
+ @ @ - 383 , 6 + 397 , 23 @ @ public class CommitLogSegment 
+ return logFile . getName ( ) ; 
+ } 
+ 
+ + void waitForFinalSync ( ) 
+ + { 
+ + while ( true ) 
+ + { 
+ + WaitQueue . Signal signal = syncComplete . register ( ) ; 
+ + if ( lastSyncedOffset < buffer . capacity ( ) ) 
+ + { 
+ + signal . awaitUninterruptibly ( ) ; 
+ + } 
+ + else 
+ + { 
+ + signal . cancel ( ) ; 
+ + break ; 
+ + } 
+ + } 
+ + } 
+ + 
+ / * * 
+ * Close the segment file . 
+ * / 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManager . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManager . java 
+ index b0be42c . . 5802e8a 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManager . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegmentManager . java 
+ @ @ - 21 , 7 + 21 , 6 @ @ import java . io . File ; 
+ import java . util . ArrayList ; 
+ import java . util . Collection ; 
+ import java . util . Collections ; 
+ - import java . util . Iterator ; 
+ import java . util . LinkedHashMap ; 
+ import java . util . List ; 
+ import java . util . Map ; 
+ @ @ - 32 , 7 + 31 , 6 @ @ import java . util . concurrent . ConcurrentLinkedQueue ; 
+ import java . util . concurrent . Future ; 
+ import java . util . concurrent . LinkedBlockingQueue ; 
+ import java . util . concurrent . atomic . AtomicLong ; 
+ - import java . util . concurrent . atomic . AtomicReferenceFieldUpdater ; 
+ 
+ import com . google . common . collect . Iterables ; 
+ import com . google . common . util . concurrent . * ; 
+ @ @ - 222 , 7 + 220 , 7 @ @ public class CommitLogSegmentManager 
+ { 
+ / / Now we can run the user defined command just after switching to the new commit log . 
+ / / ( Do this here instead of in the recycle call so we can get a head start on the archive . ) 
+ - CommitLog . instance . archiver . maybeArchive ( old . getPath ( ) , old . getName ( ) ) ; 
+ + CommitLog . instance . archiver . maybeArchive ( old ) ; 
+ 
+ / / ensure we don ' t continue to use the old file ; not strictly necessary , but cleaner to enforce it 
+ old . discardUnusedTail ( ) ; 
+ @ @ - 314 , 8 + 312 , 9 @ @ public class CommitLogSegmentManager 
+ * / 
+ void recycleSegment ( final CommitLogSegment segment ) 
+ { 
+ + boolean archiveSuccess = CommitLog . instance . archiver . maybeWaitForArchiving ( segment . getName ( ) ) ; 
+ activeSegments . remove ( segment ) ; 
+ - if ( ! CommitLog . instance . archiver . maybeWaitForArchiving ( segment . getName ( ) ) ) 
+ + if ( ! archiveSuccess ) 
+ { 
+ / / if archiving ( command ) was not successful then leave the file alone . don ' t delete or recycle . 
+ discardSegment ( segment , false ) ; 
+ diff - - git a / src / java / org / apache / cassandra / utils / PureJavaCrc32 . java b / src / java / org / apache / cassandra / utils / PureJavaCrc32 . java 
+ index 041652f . . 9a1ac02 100644 
+ - - - a / src / java / org / apache / cassandra / utils / PureJavaCrc32 . java 
+ + + + b / src / java / org / apache / cassandra / utils / PureJavaCrc32 . java 
+ @ @ - 31 , 7 + 31 , 7 @ @ import java . util . zip . Checksum ; 
+ * 
+ * @ see java . util . zip . CRC32 
+ * 
+ - * This class is copied from hadoop - commons project . 
+ + * This class is copied from hadoop - commons project and retains that formatting . 
+ * ( The initial patch added PureJavaCrc32 was HADOOP - 6148 ) 
+ * / 
+ public class PureJavaCrc32 implements Checksum { 
+ @ @ - 49 , 7 + 49 , 11 @ @ public class PureJavaCrc32 implements Checksum { 
+ return ( ~ crc ) & 0xffffffffL ; 
+ } 
+ 
+ - @ Override 
+ + public int getCrc ( ) { 
+ + return ~ crc ; 
+ + } 
+ + 
+ + @ Override 
+ public void reset ( ) { 
+ crc = 0xffffffff ; 
+ } 
+ @ @ - 172 , 7 + 176 , 14 @ @ public class PureJavaCrc32 implements Checksum { 
+ crc = ( crc > > > 8 ) ^ T [ T8 _ 0 _ start + ( ( crc ^ b ) & 0xff ) ] ; 
+ } 
+ 
+ - / * 
+ + final public void updateInt ( int v ) { 
+ + update ( ( v > > > 24 ) & 0xFF ) ; 
+ + update ( ( v > > > 16 ) & 0xFF ) ; 
+ + update ( ( v > > > 8 ) & 0xFF ) ; 
+ + update ( ( v > > > 0 ) & 0xFF ) ; 
+ + } 
+ + 
+ + / * 
+ * CRC - 32 lookup tables generated by the polynomial 0xEDB88320 . 
+ * See also TestPureJavaCrc32 . Table . 
+ * /
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index d518830 . . 52cc2c1 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 29 , 7 + 29 , 7 @ @ 
+ * add scheduler JMX metrics ( CASSANDRA - 2962 ) 
+ * add block level checksum for compressed data ( CASSANDRA - 1717 ) 
+ * make column family backed column map pluggable and introduce unsynchronized 
+ - ArrayList backed one to speedup reads ( CASSANDRA - 2843 ) 
+ + ArrayList backed one to speedup reads ( CASSANDRA - 2843 , 3165 ) 
+ * refactoring of the secondary index api ( CASSANDRA - 2982 ) 
+ * make CL > ONE reads wait for digest reconciliation before returning 
+ ( CASSANDRA - 2494 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ index c316a85 . . 71c7213 100644 
+ - - - a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ @ @ - 67 , 6 + 67 , 11 @ @ public class ArrayBackedSortedColumns extends ArrayList < IColumn > implements ISor 
+ this . reversed = reversed ; 
+ } 
+ 
+ + public ISortedColumns . Factory getFactory ( ) 
+ + { 
+ + return factory ( ) ; 
+ + } 
+ + 
+ public AbstractType < ? > getComparator ( ) 
+ { 
+ return comparator ; 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ index 1239d1c . . 38bc0d7 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ @ @ - 81 , 14 + 81 , 19 @ @ public class ColumnFamily extends AbstractColumnContainer 
+ this . cfm = cfm ; 
+ } 
+ 
+ - public ColumnFamily cloneMeShallow ( ) 
+ + public ColumnFamily cloneMeShallow ( ISortedColumns . Factory factory ) 
+ { 
+ - ColumnFamily cf = ColumnFamily . create ( cfm ) ; 
+ + ColumnFamily cf = ColumnFamily . create ( cfm , factory ) ; 
+ / / since deletion info is immutable , aliasing it is fine 
+ cf . deletionInfo . set ( deletionInfo . get ( ) ) ; 
+ return cf ; 
+ } 
+ 
+ + public ColumnFamily cloneMeShallow ( ) 
+ + { 
+ + return cloneMeShallow ( columns . getFactory ( ) ) ; 
+ + } 
+ + 
+ public AbstractType getSubComparator ( ) 
+ { 
+ IColumnSerializer s = getColumnSerializer ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 0bfd1c5 . . 552d3e9 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1162 , 8 + 1162 , 11 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ } 
+ } 
+ 
+ - / * * filter a cached row , which will not be modified by the filter , but may be modified by throwing out 
+ - * tombstones that are no longer relevant . * / 
+ + / * * 
+ + * Filter a cached row , which will not be modified by the filter , but may be modified by throwing out 
+ + * tombstones that are no longer relevant . 
+ + * The returned column family won ' t be thread safe . 
+ + * / 
+ ColumnFamily filterColumnFamily ( ColumnFamily cached , QueryFilter filter , int gcBefore ) 
+ { 
+ / / special case slicing the entire row : 
+ @ @ - 1184 , 7 + 1187 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ IColumn sc = cached . getColumn ( filter . path . superColumnName ) ; 
+ if ( sc = = null | | sliceFilter . count > = sc . getSubColumns ( ) . size ( ) ) 
+ { 
+ - ColumnFamily cf = cached . cloneMeShallow ( ) ; 
+ + ColumnFamily cf = cached . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; 
+ if ( sc ! = null ) 
+ cf . addColumn ( sc , HeapAllocator . instance ) ; 
+ return removeDeleted ( cf , gcBefore ) ; 
+ @ @ - 1203 , 7 + 1206 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ } 
+ 
+ IColumnIterator ci = filter . getMemtableColumnIterator ( cached , null , getComparator ( ) ) ; 
+ - ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ) ; 
+ + ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; 
+ filter . collateColumns ( cf , Collections . singletonList ( ci ) , getComparator ( ) , gcBefore ) ; 
+ / / TODO this is necessary because when we collate supercolumns together , we don ' t check 
+ / / their subcolumns for relevance , so we need to do a second prune post facto here . 
+ diff - - git a / src / java / org / apache / cassandra / db / ISortedColumns . java b / src / java / org / apache / cassandra / db / ISortedColumns . java 
+ index 37f5a60 . . 624dec7 100644 
+ - - - a / src / java / org / apache / cassandra / db / ISortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / ISortedColumns . java 
+ @ @ - 42 , 6 + 42 , 11 @ @ public interface ISortedColumns extends IIterableColumns 
+ public ISortedColumns cloneMe ( ) ; 
+ 
+ / * * 
+ + * Returns the factory used for this ISortedColumns implementation . 
+ + * / 
+ + public Factory getFactory ( ) ; 
+ + 
+ + / * * 
+ * Adds a column to this column map . 
+ * If a column with the same name is already present in the map , it will 
+ * be replaced by the newly added column . 
+ diff - - git a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java 
+ index cd2488a . . 13a111a 100644 
+ - - - a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java 
+ @ @ - 62 , 6 + 62 , 11 @ @ public class ThreadSafeSortedColumns extends ConcurrentSkipListMap < ByteBuffer , I 
+ super ( columns ) ; 
+ } 
+ 
+ + public ISortedColumns . Factory getFactory ( ) 
+ + { 
+ + return factory ( ) ; 
+ + } 
+ + 
+ public ISortedColumns cloneMe ( ) 
+ { 
+ return new ThreadSafeSortedColumns ( this ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java 
+ index 34e83dc . . 6c3fc42 100644 
+ - - - a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java 
+ @ @ - 62 , 6 + 62 , 11 @ @ public class TreeMapBackedSortedColumns extends TreeMap < ByteBuffer , IColumn > imp 
+ super ( columns ) ; 
+ } 
+ 
+ + public ISortedColumns . Factory getFactory ( ) 
+ + { 
+ + return factory ( ) ; 
+ + } 
+ + 
+ public ISortedColumns cloneMe ( ) 
+ { 
+ return new TreeMapBackedSortedColumns ( this ) ;

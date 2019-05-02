@@ -1,0 +1,313 @@
+BLEU SCORE: 0.027611988917697356
+
+TEST MSG: Avoid clock skew corrupting other nodes through paxos
+GENERATED MSG: Spelling and grammar errors in cassandra . yaml
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 7944967 . . 7474045 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 15 <nl> + * Fix clock skew corrupting other nodes with paxos ( CASSANDRA - 11991 ) <nl> * Remove distinction between non - existing static columns and existing but null in LWTs ( CASSANDRA - 9842 ) <nl> * Support mlockall on IBM POWER arch ( CASSANDRA - 11576 ) <nl> * Cache local ranges when calculating repair neighbors ( CASSANDRA - 11933 ) <nl> diff - - git a / src / java / org / apache / cassandra / service / ClientState . java b / src / java / org / apache / cassandra / service / ClientState . java <nl> index 23eec73 . . f2e3f1c 100644 <nl> - - - a / src / java / org / apache / cassandra / service / ClientState . java <nl> + + + b / src / java / org / apache / cassandra / service / ClientState . java <nl> @ @ - 98 , 8 + 98 , 10 @ @ public class ClientState <nl> / / The remote address of the client - null for internal clients . <nl> private final SocketAddress remoteAddress ; <nl> <nl> - / / The biggest timestamp that was returned by getTimestamp / assigned to a query . This is global to the VM <nl> - / / for the sake of paxos ( see # 9649 ) . <nl> + / / The biggest timestamp that was returned by getTimestamp / assigned to a query . This is global to ensure that the <nl> + / / timestamp assigned are strictly monotonic on a node , which is likely what user expect intuitively ( more likely , <nl> + / / most new user will intuitively expect timestamp to be strictly monotonic cluster - wise , but while that last part <nl> + / / is unrealistic expectation , doing it node - wise is easy ) . <nl> private static final AtomicLong lastTimestampMicros = new AtomicLong ( 0 ) ; <nl> <nl> / * * <nl> @ @ - 152 , 17 + 154 , 59 @ @ public class ClientState <nl> } <nl> <nl> / * * <nl> - * This is the same than { @ link # getTimestamp ( ) } but this guarantees that the returned timestamp <nl> - * will not be smaller than the provided { @ code minTimestampToUse } . <nl> + * Returns a timestamp suitable for paxos given the timestamp of the last known commit ( or in progress update ) . <nl> + * < p > <nl> + * Paxos ensures that the timestamp it uses for commits respects the serial order of those commits . It does so <nl> + * by having each replica reject any proposal whose timestamp is not strictly greater than the last proposal it <nl> + * accepted . So in practice , which timestamp we use for a given proposal doesn ' t affect correctness but it does <nl> + * affect the chance of making progress ( if we pick a timestamp lower than what has been proposed before , our <nl> + * new proposal will just get rejected ) . <nl> + * < p > <nl> + * As during the prepared phase replica send us the last propose they accepted , a first option would be to take <nl> + * the maximum of those last accepted proposal timestamp plus 1 ( and use a default value , say 0 , if it ' s the <nl> + * first known proposal for the partition ) . This would most work ( giving commits the timestamp 0 , 1 , 2 , . . . <nl> + * in the order they are commited ) up to 2 important caveats : <nl> + * 1 ) it would give a very poor experience when Paxos and non - Paxos updates are mixed in the same partition , <nl> + * since paxos operations wouldn ' t be using microseconds timestamps . And while you shouldn ' t theoretically <nl> + * mix the 2 kind of operations , this would still be pretty unintuitive . And what if you started writing <nl> + * normal updates and realize later you should switch to Paxos to enforce a property you want ? <nl> + * 2 ) this wouldn ' t actually be safe due to the expiration set on the Paxos state table . <nl> + * < p > <nl> + * So instead , we initially chose to use the current time in microseconds as for normal update . Which works in <nl> + * general but mean that clock skew creates unavailability periods for Paxos updates ( either a node has his clock <nl> + * in the past and he may no be able to get commit accepted until its clock catch up , or a node has his clock in <nl> + * the future and then once one of its commit his accepted , other nodes ones won ' t be until they catch up ) . This <nl> + * is ok for small clock skew ( few ms ) but can be pretty bad for large one . <nl> + * < p > <nl> + * Hence our current solution : we mix both approaches . That is , we compare the timestamp of the last known <nl> + * accepted proposal and the local time . If the local time is greater , we use it , thus keeping paxos timestamps <nl> + * locked to the current time in general ( making mixing Paxos and non - Paxos more friendly , and behaving correctly <nl> + * when the paxos state expire ( as long as your maximum clock skew is lower than the Paxos state expiration <nl> + * time ) ) . Otherwise ( the local time is lower than the last proposal , meaning that this last proposal was done <nl> + * with a clock in the future compared to the local one ) , we use the last proposal timestamp plus 1 , ensuring <nl> + * progress . <nl> + * <nl> + * @ param minTimestampToUse the max timestamp of the last proposal accepted by replica having responded <nl> + * to the prepare phase of the paxos round this is for . In practice , that ' s the minimum timestamp this method <nl> + * may return . <nl> + * @ return a timestamp suitable for a Paxos proposal ( using the reasoning described above ) . Note that <nl> + * contrarily to the { @ link # getTimestamp ( ) } method , the return value is not guaranteed to be unique ( nor <nl> + * monotonic ) across calls since it can return it ' s argument ( so if the same argument is passed multiple times , <nl> + * it may be returned multiple times ) . Note that we still ensure Paxos " ballot " are unique ( for different <nl> + * proposal ) by ( securely ) randomizing the non - timestamp part of the UUID . <nl> * / <nl> - public long getTimestamp ( long minTimestampToUse ) <nl> + public long getTimestampForPaxos ( long minTimestampToUse ) <nl> { <nl> while ( true ) <nl> { <nl> long current = Math . max ( System . currentTimeMillis ( ) * 1000 , minTimestampToUse ) ; <nl> long last = lastTimestampMicros . get ( ) ; <nl> long tstamp = last > = current ? last + 1 : current ; <nl> - if ( lastTimestampMicros . compareAndSet ( last , tstamp ) ) <nl> + / / Note that if we ended up picking minTimestampMicrosToUse ( it was " in the future " ) , we don ' t <nl> + / / want to change the local clock , otherwise a single node in the future could corrupt the clock <nl> + / / of all nodes and for all inserts ( since non - paxos inserts also use lastTimestampMicros ) . <nl> + / / See CASSANDRA - 11991 <nl> + if ( tstamp = = minTimestampToUse | | lastTimestampMicros . compareAndSet ( last , tstamp ) ) <nl> return tstamp ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index 845a732 . . af0693b 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 364 , 8 + 364 , 10 @ @ public class StorageProxy implements StorageProxyMBean <nl> / / in progress ( # 5667 ) . Lastly , we don ' t want to use a timestamp that is older than the last one assigned by ClientState or operations may appear <nl> / / out - of - order
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 2f5f5a9 . . 9551c4c 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 7 + 1 , 8 @ @ <nl> 2 . 0 <nl> * removed PBSPredictor ( CASSANDRA - 5455 ) <nl> * CAS support ( CASSANDRA - 5062 , ) <nl> - * Leveled compaction performs size - tiered compactions in L0 ( CASSANDRA - 5371 ) <nl> + * Leveled compaction performs size - tiered compactions in L0 <nl> + ( CASSANDRA - 5371 , 5439 ) <nl> * Add yaml network topology snitch for mixed ec2 / other envs ( CASSANDRA - 5339 ) <nl> * Log when a node is down longer than the hint window ( CASSANDRA - 4554 ) <nl> * Optimize tombstone creation for ExpiringColumns ( CASSANDRA - 4917 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java <nl> index f704518 . . 0e8c2a7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java <nl> @ @ - 53 , 6 + 53 , 7 @ @ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem <nl> { <nl> super ( cfs , options ) ; <nl> int configuredMaxSSTableSize = 5 ; <nl> + SizeTieredCompactionStrategyOptions localOptions = new SizeTieredCompactionStrategyOptions ( options ) ; <nl> if ( options ! = null ) <nl> { <nl> String value = options . containsKey ( SSTABLE _ SIZE _ OPTION ) ? options . get ( SSTABLE _ SIZE _ OPTION ) : " 5 " ; <nl> @ @ - 63 , 7 + 64 , 7 @ @ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem <nl> cfs . getDataTracker ( ) . subscribe ( this ) ; <nl> logger . debug ( " { } subscribed to the data tracker . " , this ) ; <nl> <nl> - manifest = LeveledManifest . create ( cfs , this . maxSSTableSizeInMB ) ; <nl> + manifest = LeveledManifest . create ( cfs , this . maxSSTableSizeInMB , Collections . < SSTableReader > emptyList ( ) , localOptions ) ; <nl> logger . debug ( " Created { } " , manifest ) ; <nl> } <nl> <nl> @ @ - 347 , 6 + 348 , 8 @ @ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem <nl> <nl> uncheckedOptions . remove ( SSTABLE _ SIZE _ OPTION ) ; <nl> <nl> + uncheckedOptions = SizeTieredCompactionStrategyOptions . validateOptions ( options , uncheckedOptions ) ; <nl> + <nl> return uncheckedOptions ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java b / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java <nl> index 8ae0834 . . fb4244d 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java <nl> @ @ - 57 , 11 + 57 , 13 @ @ public class LeveledManifest <nl> private final List < SSTableReader > [ ] generations ; <nl> private final RowPosition [ ] lastCompactedKeys ; <nl> private final int maxSSTableSizeInBytes ; <nl> + private final SizeTieredCompactionStrategyOptions options ; <nl> <nl> - private LeveledManifest ( ColumnFamilyStore cfs , int maxSSTableSizeInMB ) <nl> + private LeveledManifest ( ColumnFamilyStore cfs , int maxSSTableSizeInMB , SizeTieredCompactionStrategyOptions options ) <nl> { <nl> this . cfs = cfs ; <nl> this . maxSSTableSizeInBytes = maxSSTableSizeInMB * 1024 * 1024 ; <nl> + this . options = options ; <nl> <nl> / / allocate enough generations for a PB of data <nl> int n = ( int ) Math . log10 ( 1000 * 1000 * 1000 / maxSSTableSizeInMB ) ; <nl> @ @ - 74 , 14 + 76 , 14 @ @ public class LeveledManifest <nl> } <nl> } <nl> <nl> - static LeveledManifest create ( ColumnFamilyStore cfs , int maxSSTableSize ) <nl> + public static LeveledManifest create ( ColumnFamilyStore cfs , int maxSSTableSize , List < SSTableReader > sstables ) <nl> { <nl> - return create ( cfs , maxSSTableSize , cfs . getSSTables ( ) ) ; <nl> + return create ( cfs , maxSSTableSize , sstables , new SizeTieredCompactionStrategyOptions ( ) ) ; <nl> } <nl> <nl> - public static LeveledManifest create ( ColumnFamilyStore cfs , int maxSSTableSize , Iterable < SSTableReader > sstables ) <nl> + public static LeveledManifest create ( ColumnFamilyStore cfs , int maxSSTableSize , Iterable < SSTableReader > sstables , SizeTieredCompactionStrategyOptions options ) <nl> { <nl> - LeveledManifest manifest = new LeveledManifest ( cfs , maxSSTableSize ) ; <nl> + LeveledManifest manifest = new LeveledManifest ( cfs , maxSSTableSize , options ) ; <nl> <nl> / / ensure all SSTables are in the manifest <nl> for ( SSTableReader ssTableReader : sstables ) <nl> @ @ - 271 , 9 + 273 , 9 @ @ public class LeveledManifest <nl> Iterable < SSTableReader > candidates = cfs . getDataTracker ( ) . getUncompactingSSTables ( generations [ 0 ] ) ; <nl> List < Pair < SSTableReader , Long > > pairs = SizeTieredCompactionStrategy . createSSTableAndLengthPairs ( AbstractCompactionStrategy . filterSuspectSSTables ( candidates ) ) ; <nl> List < List < SSTableReader > > buckets = SizeTieredCompactionStrategy . getBuckets ( pairs , <nl> - SizeTieredCompactionStrategy . DEFAULT _ BUCKET _ HIGH , <nl> - SizeTieredCompactionStrategy . DEFAULT _ BUCKET _ LOW , <nl> - SizeTieredCompactionStrategy . DEFAULT _ MIN _ SSTABLE _ SIZE ) ; <nl> + options . bucketHigh , <nl> + options . bucketLow , <nl> + options . minSSTableSize ) ; <nl> List < SSTableReader > mostInteresting = SizeTieredCompactionStrategy . mostInterestingBucket ( buckets , 4 , 32 ) ; <nl> if ( ! mostInteresting . isEmpty ( ) ) <nl> return Pair . create ( mostInteresting , 0 ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java <nl> index ae6f627 . . 3678184 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java <nl> @ @ - 34 , 28 + 34 , 15 @ @ import org . apache . cassandra . utils . Pair ; <nl> public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( SizeTieredCompactionStrategy . class ) ; <nl> - protected static final long DEFAULT _ MIN _ SSTABLE _ SIZE = 50L * 1024L * 1024L ; <nl> - protected static final double DEFAULT _ BUCKET _ LOW = 0 . 5 ; <nl> - protected static final double DEFAULT _ BUCKET _ HIGH = 1 . 5 ; <nl> - protected static final String MIN _ SSTABLE _ SIZE _ KEY = " min _ sstable _ size " ; <nl> - protected static final String BUCKET _ LOW _ KEY = " bucket _ low " ; <nl> - protected static final String BUCKET _ HIGH _ KEY = " bucket _ high " ; <nl> - <nl> - protected long minSSTableSize ; <nl> - protected double bucketLow ; <nl> - protected double bucketHigh ; <nl> + <nl> + protected SizeTieredCompactionStrategyOptions options ; <nl> protected volatile int estimatedRemainingTasks ; <nl> <nl> public SizeTieredCompactionStrategy ( ColumnFamilyStore cfs , Map < String , String > options ) <nl> { <nl> super ( cfs , options ) ; <nl> this . estimatedRemainingTasks = 0 ; <nl> - String optionValue = options . get ( MIN _ SSTABLE _ SIZE _ KEY ) ; <nl> - minSSTableSize = optionValue = = null ? DEFAULT _ MIN _ SSTABLE _ SIZE : Long . parseLong ( optionValue ) ; <nl> - optionValue = options . get ( BUCKET _ LOW _ KEY ) ; <nl> - bucketLow = optionValue = = null ? DEFAULT _ BUCKET _ LOW : Double . parseDouble ( optionValue ) ; <nl> - optionValue = options . get ( BUCKET _ HIGH _ KEY ) ; <nl> - bucketHigh = optionValue = = null ? DEFAULT _ BUCKET _ HIGH : Double . parseDouble ( optionValue ) ; <nl> + this . options = new SizeTieredCompactionStrategyOptions ( options ) ; <nl> } <nl> <nl> private List < SSTableReader > getNextBackgroundSSTables ( final int gcBefore ) <nl> @ @ - 68 , 7 + 55 , 7 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy <nl> int maxThreshold = cfs . getMaximumCompactionThreshold ( ) ; <nl> <nl> Set < SSTableReader > candidates = cfs . getUncompactingSSTables ( ) ; <nl> - List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndLengthPairs ( filterSuspectSSTables ( candidates ) ) , bucketHigh , bucketLow , minSSTableSize ) ; <nl> + List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndLengthPairs ( filterSuspectSSTables ( candidates ) ) , options . bucketHigh , options . bucketLow , options . minSSTableSize ) ; <nl> logger . debug ( " Compaction buckets are { } " , buckets ) ; <nl> updateEstimatedCompactionsByTasks ( buckets ) ; <nl> List < SSTableReader > mostInteresting = mostInterestingBucket ( buckets , minThreshold , maxThreshold ) ; <nl> @ @ - 252 , 50 + 239 , 8 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy <nl> public static Map < String , String > validateOptions ( Map < String , String > options ) throws ConfigurationException <nl> { <nl> Map < String , String > uncheckedOptions = AbstractCompactionStrategy . validateOptions ( options ) ; <nl> + uncheckedOptions = SizeTieredCompactionStrategyOptions . validateOptions ( options , uncheckedOptions ) ; <nl> <nl> - String optionValue = options . get ( MIN _ SSTABLE _ SIZE _ KEY ) ; <nl> - try <nl> - { <nl> - long minSSTableSize = optionValue = = null ? DEFAULT _ MIN _ SSTABLE _ SIZE : Long . parseLong ( optionValue ) ; <nl> - if ( minSSTableSize < 0 ) <nl> - { <nl> - throw new ConfigurationException ( String . format ( " % s must be non negative : % d " , MIN _ SSTABLE _ SIZE _ KEY , minSSTableSize ) ) ; <nl> - } <nl> - } <nl> - catch ( NumberFormatException e ) <nl> - { <nl> - throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , MIN _ SSTABLE _ SIZE _ KEY ) , e ) ; <nl> - } <nl> - <nl> - double bucketLow , bucketHigh ; <nl> - optionValue = options . get ( BUCKET _ LOW _ KEY ) ; <nl> - try <nl> - { <nl> - bucketLow = optionValue = = null ? DEFAULT _ BUCKET _ LOW : Double . parseDouble ( optionValue ) ; <nl> - } <nl> - catch ( NumberFormatException e ) <nl> - { <nl> - throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , DEFAULT _ BUCKET _ LOW ) , e ) ; <nl> - } <nl> - <nl> - optionValue = options . get ( BUCKET _ HIGH _ KEY ) ; <nl> - try <nl> - { <nl> - bucketHigh = optionValue = = null ? DEFAULT _ BUCKET _ HIGH : Double . parseDouble ( optionValue ) ; <nl> - } <nl> - catch ( NumberFormatException e ) <nl> - { <nl> - throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , DEFAULT _ BUCKET _ HIGH ) , e ) ; <nl> - } <nl> - <nl> - if ( bucketHigh < = bucketLow ) <nl> - { <nl> - throw new ConfigurationException ( String . format ( " Bucket high value ( % s ) is less than or equal bucket low value ( % s ) " , bucketHigh , bucketLow ) ) ; <nl> - } <nl> - <nl> - uncheckedOptions . remove ( MIN _ SSTABLE _ SIZE _ KEY ) ; <nl> - uncheckedOptions . remove ( BUCKET _ LOW _ KEY ) ; <nl> - uncheckedOptions . remove ( BUCKET _ HIGH _ KEY ) ; <nl> uncheckedOptions . remove ( CFPropDefs . KW _ MINCOMPACTIONTHRESHOLD ) ; <nl> uncheckedOptions . remove ( CFPropDefs . KW _ MAXCOMPACTIONTHRESHOLD ) ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / tools / StandaloneScrubber . java b / src / java / org / apache / cassandra / tools / StandaloneScrubber . java <nl> index 34a8a72 . . c9d39bb 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / StandaloneScrubber . java <nl> + + + b / src / java / org / apache / cassandra / tools / StandaloneScrubber . java <nl> @ @ - 22 , 6 + 22 , 7 @ @ import java . io . File ; <nl> import java . io . IOException ; <nl> import java . util . * ; <nl> <nl> + import org . apache . cassandra . db . compaction . SizeTieredCompactionStrategyOptions ; <nl> import org . apache . commons . cli . * ; <nl> <nl> import org . apache . cassandra . config . DatabaseDescriptor ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 7944967 . . 7474045 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 15 
+ + * Fix clock skew corrupting other nodes with paxos ( CASSANDRA - 11991 ) 
+ * Remove distinction between non - existing static columns and existing but null in LWTs ( CASSANDRA - 9842 ) 
+ * Support mlockall on IBM POWER arch ( CASSANDRA - 11576 ) 
+ * Cache local ranges when calculating repair neighbors ( CASSANDRA - 11933 ) 
+ diff - - git a / src / java / org / apache / cassandra / service / ClientState . java b / src / java / org / apache / cassandra / service / ClientState . java 
+ index 23eec73 . . f2e3f1c 100644 
+ - - - a / src / java / org / apache / cassandra / service / ClientState . java 
+ + + + b / src / java / org / apache / cassandra / service / ClientState . java 
+ @ @ - 98 , 8 + 98 , 10 @ @ public class ClientState 
+ / / The remote address of the client - null for internal clients . 
+ private final SocketAddress remoteAddress ; 
+ 
+ - / / The biggest timestamp that was returned by getTimestamp / assigned to a query . This is global to the VM 
+ - / / for the sake of paxos ( see # 9649 ) . 
+ + / / The biggest timestamp that was returned by getTimestamp / assigned to a query . This is global to ensure that the 
+ + / / timestamp assigned are strictly monotonic on a node , which is likely what user expect intuitively ( more likely , 
+ + / / most new user will intuitively expect timestamp to be strictly monotonic cluster - wise , but while that last part 
+ + / / is unrealistic expectation , doing it node - wise is easy ) . 
+ private static final AtomicLong lastTimestampMicros = new AtomicLong ( 0 ) ; 
+ 
+ / * * 
+ @ @ - 152 , 17 + 154 , 59 @ @ public class ClientState 
+ } 
+ 
+ / * * 
+ - * This is the same than { @ link # getTimestamp ( ) } but this guarantees that the returned timestamp 
+ - * will not be smaller than the provided { @ code minTimestampToUse } . 
+ + * Returns a timestamp suitable for paxos given the timestamp of the last known commit ( or in progress update ) . 
+ + * < p > 
+ + * Paxos ensures that the timestamp it uses for commits respects the serial order of those commits . It does so 
+ + * by having each replica reject any proposal whose timestamp is not strictly greater than the last proposal it 
+ + * accepted . So in practice , which timestamp we use for a given proposal doesn ' t affect correctness but it does 
+ + * affect the chance of making progress ( if we pick a timestamp lower than what has been proposed before , our 
+ + * new proposal will just get rejected ) . 
+ + * < p > 
+ + * As during the prepared phase replica send us the last propose they accepted , a first option would be to take 
+ + * the maximum of those last accepted proposal timestamp plus 1 ( and use a default value , say 0 , if it ' s the 
+ + * first known proposal for the partition ) . This would most work ( giving commits the timestamp 0 , 1 , 2 , . . . 
+ + * in the order they are commited ) up to 2 important caveats : 
+ + * 1 ) it would give a very poor experience when Paxos and non - Paxos updates are mixed in the same partition , 
+ + * since paxos operations wouldn ' t be using microseconds timestamps . And while you shouldn ' t theoretically 
+ + * mix the 2 kind of operations , this would still be pretty unintuitive . And what if you started writing 
+ + * normal updates and realize later you should switch to Paxos to enforce a property you want ? 
+ + * 2 ) this wouldn ' t actually be safe due to the expiration set on the Paxos state table . 
+ + * < p > 
+ + * So instead , we initially chose to use the current time in microseconds as for normal update . Which works in 
+ + * general but mean that clock skew creates unavailability periods for Paxos updates ( either a node has his clock 
+ + * in the past and he may no be able to get commit accepted until its clock catch up , or a node has his clock in 
+ + * the future and then once one of its commit his accepted , other nodes ones won ' t be until they catch up ) . This 
+ + * is ok for small clock skew ( few ms ) but can be pretty bad for large one . 
+ + * < p > 
+ + * Hence our current solution : we mix both approaches . That is , we compare the timestamp of the last known 
+ + * accepted proposal and the local time . If the local time is greater , we use it , thus keeping paxos timestamps 
+ + * locked to the current time in general ( making mixing Paxos and non - Paxos more friendly , and behaving correctly 
+ + * when the paxos state expire ( as long as your maximum clock skew is lower than the Paxos state expiration 
+ + * time ) ) . Otherwise ( the local time is lower than the last proposal , meaning that this last proposal was done 
+ + * with a clock in the future compared to the local one ) , we use the last proposal timestamp plus 1 , ensuring 
+ + * progress . 
+ + * 
+ + * @ param minTimestampToUse the max timestamp of the last proposal accepted by replica having responded 
+ + * to the prepare phase of the paxos round this is for . In practice , that ' s the minimum timestamp this method 
+ + * may return . 
+ + * @ return a timestamp suitable for a Paxos proposal ( using the reasoning described above ) . Note that 
+ + * contrarily to the { @ link # getTimestamp ( ) } method , the return value is not guaranteed to be unique ( nor 
+ + * monotonic ) across calls since it can return it ' s argument ( so if the same argument is passed multiple times , 
+ + * it may be returned multiple times ) . Note that we still ensure Paxos " ballot " are unique ( for different 
+ + * proposal ) by ( securely ) randomizing the non - timestamp part of the UUID . 
+ * / 
+ - public long getTimestamp ( long minTimestampToUse ) 
+ + public long getTimestampForPaxos ( long minTimestampToUse ) 
+ { 
+ while ( true ) 
+ { 
+ long current = Math . max ( System . currentTimeMillis ( ) * 1000 , minTimestampToUse ) ; 
+ long last = lastTimestampMicros . get ( ) ; 
+ long tstamp = last > = current ? last + 1 : current ; 
+ - if ( lastTimestampMicros . compareAndSet ( last , tstamp ) ) 
+ + / / Note that if we ended up picking minTimestampMicrosToUse ( it was " in the future " ) , we don ' t 
+ + / / want to change the local clock , otherwise a single node in the future could corrupt the clock 
+ + / / of all nodes and for all inserts ( since non - paxos inserts also use lastTimestampMicros ) . 
+ + / / See CASSANDRA - 11991 
+ + if ( tstamp = = minTimestampToUse | | lastTimestampMicros . compareAndSet ( last , tstamp ) ) 
+ return tstamp ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index 845a732 . . af0693b 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 364 , 8 + 364 , 10 @ @ public class StorageProxy implements StorageProxyMBean 
+ / / in progress ( # 5667 ) . Lastly , we don ' t want to use a timestamp that is older than the last one assigned by ClientState or operations may appear 
+ / / out - of - order
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 2f5f5a9 . . 9551c4c 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 7 + 1 , 8 @ @ 
+ 2 . 0 
+ * removed PBSPredictor ( CASSANDRA - 5455 ) 
+ * CAS support ( CASSANDRA - 5062 , ) 
+ - * Leveled compaction performs size - tiered compactions in L0 ( CASSANDRA - 5371 ) 
+ + * Leveled compaction performs size - tiered compactions in L0 
+ + ( CASSANDRA - 5371 , 5439 ) 
+ * Add yaml network topology snitch for mixed ec2 / other envs ( CASSANDRA - 5339 ) 
+ * Log when a node is down longer than the hint window ( CASSANDRA - 4554 ) 
+ * Optimize tombstone creation for ExpiringColumns ( CASSANDRA - 4917 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java 
+ index f704518 . . 0e8c2a7 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java 
+ @ @ - 53 , 6 + 53 , 7 @ @ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem 
+ { 
+ super ( cfs , options ) ; 
+ int configuredMaxSSTableSize = 5 ; 
+ + SizeTieredCompactionStrategyOptions localOptions = new SizeTieredCompactionStrategyOptions ( options ) ; 
+ if ( options ! = null ) 
+ { 
+ String value = options . containsKey ( SSTABLE _ SIZE _ OPTION ) ? options . get ( SSTABLE _ SIZE _ OPTION ) : " 5 " ; 
+ @ @ - 63 , 7 + 64 , 7 @ @ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem 
+ cfs . getDataTracker ( ) . subscribe ( this ) ; 
+ logger . debug ( " { } subscribed to the data tracker . " , this ) ; 
+ 
+ - manifest = LeveledManifest . create ( cfs , this . maxSSTableSizeInMB ) ; 
+ + manifest = LeveledManifest . create ( cfs , this . maxSSTableSizeInMB , Collections . < SSTableReader > emptyList ( ) , localOptions ) ; 
+ logger . debug ( " Created { } " , manifest ) ; 
+ } 
+ 
+ @ @ - 347 , 6 + 348 , 8 @ @ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem 
+ 
+ uncheckedOptions . remove ( SSTABLE _ SIZE _ OPTION ) ; 
+ 
+ + uncheckedOptions = SizeTieredCompactionStrategyOptions . validateOptions ( options , uncheckedOptions ) ; 
+ + 
+ return uncheckedOptions ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java b / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java 
+ index 8ae0834 . . fb4244d 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java 
+ @ @ - 57 , 11 + 57 , 13 @ @ public class LeveledManifest 
+ private final List < SSTableReader > [ ] generations ; 
+ private final RowPosition [ ] lastCompactedKeys ; 
+ private final int maxSSTableSizeInBytes ; 
+ + private final SizeTieredCompactionStrategyOptions options ; 
+ 
+ - private LeveledManifest ( ColumnFamilyStore cfs , int maxSSTableSizeInMB ) 
+ + private LeveledManifest ( ColumnFamilyStore cfs , int maxSSTableSizeInMB , SizeTieredCompactionStrategyOptions options ) 
+ { 
+ this . cfs = cfs ; 
+ this . maxSSTableSizeInBytes = maxSSTableSizeInMB * 1024 * 1024 ; 
+ + this . options = options ; 
+ 
+ / / allocate enough generations for a PB of data 
+ int n = ( int ) Math . log10 ( 1000 * 1000 * 1000 / maxSSTableSizeInMB ) ; 
+ @ @ - 74 , 14 + 76 , 14 @ @ public class LeveledManifest 
+ } 
+ } 
+ 
+ - static LeveledManifest create ( ColumnFamilyStore cfs , int maxSSTableSize ) 
+ + public static LeveledManifest create ( ColumnFamilyStore cfs , int maxSSTableSize , List < SSTableReader > sstables ) 
+ { 
+ - return create ( cfs , maxSSTableSize , cfs . getSSTables ( ) ) ; 
+ + return create ( cfs , maxSSTableSize , sstables , new SizeTieredCompactionStrategyOptions ( ) ) ; 
+ } 
+ 
+ - public static LeveledManifest create ( ColumnFamilyStore cfs , int maxSSTableSize , Iterable < SSTableReader > sstables ) 
+ + public static LeveledManifest create ( ColumnFamilyStore cfs , int maxSSTableSize , Iterable < SSTableReader > sstables , SizeTieredCompactionStrategyOptions options ) 
+ { 
+ - LeveledManifest manifest = new LeveledManifest ( cfs , maxSSTableSize ) ; 
+ + LeveledManifest manifest = new LeveledManifest ( cfs , maxSSTableSize , options ) ; 
+ 
+ / / ensure all SSTables are in the manifest 
+ for ( SSTableReader ssTableReader : sstables ) 
+ @ @ - 271 , 9 + 273 , 9 @ @ public class LeveledManifest 
+ Iterable < SSTableReader > candidates = cfs . getDataTracker ( ) . getUncompactingSSTables ( generations [ 0 ] ) ; 
+ List < Pair < SSTableReader , Long > > pairs = SizeTieredCompactionStrategy . createSSTableAndLengthPairs ( AbstractCompactionStrategy . filterSuspectSSTables ( candidates ) ) ; 
+ List < List < SSTableReader > > buckets = SizeTieredCompactionStrategy . getBuckets ( pairs , 
+ - SizeTieredCompactionStrategy . DEFAULT _ BUCKET _ HIGH , 
+ - SizeTieredCompactionStrategy . DEFAULT _ BUCKET _ LOW , 
+ - SizeTieredCompactionStrategy . DEFAULT _ MIN _ SSTABLE _ SIZE ) ; 
+ + options . bucketHigh , 
+ + options . bucketLow , 
+ + options . minSSTableSize ) ; 
+ List < SSTableReader > mostInteresting = SizeTieredCompactionStrategy . mostInterestingBucket ( buckets , 4 , 32 ) ; 
+ if ( ! mostInteresting . isEmpty ( ) ) 
+ return Pair . create ( mostInteresting , 0 ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java 
+ index ae6f627 . . 3678184 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java 
+ @ @ - 34 , 28 + 34 , 15 @ @ import org . apache . cassandra . utils . Pair ; 
+ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( SizeTieredCompactionStrategy . class ) ; 
+ - protected static final long DEFAULT _ MIN _ SSTABLE _ SIZE = 50L * 1024L * 1024L ; 
+ - protected static final double DEFAULT _ BUCKET _ LOW = 0 . 5 ; 
+ - protected static final double DEFAULT _ BUCKET _ HIGH = 1 . 5 ; 
+ - protected static final String MIN _ SSTABLE _ SIZE _ KEY = " min _ sstable _ size " ; 
+ - protected static final String BUCKET _ LOW _ KEY = " bucket _ low " ; 
+ - protected static final String BUCKET _ HIGH _ KEY = " bucket _ high " ; 
+ - 
+ - protected long minSSTableSize ; 
+ - protected double bucketLow ; 
+ - protected double bucketHigh ; 
+ + 
+ + protected SizeTieredCompactionStrategyOptions options ; 
+ protected volatile int estimatedRemainingTasks ; 
+ 
+ public SizeTieredCompactionStrategy ( ColumnFamilyStore cfs , Map < String , String > options ) 
+ { 
+ super ( cfs , options ) ; 
+ this . estimatedRemainingTasks = 0 ; 
+ - String optionValue = options . get ( MIN _ SSTABLE _ SIZE _ KEY ) ; 
+ - minSSTableSize = optionValue = = null ? DEFAULT _ MIN _ SSTABLE _ SIZE : Long . parseLong ( optionValue ) ; 
+ - optionValue = options . get ( BUCKET _ LOW _ KEY ) ; 
+ - bucketLow = optionValue = = null ? DEFAULT _ BUCKET _ LOW : Double . parseDouble ( optionValue ) ; 
+ - optionValue = options . get ( BUCKET _ HIGH _ KEY ) ; 
+ - bucketHigh = optionValue = = null ? DEFAULT _ BUCKET _ HIGH : Double . parseDouble ( optionValue ) ; 
+ + this . options = new SizeTieredCompactionStrategyOptions ( options ) ; 
+ } 
+ 
+ private List < SSTableReader > getNextBackgroundSSTables ( final int gcBefore ) 
+ @ @ - 68 , 7 + 55 , 7 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy 
+ int maxThreshold = cfs . getMaximumCompactionThreshold ( ) ; 
+ 
+ Set < SSTableReader > candidates = cfs . getUncompactingSSTables ( ) ; 
+ - List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndLengthPairs ( filterSuspectSSTables ( candidates ) ) , bucketHigh , bucketLow , minSSTableSize ) ; 
+ + List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndLengthPairs ( filterSuspectSSTables ( candidates ) ) , options . bucketHigh , options . bucketLow , options . minSSTableSize ) ; 
+ logger . debug ( " Compaction buckets are { } " , buckets ) ; 
+ updateEstimatedCompactionsByTasks ( buckets ) ; 
+ List < SSTableReader > mostInteresting = mostInterestingBucket ( buckets , minThreshold , maxThreshold ) ; 
+ @ @ - 252 , 50 + 239 , 8 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy 
+ public static Map < String , String > validateOptions ( Map < String , String > options ) throws ConfigurationException 
+ { 
+ Map < String , String > uncheckedOptions = AbstractCompactionStrategy . validateOptions ( options ) ; 
+ + uncheckedOptions = SizeTieredCompactionStrategyOptions . validateOptions ( options , uncheckedOptions ) ; 
+ 
+ - String optionValue = options . get ( MIN _ SSTABLE _ SIZE _ KEY ) ; 
+ - try 
+ - { 
+ - long minSSTableSize = optionValue = = null ? DEFAULT _ MIN _ SSTABLE _ SIZE : Long . parseLong ( optionValue ) ; 
+ - if ( minSSTableSize < 0 ) 
+ - { 
+ - throw new ConfigurationException ( String . format ( " % s must be non negative : % d " , MIN _ SSTABLE _ SIZE _ KEY , minSSTableSize ) ) ; 
+ - } 
+ - } 
+ - catch ( NumberFormatException e ) 
+ - { 
+ - throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , MIN _ SSTABLE _ SIZE _ KEY ) , e ) ; 
+ - } 
+ - 
+ - double bucketLow , bucketHigh ; 
+ - optionValue = options . get ( BUCKET _ LOW _ KEY ) ; 
+ - try 
+ - { 
+ - bucketLow = optionValue = = null ? DEFAULT _ BUCKET _ LOW : Double . parseDouble ( optionValue ) ; 
+ - } 
+ - catch ( NumberFormatException e ) 
+ - { 
+ - throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , DEFAULT _ BUCKET _ LOW ) , e ) ; 
+ - } 
+ - 
+ - optionValue = options . get ( BUCKET _ HIGH _ KEY ) ; 
+ - try 
+ - { 
+ - bucketHigh = optionValue = = null ? DEFAULT _ BUCKET _ HIGH : Double . parseDouble ( optionValue ) ; 
+ - } 
+ - catch ( NumberFormatException e ) 
+ - { 
+ - throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , DEFAULT _ BUCKET _ HIGH ) , e ) ; 
+ - } 
+ - 
+ - if ( bucketHigh < = bucketLow ) 
+ - { 
+ - throw new ConfigurationException ( String . format ( " Bucket high value ( % s ) is less than or equal bucket low value ( % s ) " , bucketHigh , bucketLow ) ) ; 
+ - } 
+ - 
+ - uncheckedOptions . remove ( MIN _ SSTABLE _ SIZE _ KEY ) ; 
+ - uncheckedOptions . remove ( BUCKET _ LOW _ KEY ) ; 
+ - uncheckedOptions . remove ( BUCKET _ HIGH _ KEY ) ; 
+ uncheckedOptions . remove ( CFPropDefs . KW _ MINCOMPACTIONTHRESHOLD ) ; 
+ uncheckedOptions . remove ( CFPropDefs . KW _ MAXCOMPACTIONTHRESHOLD ) ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / tools / StandaloneScrubber . java b / src / java / org / apache / cassandra / tools / StandaloneScrubber . java 
+ index 34a8a72 . . c9d39bb 100644 
+ - - - a / src / java / org / apache / cassandra / tools / StandaloneScrubber . java 
+ + + + b / src / java / org / apache / cassandra / tools / StandaloneScrubber . java 
+ @ @ - 22 , 6 + 22 , 7 @ @ import java . io . File ; 
+ import java . io . IOException ; 
+ import java . util . * ; 
+ 
+ + import org . apache . cassandra . db . compaction . SizeTieredCompactionStrategyOptions ; 
+ import org . apache . commons . cli . * ; 
+ 
+ import org . apache . cassandra . config . DatabaseDescriptor ;

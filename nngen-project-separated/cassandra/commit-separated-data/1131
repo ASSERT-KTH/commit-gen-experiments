@@ -1,0 +1,1712 @@
+BLEU SCORE: 1.0790711576924288E-8
+
+TEST MSG: Allow cancellation of index summary redistribution
+GENERATED MSG: Replace PriorityQueue mess with a CompactionIterator that efficiently yields compacted Rows from a set of sstables by feeding CollationIterator into a ReducingIterator transform . ( " Efficiently " means we never deserialize data until it is needed , so the number of sstables that can be compacted at once is virtually unlimited , and if only one sstable contains a given key that row data will be copied over without an intermediate de / serialize step . ) This is a very natural fit for the compaction algorithm and almost entirely gets rid of duplicated code between doFileCompaction and doAntiCompaction .
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 46cda65 . . 2ee8b07 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 13 <nl> + * Allow cancellation of index summary redistribution ( CASSANDRA - 8805 ) <nl> * Disable reloading of GossipingPropertyFileSnitch ( CASSANDRA - 9474 ) <nl> * Fix Stress profile parsing on Windows ( CASSANDRA - 10808 ) <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionInfo . java b / src / java / org / apache / cassandra / db / compaction / CompactionInfo . java <nl> index d086eef . . e88143e 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionInfo . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionInfo . java <nl> @ @ - 98 , 9 + 98 , 17 @ @ public final class CompactionInfo implements Serializable <nl> public String toString ( ) <nl> { <nl> StringBuilder buff = new StringBuilder ( ) ; <nl> - buff . append ( getTaskType ( ) ) . append ( ' @ ' ) . append ( getId ( ) ) ; <nl> - buff . append ( ' ( ' ) . append ( getKeyspace ( ) ) . append ( " , " ) . append ( getColumnFamily ( ) ) ; <nl> - buff . append ( " , " ) . append ( getCompleted ( ) ) . append ( ' / ' ) . append ( getTotal ( ) ) ; <nl> + buff . append ( getTaskType ( ) ) ; <nl> + if ( cfm ! = null ) <nl> + { <nl> + buff . append ( ' @ ' ) . append ( getId ( ) ) . append ( ' ( ' ) ; <nl> + buff . append ( getKeyspace ( ) ) . append ( " , " ) . append ( getColumnFamily ( ) ) . append ( " , " ) ; <nl> + } <nl> + else <nl> + { <nl> + buff . append ( ' ( ' ) ; <nl> + } <nl> + buff . append ( getCompleted ( ) ) . append ( ' / ' ) . append ( getTotal ( ) ) ; <nl> return buff . append ( ' ) ' ) . append ( unit ) . toString ( ) ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> index 2630ba2 . . 9bddaf5 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> @ @ - 1222 , 6 + 1222 , 20 @ @ public class CompactionManager implements CompactionManagerMBean <nl> return executor . submit ( runnable ) ; <nl> } <nl> <nl> + public List < SSTableReader > runIndexSummaryRedistribution ( IndexSummaryRedistribution redistribution ) throws IOException <nl> + { <nl> + metrics . beginCompaction ( redistribution ) ; <nl> + <nl> + try <nl> + { <nl> + return redistribution . redistributeSummaries ( ) ; <nl> + } <nl> + finally <nl> + { <nl> + metrics . finishCompaction ( redistribution ) ; <nl> + } <nl> + } <nl> + <nl> static int getDefaultGcBefore ( ColumnFamilyStore cfs ) <nl> { <nl> / / 2ndary indexes have ExpiringColumns too , so we need to purge tombstones deleted before now . We do not need to <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / OperationType . java b / src / java / org / apache / cassandra / db / compaction / OperationType . java <nl> index 15d18f6 . . 475b591 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / OperationType . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / OperationType . java <nl> @ @ - 31 , 7 + 31 , 8 @ @ public enum OperationType <nl> / * * Compaction for tombstone removal * / <nl> TOMBSTONE _ COMPACTION ( " Tombstone Compaction " ) , <nl> UNKNOWN ( " Unknown compaction type " ) , <nl> - ANTICOMPACTION ( " Anticompaction after repair " ) ; <nl> + ANTICOMPACTION ( " Anticompaction after repair " ) , <nl> + INDEX _ SUMMARY ( " Index summary redistribution " ) ; <nl> <nl> private final String type ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / IndexSummaryManager . java b / src / java / org / apache / cassandra / io / sstable / IndexSummaryManager . java <nl> index 0c196ff . . be5cc3c 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / IndexSummaryManager . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / IndexSummaryManager . java <nl> @ @ - 20 , 8 + 20 , 6 @ @ package org . apache . cassandra . io . sstable ; <nl> import java . io . IOException ; <nl> import java . lang . management . ManagementFactory ; <nl> import java . util . ArrayList ; <nl> - import java . util . Collections ; <nl> - import java . util . Comparator ; <nl> import java . util . HashMap ; <nl> import java . util . List ; <nl> import java . util . Map ; <nl> @ @ - 33 , 7 + 31 , 6 @ @ import javax . management . ObjectName ; <nl> <nl> import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . collect . HashMultimap ; <nl> - import com . google . common . collect . Iterables ; <nl> import com . google . common . collect . Lists ; <nl> import com . google . common . collect . Multimap ; <nl> import com . google . common . collect . Sets ; <nl> @ @ - 45 , 11 + 42 , 10 @ @ import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . db . DataTracker ; <nl> import org . apache . cassandra . db . Keyspace ; <nl> + import org . apache . cassandra . db . compaction . CompactionManager ; <nl> import org . apache . cassandra . utils . Pair ; <nl> import org . apache . cassandra . utils . WrappedRunnable ; <nl> <nl> - import static org . apache . cassandra . io . sstable . Downsampling . BASE _ SAMPLING _ LEVEL ; <nl> - <nl> / * * <nl> * Manages the fixed - size memory pool for index summaries , periodically resizing them <nl> * in order to give more memory to hot sstables and less memory to cold sstables . <nl> @ @ - 255 , 261 + 251 , 6 @ @ public class IndexSummaryManager implements IndexSummaryManagerMBean <nl> @ VisibleForTesting <nl> public static List < SSTableReader > redistributeSummaries ( List < SSTableReader > compacting , List < SSTableReader > nonCompacting , long memoryPoolBytes ) throws IOException <nl> { <nl> - long total = 0 ; <nl> - for ( SSTableReader sstable : Iterables . concat ( compacting , nonCompacting ) ) <nl> - total + = sstable . getIndexSummaryOffHeapSize ( ) ; <nl> - <nl> - List < SSTableReader > oldFormatSSTables = new ArrayList < > ( ) ; <nl> - for ( SSTableReader sstable : nonCompacting ) <nl> - { <nl> - / / We can ' t change the sampling level of sstables with the old format , because the serialization format <nl> - / / doesn ' t include the sampling level . Leave this one as it is . ( See CASSANDRA - 8993 for details . ) <nl> - logger . trace ( " SSTable { } cannot be re - sampled due to old sstable format " , sstable ) ; <nl> - if ( ! sstable . descriptor . version . hasSamplingLevel ) <nl> - oldFormatSSTables . add ( sstable ) ; <nl> - } <nl> - nonCompacting . removeAll ( oldFormatSSTables ) ; <nl> - <nl> - logger . debug ( " Beginning redistribution of index summaries for { } sstables with memory pool size { } MB ; current spaced used is { } MB " , <nl> - nonCompacting . size ( ) , memoryPoolBytes / 1024L / 1024L , total / 1024 . 0 / 1024 . 0 ) ; <nl> - <nl> - final Map < SSTableReader , Double > readRates = new HashMap < > ( nonCompacting . size ( ) ) ; <nl> - double totalReadsPerSec = 0 . 0 ; <nl> - for ( SSTableReader sstable : nonCompacting ) <nl> - { <nl> - if ( sstable . getReadMeter ( ) ! = null ) <nl> - { <nl> - Double readRate = sstable . getReadMeter ( ) . fifteenMinuteRate ( ) ; <nl> - totalReadsPerSec + = readRate ; <nl> - readRates . put ( sstable , readRate ) ; <nl> - } <nl> - } <nl> - logger . trace ( " Total reads / sec across all sstables in index summary resize process : { } " , totalReadsPerSec ) ; <nl> - <nl> - / / copy and sort by read rates ( ascending ) <nl> - List < SSTableReader > sstablesByHotness = new ArrayList < > ( nonCompacting ) ; <nl> - Collections . sort ( sstablesByHotness , new ReadRateComparator ( readRates ) ) ; <nl> - <nl> - long remainingBytes = memoryPoolBytes ; <nl> - for ( SSTableReader sstable : Iterables . concat ( compacting , oldFormatSSTables ) ) <nl> - remainingBytes - = sstable . getIndexSummaryOffHeapSize ( ) ; <nl> - <nl> - logger . trace ( " Index summaries for compacting SSTables are using { } MB of space " , <nl> - ( memoryPoolBytes - remainingBytes ) / 1024 . 0 / 1024 . 0 ) ; <nl> - List < SSTableReader > newSSTables = adjustSamplingLevels ( sstablesByHotness , totalReadsPerSec , remainingBytes ) ; <nl> - <nl> - total = 0 ; <nl> - for ( SSTableReader sstable : Iterables . concat ( compacting , oldFormatSSTables , newSSTables ) ) <nl> - total + = sstable . getIndexSummaryOffHeapSize ( ) ; <nl> - logger . debug ( " Completed resizing of index summaries ; current approximate memory used : { } MB " , <nl> - total / 1024 . 0 / 1024 . 0 ) ; <nl> - <nl> - return newSSTables ; <nl> - } <nl> - <nl> - private static List < SSTableReader > adjustSamplingLevels ( List < SSTableReader > sstables , <nl> - double totalReadsPerSec , long memoryPoolCapacity ) throws IOException <nl> - { <nl> - <nl> - List < ResampleEntry > toDownsample = new ArrayList < > ( sstables . size ( ) / 4 ) ; <nl> - List < ResampleEntry > toUpsample = new ArrayList < > ( sstables . size ( ) / 4 ) ; <nl> - List < ResampleEntry > forceResample = new ArrayList < > ( ) ; <nl> - List < ResampleEntry > forceUpsample = new ArrayList < > ( ) ; <nl> - List < SSTableReader > newSSTables = new ArrayList < > ( sstables . size ( ) ) ; <nl> - <nl> - / / Going from the coldest to the hottest sstables , try to give each sstable an amount of space proportional <nl> - / / to the number of total reads / sec it handles . <nl> - long remainingSpace = memoryPoolCapacity ; <nl> - for ( SSTableReader sstable : sstables ) <nl> - { <nl> - int minIndexInterval = sstable . metadata . getMinIndexInterval ( ) ; <nl> - int maxIndexInterval = sstable . metadata . getMaxIndexInterval ( ) ; <nl> - <nl> - double readsPerSec = sstable . getReadMeter ( ) = = null ? 0 . 0 : sstable . getReadMeter ( ) . fifteenMinuteRate ( ) ; <nl> - long idealSpace = Math . round ( remainingSpace * ( readsPerSec / totalReadsPerSec ) ) ; <nl> - <nl> - / / figure out how many entries our idealSpace would buy us , and pick a new sampling level based on that <nl> - int currentNumEntries = sstable . getIndexSummarySize ( ) ; <nl> - double avgEntrySize = sstable . getIndexSummaryOffHeapSize ( ) / ( double ) currentNumEntries ; <nl> - long targetNumEntries = Math . max ( 1 , Math . round ( idealSpace / avgEntrySize ) ) ; <nl> - int currentSamplingLevel = sstable . getIndexSummarySamplingLevel ( ) ; <nl> - int maxSummarySize = sstable . getMaxIndexSummarySize ( ) ; <nl> - <nl> - / / if the min _ index _ interval changed , calculate what our current sampling level would be under the new min <nl> - if ( sstable . getMinIndexInterval ( ) ! = minIndexInterval ) <nl> - { <nl> - int effectiveSamplingLevel = ( int ) Math . round ( currentSamplingLevel * ( minIndexInterval / ( double ) sstable . getMinIndexInterval ( ) ) ) ; <nl> - maxSummarySize = ( int ) Math . round ( maxSummarySize * ( sstable . getMinIndexInterval ( ) / ( double ) minIndexInterval ) ) ; <nl> - logger . trace ( " min _ index _ interval changed from { } to { } , so the current sampling level for { } is effectively now { } ( was { } ) " , <nl> - sstable . getMinIndexInterval ( ) , minIndexInterval , sstable , effectiveSamplingLevel , currentSamplingLevel ) ; <nl> - currentSamplingLevel = effectiveSamplingLevel ; <nl> - } <nl> - <nl> - int newSamplingLevel = IndexSummaryBuilder . calculateSamplingLevel ( currentSamplingLevel , currentNumEntries , targetNumEntries , <nl> - minIndexInterval , maxIndexInterval ) ; <nl> - int numEntriesAtNewSamplingLevel = IndexSummaryBuilder . entriesAtSamplingLevel ( newSamplingLevel , maxSummarySize ) ; <nl> - double effectiveIndexInterval = sstable . getEffectiveIndexInterval ( ) ; <nl> - <nl> - logger . trace ( " { } has { } reads / sec ; ideal space for index summary : { } bytes ( { } entries ) ; considering moving " + <nl> - " from level { } ( { } entries , { } bytes ) to level { } ( { } entries , { } bytes ) " , <nl> - sstable . getFilename ( ) , readsPerSec , idealSpace , targetNumEntries , currentSamplingLevel , currentNumEntries , <nl> - currentNumEntries * avgEntrySize , newSamplingLevel , numEntriesAtNewSamplingLevel , <nl> - numEntriesAtNewSamplingLevel * avgEntrySize ) ; <nl> - <nl> - if ( effectiveIndexInterval < minIndexInterval ) <nl> - { <nl> - / / The min _ index _ interval was changed ; re - sample to match it . <nl> - logger . debug ( " Forcing resample of { } because the current index interval ( { } ) is below min _ index _ interval ( { } ) " , <nl> - sstable , effectiveIndexInterval , minIndexInterval ) ; <nl> - long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; <nl> - forceResample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; <nl> - remainingSpace - = spaceUsed ; <nl> - } <nl> - else if ( effectiveIndexInterval > maxIndexInterval ) <nl> - { <nl> - / / The max _ index _ interval was lowered ; force an upsample to the effective minimum sampling level <nl> - logger . debug ( " Forcing upsample of { } because the current index interval ( { } ) is above max _ index _ interval ( { } ) " , <nl> - sstable , effectiveIndexInterval , maxIndexInterval ) ; <nl> - newSamplingLevel = Math . max ( 1 , ( BASE _ SAMPLING _ LEVEL * minIndexInterval ) / maxIndexInterval ) ; <nl> - numEntriesAtNewSamplingLevel = IndexSummaryBuilder . entriesAtSamplingLevel ( newSamplingLevel , sstable . getMaxIndexSummarySize ( ) ) ; <nl> - long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; <nl> - forceUpsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; <nl> - remainingSpace - = avgEntrySize * numEntriesAtNewSamplingLevel ; <nl> - } <nl> - else if ( targetNumEntries > = currentNumEntries * UPSAMPLE _ THRESHOLD & & newSamplingLevel > currentSamplingLevel ) <nl> - { <nl> - long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; <nl> - toUpsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; <nl> - remainingSpace - = avgEntrySize * numEntriesAtNewSamplingLevel ; <nl> - } <nl> - else if ( targetNumEntries < currentNumEntries * DOWNSAMPLE _ THESHOLD & & newSamplingLevel < currentSamplingLevel ) <nl> - { <nl> - long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; <nl> - toDownsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; <nl> - remainingSpace - = spaceUsed ; <nl> - } <nl> - else <nl> - { <nl> - / / keep the same sampling level <nl> - logger . trace ( " SSTable { } is within thresholds of ideal sampling " , sstable ) ; <nl> - remainingSpace - = sstable . getIndexSummaryOffHeapSize ( ) ; <nl> - newSSTables . add ( sstable ) ; <nl> - } <nl> - totalReadsPerSec - = readsPerSec ; <nl> - } <nl> - <nl> - if ( remainingSpace > 0 ) <nl> - { <nl> - Pair < List < SSTableReader > , List < ResampleEntry > > result = distributeRemainingSpace ( toDownsample , remainingSpace ) ; <nl> - toDownsample = result . right ; <nl> - newSSTables . addAll ( result . left ) ; <nl> - } <nl> - <nl> - / / downsample first , then upsample <nl> - toDownsample . addAll ( forceResample ) ; <nl> - toDownsample . addAll ( toUpsample ) ; <nl> - toDownsample . addAll ( forceUpsample ) ; <nl> - Multimap < DataTracker , SSTableReader > replacedByTracker = HashMultimap . create ( ) ; <nl> - Multimap < DataTracker , SSTableReader > replacementsByTracker = HashMultimap . create ( ) ; <nl> - for ( ResampleEntry entry : toDownsample ) <nl> - { <nl> - SSTableReader sstable = entry . sstable ; <nl> - logger . debug ( " Re - sampling index summary for { } from { } / { } to { } / { } of the original number of entries " , <nl> - sstable , sstable . getIndexSummarySamplingLevel ( ) , Downsampling . BASE _ SAMPLING _ LEVEL , <nl> - entry . newSamplingLevel , Downsampling . BASE _ SAMPLING _ LEVEL ) ; <nl> - ColumnFamilyStore cfs = Keyspace . open ( sstable . getKeyspaceName ( ) ) . getColumnFamilyStore ( sstable . getColumnFamilyName ( ) ) ; <nl> - SSTableReader replacement = sstable . cloneWithNewSummarySamplingLevel ( cfs , entry . newSamplingLevel ) ; <nl> - DataTracker tracker = cfs . getDataTracker ( ) ; <nl> - <nl> - replacedByTracker . put ( tracker , sstable ) ; <nl> - replacementsByTracker . put ( tracker , replacement ) ; <nl> - } <nl> - <nl> - for ( DataTracker tracker : replacedByTracker . keySet ( ) ) <nl> - { <nl> - tracker . replaceWithNewInstances ( replacedByTracker . get ( tracker ) , replacementsByTracker . get ( tracker ) ) ; <nl> - newSSTables . addAll ( replacementsByTracker . get ( tracker ) ) ; <nl> - } <nl> - <nl> - return newSSTables ; <nl> - } <nl> - <nl> - @ VisibleForTesting <nl> - static Pair < List < SSTableReader > , List < ResampleEntry > > distributeRemainingSpace ( List < ResampleEntry > toDownsample , long remainingSpace ) <nl> - { <nl> - / / sort by the amount of space regained by doing the downsample operation ; we want to try to avoid operations <nl> - / / that will make little difference . <nl> - Collections . sort ( toDownsample , new Comparator < ResampleEntry > ( ) <nl> - { <nl> - public int compare ( ResampleEntry o1 , ResampleEntry o2 ) <nl> - { <nl> - return Double . compare ( o1 . sstable . getIndexSummaryOffHeapSize ( ) - o1 . newSpaceUsed , <nl> - o2 . sstable . getIndexSummaryOffHeapSize ( ) - o2 . newSpaceUsed ) ; <nl> - } <nl> - } ) ; <nl> - <nl> - int noDownsampleCutoff = 0 ; <nl> - List < SSTableReader > willNotDownsample = new ArrayList < > ( ) ; <nl> - while ( remainingSpace > 0 & & noDownsampleCutoff < toDownsample . size ( ) ) <nl> - { <nl> - ResampleEntry entry = toDownsample . get ( noDownsampleCutoff ) ; <nl> - <nl> - long extraSpaceRequired = entry . sstable . getIndexSummaryOffHeapSize ( ) - entry . newSpaceUsed ; <nl> - / / see if we have enough leftover space to keep the current sampling level <nl> - if ( extraSpaceRequired < = remainingSpace ) <nl> - { <nl> - logger . trace ( " Using leftover space to keep { } at the current sampling level ( { } ) " , <nl> - entry . sstable , entry . sstable . getIndexSummarySamplingLevel ( ) ) ; <nl> - willNotDownsample . add ( entry . sstable ) ; <nl> - remainingSpace - = extraSpaceRequired ; <nl> - } <nl> - else <nl> - { <nl> - break ; <nl> - } <nl> - <nl> - noDownsampleCutoff + + ; <nl> - } <nl> - return Pair . create ( willNotDownsample , toDownsample . subList ( noDownsampleCutoff , toDownsample . size ( ) ) ) ; <nl> - } <nl> - <nl> - private static class ResampleEntry <nl> - { <nl> - public final SSTableReader sstable ; <nl> - public final long newSpaceUsed ; <nl> - public final int newSamplingLevel ; <nl> - <nl> - public ResampleEntry ( SSTableReader sstable , long newSpaceUsed , int newSamplingLevel ) <nl> - { <nl> - this . sstable = sstable ; <nl> - this . newSpaceUsed = newSpaceUsed ; <nl> - this . newSamplingLevel = newSamplingLevel ; <nl> - } <nl> - } <nl> - <nl> - / * * Utility class for sorting sstables by their read rates . * / <nl> - private static class ReadRateComparator implements Comparator < SSTableReader > <nl> - { <nl> - private final Map < SSTableReader , Double > readRates ; <nl> - <nl> - public ReadRateComparator ( Map < SSTableReader , Double > readRates ) <nl> - { <nl> - this . readRates = readRates ; <nl> - } <nl> - <nl> - @ Override <nl> - public int compare ( SSTableReader o1 , SSTableReader o2 ) <nl> - { <nl> - Double readRate1 = readRates . get ( o1 ) ; <nl> - Double readRate2 = readRates . get ( o2 ) ; <nl> - if ( readRate1 = = null & & readRate2 = = null ) <nl> - return 0 ; <nl> - else if ( readRate1 = = null ) <nl> - return - 1 ; <nl> - else if ( readRate2 = = null ) <nl> - return 1 ; <nl> - else <nl> - return Double . compare ( readRate1 , readRate2 ) ; <nl> - } <nl> + return CompactionManager . instance . runIndexSummaryRedistribution ( new IndexSummaryRedistribution ( compacting , nonCompacting , memoryPoolBytes ) ) ; <nl> } <nl> - } <nl> \ No newline at end of file <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / IndexSummaryRedistribution . java b / src / java / org / apache / cassandra / io / sstable / IndexSummaryRedistribution . java <nl> new file mode 100644 <nl> index 0000000 . . adb3e4e <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / io / sstable / IndexSummaryRedistribution . java <nl> @ @ - 0 , 0 + 1 , 338 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + <nl> + package org . apache . cassandra . io . sstable ; <nl> + <nl> + import java . io . IOException ; <nl> + import java . util . ArrayList ; <nl> + import java . util . Collections ; <nl> + import java . util . Comparator ; <nl> + import java . util . HashMap ; <nl> + import java . util . List ; <nl> + import java . util . Map ; <nl> + <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> + import com . google . common . collect . HashMultimap ; <nl> + import com . google . common . collect . Iterables ; <nl> + import com . google . common . collect . Multimap ; <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> + <nl> + import org . apache . cassandra . db . ColumnFamilyStore ; <nl> + import org . apache . cassandra . db . DataTracker ; <nl> + import org . apache . cassandra . db . Keyspace ; <nl> + import org . apache . cassandra . db . compaction . CompactionInfo ; <nl> + import org . apache . cassandra . db . compaction . CompactionInterruptedException ; <nl> + import org . apache . cassandra . db . compaction . OperationType ; <nl> + import org . apache . cassandra . utils . Pair ; <nl> + <nl> + import static org . apache . cassandra . io . sstable . Downsampling . BASE _ SAMPLING _ LEVEL ; <nl> + <nl> + public class IndexSummaryRedistribution extends CompactionInfo . Holder <nl> + { <nl> + private static final Logger logger = LoggerFactory . getLogger ( IndexSummaryRedistribution . class ) ; <nl> + <nl> + private final List < SSTableReader > compacting ; <nl> + private final List < SSTableReader > nonCompacting ; <nl> + private final long memoryPoolBytes ; <nl> + private volatile long remainingSpace ; <nl> + <nl> + public IndexSummaryRedistribution ( List < SSTableReader > compacting , List < SSTableReader > nonCompacting , long memoryPoolBytes ) <nl> + { <nl> + this . compacting = compacting ; <nl> + this . nonCompacting = nonCompacting ; <nl> + this . memoryPoolBytes = memoryPoolBytes ; <nl> + } <nl> + <nl> + public List < SSTableReader > redistributeSummaries ( ) throws IOException <nl> + { <nl> + long total = 0 ; <nl> + for ( SSTableReader sstable : Iterables . concat ( compacting , nonCompacting ) ) <nl> + total + = sstable . getIndexSummaryOffHeapSize ( ) ; <nl> + <nl> + List < SSTableReader > oldFormatSSTables = new ArrayList < > ( ) ; <nl> + for ( SSTableReader sstable : nonCompacting ) <nl> + { <nl> + / / We can ' t change the sampling level of sstables with the old format , because the serialization format <nl> + / / doesn ' t include the sampling level . Leave this one as it is . ( See CASSANDRA - 8993 for details . ) <nl> + logger . trace ( " SSTable { } cannot be re - sampled due to old sstable format " , sstable ) ; <nl> + if ( ! sstable . descriptor . version . hasSamplingLevel ) <nl> + oldFormatSSTables . add ( sstable ) ; <nl> + } <nl> + nonCompacting . removeAll ( oldFormatSSTables ) ; <nl> + <nl> + logger . debug ( " Beginning redistribution of index summaries for { } sstables with memory pool size { } MB ; current spaced used is { } MB " , <nl> + nonCompacting . size ( ) , memoryPoolBytes / 1024L / 1024L , total / 1024 . 0 / 1024 . 0 ) ; <nl> + <nl> + final Map < SSTableReader , Double > readRates = new HashMap < > ( nonCompacting . size ( ) ) ; <nl> + double totalReadsPerSec = 0 . 0 ; <nl> + for ( SSTableReader sstable : nonCompacting ) <nl> + { <nl> + if ( isStopRequested ( ) ) <nl> + throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; <nl> + <nl> + if ( sstable . getReadMeter ( ) ! = null ) <nl> + { <nl> + Double readRate = sstable . getReadMeter ( ) . fifteenMinuteRate ( ) ; <nl> + totalReadsPerSec + = readRate ; <nl> + readRates . put ( sstable , readRate ) ; <nl> + } <nl> + } <nl> + logger . trace ( " Total reads / sec across all sstables in index summary resize process : { } " , totalReadsPerSec ) ; <nl> + <nl> + / / copy and sort by read rates ( ascending ) <nl> + List < SSTableReader > sstablesByHotness = new ArrayList < > ( nonCompacting ) ; <nl> + Collections . sort ( sstablesByHotness , new ReadRateComparator ( readRates ) ) ; <nl> + <nl> + long remainingBytes = memoryPoolBytes ; <nl> + for ( SSTableReader sstable : Iterables . concat ( compacting , oldFormatSSTables ) ) <nl> + remainingBytes - = sstable . getIndexSummaryOffHeapSize ( ) ; <nl> + <nl> + logger . trace ( " Index summaries for compacting SSTables are using { } MB of space " , <nl> + ( memoryPoolBytes - remainingBytes ) / 1024 . 0 / 1024 . 0 ) ; <nl> + List < SSTableReader > newSSTables = adjustSamplingLevels ( sstablesByHotness , totalReadsPerSec , remainingBytes ) ; <nl> + <nl> + total = 0 ; <nl> + for ( SSTableReader sstable : Iterables . concat ( compacting , oldFormatSSTables , newSSTables ) ) <nl> + total + = sstable . getIndexSummaryOffHeapSize ( ) ; <nl> + logger . debug ( " Completed resizing of index summaries ; current approximate memory used : { } MB " , <nl> + total / 1024 . 0 / 1024 . 0 ) ; <nl> + <nl> + return newSSTables ; <nl> + } <nl> + <nl> + private List < SSTableReader > adjustSamplingLevels ( List < SSTableReader > sstables , <nl> + double totalReadsPerSec , long memoryPoolCapacity ) throws IOException <nl> + { <nl> + <nl> + List < ResampleEntry > toDownsample = new ArrayList < > ( sstables . size ( ) / 4 ) ; <nl> + List < ResampleEntry > toUpsample = new ArrayList < > ( sstables . size ( ) / 4 ) ; <nl> + List < ResampleEntry > forceResample = new ArrayList < > ( ) ; <nl> + List < ResampleEntry > forceUpsample = new ArrayList < > ( ) ; <nl> + List < SSTableReader > newSSTables = new ArrayList < > ( sstables . size ( ) ) ; <nl> + <nl> + / / Going from the coldest to the hottest sstables , try to give each sstable an amount of space proportional <nl> + / / to the number of total reads / sec it handles . <nl> + remainingSpace = memoryPoolCapacity ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + { <nl> + if ( isStopRequested ( ) ) <nl> + throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; <nl> + <nl> + int minIndexInterval = sstable . metadata . getMinIndexInterval ( ) ; <nl> + int maxIndexInterval = sstable . metadata . getMaxIndexInterval ( ) ; <nl> + <nl> + double readsPerSec = sstable . getReadMeter ( ) = = null ? 0 . 0 : sstable . getReadMeter ( ) . fifteenMinuteRate ( ) ; <nl> + long idealSpace = Math . round ( remainingSpace * ( readsPerSec / totalReadsPerSec ) ) ; <nl> + <nl> + / / figure out how many entries our idealSpace would buy us , and pick a new sampling level based on that <nl> + int currentNumEntries = sstable . getIndexSummarySize ( ) ; <nl> + double avgEntrySize = sstable . getIndexSummaryOffHeapSize ( ) / ( double ) currentNumEntries ; <nl> + long targetNumEntries = Math . max ( 1 , Math . round ( idealSpace / avgEntrySize ) ) ; <nl> + int currentSamplingLevel = sstable . getIndexSummarySamplingLevel ( ) ; <nl> + int maxSummarySize = sstable . getMaxIndexSummarySize ( ) ; <nl> + <nl> + / / if the min _ index _ interval changed , calculate what our current sampling level would be under the new min <nl> + if ( sstable . getMinIndexInterval ( ) ! = minIndexInterval ) <nl> + { <nl> + int effectiveSamplingLevel = ( int ) Math . round ( currentSamplingLevel * ( minIndexInterval / ( double ) sstable . getMinIndexInterval ( ) ) ) ; <nl> + maxSummarySize = ( int ) Math . round ( maxSummarySize * ( sstable . getMinIndexInterval ( ) / ( double ) minIndexInterval ) ) ; <nl> + logger . trace ( " min _ index _ interval changed from { } to { } , so the current sampling level for { } is effectively now { } ( was { } ) " , <nl> + sstable . getMinIndexInterval ( ) , minIndexInterval , sstable , effectiveSamplingLevel , currentSamplingLevel ) ; <nl> + currentSamplingLevel = effectiveSamplingLevel ; <nl> + } <nl> + <nl> + int newSamplingLevel = IndexSummaryBuilder . calculateSamplingLevel ( currentSamplingLevel , currentNumEntries , targetNumEntries , <nl> + minIndexInterval , maxIndexInterval ) ; <nl> + int numEntriesAtNewSamplingLevel = IndexSummaryBuilder . entriesAtSamplingLevel ( newSamplingLevel , maxSummarySize ) ; <nl> + double effectiveIndexInterval = sstable . getEffectiveIndexInterval ( ) ; <nl> + <nl> + logger . trace ( " { } has { } reads / sec ; ideal space for index summary : { } bytes ( { } entries ) ; considering moving " + <nl> + " from level { } ( { } entries , { } bytes ) to level { } ( { } entries , { } bytes ) " , <nl> + sstable . getFilename ( ) , readsPerSec , idealSpace , targetNumEntries , currentSamplingLevel , currentNumEntries , <nl> + currentNumEntries * avgEntrySize , newSamplingLevel , numEntriesAtNewSamplingLevel , <nl> + numEntriesAtNewSamplingLevel * avgEntrySize ) ; <nl> + <nl> + if ( effectiveIndexInterval < minIndexInterval ) <nl> + { <nl> + / / The min _ index _ interval was changed ; re - sample to match it . <nl> + logger . debug ( " Forcing resample of { } because the current index interval ( { } ) is below min _ index _ interval ( { } ) " , <nl> + sstable , effectiveIndexInterval , minIndexInterval ) ; <nl> + long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; <nl> + forceResample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; <nl> + remainingSpace - = spaceUsed ; <nl> + } <nl> + else if ( effectiveIndexInterval > maxIndexInterval ) <nl> + { <nl> + / / The max _ index _ interval was lowered ; force an upsample to the effective minimum sampling level <nl> + logger . debug ( " Forcing upsample of { } because the current index interval ( { } ) is above max _ index _ interval ( { } ) " , <nl> + sstable , effectiveIndexInterval , maxIndexInterval ) ; <nl> + newSamplingLevel = Math . max ( 1 , ( BASE _ SAMPLING _ LEVEL * minIndexInterval ) / maxIndexInterval ) ; <nl> + numEntriesAtNewSamplingLevel = IndexSummaryBuilder . entriesAtSamplingLevel ( newSamplingLevel , sstable . getMaxIndexSummarySize ( ) ) ; <nl> + long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; <nl> + forceUpsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; <nl> + remainingSpace - = avgEntrySize * numEntriesAtNewSamplingLevel ; <nl> + } <nl> + else if ( targetNumEntries > = currentNumEntries * IndexSummaryManager . UPSAMPLE _ THRESHOLD & & newSamplingLevel > currentSamplingLevel ) <nl> + { <nl> + long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; <nl> + toUpsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; <nl> + remainingSpace - = avgEntrySize * numEntriesAtNewSamplingLevel ; <nl> + } <nl> + else if ( targetNumEntries < currentNumEntries * IndexSummaryManager . DOWNSAMPLE _ THESHOLD & & newSamplingLevel < currentSamplingLevel ) <nl> + { <nl> + long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; <nl> + toDownsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; <nl> + remainingSpace - = spaceUsed ; <nl> + } <nl> + else <nl> + { <nl> + / / keep the same sampling level <nl> + logger . trace ( " SSTable { } is within thresholds of ideal sampling " , sstable ) ; <nl> + remainingSpace - = sstable . getIndexSummaryOffHeapSize ( ) ; <nl> + newSSTables . add ( sstable ) ; <nl> + } <nl> + totalReadsPerSec - = readsPerSec ; <nl> + } <nl> + <nl> + if ( remainingSpace > 0 ) <nl> + { <nl> + Pair < List < SSTableReader > , List < ResampleEntry > > result = distributeRemainingSpace ( toDownsample , remainingSpace ) ; <nl> + toDownsample = result . right ; <nl> + newSSTables . addAll ( result . left ) ; <nl> + } <nl> + <nl> + / / downsample first , then upsample <nl> + toDownsample . addAll ( forceResample ) ; <nl> + toDownsample . addAll ( toUpsample ) ; <nl> + toDownsample . addAll ( forceUpsample ) ; <nl> + Multimap < DataTracker , SSTableReader > replacedByTracker = HashMultimap . create ( ) ; <nl> + Multimap < DataTracker , SSTableReader > replacementsByTracker = HashMultimap . create ( ) ; <nl> + <nl> + try <nl> + { <nl> + for ( ResampleEntry entry : toDownsample ) <nl> + { <nl> + if ( isStopRequested ( ) ) <nl> + throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; <nl> + <nl> + SSTableReader sstable = entry . sstable ; <nl> + logger . debug ( " Re - sampling index summary for { } from { } / { } to { } / { } of the original number of entries " , <nl> + sstable , sstable . getIndexSummarySamplingLevel ( ) , Downsampling . BASE _ SAMPLING _ LEVEL , <nl> + entry . newSamplingLevel , Downsampling . BASE _ SAMPLING _ LEVEL ) ; <nl> + ColumnFamilyStore cfs = Keyspace . open ( sstable . getKeyspaceName ( ) ) . getColumnFamilyStore ( sstable . getColumnFamilyName ( ) ) ; <nl> + DataTracker tracker = cfs . getDataTracker ( ) ; <nl> + SSTableReader replacement = sstable . cloneWithNewSummarySamplingLevel ( cfs , entry . newSamplingLevel ) ; <nl> + newSSTables . add ( replacement ) ; <nl> + replacedByTracker . put ( tracker , sstable ) ; <nl> + replacementsByTracker . put ( tracker , replacement ) ; <nl> + } <nl> + } <nl> + finally <nl> + { <nl> + for ( DataTracker tracker : replacedByTracker . keySet ( ) ) <nl> + tracker . replaceWithNewInstances ( replacedByTracker . get ( tracker ) , replacementsByTracker . get ( tracker ) ) ; <nl> + } <nl> + <nl> + return newSSTables ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + static Pair < List < SSTableReader > , List < ResampleEntry > > distributeRemainingSpace ( List < ResampleEntry > toDownsample , long remainingSpace ) <nl> + { <nl> + / / sort by the amount of space regained by doing the downsample operation ; we want to try to avoid operations <nl> + / / that will make little difference . <nl> + Collections . sort ( toDownsample , new Comparator < ResampleEntry > ( ) <nl> + { <nl> + public int compare ( ResampleEntry o1 , ResampleEntry o2 ) <nl> + { <nl> + return Double . compare ( o1 . sstable . getIndexSummaryOffHeapSize ( ) - o1 . newSpaceUsed , <nl> + o2 . sstable . getIndexSummaryOffHeapSize ( ) - o2 . newSpaceUsed ) ; <nl> + } <nl> + } ) ; <nl> + <nl> + int noDownsampleCutoff = 0 ; <nl> + List < SSTableReader > willNotDownsample = new ArrayList < > ( ) ; <nl> + while ( remainingSpace > 0 & & noDownsampleCutoff < toDownsample . size ( ) ) <nl> + { <nl> + ResampleEntry entry = toDownsample . get ( noDownsampleCutoff ) ; <nl> + <nl> + long extraSpaceRequired = entry . sstable . getIndexSummaryOffHeapSize ( ) - entry . newSpaceUsed ; <nl> + / / see if we have enough leftover space to keep the current sampling level <nl> + if ( extraSpaceRequired < = remainingSpace ) <nl> + { <nl> + logger . trace ( " Using leftover space to keep { } at the current sampling level ( { } ) " , <nl> + entry . sstable , entry . sstable . getIndexSummarySamplingLevel ( ) ) ; <nl> + willNotDownsample . add ( entry . sstable ) ; <nl> + remainingSpace - = extraSpaceRequired ; <nl> + } <nl> + else <nl> + { <nl> + break ; <nl> + } <nl> + <nl> + noDownsampleCutoff + + ; <nl> + } <nl> + return Pair . create ( willNotDownsample , toDownsample . subList ( noDownsampleCutoff , toDownsample . size ( ) ) ) ; <nl> + } <nl> + <nl> + public CompactionInfo getCompactionInfo ( ) <nl> + { <nl> + return new CompactionInfo ( OperationType . INDEX _ SUMMARY , ( remainingSpace - memoryPoolBytes ) , memoryPoolBytes , " bytes " ) ; <nl> + } <nl> + <nl> + / * * Utility class for sorting sstables by their read rates . * / <nl> + private static class ReadRateComparator implements Comparator < SSTableReader > <nl> + { <nl> + private final Map < SSTableReader , Double > readRates ; <nl> + <nl> + ReadRateComparator ( Map < SSTableReader , Double > readRates ) <nl> + { <nl> + this . readRates = readRates ; <nl> + } <nl> + <nl> + @ Override <nl> + public int compare ( SSTableReader o1 , SSTableReader o2 ) <nl> + { <nl> + Double readRate1 = readRates . get ( o1 ) ; <nl> + Double readRate2 = readRates . get ( o2 ) ; <nl> + if ( readRate1 = = null & & readRate2 = = null ) <nl> + return 0 ; <nl> + else if ( readRate1 = = null ) <nl> + return - 1 ; <nl> + else if ( readRate2 = = null ) <nl> + return 1 ; <nl> + else <nl> + return Double . compare ( readRate1 , readRate2 ) ; <nl> + } <nl> + } <nl> + <nl> + private static class ResampleEntry <nl> + { <nl> + public final SSTableReader sstable ; <nl> + public final long newSpaceUsed ; <nl> + public final int newSamplingLevel ; <nl> + <nl> + ResampleEntry ( SSTableReader sstable , long newSpaceUsed , int newSamplingLevel ) <nl> + { <nl> + this . sstable = sstable ; <nl> + this . newSpaceUsed = newSpaceUsed ; <nl> + this . newSamplingLevel = newSamplingLevel ; <nl> + } <nl> + } <nl> + } <nl> diff - - git a / test / unit / org / apache / cassandra / io / sstable / IndexSummaryManagerTest . java b / test / unit / org / apache / cassandra / io / sstable / IndexSummaryManagerTest . java <nl> index 64d3354 . . 63928e2 100644 <nl> - - - a / test / unit / org / apache / cassandra / io / sstable / IndexSummaryManagerTest . java <nl> + + + b / test / unit / org / apache / cassandra / io / sstable / IndexSummaryManagerTest . java <nl> @ @ - 22 , 12 + 22 , 14 @ @ import java . nio . ByteBuffer ; <nl> import java . util . * ; <nl> import java . util . concurrent . * ; <nl> import java . util . concurrent . atomic . AtomicBoolean ; <nl> + import java . util . concurrent . atomic . AtomicReference ; <nl> <nl> + import com . google . common . base . Joiner ; <nl> + import com . google . common . collect . Sets ; <nl> import org . junit . After ; <nl> import org . junit . Before ; <nl> import org . junit . Test ; <nl> import org . junit . runner . RunWith ; <nl> - <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 36 , 11 + 38 , 12 @ @ import org . apache . cassandra . OrderedJUnit4ClassRunner ; <nl> import org . apache . cassandra . SchemaLoader ; <nl> import org . apache . cassandra . Util ; <nl> import org . apache . cassandra . db . * ; <nl> + import org . apache . cassandra . db . compaction . CompactionInfo ; <nl> + import org . apache . cassandra . db . compaction . CompactionInterruptedException ; <nl> import org . apache . cassandra . db . compaction . CompactionManager ; <nl> import org . apache . cassandra . db . filter . QueryFilter ; <nl> + import org . apache . cassandra . metrics . CompactionMetrics ; <nl> import org . apache . cassandra . metrics . RestorableMeter ; <nl> - import org . apache . cassandra . utils . FBUtilities ; <nl> - import org . apache . cassandra . utils . concurrent . OpOrder ; <nl> <nl> import static org . apache . cassandra . io . sstable . Downsampling . BASE _ SAMPLING _ LEVEL ; <nl> import static org . apache . cassandra . io . sstable . IndexSummaryManager . DOWNSAMPLE _ THESHOLD ; <nl> @ @ - 75 , 6 + 78 , 11 @ @ public class IndexSummaryManagerTest extends SchemaLoader <nl> @ After <nl> public void afterTest ( ) <nl> { <nl> + for ( CompactionInfo . Holder holder : CompactionMetrics . getCompactions ( ) ) <nl> + { <nl> + holder . stop ( ) ; <nl> + } <nl> + <nl> String ksname = " Keyspace1 " ; <nl> String cfname = " StandardLowIndexInterval " ; / / index interval of 8 , no key caching <nl> Keyspace keyspace = Keyspace . open ( ksname ) ; <nl> @ @ - 499 , 4 + 507 , 59 @ @ public class IndexSummaryManagerTest extends SchemaLoader <nl> assertTrue ( entry . getValue ( ) > = cfs . metadata . getMinIndexInterval ( ) ) ; <nl> } <nl> } <nl> + <nl> + @ Test <nl> + public void testCancelIndex ( ) throws Exception <nl> + { <nl> + String ksname = " Keyspace1 " ; <nl> + String cfname = " StandardLowIndexInterval " ; / / index interval of 8 , no key caching <nl> + Keyspace keyspace = Keyspace . open ( ksname ) ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfname ) ; <nl> + final int numSSTables = 4 ; <nl> + int numRows = 256 ; <nl> + createSSTables ( ksname , cfname , numSSTables , numRows ) ; <nl> + <nl> + final List < SSTableReader > sstables = new ArrayList < > ( cfs . getSSTables ( ) ) ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + sstable . overrideReadMeter ( new RestorableMeter ( 100 . 0 , 100 . 0 ) ) ; <nl> + <nl> + final long singleSummaryOffHeapSpace = sstables . get ( 0 ) . getIndexSummaryOffHeapSize ( ) ; <nl> + <nl> + / / everything should get cut in half <nl> + final AtomicReference < CompactionInterruptedException > exception = new AtomicReference < > ( ) ; <nl> + Thread t = new Thread ( new Runnable ( ) <nl> + { <nl> + public void run ( ) <nl> + { <nl> + try <nl> + { <nl> + redistributeSummaries ( Collections . < SSTableReader > emptyList ( ) , sstables , ( singleSummaryOffHeapSpace * ( numSSTables / 2 ) ) ) ; <nl> + } <nl> + catch ( CompactionInterruptedException ex ) <nl> + { <nl> + exception . set ( ex ) ; <nl> + } <nl> + catch ( IOException ignored ) <nl> + { <nl> + } <nl> + } <nl> + } ) ; <nl> + t . start ( ) ; <nl> + while ( CompactionManager . instance . getActiveCompactions ( ) = = 0 & & t . isAlive ( ) ) <nl> + Thread . sleep ( 1 ) ; <nl> + CompactionManager . instance . stopCompaction ( " INDEX _ SUMMARY " ) ; <nl> + t . join ( ) ; <nl> + <nl> + assertNotNull ( " Expected compaction interrupted exception " , exception . get ( ) ) ; <nl> + assertTrue ( " Expected no active compactions " , CompactionMetrics . getCompactions ( ) . isEmpty ( ) ) ; <nl> + <nl> + Set < SSTableReader > beforeRedistributionSSTables = new HashSet < > ( sstables ) ; <nl> + Set < SSTableReader > afterCancelSSTables = new HashSet < > ( cfs . getSSTables ( ) ) ; <nl> + Set < SSTableReader > disjoint = Sets . symmetricDifference ( beforeRedistributionSSTables , afterCancelSSTables ) ; <nl> + assertTrue ( String . format ( " Mismatched files before and after cancelling redistribution : % s " , <nl> + Joiner . on ( " , " ) . join ( disjoint ) ) , <nl> + disjoint . isEmpty ( ) ) ; <nl> + <nl> + validateData ( cfs , numRows ) ; <nl> + } <nl> }
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> index c3bddd4 . . cb87833 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> @ @ - 35 , 7 + 35 , 6 @ @ import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . io . ICompactSerializer2 ; <nl> import org . apache . cassandra . db . filter . QueryPath ; <nl> import org . apache . cassandra . db . marshal . AbstractType ; <nl> - import org . apache . cassandra . db . marshal . MarshalException ; <nl> <nl> <nl> public final class ColumnFamily implements IColumnContainer <nl> @ @ - 121 , 12 + 120 , 13 @ @ public final class ColumnFamily implements IColumnContainer <nl> * We need to go through each column <nl> * in the column family and resolve it before adding <nl> * / <nl> - void addColumns ( ColumnFamily cf ) <nl> + public void addAll ( ColumnFamily cf ) <nl> { <nl> for ( IColumn column : cf . getSortedColumns ( ) ) <nl> { <nl> addColumn ( column ) ; <nl> } <nl> + delete ( cf ) ; <nl> } <nl> <nl> public ICompactSerializer2 < IColumn > getColumnSerializer ( ) <nl> @ @ - 415 , 8 + 415 , 7 @ @ public final class ColumnFamily implements IColumnContainer <nl> for ( ColumnFamily cf2 : columnFamilies ) <nl> { <nl> assert cf . name ( ) . equals ( cf2 . name ( ) ) ; <nl> - cf . addColumns ( cf2 ) ; <nl> - cf . delete ( cf2 ) ; <nl> + cf . addAll ( cf2 ) ; <nl> } <nl> return cf ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 001c644 . . 96bb18b 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 560 , 26 + 560 , 6 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> CompactionManager . instance ( ) . submit ( this ) ; <nl> } <nl> <nl> - private PriorityQueue < FileStruct > initializePriorityQueue ( Collection < SSTableReader > sstables , List < Range > ranges ) throws IOException <nl> - { <nl> - PriorityQueue < FileStruct > pq = new PriorityQueue < FileStruct > ( ) ; <nl> - if ( sstables . size ( ) > 1 | | ( ranges ! = null & & sstables . size ( ) > 0 ) ) <nl> - { <nl> - FileStruct fs = null ; <nl> - for ( SSTableReader sstable : sstables ) <nl> - { <nl> - fs = sstable . getFileStruct ( ) ; <nl> - fs . advance ( true ) ; <nl> - if ( fs . isExhausted ( ) ) <nl> - { <nl> - continue ; <nl> - } <nl> - pq . add ( fs ) ; <nl> - } <nl> - } <nl> - return pq ; <nl> - } <nl> - <nl> / * <nl> * Group files of similar size into buckets . <nl> * / <nl> @ @ - 766 , 150 + 746 , 67 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> * / <nl> List < SSTableReader > doFileAntiCompaction ( Collection < SSTableReader > sstables , List < Range > ranges , EndPoint target ) throws IOException <nl> { <nl> - List < SSTableReader > results = new ArrayList < SSTableReader > ( ) ; <nl> - long startTime = System . currentTimeMillis ( ) ; <nl> - long totalBytesRead = 0 ; <nl> - long totalBytesWritten = 0 ; <nl> - long totalkeysRead = 0 ; <nl> - long totalkeysWritten = 0 ; <nl> - String rangeFileLocation ; <nl> - String mergedFileName ; <nl> + logger _ . info ( " AntiCompacting [ " + StringUtils . join ( sstables , " , " ) + " ] " ) ; <nl> / / Calculate the expected compacted filesize <nl> - long expectedRangeFileSize = getExpectedCompactedFileSize ( sstables ) ; <nl> - / * in the worst case a node will be giving out half of its data so we take a chance * / <nl> - expectedRangeFileSize = expectedRangeFileSize / 2 ; <nl> - rangeFileLocation = DatabaseDescriptor . getDataFileLocationForTable ( table _ , expectedRangeFileSize ) ; <nl> - / / If the compaction file path is null that means we have no space left for this compaction . <nl> - if ( rangeFileLocation = = null ) <nl> - { <nl> - logger _ . error ( " Total bytes to be written for range compaction . . . " <nl> - + expectedRangeFileSize + " is greater than the safe limit of the disk space available . " ) ; <nl> - return results ; <nl> - } <nl> - PriorityQueue < FileStruct > pq = initializePriorityQueue ( sstables , ranges ) ; <nl> - if ( pq . isEmpty ( ) ) <nl> + long expectedRangeFileSize = getExpectedCompactedFileSize ( sstables ) / 2 ; <nl> + String compactionFileLocation = DatabaseDescriptor . getDataFileLocationForTable ( table _ , expectedRangeFileSize ) ; <nl> + if ( compactionFileLocation = = null ) <nl> { <nl> - return results ; <nl> + throw new UnsupportedOperationException ( " disk full " ) ; <nl> } <nl> + List < SSTableReader > results = new ArrayList < SSTableReader > ( ) ; <nl> <nl> - mergedFileName = getTempSSTableFileName ( ) ; <nl> - SSTableWriter rangeWriter = null ; <nl> - String lastkey = null ; <nl> - List < FileStruct > lfs = new ArrayList < FileStruct > ( ) ; <nl> - DataOutputBuffer bufOut = new DataOutputBuffer ( ) ; <nl> - int expectedBloomFilterSize = SSTableReader . getApproximateKeyCount ( sstables ) ; <nl> - expectedBloomFilterSize = ( expectedBloomFilterSize > 0 ) ? expectedBloomFilterSize : SSTableReader . indexInterval ( ) ; <nl> + long startTime = System . currentTimeMillis ( ) ; <nl> + long totalkeysWritten = 0 ; <nl> + <nl> + int expectedBloomFilterSize = Math . max ( SSTableReader . indexInterval ( ) , SSTableReader . getApproximateKeyCount ( sstables ) / 2 ) ; <nl> if ( logger _ . isDebugEnabled ( ) ) <nl> logger _ . debug ( " Expected bloom filter size : " + expectedBloomFilterSize ) ; <nl> - List < ColumnFamily > columnFamilies = new ArrayList < ColumnFamily > ( ) ; <nl> <nl> - while ( pq . size ( ) > 0 | | lfs . size ( ) > 0 ) <nl> + SSTableWriter writer = null ; <nl> + CompactionIterator ci = new CompactionIterator ( sstables ) ; <nl> + <nl> + try <nl> { <nl> - FileStruct fs = null ; <nl> - if ( pq . size ( ) > 0 ) <nl> + if ( ! ci . hasNext ( ) ) <nl> { <nl> - fs = pq . poll ( ) ; <nl> + logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; <nl> + return results ; <nl> } <nl> - if ( fs ! = null <nl> - & & ( lastkey = = null | | lastkey . equals ( fs . getKey ( ) ) ) ) <nl> - { <nl> - / / The keys are the same so we need to add this to the <nl> - / / ldfs list <nl> - lastkey = fs . getKey ( ) ; <nl> - lfs . add ( fs ) ; <nl> - } <nl> - else <nl> + <nl> + while ( ci . hasNext ( ) ) <nl> { <nl> - Collections . sort ( lfs , new FileStructComparator ( ) ) ; <nl> - ColumnFamily columnFamily ; <nl> - bufOut . reset ( ) ; <nl> - if ( lfs . size ( ) > 1 ) <nl> + CompactionIterator . CompactedRow row = ci . next ( ) ; <nl> + if ( Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( row . key ) , ranges ) ) <nl> { <nl> - for ( FileStruct filestruct : lfs ) <nl> - { <nl> - / / We want to add only 2 and resolve them right there in order to save on memory footprint <nl> - if ( columnFamilies . size ( ) > 1 ) <nl> - { <nl> - / / Now merge the 2 column families <nl> - merge ( columnFamilies ) ; <nl> - } <nl> - / / deserialize into column families <nl> - columnFamilies . add ( filestruct . getColumnFamily ( ) ) ; <nl> - } <nl> - / / Now after merging all crap append to the sstable <nl> - columnFamily = resolveAndRemoveDeleted ( columnFamilies ) ; <nl> - columnFamilies . clear ( ) ; <nl> - if ( columnFamily ! = null ) <nl> - { <nl> - ColumnFamily . serializer ( ) . serializeWithIndexes ( columnFamily , bufOut ) ; <nl> - } <nl> - } <nl> - else <nl> - { <nl> - / / TODO deserializing only to reserialize is dumb <nl> - FileStruct filestruct = lfs . get ( 0 ) ; <nl> - ColumnFamily . serializer ( ) . serializeWithIndexes ( filestruct . getColumnFamily ( ) , bufOut ) ; <nl> - } <nl> - if ( Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( lastkey ) , ranges ) ) <nl> - { <nl> - if ( rangeWriter = = null ) <nl> + if ( writer = = null ) <nl> { <nl> if ( target ! = null ) <nl> { <nl> - rangeFileLocation = rangeFileLocation + File . separator + " bootstrap " ; <nl> + compactionFileLocation = compactionFileLocation + File . separator + " bootstrap " ; <nl> } <nl> - FileUtils . createDirectory ( rangeFileLocation ) ; <nl> - String fname = new File ( rangeFileLocation , mergedFileName ) . getAbsolutePath ( ) ; <nl> - rangeWriter = new SSTableWriter ( fname , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; <nl> + FileUtils . createDirectory ( compactionFileLocation ) ; <nl> + String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; <nl> + writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; <nl> } <nl> - rangeWriter . append ( lastkey , bufOut ) ; <nl> - } <nl> - totalkeysWritten + + ; <nl> - for ( FileStruct filestruct : lfs ) <nl> - { <nl> - filestruct . advance ( true ) ; <nl> - if ( filestruct . isExhausted ( ) ) <nl> - { <nl> - continue ; <nl> - } <nl> - / * keep on looping until we find a key in the range * / <nl> - while ( ! Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( filestruct . getKey ( ) ) , ranges ) ) <nl> - { <nl> - filestruct . advance ( true ) ; <nl> - if ( filestruct . isExhausted ( ) ) <nl> - { <nl> - break ; <nl> - } <nl> - } <nl> - if ( ! filestruct . isExhausted ( ) ) <nl> - { <nl> - pq . add ( filestruct ) ; <nl> - } <nl> - totalkeysRead + + ; <nl> - } <nl> - lfs . clear ( ) ; <nl> - lastkey = null ; <nl> - if ( fs ! = null ) <nl> - { <nl> - / / Add back the fs since we processed the rest of <nl> - / / filestructs <nl> - pq . add ( fs ) ; <nl> + writer . append ( row . key , row . buffer ) ; <nl> + totalkeysWritten + + ; <nl> } <nl> } <nl> } <nl> - <nl> - if ( rangeWriter ! = null ) <nl> + finally <nl> { <nl> - results . add ( rangeWriter . closeAndOpenReader ( ) ) ; <nl> + ci . close ( ) ; <nl> } <nl> <nl> - if ( logger _ . isDebugEnabled ( ) ) <nl> + if ( writer ! = null ) <nl> { <nl> - logger _ . debug ( " Total time taken for range split . . . " + ( System . currentTimeMillis ( ) - startTime ) ) ; <nl> - logger _ . debug ( " Total bytes Read for range split . . . " + totalBytesRead ) ; <nl> - logger _ . debug ( " Total bytes written for range split . . . " <nl> - + totalBytesWritten + " Total keys read . . . " + totalkeysRead ) ; <nl> + results . add ( writer . closeAndOpenReader ( ) ) ; <nl> + String format = " AntiCompacted to % s . % d / % d bytes for % d keys . Time : % dms . " ; <nl> + long dTime = System . currentTimeMillis ( ) - startTime ; <nl> + logger _ . info ( String . format ( format , writer . getFilename ( ) , getTotalBytes ( sstables ) , results . get ( 0 ) . length ( ) , totalkeysWritten , dTime ) ) ; <nl> } <nl> + <nl> return results ; <nl> } <nl> <nl> @ @ - 938 , 111 + 835 , 59 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> } <nl> <nl> long startTime = System . currentTimeMillis ( ) ; <nl> - long totalBytesRead = 0 ; <nl> - long totalkeysRead = 0 ; <nl> long totalkeysWritten = 0 ; <nl> - PriorityQueue < FileStruct > pq = initializePriorityQueue ( sstables , null ) ; <nl> - <nl> - if ( pq . isEmpty ( ) ) <nl> - { <nl> - logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; <nl> - / / TODO clean out bad files , if any <nl> - return 0 ; <nl> - } <nl> <nl> - int expectedBloomFilterSize = SSTableReader . getApproximateKeyCount ( sstables ) ; <nl> - if ( expectedBloomFilterSize < 0 ) <nl> - expectedBloomFilterSize = SSTableReader . indexInterval ( ) ; <nl> - String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; <nl> - SSTableWriter writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; <nl> - SSTableReader ssTable = null ; <nl> - String lastkey = null ; <nl> - List < FileStruct > lfs = new ArrayList < FileStruct > ( ) ; <nl> - DataOutputBuffer bufOut = new DataOutputBuffer ( ) ; <nl> + int expectedBloomFilterSize = Math . max ( SSTableReader . indexInterval ( ) , SSTableReader . getApproximateKeyCount ( sstables ) ) ; <nl> if ( logger _ . isDebugEnabled ( ) ) <nl> logger _ . debug ( " Expected bloom filter size : " + expectedBloomFilterSize ) ; <nl> - List < ColumnFamily > columnFamilies = new ArrayList < ColumnFamily > ( ) ; <nl> <nl> - while ( pq . size ( ) > 0 | | lfs . size ( ) > 0 ) <nl> + SSTableWriter writer ; <nl> + CompactionIterator ci = new CompactionIterator ( sstables ) ; <nl> + <nl> + try <nl> { <nl> - FileStruct fs = null ; <nl> - if ( pq . size ( ) > 0 ) <nl> + if ( ! ci . hasNext ( ) ) <nl> { <nl> - fs = pq . poll ( ) ; <nl> + logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; <nl> + return 0 ; <nl> } <nl> - if ( fs ! = null <nl> - & & ( lastkey = = null | | lastkey . equals ( fs . getKey ( ) ) ) ) <nl> - { <nl> - / / The keys are the same so we need to add this to the <nl> - / / ldfs list <nl> - lastkey = fs . getKey ( ) ; <nl> - lfs . add ( fs ) ; <nl> - } <nl> - else <nl> - { <nl> - Collections . sort ( lfs , new FileStructComparator ( ) ) ; <nl> - ColumnFamily columnFamily ; <nl> - bufOut . reset ( ) ; <nl> - if ( lfs . size ( ) > 1 ) <nl> - { <nl> - for ( FileStruct filestruct : lfs ) <nl> - { <nl> - / / We want to add only 2 and resolve them right there in order to save on memory footprint <nl> - if ( columnFamilies . size ( ) > 1 ) <nl> - { <nl> - merge ( columnFamilies ) ; <nl> - } <nl> - / / deserialize into column families <nl> - columnFamilies . add ( filestruct . getColumnFamily ( ) ) ; <nl> - } <nl> - / / Now after merging all crap append to the sstable <nl> - columnFamily = resolveAndRemoveDeleted ( columnFamilies ) ; <nl> - columnFamilies . clear ( ) ; <nl> - if ( columnFamily ! = null ) <nl> - { <nl> - ColumnFamily . serializer ( ) . serializeWithIndexes ( columnFamily , bufOut ) ; <nl> - } <nl> - } <nl> - else <nl> - { <nl> - / / TODO deserializing only to reserialize is dumb <nl> - FileStruct filestruct = lfs . get ( 0 ) ; <nl> - ColumnFamily . serializer ( ) . serializeWithIndexes ( filestruct . getColumnFamily ( ) , bufOut ) ; <nl> - } <nl> <nl> - writer . append ( lastkey , bufOut ) ; <nl> - totalkeysWritten + + ; <nl> + String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; <nl> + writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; <nl> <nl> - for ( FileStruct filestruct : lfs ) <nl> - { <nl> - filestruct . advance ( true ) ; <nl> - if ( filestruct . isExhausted ( ) ) <nl> - { <nl> - continue ; <nl> - } <nl> - pq . add ( filestruct ) ; <nl> - totalkeysRead + + ; <nl> - } <nl> - lfs . clear ( ) ; <nl> - lastkey = null ; <nl> - if ( fs ! = null ) <nl> - { <nl> - / * Add back the fs since we processed the rest of filestructs * / <nl> - pq . add ( fs ) ; <nl> - } <nl> + while ( ci . hasNext ( ) ) <nl> + { <nl> + CompactionIterator . CompactedRow row = ci . next ( ) ; <nl> + writer . append ( row . key , row . buffer ) ; <nl> + totalkeysWritten + + ; <nl> } <nl> } <nl> - ssTable = writer . closeAndOpenReader ( ) ; <nl> + finally <nl> + { <nl> + ci . close ( ) ; <nl> + } <nl> + <nl> + SSTableReader ssTable = writer . closeAndOpenReader ( ) ; <nl> ssTables _ . add ( ssTable ) ; <nl> ssTables _ . markCompacted ( sstables ) ; <nl> CompactionManager . instance ( ) . submit ( ColumnFamilyStore . this ) ; <nl> <nl> - String format = " Compacted to % s . % d / % d bytes for % d / % d keys read / written . Time : % dms . " ; <nl> + String format = " Compacted to % s . % d / % d bytes for % d keys . Time : % dms . " ; <nl> long dTime = System . currentTimeMillis ( ) - startTime ; <nl> - logger _ . info ( String . format ( format , writer . getFilename ( ) , totalBytesRead , ssTable . length ( ) , totalkeysRead , totalkeysWritten , dTime ) ) ; <nl> + logger _ . info ( String . format ( format , writer . getFilename ( ) , getTotalBytes ( sstables ) , ssTable . length ( ) , totalkeysWritten , dTime ) ) ; <nl> return sstables . size ( ) ; <nl> } <nl> <nl> + private long getTotalBytes ( Iterable < SSTableReader > sstables ) <nl> + { <nl> + long sum = 0 ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + { <nl> + sum + = sstable . length ( ) ; <nl> + } <nl> + return sum ; <nl> + } <nl> + <nl> public static List < Memtable > getUnflushedMemtables ( String cfName ) <nl> { <nl> return new ArrayList < Memtable > ( getMemtablesPendingFlushNotNull ( cfName ) ) ; <nl> @ @ - 1341 , 23 + 1186 , 24 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> / / sstables <nl> for ( SSTableReader sstable : ssTables _ ) <nl> { <nl> - final SSTableScanner fs = sstable . getScanner ( ) ; <nl> - fs . seekTo ( startWith ) ; <nl> - iterators . add ( new Iterator < String > ( ) <nl> + final SSTableScanner scanner = sstable . getScanner ( ) ; <nl> + scanner . seekTo ( startWith ) ; <nl> + Iterator < String > iter = new Iterator < String > ( ) <nl> { <nl> public boolean hasNext ( ) <nl> { <nl> - return fs . hasNext ( ) ; <nl> + return scanner . hasNext ( ) ; <nl> } <nl> public String next ( ) <nl> { <nl> - return fs . next ( ) . getKey ( ) ; <nl> + return scanner . next ( ) . getKey ( ) ; <nl> } <nl> public void remove ( ) <nl> { <nl> throw new UnsupportedOperationException ( ) ; <nl> } <nl> - } ) ; <nl> + } ; <nl> + iterators . add ( iter ) ; <nl> } <nl> <nl> Iterator < String > collated = IteratorUtils . collatedIterator ( comparator , iterators ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / FileStructComparator . java b / src / java / org / apache / cassandra / db / FileStructComparator . java <nl> deleted file mode 100644 <nl> index e81a992 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / db / FileStructComparator . java <nl> + + + / dev / null <nl> @ @ - 1 , 31 + 0 , 0 @ @ <nl> - / * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , <nl> - * software distributed under the License is distributed on an <nl> - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> - * KIND , either express or implied . See the License for the <nl> - * specific language governing permissions and limitations <nl> - * under the License . <nl> - * / <nl> - package org . apache . cassandra . db ; <nl> - <nl> - import java . util . Comparator ; <nl> - <nl> - import org . apache . cassandra . io . FileStruct ; <nl> - <nl> - class FileStructComparator implements Comparator < FileStruct > <nl> - { <nl> - public int compare ( FileStruct f , FileStruct f2 ) <nl> - { <nl> - return f . getFileName ( ) . compareTo ( f2 . getFileName ( ) ) ; <nl> - } <nl> - } <nl> \ No newline at end of file <nl> diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java <nl> index d88e004 . . 696ae5a 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Memtable . java <nl> + + + b / src / java / org / apache / cassandra / db / Memtable . java <nl> @ @ - 153 , 7 + 153 , 7 @ @ public class Memtable implements Comparable < Memtable > <nl> { <nl> int oldSize = oldCf . size ( ) ; <nl> int oldObjectCount = oldCf . getColumnCount ( ) ; <nl> - oldCf . addColumns ( columnFamily ) ; <nl> + oldCf . addAll ( columnFamily ) ; <nl> int newSize = oldCf . size ( ) ; <nl> int newObjectCount = oldCf . getColumnCount ( ) ; <nl> resolveSize ( oldSize , newSize ) ; <nl> diff - - git a / src / java / org / apache / cassandra / io / CompactionIterator . java b / src / java / org / apache / cassandra / io / CompactionIterator . java <nl> new file mode 100644 <nl> index 0000000 . . b65e132 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / io / CompactionIterator . java <nl> @ @ - 0 , 0 + 1 , 113 @ @ <nl> + package org . apache . cassandra . io ; <nl> + <nl> + import java . io . Closeable ; <nl> + import java . io . IOException ; <nl> + import java . util . List ; <nl> + import java . util . ArrayList ; <nl> + import java . util . Comparator ; <nl> + <nl> + import org . apache . commons . collections . iterators . CollatingIterator ; <nl> + <nl> + import org . apache . cassandra . utils . ReducingIterator ; <nl> + import org . apache . cassandra . db . ColumnFamily ; <nl> + <nl> + public class CompactionIterator extends ReducingIterator < IteratingRow , CompactionIterator . CompactedRow > implements Closeable <nl> + { <nl> + private final List < IteratingRow > rows = new ArrayList < IteratingRow > ( ) ; <nl> + <nl> + @ SuppressWarnings ( " unchecked " ) <nl> + public CompactionIterator ( Iterable < SSTableReader > sstables ) throws IOException <nl> + { <nl> + super ( getCollatingIterator ( sstables ) ) ; <nl> + } <nl> + <nl> + @ SuppressWarnings ( " unchecked " ) <nl> + private static CollatingIterator getCollatingIterator ( Iterable < SSTableReader > sstables ) throws IOException <nl> + { <nl> + / / CollatingIterator has a bug that causes NPE when you try to use default comparator . : ( <nl> + CollatingIterator iter = new CollatingIterator ( new Comparator ( ) <nl> + { <nl> + public int compare ( Object o1 , Object o2 ) <nl> + { <nl> + return ( ( Comparable ) o1 ) . compareTo ( o2 ) ; <nl> + } <nl> + } ) ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + { <nl> + iter . addIterator ( sstable . getScanner ( ) ) ; <nl> + } <nl> + return iter ; <nl> + } <nl> + <nl> + @ Override <nl> + protected boolean isEqual ( IteratingRow o1 , IteratingRow o2 ) <nl> + { <nl> + return o1 . getKey ( ) . equals ( o2 . getKey ( ) ) ; <nl> + } <nl> + <nl> + public void reduce ( IteratingRow current ) <nl> + { <nl> + rows . add ( current ) ; <nl> + } <nl> + <nl> + protected CompactedRow getReduced ( ) <nl> + { <nl> + try <nl> + { <nl> + return getReducedRaw ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + protected CompactedRow getReducedRaw ( ) throws IOException <nl> + { <nl> + DataOutputBuffer buffer = new DataOutputBuffer ( ) ; <nl> + String key = rows . get ( 0 ) . getKey ( ) ; <nl> + if ( rows . size ( ) > 1 ) <nl> + { <nl> + ColumnFamily cf = null ; <nl> + for ( IteratingRow row : rows ) <nl> + { <nl> + if ( cf = = null ) <nl> + { <nl> + cf = row . getColumnFamily ( ) ; <nl> + } <nl> + else <nl> + { <nl> + cf . addAll ( row . getColumnFamily ( ) ) ; <nl> + } <nl> + } <nl> + ColumnFamily . serializer ( ) . serializeWithIndexes ( cf , buffer ) ; <nl> + } <nl> + else <nl> + { <nl> + assert rows . size ( ) = = 1 ; <nl> + rows . get ( 0 ) . echoData ( buffer ) ; <nl> + } <nl> + rows . clear ( ) ; <nl> + return new CompactedRow ( key , buffer ) ; <nl> + } <nl> + <nl> + public void close ( ) throws IOException <nl> + { <nl> + for ( Object o : ( ( CollatingIterator ) source ) . getIterators ( ) ) <nl> + { <nl> + ( ( SSTableScanner ) o ) . close ( ) ; <nl> + } <nl> + } <nl> + <nl> + public static class CompactedRow <nl> + { <nl> + public final String key ; <nl> + public final DataOutputBuffer buffer ; <nl> + <nl> + public CompactedRow ( String key , DataOutputBuffer buffer ) <nl> + { <nl> + this . key = key ; <nl> + this . buffer = buffer ; <nl> + } <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / io / FileStruct . java b / src / java / org / apache / cassandra / io / FileStruct . java <nl> deleted file mode 100644 <nl> index b561239 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / io / FileStruct . java <nl> + + + / dev / null <nl> @ @ - 1 , 195 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . io ; <nl> - <nl> - import java . io . IOException ; <nl> - import java . io . File ; <nl> - import java . util . Iterator ; <nl> - <nl> - import org . apache . cassandra . db . IColumn ; <nl> - import org . apache . cassandra . db . ColumnFamily ; <nl> - import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - <nl> - import org . apache . log4j . Logger ; <nl> - import com . google . common . collect . AbstractIterator ; <nl> - <nl> - <nl> - public class FileStruct implements Comparable < FileStruct > , Iterator < String > <nl> - { <nl> - private static Logger logger = Logger . getLogger ( FileStruct . class ) ; <nl> - <nl> - private IteratingRow row ; <nl> - private boolean exhausted = false ; <nl> - private BufferedRandomAccessFile file ; <nl> - private SSTableReader sstable ; <nl> - private FileStructIterator iterator ; <nl> - <nl> - FileStruct ( SSTableReader sstable ) throws IOException <nl> - { <nl> - / / TODO this is used for both compactions and key ranges . the buffer sizes we want <nl> - / / to use for these ops are very different . here we are leaning towards the key - range <nl> - / / use case since that is more common . What we really want is to split those <nl> - / / two uses of this class up . <nl> - this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , 256 * 1024 ) ; <nl> - this . sstable = sstable ; <nl> - } <nl> - <nl> - public String getFileName ( ) <nl> - { <nl> - return file . getPath ( ) ; <nl> - } <nl> - <nl> - public void close ( ) throws IOException <nl> - { <nl> - file . close ( ) ; <nl> - } <nl> - <nl> - public boolean isExhausted ( ) <nl> - { <nl> - return exhausted ; <nl> - } <nl> - <nl> - public String getKey ( ) <nl> - { <nl> - return row . getKey ( ) ; <nl> - } <nl> - <nl> - public ColumnFamily getColumnFamily ( ) <nl> - { <nl> - return row . getEmptyColumnFamily ( ) ; <nl> - } <nl> - <nl> - public int compareTo ( FileStruct f ) <nl> - { <nl> - return sstable . getPartitioner ( ) . getDecoratedKeyComparator ( ) . compare ( getKey ( ) , f . getKey ( ) ) ; <nl> - } <nl> - <nl> - public void seekTo ( String seekKey ) <nl> - { <nl> - try <nl> - { <nl> - long position = sstable . getNearestPosition ( seekKey ) ; <nl> - if ( position < 0 ) <nl> - { <nl> - exhausted = true ; <nl> - return ; <nl> - } <nl> - file . seek ( position ) ; <nl> - advance ( false ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( " corrupt sstable " , e ) ; <nl> - } <nl> - } <nl> - <nl> - / * <nl> - * Read the next key from the data file . <nl> - * Caller must check isExhausted after each call to see if further <nl> - * reads are valid . <nl> - * Do not mix with calls to the iterator interface ( next / hasnext ) . <nl> - * @ deprecated - - prefer the iterator interface . <nl> - * / <nl> - public void advance ( boolean materialize ) throws IOException <nl> - { <nl> - / / TODO r / m materialize option - - use iterableness ! <nl> - if ( exhausted ) <nl> - { <nl> - throw new IndexOutOfBoundsException ( ) ; <nl> - } <nl> - <nl> - if ( file . isEOF ( ) ) <nl> - { <nl> - file . close ( ) ; <nl> - exhausted = true ; <nl> - return ; <nl> - } <nl> - <nl> - row = new IteratingRow ( file , sstable ) ; <nl> - if ( materialize ) <nl> - { <nl> - while ( row . hasNext ( ) ) <nl> - { <nl> - IColumn column = row . next ( ) ; <nl> - row . getEmptyColumnFamily ( ) . addColumn ( column ) ; <nl> - } <nl> - } <nl> - else <nl> - { <nl> - row . skipRemaining ( ) ; <nl> - } <nl> - } <nl> - <nl> - public boolean hasNext ( ) <nl> - { <nl> - if ( iterator = = null ) <nl> - iterator = new FileStructIterator ( ) ; <nl> - return iterator . hasNext ( ) ; <nl> - } <nl> - <nl> - / * * do not mix with manual calls to advance ( ) . * / <nl> - public String next ( ) <nl> - { <nl> - if ( iterator = = null ) <nl> - iterator = new FileStructIterator ( ) ; <nl> - return iterator . next ( ) ; <nl> - } <nl> - <nl> - public void remove ( ) <nl> - { <nl> - throw new UnsupportedOperationException ( ) ; <nl> - } <nl> - <nl> - private class FileStructIterator extends AbstractIterator < String > <nl> - { <nl> - public FileStructIterator ( ) <nl> - { <nl> - if ( row = = null ) <nl> - { <nl> - if ( ! isExhausted ( ) ) <nl> - { <nl> - forward ( ) ; <nl> - } <nl> - } <nl> - } <nl> - <nl> - private void forward ( ) <nl> - { <nl> - try <nl> - { <nl> - advance ( false ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> - } <nl> - <nl> - protected String computeNext ( ) <nl> - { <nl> - if ( isExhausted ( ) ) <nl> - { <nl> - return endOfData ( ) ; <nl> - } <nl> - String oldKey = getKey ( ) ; <nl> - forward ( ) ; <nl> - return oldKey ; <nl> - } <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / io / IteratingRow . java b / src / java / org / apache / cassandra / io / IteratingRow . java <nl> index 5ace95f . . 628fe50 100644 <nl> - - - a / src / java / org / apache / cassandra / io / IteratingRow . java <nl> + + + b / src / java / org / apache / cassandra / io / IteratingRow . java <nl> @ @ - 37 , 7 + 37 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl <nl> { <nl> private final String key ; <nl> private final long finishedAt ; <nl> - private final ColumnFamily emptyColumnFamily ; <nl> private final BufferedRandomAccessFile file ; <nl> private SSTableReader sstable ; <nl> private long dataStart ; <nl> @ @ - 51 , 10 + 50 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl <nl> int dataSize = file . readInt ( ) ; <nl> dataStart = file . getFilePointer ( ) ; <nl> finishedAt = dataStart + dataSize ; <nl> - / / legacy stuff to support FileStruct : <nl> - IndexHelper . skipBloomFilterAndIndex ( file ) ; <nl> - emptyColumnFamily = ColumnFamily . serializer ( ) . deserializeFromSSTableNoColumns ( sstable . makeColumnFamily ( ) , file ) ; <nl> - file . readInt ( ) ; <nl> } <nl> <nl> public String getKey ( ) <nl> @ @ - 62 , 11 + 57 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl <nl> return key ; <nl> } <nl> <nl> - public ColumnFamily getEmptyColumnFamily ( ) <nl> - { <nl> - return emptyColumnFamily ; <nl> - } <nl> - <nl> public void echoData ( DataOutput out ) throws IOException <nl> { <nl> file . seek ( dataStart ) ; <nl> diff - - git a / src / java / org / apache / cassandra / io / SSTableReader . java b / src / java / org / apache / cassandra / io / SSTableReader . java <nl> index fc94fca . . 81a71fd 100644 <nl> - - - a / src / java / org / apache / cassandra / io / SSTableReader . java <nl> + + + b / src / java / org / apache / cassandra / io / SSTableReader . java <nl> @ @ - 333 , 11 + 333 , 6 @ @ public class SSTableReader extends SSTable implements Comparable < SSTableReader > <nl> return partitioner ; <nl> } <nl> <nl> - public FileStruct getFileStruct ( ) throws IOException <nl> - { <nl> - return new FileStruct ( this ) ; <nl> - } <nl> - <nl> public SSTableScanner getScanner ( ) throws IOException <nl> { <nl> return new SSTableScanner ( this ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java b / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java <nl> index 40e5889 . . 4219ff9 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java <nl> @ @ - 20 , 8 + 20 , 6 @ @ package org . apache . cassandra . db ; <nl> <nl> import java . io . IOException ; <nl> import java . util . Arrays ; <nl> - import java . util . HashSet ; <nl> - import java . util . Random ; <nl> import java . util . TreeMap ; <nl> <nl> import org . junit . Test ; <nl> @ @ - 125 , 8 + 123 , 8 @ @ public class ColumnFamilyTest <nl> cf _ old . addColumn ( QueryPath . column ( " col2 " . getBytes ( ) ) , val2 , 1 ) ; <nl> cf _ old . addColumn ( QueryPath . column ( " col3 " . getBytes ( ) ) , val2 , 2 ) ; <nl> <nl> - cf _ result . addColumns ( cf _ new ) ; <nl> - cf _ result . addColumns ( cf _ old ) ; <nl> + cf _ result . addAll ( cf _ new ) ; <nl> + cf _ result . addAll ( cf _ old ) ; <nl> <nl> assert 3 = = cf _ result . getColumnCount ( ) : " Count is " + cf _ new . getColumnCount ( ) ; <nl> / / addcolumns will only add if timestamp > = old timestamp
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 46cda65 . . 2ee8b07 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 13 
+ + * Allow cancellation of index summary redistribution ( CASSANDRA - 8805 ) 
+ * Disable reloading of GossipingPropertyFileSnitch ( CASSANDRA - 9474 ) 
+ * Fix Stress profile parsing on Windows ( CASSANDRA - 10808 ) 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionInfo . java b / src / java / org / apache / cassandra / db / compaction / CompactionInfo . java 
+ index d086eef . . e88143e 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionInfo . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionInfo . java 
+ @ @ - 98 , 9 + 98 , 17 @ @ public final class CompactionInfo implements Serializable 
+ public String toString ( ) 
+ { 
+ StringBuilder buff = new StringBuilder ( ) ; 
+ - buff . append ( getTaskType ( ) ) . append ( ' @ ' ) . append ( getId ( ) ) ; 
+ - buff . append ( ' ( ' ) . append ( getKeyspace ( ) ) . append ( " , " ) . append ( getColumnFamily ( ) ) ; 
+ - buff . append ( " , " ) . append ( getCompleted ( ) ) . append ( ' / ' ) . append ( getTotal ( ) ) ; 
+ + buff . append ( getTaskType ( ) ) ; 
+ + if ( cfm ! = null ) 
+ + { 
+ + buff . append ( ' @ ' ) . append ( getId ( ) ) . append ( ' ( ' ) ; 
+ + buff . append ( getKeyspace ( ) ) . append ( " , " ) . append ( getColumnFamily ( ) ) . append ( " , " ) ; 
+ + } 
+ + else 
+ + { 
+ + buff . append ( ' ( ' ) ; 
+ + } 
+ + buff . append ( getCompleted ( ) ) . append ( ' / ' ) . append ( getTotal ( ) ) ; 
+ return buff . append ( ' ) ' ) . append ( unit ) . toString ( ) ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ index 2630ba2 . . 9bddaf5 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ @ @ - 1222 , 6 + 1222 , 20 @ @ public class CompactionManager implements CompactionManagerMBean 
+ return executor . submit ( runnable ) ; 
+ } 
+ 
+ + public List < SSTableReader > runIndexSummaryRedistribution ( IndexSummaryRedistribution redistribution ) throws IOException 
+ + { 
+ + metrics . beginCompaction ( redistribution ) ; 
+ + 
+ + try 
+ + { 
+ + return redistribution . redistributeSummaries ( ) ; 
+ + } 
+ + finally 
+ + { 
+ + metrics . finishCompaction ( redistribution ) ; 
+ + } 
+ + } 
+ + 
+ static int getDefaultGcBefore ( ColumnFamilyStore cfs ) 
+ { 
+ / / 2ndary indexes have ExpiringColumns too , so we need to purge tombstones deleted before now . We do not need to 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / OperationType . java b / src / java / org / apache / cassandra / db / compaction / OperationType . java 
+ index 15d18f6 . . 475b591 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / OperationType . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / OperationType . java 
+ @ @ - 31 , 7 + 31 , 8 @ @ public enum OperationType 
+ / * * Compaction for tombstone removal * / 
+ TOMBSTONE _ COMPACTION ( " Tombstone Compaction " ) , 
+ UNKNOWN ( " Unknown compaction type " ) , 
+ - ANTICOMPACTION ( " Anticompaction after repair " ) ; 
+ + ANTICOMPACTION ( " Anticompaction after repair " ) , 
+ + INDEX _ SUMMARY ( " Index summary redistribution " ) ; 
+ 
+ private final String type ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / IndexSummaryManager . java b / src / java / org / apache / cassandra / io / sstable / IndexSummaryManager . java 
+ index 0c196ff . . be5cc3c 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / IndexSummaryManager . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / IndexSummaryManager . java 
+ @ @ - 20 , 8 + 20 , 6 @ @ package org . apache . cassandra . io . sstable ; 
+ import java . io . IOException ; 
+ import java . lang . management . ManagementFactory ; 
+ import java . util . ArrayList ; 
+ - import java . util . Collections ; 
+ - import java . util . Comparator ; 
+ import java . util . HashMap ; 
+ import java . util . List ; 
+ import java . util . Map ; 
+ @ @ - 33 , 7 + 31 , 6 @ @ import javax . management . ObjectName ; 
+ 
+ import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . collect . HashMultimap ; 
+ - import com . google . common . collect . Iterables ; 
+ import com . google . common . collect . Lists ; 
+ import com . google . common . collect . Multimap ; 
+ import com . google . common . collect . Sets ; 
+ @ @ - 45 , 11 + 42 , 10 @ @ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . db . DataTracker ; 
+ import org . apache . cassandra . db . Keyspace ; 
+ + import org . apache . cassandra . db . compaction . CompactionManager ; 
+ import org . apache . cassandra . utils . Pair ; 
+ import org . apache . cassandra . utils . WrappedRunnable ; 
+ 
+ - import static org . apache . cassandra . io . sstable . Downsampling . BASE _ SAMPLING _ LEVEL ; 
+ - 
+ / * * 
+ * Manages the fixed - size memory pool for index summaries , periodically resizing them 
+ * in order to give more memory to hot sstables and less memory to cold sstables . 
+ @ @ - 255 , 261 + 251 , 6 @ @ public class IndexSummaryManager implements IndexSummaryManagerMBean 
+ @ VisibleForTesting 
+ public static List < SSTableReader > redistributeSummaries ( List < SSTableReader > compacting , List < SSTableReader > nonCompacting , long memoryPoolBytes ) throws IOException 
+ { 
+ - long total = 0 ; 
+ - for ( SSTableReader sstable : Iterables . concat ( compacting , nonCompacting ) ) 
+ - total + = sstable . getIndexSummaryOffHeapSize ( ) ; 
+ - 
+ - List < SSTableReader > oldFormatSSTables = new ArrayList < > ( ) ; 
+ - for ( SSTableReader sstable : nonCompacting ) 
+ - { 
+ - / / We can ' t change the sampling level of sstables with the old format , because the serialization format 
+ - / / doesn ' t include the sampling level . Leave this one as it is . ( See CASSANDRA - 8993 for details . ) 
+ - logger . trace ( " SSTable { } cannot be re - sampled due to old sstable format " , sstable ) ; 
+ - if ( ! sstable . descriptor . version . hasSamplingLevel ) 
+ - oldFormatSSTables . add ( sstable ) ; 
+ - } 
+ - nonCompacting . removeAll ( oldFormatSSTables ) ; 
+ - 
+ - logger . debug ( " Beginning redistribution of index summaries for { } sstables with memory pool size { } MB ; current spaced used is { } MB " , 
+ - nonCompacting . size ( ) , memoryPoolBytes / 1024L / 1024L , total / 1024 . 0 / 1024 . 0 ) ; 
+ - 
+ - final Map < SSTableReader , Double > readRates = new HashMap < > ( nonCompacting . size ( ) ) ; 
+ - double totalReadsPerSec = 0 . 0 ; 
+ - for ( SSTableReader sstable : nonCompacting ) 
+ - { 
+ - if ( sstable . getReadMeter ( ) ! = null ) 
+ - { 
+ - Double readRate = sstable . getReadMeter ( ) . fifteenMinuteRate ( ) ; 
+ - totalReadsPerSec + = readRate ; 
+ - readRates . put ( sstable , readRate ) ; 
+ - } 
+ - } 
+ - logger . trace ( " Total reads / sec across all sstables in index summary resize process : { } " , totalReadsPerSec ) ; 
+ - 
+ - / / copy and sort by read rates ( ascending ) 
+ - List < SSTableReader > sstablesByHotness = new ArrayList < > ( nonCompacting ) ; 
+ - Collections . sort ( sstablesByHotness , new ReadRateComparator ( readRates ) ) ; 
+ - 
+ - long remainingBytes = memoryPoolBytes ; 
+ - for ( SSTableReader sstable : Iterables . concat ( compacting , oldFormatSSTables ) ) 
+ - remainingBytes - = sstable . getIndexSummaryOffHeapSize ( ) ; 
+ - 
+ - logger . trace ( " Index summaries for compacting SSTables are using { } MB of space " , 
+ - ( memoryPoolBytes - remainingBytes ) / 1024 . 0 / 1024 . 0 ) ; 
+ - List < SSTableReader > newSSTables = adjustSamplingLevels ( sstablesByHotness , totalReadsPerSec , remainingBytes ) ; 
+ - 
+ - total = 0 ; 
+ - for ( SSTableReader sstable : Iterables . concat ( compacting , oldFormatSSTables , newSSTables ) ) 
+ - total + = sstable . getIndexSummaryOffHeapSize ( ) ; 
+ - logger . debug ( " Completed resizing of index summaries ; current approximate memory used : { } MB " , 
+ - total / 1024 . 0 / 1024 . 0 ) ; 
+ - 
+ - return newSSTables ; 
+ - } 
+ - 
+ - private static List < SSTableReader > adjustSamplingLevels ( List < SSTableReader > sstables , 
+ - double totalReadsPerSec , long memoryPoolCapacity ) throws IOException 
+ - { 
+ - 
+ - List < ResampleEntry > toDownsample = new ArrayList < > ( sstables . size ( ) / 4 ) ; 
+ - List < ResampleEntry > toUpsample = new ArrayList < > ( sstables . size ( ) / 4 ) ; 
+ - List < ResampleEntry > forceResample = new ArrayList < > ( ) ; 
+ - List < ResampleEntry > forceUpsample = new ArrayList < > ( ) ; 
+ - List < SSTableReader > newSSTables = new ArrayList < > ( sstables . size ( ) ) ; 
+ - 
+ - / / Going from the coldest to the hottest sstables , try to give each sstable an amount of space proportional 
+ - / / to the number of total reads / sec it handles . 
+ - long remainingSpace = memoryPoolCapacity ; 
+ - for ( SSTableReader sstable : sstables ) 
+ - { 
+ - int minIndexInterval = sstable . metadata . getMinIndexInterval ( ) ; 
+ - int maxIndexInterval = sstable . metadata . getMaxIndexInterval ( ) ; 
+ - 
+ - double readsPerSec = sstable . getReadMeter ( ) = = null ? 0 . 0 : sstable . getReadMeter ( ) . fifteenMinuteRate ( ) ; 
+ - long idealSpace = Math . round ( remainingSpace * ( readsPerSec / totalReadsPerSec ) ) ; 
+ - 
+ - / / figure out how many entries our idealSpace would buy us , and pick a new sampling level based on that 
+ - int currentNumEntries = sstable . getIndexSummarySize ( ) ; 
+ - double avgEntrySize = sstable . getIndexSummaryOffHeapSize ( ) / ( double ) currentNumEntries ; 
+ - long targetNumEntries = Math . max ( 1 , Math . round ( idealSpace / avgEntrySize ) ) ; 
+ - int currentSamplingLevel = sstable . getIndexSummarySamplingLevel ( ) ; 
+ - int maxSummarySize = sstable . getMaxIndexSummarySize ( ) ; 
+ - 
+ - / / if the min _ index _ interval changed , calculate what our current sampling level would be under the new min 
+ - if ( sstable . getMinIndexInterval ( ) ! = minIndexInterval ) 
+ - { 
+ - int effectiveSamplingLevel = ( int ) Math . round ( currentSamplingLevel * ( minIndexInterval / ( double ) sstable . getMinIndexInterval ( ) ) ) ; 
+ - maxSummarySize = ( int ) Math . round ( maxSummarySize * ( sstable . getMinIndexInterval ( ) / ( double ) minIndexInterval ) ) ; 
+ - logger . trace ( " min _ index _ interval changed from { } to { } , so the current sampling level for { } is effectively now { } ( was { } ) " , 
+ - sstable . getMinIndexInterval ( ) , minIndexInterval , sstable , effectiveSamplingLevel , currentSamplingLevel ) ; 
+ - currentSamplingLevel = effectiveSamplingLevel ; 
+ - } 
+ - 
+ - int newSamplingLevel = IndexSummaryBuilder . calculateSamplingLevel ( currentSamplingLevel , currentNumEntries , targetNumEntries , 
+ - minIndexInterval , maxIndexInterval ) ; 
+ - int numEntriesAtNewSamplingLevel = IndexSummaryBuilder . entriesAtSamplingLevel ( newSamplingLevel , maxSummarySize ) ; 
+ - double effectiveIndexInterval = sstable . getEffectiveIndexInterval ( ) ; 
+ - 
+ - logger . trace ( " { } has { } reads / sec ; ideal space for index summary : { } bytes ( { } entries ) ; considering moving " + 
+ - " from level { } ( { } entries , { } bytes ) to level { } ( { } entries , { } bytes ) " , 
+ - sstable . getFilename ( ) , readsPerSec , idealSpace , targetNumEntries , currentSamplingLevel , currentNumEntries , 
+ - currentNumEntries * avgEntrySize , newSamplingLevel , numEntriesAtNewSamplingLevel , 
+ - numEntriesAtNewSamplingLevel * avgEntrySize ) ; 
+ - 
+ - if ( effectiveIndexInterval < minIndexInterval ) 
+ - { 
+ - / / The min _ index _ interval was changed ; re - sample to match it . 
+ - logger . debug ( " Forcing resample of { } because the current index interval ( { } ) is below min _ index _ interval ( { } ) " , 
+ - sstable , effectiveIndexInterval , minIndexInterval ) ; 
+ - long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; 
+ - forceResample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; 
+ - remainingSpace - = spaceUsed ; 
+ - } 
+ - else if ( effectiveIndexInterval > maxIndexInterval ) 
+ - { 
+ - / / The max _ index _ interval was lowered ; force an upsample to the effective minimum sampling level 
+ - logger . debug ( " Forcing upsample of { } because the current index interval ( { } ) is above max _ index _ interval ( { } ) " , 
+ - sstable , effectiveIndexInterval , maxIndexInterval ) ; 
+ - newSamplingLevel = Math . max ( 1 , ( BASE _ SAMPLING _ LEVEL * minIndexInterval ) / maxIndexInterval ) ; 
+ - numEntriesAtNewSamplingLevel = IndexSummaryBuilder . entriesAtSamplingLevel ( newSamplingLevel , sstable . getMaxIndexSummarySize ( ) ) ; 
+ - long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; 
+ - forceUpsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; 
+ - remainingSpace - = avgEntrySize * numEntriesAtNewSamplingLevel ; 
+ - } 
+ - else if ( targetNumEntries > = currentNumEntries * UPSAMPLE _ THRESHOLD & & newSamplingLevel > currentSamplingLevel ) 
+ - { 
+ - long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; 
+ - toUpsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; 
+ - remainingSpace - = avgEntrySize * numEntriesAtNewSamplingLevel ; 
+ - } 
+ - else if ( targetNumEntries < currentNumEntries * DOWNSAMPLE _ THESHOLD & & newSamplingLevel < currentSamplingLevel ) 
+ - { 
+ - long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; 
+ - toDownsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; 
+ - remainingSpace - = spaceUsed ; 
+ - } 
+ - else 
+ - { 
+ - / / keep the same sampling level 
+ - logger . trace ( " SSTable { } is within thresholds of ideal sampling " , sstable ) ; 
+ - remainingSpace - = sstable . getIndexSummaryOffHeapSize ( ) ; 
+ - newSSTables . add ( sstable ) ; 
+ - } 
+ - totalReadsPerSec - = readsPerSec ; 
+ - } 
+ - 
+ - if ( remainingSpace > 0 ) 
+ - { 
+ - Pair < List < SSTableReader > , List < ResampleEntry > > result = distributeRemainingSpace ( toDownsample , remainingSpace ) ; 
+ - toDownsample = result . right ; 
+ - newSSTables . addAll ( result . left ) ; 
+ - } 
+ - 
+ - / / downsample first , then upsample 
+ - toDownsample . addAll ( forceResample ) ; 
+ - toDownsample . addAll ( toUpsample ) ; 
+ - toDownsample . addAll ( forceUpsample ) ; 
+ - Multimap < DataTracker , SSTableReader > replacedByTracker = HashMultimap . create ( ) ; 
+ - Multimap < DataTracker , SSTableReader > replacementsByTracker = HashMultimap . create ( ) ; 
+ - for ( ResampleEntry entry : toDownsample ) 
+ - { 
+ - SSTableReader sstable = entry . sstable ; 
+ - logger . debug ( " Re - sampling index summary for { } from { } / { } to { } / { } of the original number of entries " , 
+ - sstable , sstable . getIndexSummarySamplingLevel ( ) , Downsampling . BASE _ SAMPLING _ LEVEL , 
+ - entry . newSamplingLevel , Downsampling . BASE _ SAMPLING _ LEVEL ) ; 
+ - ColumnFamilyStore cfs = Keyspace . open ( sstable . getKeyspaceName ( ) ) . getColumnFamilyStore ( sstable . getColumnFamilyName ( ) ) ; 
+ - SSTableReader replacement = sstable . cloneWithNewSummarySamplingLevel ( cfs , entry . newSamplingLevel ) ; 
+ - DataTracker tracker = cfs . getDataTracker ( ) ; 
+ - 
+ - replacedByTracker . put ( tracker , sstable ) ; 
+ - replacementsByTracker . put ( tracker , replacement ) ; 
+ - } 
+ - 
+ - for ( DataTracker tracker : replacedByTracker . keySet ( ) ) 
+ - { 
+ - tracker . replaceWithNewInstances ( replacedByTracker . get ( tracker ) , replacementsByTracker . get ( tracker ) ) ; 
+ - newSSTables . addAll ( replacementsByTracker . get ( tracker ) ) ; 
+ - } 
+ - 
+ - return newSSTables ; 
+ - } 
+ - 
+ - @ VisibleForTesting 
+ - static Pair < List < SSTableReader > , List < ResampleEntry > > distributeRemainingSpace ( List < ResampleEntry > toDownsample , long remainingSpace ) 
+ - { 
+ - / / sort by the amount of space regained by doing the downsample operation ; we want to try to avoid operations 
+ - / / that will make little difference . 
+ - Collections . sort ( toDownsample , new Comparator < ResampleEntry > ( ) 
+ - { 
+ - public int compare ( ResampleEntry o1 , ResampleEntry o2 ) 
+ - { 
+ - return Double . compare ( o1 . sstable . getIndexSummaryOffHeapSize ( ) - o1 . newSpaceUsed , 
+ - o2 . sstable . getIndexSummaryOffHeapSize ( ) - o2 . newSpaceUsed ) ; 
+ - } 
+ - } ) ; 
+ - 
+ - int noDownsampleCutoff = 0 ; 
+ - List < SSTableReader > willNotDownsample = new ArrayList < > ( ) ; 
+ - while ( remainingSpace > 0 & & noDownsampleCutoff < toDownsample . size ( ) ) 
+ - { 
+ - ResampleEntry entry = toDownsample . get ( noDownsampleCutoff ) ; 
+ - 
+ - long extraSpaceRequired = entry . sstable . getIndexSummaryOffHeapSize ( ) - entry . newSpaceUsed ; 
+ - / / see if we have enough leftover space to keep the current sampling level 
+ - if ( extraSpaceRequired < = remainingSpace ) 
+ - { 
+ - logger . trace ( " Using leftover space to keep { } at the current sampling level ( { } ) " , 
+ - entry . sstable , entry . sstable . getIndexSummarySamplingLevel ( ) ) ; 
+ - willNotDownsample . add ( entry . sstable ) ; 
+ - remainingSpace - = extraSpaceRequired ; 
+ - } 
+ - else 
+ - { 
+ - break ; 
+ - } 
+ - 
+ - noDownsampleCutoff + + ; 
+ - } 
+ - return Pair . create ( willNotDownsample , toDownsample . subList ( noDownsampleCutoff , toDownsample . size ( ) ) ) ; 
+ - } 
+ - 
+ - private static class ResampleEntry 
+ - { 
+ - public final SSTableReader sstable ; 
+ - public final long newSpaceUsed ; 
+ - public final int newSamplingLevel ; 
+ - 
+ - public ResampleEntry ( SSTableReader sstable , long newSpaceUsed , int newSamplingLevel ) 
+ - { 
+ - this . sstable = sstable ; 
+ - this . newSpaceUsed = newSpaceUsed ; 
+ - this . newSamplingLevel = newSamplingLevel ; 
+ - } 
+ - } 
+ - 
+ - / * * Utility class for sorting sstables by their read rates . * / 
+ - private static class ReadRateComparator implements Comparator < SSTableReader > 
+ - { 
+ - private final Map < SSTableReader , Double > readRates ; 
+ - 
+ - public ReadRateComparator ( Map < SSTableReader , Double > readRates ) 
+ - { 
+ - this . readRates = readRates ; 
+ - } 
+ - 
+ - @ Override 
+ - public int compare ( SSTableReader o1 , SSTableReader o2 ) 
+ - { 
+ - Double readRate1 = readRates . get ( o1 ) ; 
+ - Double readRate2 = readRates . get ( o2 ) ; 
+ - if ( readRate1 = = null & & readRate2 = = null ) 
+ - return 0 ; 
+ - else if ( readRate1 = = null ) 
+ - return - 1 ; 
+ - else if ( readRate2 = = null ) 
+ - return 1 ; 
+ - else 
+ - return Double . compare ( readRate1 , readRate2 ) ; 
+ - } 
+ + return CompactionManager . instance . runIndexSummaryRedistribution ( new IndexSummaryRedistribution ( compacting , nonCompacting , memoryPoolBytes ) ) ; 
+ } 
+ - } 
+ \ No newline at end of file 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / IndexSummaryRedistribution . java b / src / java / org / apache / cassandra / io / sstable / IndexSummaryRedistribution . java 
+ new file mode 100644 
+ index 0000000 . . adb3e4e 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / io / sstable / IndexSummaryRedistribution . java 
+ @ @ - 0 , 0 + 1 , 338 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + 
+ + package org . apache . cassandra . io . sstable ; 
+ + 
+ + import java . io . IOException ; 
+ + import java . util . ArrayList ; 
+ + import java . util . Collections ; 
+ + import java . util . Comparator ; 
+ + import java . util . HashMap ; 
+ + import java . util . List ; 
+ + import java . util . Map ; 
+ + 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ + import com . google . common . collect . HashMultimap ; 
+ + import com . google . common . collect . Iterables ; 
+ + import com . google . common . collect . Multimap ; 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ + 
+ + import org . apache . cassandra . db . ColumnFamilyStore ; 
+ + import org . apache . cassandra . db . DataTracker ; 
+ + import org . apache . cassandra . db . Keyspace ; 
+ + import org . apache . cassandra . db . compaction . CompactionInfo ; 
+ + import org . apache . cassandra . db . compaction . CompactionInterruptedException ; 
+ + import org . apache . cassandra . db . compaction . OperationType ; 
+ + import org . apache . cassandra . utils . Pair ; 
+ + 
+ + import static org . apache . cassandra . io . sstable . Downsampling . BASE _ SAMPLING _ LEVEL ; 
+ + 
+ + public class IndexSummaryRedistribution extends CompactionInfo . Holder 
+ + { 
+ + private static final Logger logger = LoggerFactory . getLogger ( IndexSummaryRedistribution . class ) ; 
+ + 
+ + private final List < SSTableReader > compacting ; 
+ + private final List < SSTableReader > nonCompacting ; 
+ + private final long memoryPoolBytes ; 
+ + private volatile long remainingSpace ; 
+ + 
+ + public IndexSummaryRedistribution ( List < SSTableReader > compacting , List < SSTableReader > nonCompacting , long memoryPoolBytes ) 
+ + { 
+ + this . compacting = compacting ; 
+ + this . nonCompacting = nonCompacting ; 
+ + this . memoryPoolBytes = memoryPoolBytes ; 
+ + } 
+ + 
+ + public List < SSTableReader > redistributeSummaries ( ) throws IOException 
+ + { 
+ + long total = 0 ; 
+ + for ( SSTableReader sstable : Iterables . concat ( compacting , nonCompacting ) ) 
+ + total + = sstable . getIndexSummaryOffHeapSize ( ) ; 
+ + 
+ + List < SSTableReader > oldFormatSSTables = new ArrayList < > ( ) ; 
+ + for ( SSTableReader sstable : nonCompacting ) 
+ + { 
+ + / / We can ' t change the sampling level of sstables with the old format , because the serialization format 
+ + / / doesn ' t include the sampling level . Leave this one as it is . ( See CASSANDRA - 8993 for details . ) 
+ + logger . trace ( " SSTable { } cannot be re - sampled due to old sstable format " , sstable ) ; 
+ + if ( ! sstable . descriptor . version . hasSamplingLevel ) 
+ + oldFormatSSTables . add ( sstable ) ; 
+ + } 
+ + nonCompacting . removeAll ( oldFormatSSTables ) ; 
+ + 
+ + logger . debug ( " Beginning redistribution of index summaries for { } sstables with memory pool size { } MB ; current spaced used is { } MB " , 
+ + nonCompacting . size ( ) , memoryPoolBytes / 1024L / 1024L , total / 1024 . 0 / 1024 . 0 ) ; 
+ + 
+ + final Map < SSTableReader , Double > readRates = new HashMap < > ( nonCompacting . size ( ) ) ; 
+ + double totalReadsPerSec = 0 . 0 ; 
+ + for ( SSTableReader sstable : nonCompacting ) 
+ + { 
+ + if ( isStopRequested ( ) ) 
+ + throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; 
+ + 
+ + if ( sstable . getReadMeter ( ) ! = null ) 
+ + { 
+ + Double readRate = sstable . getReadMeter ( ) . fifteenMinuteRate ( ) ; 
+ + totalReadsPerSec + = readRate ; 
+ + readRates . put ( sstable , readRate ) ; 
+ + } 
+ + } 
+ + logger . trace ( " Total reads / sec across all sstables in index summary resize process : { } " , totalReadsPerSec ) ; 
+ + 
+ + / / copy and sort by read rates ( ascending ) 
+ + List < SSTableReader > sstablesByHotness = new ArrayList < > ( nonCompacting ) ; 
+ + Collections . sort ( sstablesByHotness , new ReadRateComparator ( readRates ) ) ; 
+ + 
+ + long remainingBytes = memoryPoolBytes ; 
+ + for ( SSTableReader sstable : Iterables . concat ( compacting , oldFormatSSTables ) ) 
+ + remainingBytes - = sstable . getIndexSummaryOffHeapSize ( ) ; 
+ + 
+ + logger . trace ( " Index summaries for compacting SSTables are using { } MB of space " , 
+ + ( memoryPoolBytes - remainingBytes ) / 1024 . 0 / 1024 . 0 ) ; 
+ + List < SSTableReader > newSSTables = adjustSamplingLevels ( sstablesByHotness , totalReadsPerSec , remainingBytes ) ; 
+ + 
+ + total = 0 ; 
+ + for ( SSTableReader sstable : Iterables . concat ( compacting , oldFormatSSTables , newSSTables ) ) 
+ + total + = sstable . getIndexSummaryOffHeapSize ( ) ; 
+ + logger . debug ( " Completed resizing of index summaries ; current approximate memory used : { } MB " , 
+ + total / 1024 . 0 / 1024 . 0 ) ; 
+ + 
+ + return newSSTables ; 
+ + } 
+ + 
+ + private List < SSTableReader > adjustSamplingLevels ( List < SSTableReader > sstables , 
+ + double totalReadsPerSec , long memoryPoolCapacity ) throws IOException 
+ + { 
+ + 
+ + List < ResampleEntry > toDownsample = new ArrayList < > ( sstables . size ( ) / 4 ) ; 
+ + List < ResampleEntry > toUpsample = new ArrayList < > ( sstables . size ( ) / 4 ) ; 
+ + List < ResampleEntry > forceResample = new ArrayList < > ( ) ; 
+ + List < ResampleEntry > forceUpsample = new ArrayList < > ( ) ; 
+ + List < SSTableReader > newSSTables = new ArrayList < > ( sstables . size ( ) ) ; 
+ + 
+ + / / Going from the coldest to the hottest sstables , try to give each sstable an amount of space proportional 
+ + / / to the number of total reads / sec it handles . 
+ + remainingSpace = memoryPoolCapacity ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + { 
+ + if ( isStopRequested ( ) ) 
+ + throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; 
+ + 
+ + int minIndexInterval = sstable . metadata . getMinIndexInterval ( ) ; 
+ + int maxIndexInterval = sstable . metadata . getMaxIndexInterval ( ) ; 
+ + 
+ + double readsPerSec = sstable . getReadMeter ( ) = = null ? 0 . 0 : sstable . getReadMeter ( ) . fifteenMinuteRate ( ) ; 
+ + long idealSpace = Math . round ( remainingSpace * ( readsPerSec / totalReadsPerSec ) ) ; 
+ + 
+ + / / figure out how many entries our idealSpace would buy us , and pick a new sampling level based on that 
+ + int currentNumEntries = sstable . getIndexSummarySize ( ) ; 
+ + double avgEntrySize = sstable . getIndexSummaryOffHeapSize ( ) / ( double ) currentNumEntries ; 
+ + long targetNumEntries = Math . max ( 1 , Math . round ( idealSpace / avgEntrySize ) ) ; 
+ + int currentSamplingLevel = sstable . getIndexSummarySamplingLevel ( ) ; 
+ + int maxSummarySize = sstable . getMaxIndexSummarySize ( ) ; 
+ + 
+ + / / if the min _ index _ interval changed , calculate what our current sampling level would be under the new min 
+ + if ( sstable . getMinIndexInterval ( ) ! = minIndexInterval ) 
+ + { 
+ + int effectiveSamplingLevel = ( int ) Math . round ( currentSamplingLevel * ( minIndexInterval / ( double ) sstable . getMinIndexInterval ( ) ) ) ; 
+ + maxSummarySize = ( int ) Math . round ( maxSummarySize * ( sstable . getMinIndexInterval ( ) / ( double ) minIndexInterval ) ) ; 
+ + logger . trace ( " min _ index _ interval changed from { } to { } , so the current sampling level for { } is effectively now { } ( was { } ) " , 
+ + sstable . getMinIndexInterval ( ) , minIndexInterval , sstable , effectiveSamplingLevel , currentSamplingLevel ) ; 
+ + currentSamplingLevel = effectiveSamplingLevel ; 
+ + } 
+ + 
+ + int newSamplingLevel = IndexSummaryBuilder . calculateSamplingLevel ( currentSamplingLevel , currentNumEntries , targetNumEntries , 
+ + minIndexInterval , maxIndexInterval ) ; 
+ + int numEntriesAtNewSamplingLevel = IndexSummaryBuilder . entriesAtSamplingLevel ( newSamplingLevel , maxSummarySize ) ; 
+ + double effectiveIndexInterval = sstable . getEffectiveIndexInterval ( ) ; 
+ + 
+ + logger . trace ( " { } has { } reads / sec ; ideal space for index summary : { } bytes ( { } entries ) ; considering moving " + 
+ + " from level { } ( { } entries , { } bytes ) to level { } ( { } entries , { } bytes ) " , 
+ + sstable . getFilename ( ) , readsPerSec , idealSpace , targetNumEntries , currentSamplingLevel , currentNumEntries , 
+ + currentNumEntries * avgEntrySize , newSamplingLevel , numEntriesAtNewSamplingLevel , 
+ + numEntriesAtNewSamplingLevel * avgEntrySize ) ; 
+ + 
+ + if ( effectiveIndexInterval < minIndexInterval ) 
+ + { 
+ + / / The min _ index _ interval was changed ; re - sample to match it . 
+ + logger . debug ( " Forcing resample of { } because the current index interval ( { } ) is below min _ index _ interval ( { } ) " , 
+ + sstable , effectiveIndexInterval , minIndexInterval ) ; 
+ + long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; 
+ + forceResample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; 
+ + remainingSpace - = spaceUsed ; 
+ + } 
+ + else if ( effectiveIndexInterval > maxIndexInterval ) 
+ + { 
+ + / / The max _ index _ interval was lowered ; force an upsample to the effective minimum sampling level 
+ + logger . debug ( " Forcing upsample of { } because the current index interval ( { } ) is above max _ index _ interval ( { } ) " , 
+ + sstable , effectiveIndexInterval , maxIndexInterval ) ; 
+ + newSamplingLevel = Math . max ( 1 , ( BASE _ SAMPLING _ LEVEL * minIndexInterval ) / maxIndexInterval ) ; 
+ + numEntriesAtNewSamplingLevel = IndexSummaryBuilder . entriesAtSamplingLevel ( newSamplingLevel , sstable . getMaxIndexSummarySize ( ) ) ; 
+ + long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; 
+ + forceUpsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; 
+ + remainingSpace - = avgEntrySize * numEntriesAtNewSamplingLevel ; 
+ + } 
+ + else if ( targetNumEntries > = currentNumEntries * IndexSummaryManager . UPSAMPLE _ THRESHOLD & & newSamplingLevel > currentSamplingLevel ) 
+ + { 
+ + long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; 
+ + toUpsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; 
+ + remainingSpace - = avgEntrySize * numEntriesAtNewSamplingLevel ; 
+ + } 
+ + else if ( targetNumEntries < currentNumEntries * IndexSummaryManager . DOWNSAMPLE _ THESHOLD & & newSamplingLevel < currentSamplingLevel ) 
+ + { 
+ + long spaceUsed = ( long ) Math . ceil ( avgEntrySize * numEntriesAtNewSamplingLevel ) ; 
+ + toDownsample . add ( new ResampleEntry ( sstable , spaceUsed , newSamplingLevel ) ) ; 
+ + remainingSpace - = spaceUsed ; 
+ + } 
+ + else 
+ + { 
+ + / / keep the same sampling level 
+ + logger . trace ( " SSTable { } is within thresholds of ideal sampling " , sstable ) ; 
+ + remainingSpace - = sstable . getIndexSummaryOffHeapSize ( ) ; 
+ + newSSTables . add ( sstable ) ; 
+ + } 
+ + totalReadsPerSec - = readsPerSec ; 
+ + } 
+ + 
+ + if ( remainingSpace > 0 ) 
+ + { 
+ + Pair < List < SSTableReader > , List < ResampleEntry > > result = distributeRemainingSpace ( toDownsample , remainingSpace ) ; 
+ + toDownsample = result . right ; 
+ + newSSTables . addAll ( result . left ) ; 
+ + } 
+ + 
+ + / / downsample first , then upsample 
+ + toDownsample . addAll ( forceResample ) ; 
+ + toDownsample . addAll ( toUpsample ) ; 
+ + toDownsample . addAll ( forceUpsample ) ; 
+ + Multimap < DataTracker , SSTableReader > replacedByTracker = HashMultimap . create ( ) ; 
+ + Multimap < DataTracker , SSTableReader > replacementsByTracker = HashMultimap . create ( ) ; 
+ + 
+ + try 
+ + { 
+ + for ( ResampleEntry entry : toDownsample ) 
+ + { 
+ + if ( isStopRequested ( ) ) 
+ + throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; 
+ + 
+ + SSTableReader sstable = entry . sstable ; 
+ + logger . debug ( " Re - sampling index summary for { } from { } / { } to { } / { } of the original number of entries " , 
+ + sstable , sstable . getIndexSummarySamplingLevel ( ) , Downsampling . BASE _ SAMPLING _ LEVEL , 
+ + entry . newSamplingLevel , Downsampling . BASE _ SAMPLING _ LEVEL ) ; 
+ + ColumnFamilyStore cfs = Keyspace . open ( sstable . getKeyspaceName ( ) ) . getColumnFamilyStore ( sstable . getColumnFamilyName ( ) ) ; 
+ + DataTracker tracker = cfs . getDataTracker ( ) ; 
+ + SSTableReader replacement = sstable . cloneWithNewSummarySamplingLevel ( cfs , entry . newSamplingLevel ) ; 
+ + newSSTables . add ( replacement ) ; 
+ + replacedByTracker . put ( tracker , sstable ) ; 
+ + replacementsByTracker . put ( tracker , replacement ) ; 
+ + } 
+ + } 
+ + finally 
+ + { 
+ + for ( DataTracker tracker : replacedByTracker . keySet ( ) ) 
+ + tracker . replaceWithNewInstances ( replacedByTracker . get ( tracker ) , replacementsByTracker . get ( tracker ) ) ; 
+ + } 
+ + 
+ + return newSSTables ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + static Pair < List < SSTableReader > , List < ResampleEntry > > distributeRemainingSpace ( List < ResampleEntry > toDownsample , long remainingSpace ) 
+ + { 
+ + / / sort by the amount of space regained by doing the downsample operation ; we want to try to avoid operations 
+ + / / that will make little difference . 
+ + Collections . sort ( toDownsample , new Comparator < ResampleEntry > ( ) 
+ + { 
+ + public int compare ( ResampleEntry o1 , ResampleEntry o2 ) 
+ + { 
+ + return Double . compare ( o1 . sstable . getIndexSummaryOffHeapSize ( ) - o1 . newSpaceUsed , 
+ + o2 . sstable . getIndexSummaryOffHeapSize ( ) - o2 . newSpaceUsed ) ; 
+ + } 
+ + } ) ; 
+ + 
+ + int noDownsampleCutoff = 0 ; 
+ + List < SSTableReader > willNotDownsample = new ArrayList < > ( ) ; 
+ + while ( remainingSpace > 0 & & noDownsampleCutoff < toDownsample . size ( ) ) 
+ + { 
+ + ResampleEntry entry = toDownsample . get ( noDownsampleCutoff ) ; 
+ + 
+ + long extraSpaceRequired = entry . sstable . getIndexSummaryOffHeapSize ( ) - entry . newSpaceUsed ; 
+ + / / see if we have enough leftover space to keep the current sampling level 
+ + if ( extraSpaceRequired < = remainingSpace ) 
+ + { 
+ + logger . trace ( " Using leftover space to keep { } at the current sampling level ( { } ) " , 
+ + entry . sstable , entry . sstable . getIndexSummarySamplingLevel ( ) ) ; 
+ + willNotDownsample . add ( entry . sstable ) ; 
+ + remainingSpace - = extraSpaceRequired ; 
+ + } 
+ + else 
+ + { 
+ + break ; 
+ + } 
+ + 
+ + noDownsampleCutoff + + ; 
+ + } 
+ + return Pair . create ( willNotDownsample , toDownsample . subList ( noDownsampleCutoff , toDownsample . size ( ) ) ) ; 
+ + } 
+ + 
+ + public CompactionInfo getCompactionInfo ( ) 
+ + { 
+ + return new CompactionInfo ( OperationType . INDEX _ SUMMARY , ( remainingSpace - memoryPoolBytes ) , memoryPoolBytes , " bytes " ) ; 
+ + } 
+ + 
+ + / * * Utility class for sorting sstables by their read rates . * / 
+ + private static class ReadRateComparator implements Comparator < SSTableReader > 
+ + { 
+ + private final Map < SSTableReader , Double > readRates ; 
+ + 
+ + ReadRateComparator ( Map < SSTableReader , Double > readRates ) 
+ + { 
+ + this . readRates = readRates ; 
+ + } 
+ + 
+ + @ Override 
+ + public int compare ( SSTableReader o1 , SSTableReader o2 ) 
+ + { 
+ + Double readRate1 = readRates . get ( o1 ) ; 
+ + Double readRate2 = readRates . get ( o2 ) ; 
+ + if ( readRate1 = = null & & readRate2 = = null ) 
+ + return 0 ; 
+ + else if ( readRate1 = = null ) 
+ + return - 1 ; 
+ + else if ( readRate2 = = null ) 
+ + return 1 ; 
+ + else 
+ + return Double . compare ( readRate1 , readRate2 ) ; 
+ + } 
+ + } 
+ + 
+ + private static class ResampleEntry 
+ + { 
+ + public final SSTableReader sstable ; 
+ + public final long newSpaceUsed ; 
+ + public final int newSamplingLevel ; 
+ + 
+ + ResampleEntry ( SSTableReader sstable , long newSpaceUsed , int newSamplingLevel ) 
+ + { 
+ + this . sstable = sstable ; 
+ + this . newSpaceUsed = newSpaceUsed ; 
+ + this . newSamplingLevel = newSamplingLevel ; 
+ + } 
+ + } 
+ + } 
+ diff - - git a / test / unit / org / apache / cassandra / io / sstable / IndexSummaryManagerTest . java b / test / unit / org / apache / cassandra / io / sstable / IndexSummaryManagerTest . java 
+ index 64d3354 . . 63928e2 100644 
+ - - - a / test / unit / org / apache / cassandra / io / sstable / IndexSummaryManagerTest . java 
+ + + + b / test / unit / org / apache / cassandra / io / sstable / IndexSummaryManagerTest . java 
+ @ @ - 22 , 12 + 22 , 14 @ @ import java . nio . ByteBuffer ; 
+ import java . util . * ; 
+ import java . util . concurrent . * ; 
+ import java . util . concurrent . atomic . AtomicBoolean ; 
+ + import java . util . concurrent . atomic . AtomicReference ; 
+ 
+ + import com . google . common . base . Joiner ; 
+ + import com . google . common . collect . Sets ; 
+ import org . junit . After ; 
+ import org . junit . Before ; 
+ import org . junit . Test ; 
+ import org . junit . runner . RunWith ; 
+ - 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 36 , 11 + 38 , 12 @ @ import org . apache . cassandra . OrderedJUnit4ClassRunner ; 
+ import org . apache . cassandra . SchemaLoader ; 
+ import org . apache . cassandra . Util ; 
+ import org . apache . cassandra . db . * ; 
+ + import org . apache . cassandra . db . compaction . CompactionInfo ; 
+ + import org . apache . cassandra . db . compaction . CompactionInterruptedException ; 
+ import org . apache . cassandra . db . compaction . CompactionManager ; 
+ import org . apache . cassandra . db . filter . QueryFilter ; 
+ + import org . apache . cassandra . metrics . CompactionMetrics ; 
+ import org . apache . cassandra . metrics . RestorableMeter ; 
+ - import org . apache . cassandra . utils . FBUtilities ; 
+ - import org . apache . cassandra . utils . concurrent . OpOrder ; 
+ 
+ import static org . apache . cassandra . io . sstable . Downsampling . BASE _ SAMPLING _ LEVEL ; 
+ import static org . apache . cassandra . io . sstable . IndexSummaryManager . DOWNSAMPLE _ THESHOLD ; 
+ @ @ - 75 , 6 + 78 , 11 @ @ public class IndexSummaryManagerTest extends SchemaLoader 
+ @ After 
+ public void afterTest ( ) 
+ { 
+ + for ( CompactionInfo . Holder holder : CompactionMetrics . getCompactions ( ) ) 
+ + { 
+ + holder . stop ( ) ; 
+ + } 
+ + 
+ String ksname = " Keyspace1 " ; 
+ String cfname = " StandardLowIndexInterval " ; / / index interval of 8 , no key caching 
+ Keyspace keyspace = Keyspace . open ( ksname ) ; 
+ @ @ - 499 , 4 + 507 , 59 @ @ public class IndexSummaryManagerTest extends SchemaLoader 
+ assertTrue ( entry . getValue ( ) > = cfs . metadata . getMinIndexInterval ( ) ) ; 
+ } 
+ } 
+ + 
+ + @ Test 
+ + public void testCancelIndex ( ) throws Exception 
+ + { 
+ + String ksname = " Keyspace1 " ; 
+ + String cfname = " StandardLowIndexInterval " ; / / index interval of 8 , no key caching 
+ + Keyspace keyspace = Keyspace . open ( ksname ) ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfname ) ; 
+ + final int numSSTables = 4 ; 
+ + int numRows = 256 ; 
+ + createSSTables ( ksname , cfname , numSSTables , numRows ) ; 
+ + 
+ + final List < SSTableReader > sstables = new ArrayList < > ( cfs . getSSTables ( ) ) ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + sstable . overrideReadMeter ( new RestorableMeter ( 100 . 0 , 100 . 0 ) ) ; 
+ + 
+ + final long singleSummaryOffHeapSpace = sstables . get ( 0 ) . getIndexSummaryOffHeapSize ( ) ; 
+ + 
+ + / / everything should get cut in half 
+ + final AtomicReference < CompactionInterruptedException > exception = new AtomicReference < > ( ) ; 
+ + Thread t = new Thread ( new Runnable ( ) 
+ + { 
+ + public void run ( ) 
+ + { 
+ + try 
+ + { 
+ + redistributeSummaries ( Collections . < SSTableReader > emptyList ( ) , sstables , ( singleSummaryOffHeapSpace * ( numSSTables / 2 ) ) ) ; 
+ + } 
+ + catch ( CompactionInterruptedException ex ) 
+ + { 
+ + exception . set ( ex ) ; 
+ + } 
+ + catch ( IOException ignored ) 
+ + { 
+ + } 
+ + } 
+ + } ) ; 
+ + t . start ( ) ; 
+ + while ( CompactionManager . instance . getActiveCompactions ( ) = = 0 & & t . isAlive ( ) ) 
+ + Thread . sleep ( 1 ) ; 
+ + CompactionManager . instance . stopCompaction ( " INDEX _ SUMMARY " ) ; 
+ + t . join ( ) ; 
+ + 
+ + assertNotNull ( " Expected compaction interrupted exception " , exception . get ( ) ) ; 
+ + assertTrue ( " Expected no active compactions " , CompactionMetrics . getCompactions ( ) . isEmpty ( ) ) ; 
+ + 
+ + Set < SSTableReader > beforeRedistributionSSTables = new HashSet < > ( sstables ) ; 
+ + Set < SSTableReader > afterCancelSSTables = new HashSet < > ( cfs . getSSTables ( ) ) ; 
+ + Set < SSTableReader > disjoint = Sets . symmetricDifference ( beforeRedistributionSSTables , afterCancelSSTables ) ; 
+ + assertTrue ( String . format ( " Mismatched files before and after cancelling redistribution : % s " , 
+ + Joiner . on ( " , " ) . join ( disjoint ) ) , 
+ + disjoint . isEmpty ( ) ) ; 
+ + 
+ + validateData ( cfs , numRows ) ; 
+ + } 
+ }
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ index c3bddd4 . . cb87833 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ @ @ - 35 , 7 + 35 , 6 @ @ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . io . ICompactSerializer2 ; 
+ import org . apache . cassandra . db . filter . QueryPath ; 
+ import org . apache . cassandra . db . marshal . AbstractType ; 
+ - import org . apache . cassandra . db . marshal . MarshalException ; 
+ 
+ 
+ public final class ColumnFamily implements IColumnContainer 
+ @ @ - 121 , 12 + 120 , 13 @ @ public final class ColumnFamily implements IColumnContainer 
+ * We need to go through each column 
+ * in the column family and resolve it before adding 
+ * / 
+ - void addColumns ( ColumnFamily cf ) 
+ + public void addAll ( ColumnFamily cf ) 
+ { 
+ for ( IColumn column : cf . getSortedColumns ( ) ) 
+ { 
+ addColumn ( column ) ; 
+ } 
+ + delete ( cf ) ; 
+ } 
+ 
+ public ICompactSerializer2 < IColumn > getColumnSerializer ( ) 
+ @ @ - 415 , 8 + 415 , 7 @ @ public final class ColumnFamily implements IColumnContainer 
+ for ( ColumnFamily cf2 : columnFamilies ) 
+ { 
+ assert cf . name ( ) . equals ( cf2 . name ( ) ) ; 
+ - cf . addColumns ( cf2 ) ; 
+ - cf . delete ( cf2 ) ; 
+ + cf . addAll ( cf2 ) ; 
+ } 
+ return cf ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 001c644 . . 96bb18b 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 560 , 26 + 560 , 6 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ CompactionManager . instance ( ) . submit ( this ) ; 
+ } 
+ 
+ - private PriorityQueue < FileStruct > initializePriorityQueue ( Collection < SSTableReader > sstables , List < Range > ranges ) throws IOException 
+ - { 
+ - PriorityQueue < FileStruct > pq = new PriorityQueue < FileStruct > ( ) ; 
+ - if ( sstables . size ( ) > 1 | | ( ranges ! = null & & sstables . size ( ) > 0 ) ) 
+ - { 
+ - FileStruct fs = null ; 
+ - for ( SSTableReader sstable : sstables ) 
+ - { 
+ - fs = sstable . getFileStruct ( ) ; 
+ - fs . advance ( true ) ; 
+ - if ( fs . isExhausted ( ) ) 
+ - { 
+ - continue ; 
+ - } 
+ - pq . add ( fs ) ; 
+ - } 
+ - } 
+ - return pq ; 
+ - } 
+ - 
+ / * 
+ * Group files of similar size into buckets . 
+ * / 
+ @ @ - 766 , 150 + 746 , 67 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ * / 
+ List < SSTableReader > doFileAntiCompaction ( Collection < SSTableReader > sstables , List < Range > ranges , EndPoint target ) throws IOException 
+ { 
+ - List < SSTableReader > results = new ArrayList < SSTableReader > ( ) ; 
+ - long startTime = System . currentTimeMillis ( ) ; 
+ - long totalBytesRead = 0 ; 
+ - long totalBytesWritten = 0 ; 
+ - long totalkeysRead = 0 ; 
+ - long totalkeysWritten = 0 ; 
+ - String rangeFileLocation ; 
+ - String mergedFileName ; 
+ + logger _ . info ( " AntiCompacting [ " + StringUtils . join ( sstables , " , " ) + " ] " ) ; 
+ / / Calculate the expected compacted filesize 
+ - long expectedRangeFileSize = getExpectedCompactedFileSize ( sstables ) ; 
+ - / * in the worst case a node will be giving out half of its data so we take a chance * / 
+ - expectedRangeFileSize = expectedRangeFileSize / 2 ; 
+ - rangeFileLocation = DatabaseDescriptor . getDataFileLocationForTable ( table _ , expectedRangeFileSize ) ; 
+ - / / If the compaction file path is null that means we have no space left for this compaction . 
+ - if ( rangeFileLocation = = null ) 
+ - { 
+ - logger _ . error ( " Total bytes to be written for range compaction . . . " 
+ - + expectedRangeFileSize + " is greater than the safe limit of the disk space available . " ) ; 
+ - return results ; 
+ - } 
+ - PriorityQueue < FileStruct > pq = initializePriorityQueue ( sstables , ranges ) ; 
+ - if ( pq . isEmpty ( ) ) 
+ + long expectedRangeFileSize = getExpectedCompactedFileSize ( sstables ) / 2 ; 
+ + String compactionFileLocation = DatabaseDescriptor . getDataFileLocationForTable ( table _ , expectedRangeFileSize ) ; 
+ + if ( compactionFileLocation = = null ) 
+ { 
+ - return results ; 
+ + throw new UnsupportedOperationException ( " disk full " ) ; 
+ } 
+ + List < SSTableReader > results = new ArrayList < SSTableReader > ( ) ; 
+ 
+ - mergedFileName = getTempSSTableFileName ( ) ; 
+ - SSTableWriter rangeWriter = null ; 
+ - String lastkey = null ; 
+ - List < FileStruct > lfs = new ArrayList < FileStruct > ( ) ; 
+ - DataOutputBuffer bufOut = new DataOutputBuffer ( ) ; 
+ - int expectedBloomFilterSize = SSTableReader . getApproximateKeyCount ( sstables ) ; 
+ - expectedBloomFilterSize = ( expectedBloomFilterSize > 0 ) ? expectedBloomFilterSize : SSTableReader . indexInterval ( ) ; 
+ + long startTime = System . currentTimeMillis ( ) ; 
+ + long totalkeysWritten = 0 ; 
+ + 
+ + int expectedBloomFilterSize = Math . max ( SSTableReader . indexInterval ( ) , SSTableReader . getApproximateKeyCount ( sstables ) / 2 ) ; 
+ if ( logger _ . isDebugEnabled ( ) ) 
+ logger _ . debug ( " Expected bloom filter size : " + expectedBloomFilterSize ) ; 
+ - List < ColumnFamily > columnFamilies = new ArrayList < ColumnFamily > ( ) ; 
+ 
+ - while ( pq . size ( ) > 0 | | lfs . size ( ) > 0 ) 
+ + SSTableWriter writer = null ; 
+ + CompactionIterator ci = new CompactionIterator ( sstables ) ; 
+ + 
+ + try 
+ { 
+ - FileStruct fs = null ; 
+ - if ( pq . size ( ) > 0 ) 
+ + if ( ! ci . hasNext ( ) ) 
+ { 
+ - fs = pq . poll ( ) ; 
+ + logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; 
+ + return results ; 
+ } 
+ - if ( fs ! = null 
+ - & & ( lastkey = = null | | lastkey . equals ( fs . getKey ( ) ) ) ) 
+ - { 
+ - / / The keys are the same so we need to add this to the 
+ - / / ldfs list 
+ - lastkey = fs . getKey ( ) ; 
+ - lfs . add ( fs ) ; 
+ - } 
+ - else 
+ + 
+ + while ( ci . hasNext ( ) ) 
+ { 
+ - Collections . sort ( lfs , new FileStructComparator ( ) ) ; 
+ - ColumnFamily columnFamily ; 
+ - bufOut . reset ( ) ; 
+ - if ( lfs . size ( ) > 1 ) 
+ + CompactionIterator . CompactedRow row = ci . next ( ) ; 
+ + if ( Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( row . key ) , ranges ) ) 
+ { 
+ - for ( FileStruct filestruct : lfs ) 
+ - { 
+ - / / We want to add only 2 and resolve them right there in order to save on memory footprint 
+ - if ( columnFamilies . size ( ) > 1 ) 
+ - { 
+ - / / Now merge the 2 column families 
+ - merge ( columnFamilies ) ; 
+ - } 
+ - / / deserialize into column families 
+ - columnFamilies . add ( filestruct . getColumnFamily ( ) ) ; 
+ - } 
+ - / / Now after merging all crap append to the sstable 
+ - columnFamily = resolveAndRemoveDeleted ( columnFamilies ) ; 
+ - columnFamilies . clear ( ) ; 
+ - if ( columnFamily ! = null ) 
+ - { 
+ - ColumnFamily . serializer ( ) . serializeWithIndexes ( columnFamily , bufOut ) ; 
+ - } 
+ - } 
+ - else 
+ - { 
+ - / / TODO deserializing only to reserialize is dumb 
+ - FileStruct filestruct = lfs . get ( 0 ) ; 
+ - ColumnFamily . serializer ( ) . serializeWithIndexes ( filestruct . getColumnFamily ( ) , bufOut ) ; 
+ - } 
+ - if ( Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( lastkey ) , ranges ) ) 
+ - { 
+ - if ( rangeWriter = = null ) 
+ + if ( writer = = null ) 
+ { 
+ if ( target ! = null ) 
+ { 
+ - rangeFileLocation = rangeFileLocation + File . separator + " bootstrap " ; 
+ + compactionFileLocation = compactionFileLocation + File . separator + " bootstrap " ; 
+ } 
+ - FileUtils . createDirectory ( rangeFileLocation ) ; 
+ - String fname = new File ( rangeFileLocation , mergedFileName ) . getAbsolutePath ( ) ; 
+ - rangeWriter = new SSTableWriter ( fname , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; 
+ + FileUtils . createDirectory ( compactionFileLocation ) ; 
+ + String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; 
+ + writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; 
+ } 
+ - rangeWriter . append ( lastkey , bufOut ) ; 
+ - } 
+ - totalkeysWritten + + ; 
+ - for ( FileStruct filestruct : lfs ) 
+ - { 
+ - filestruct . advance ( true ) ; 
+ - if ( filestruct . isExhausted ( ) ) 
+ - { 
+ - continue ; 
+ - } 
+ - / * keep on looping until we find a key in the range * / 
+ - while ( ! Range . isTokenInRanges ( StorageService . getPartitioner ( ) . getToken ( filestruct . getKey ( ) ) , ranges ) ) 
+ - { 
+ - filestruct . advance ( true ) ; 
+ - if ( filestruct . isExhausted ( ) ) 
+ - { 
+ - break ; 
+ - } 
+ - } 
+ - if ( ! filestruct . isExhausted ( ) ) 
+ - { 
+ - pq . add ( filestruct ) ; 
+ - } 
+ - totalkeysRead + + ; 
+ - } 
+ - lfs . clear ( ) ; 
+ - lastkey = null ; 
+ - if ( fs ! = null ) 
+ - { 
+ - / / Add back the fs since we processed the rest of 
+ - / / filestructs 
+ - pq . add ( fs ) ; 
+ + writer . append ( row . key , row . buffer ) ; 
+ + totalkeysWritten + + ; 
+ } 
+ } 
+ } 
+ - 
+ - if ( rangeWriter ! = null ) 
+ + finally 
+ { 
+ - results . add ( rangeWriter . closeAndOpenReader ( ) ) ; 
+ + ci . close ( ) ; 
+ } 
+ 
+ - if ( logger _ . isDebugEnabled ( ) ) 
+ + if ( writer ! = null ) 
+ { 
+ - logger _ . debug ( " Total time taken for range split . . . " + ( System . currentTimeMillis ( ) - startTime ) ) ; 
+ - logger _ . debug ( " Total bytes Read for range split . . . " + totalBytesRead ) ; 
+ - logger _ . debug ( " Total bytes written for range split . . . " 
+ - + totalBytesWritten + " Total keys read . . . " + totalkeysRead ) ; 
+ + results . add ( writer . closeAndOpenReader ( ) ) ; 
+ + String format = " AntiCompacted to % s . % d / % d bytes for % d keys . Time : % dms . " ; 
+ + long dTime = System . currentTimeMillis ( ) - startTime ; 
+ + logger _ . info ( String . format ( format , writer . getFilename ( ) , getTotalBytes ( sstables ) , results . get ( 0 ) . length ( ) , totalkeysWritten , dTime ) ) ; 
+ } 
+ + 
+ return results ; 
+ } 
+ 
+ @ @ - 938 , 111 + 835 , 59 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ } 
+ 
+ long startTime = System . currentTimeMillis ( ) ; 
+ - long totalBytesRead = 0 ; 
+ - long totalkeysRead = 0 ; 
+ long totalkeysWritten = 0 ; 
+ - PriorityQueue < FileStruct > pq = initializePriorityQueue ( sstables , null ) ; 
+ - 
+ - if ( pq . isEmpty ( ) ) 
+ - { 
+ - logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; 
+ - / / TODO clean out bad files , if any 
+ - return 0 ; 
+ - } 
+ 
+ - int expectedBloomFilterSize = SSTableReader . getApproximateKeyCount ( sstables ) ; 
+ - if ( expectedBloomFilterSize < 0 ) 
+ - expectedBloomFilterSize = SSTableReader . indexInterval ( ) ; 
+ - String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; 
+ - SSTableWriter writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; 
+ - SSTableReader ssTable = null ; 
+ - String lastkey = null ; 
+ - List < FileStruct > lfs = new ArrayList < FileStruct > ( ) ; 
+ - DataOutputBuffer bufOut = new DataOutputBuffer ( ) ; 
+ + int expectedBloomFilterSize = Math . max ( SSTableReader . indexInterval ( ) , SSTableReader . getApproximateKeyCount ( sstables ) ) ; 
+ if ( logger _ . isDebugEnabled ( ) ) 
+ logger _ . debug ( " Expected bloom filter size : " + expectedBloomFilterSize ) ; 
+ - List < ColumnFamily > columnFamilies = new ArrayList < ColumnFamily > ( ) ; 
+ 
+ - while ( pq . size ( ) > 0 | | lfs . size ( ) > 0 ) 
+ + SSTableWriter writer ; 
+ + CompactionIterator ci = new CompactionIterator ( sstables ) ; 
+ + 
+ + try 
+ { 
+ - FileStruct fs = null ; 
+ - if ( pq . size ( ) > 0 ) 
+ + if ( ! ci . hasNext ( ) ) 
+ { 
+ - fs = pq . poll ( ) ; 
+ + logger _ . warn ( " Nothing to compact ( all files empty or corrupt ) . This should not happen . " ) ; 
+ + return 0 ; 
+ } 
+ - if ( fs ! = null 
+ - & & ( lastkey = = null | | lastkey . equals ( fs . getKey ( ) ) ) ) 
+ - { 
+ - / / The keys are the same so we need to add this to the 
+ - / / ldfs list 
+ - lastkey = fs . getKey ( ) ; 
+ - lfs . add ( fs ) ; 
+ - } 
+ - else 
+ - { 
+ - Collections . sort ( lfs , new FileStructComparator ( ) ) ; 
+ - ColumnFamily columnFamily ; 
+ - bufOut . reset ( ) ; 
+ - if ( lfs . size ( ) > 1 ) 
+ - { 
+ - for ( FileStruct filestruct : lfs ) 
+ - { 
+ - / / We want to add only 2 and resolve them right there in order to save on memory footprint 
+ - if ( columnFamilies . size ( ) > 1 ) 
+ - { 
+ - merge ( columnFamilies ) ; 
+ - } 
+ - / / deserialize into column families 
+ - columnFamilies . add ( filestruct . getColumnFamily ( ) ) ; 
+ - } 
+ - / / Now after merging all crap append to the sstable 
+ - columnFamily = resolveAndRemoveDeleted ( columnFamilies ) ; 
+ - columnFamilies . clear ( ) ; 
+ - if ( columnFamily ! = null ) 
+ - { 
+ - ColumnFamily . serializer ( ) . serializeWithIndexes ( columnFamily , bufOut ) ; 
+ - } 
+ - } 
+ - else 
+ - { 
+ - / / TODO deserializing only to reserialize is dumb 
+ - FileStruct filestruct = lfs . get ( 0 ) ; 
+ - ColumnFamily . serializer ( ) . serializeWithIndexes ( filestruct . getColumnFamily ( ) , bufOut ) ; 
+ - } 
+ 
+ - writer . append ( lastkey , bufOut ) ; 
+ - totalkeysWritten + + ; 
+ + String newFilename = new File ( compactionFileLocation , getTempSSTableFileName ( ) ) . getAbsolutePath ( ) ; 
+ + writer = new SSTableWriter ( newFilename , expectedBloomFilterSize , StorageService . getPartitioner ( ) ) ; 
+ 
+ - for ( FileStruct filestruct : lfs ) 
+ - { 
+ - filestruct . advance ( true ) ; 
+ - if ( filestruct . isExhausted ( ) ) 
+ - { 
+ - continue ; 
+ - } 
+ - pq . add ( filestruct ) ; 
+ - totalkeysRead + + ; 
+ - } 
+ - lfs . clear ( ) ; 
+ - lastkey = null ; 
+ - if ( fs ! = null ) 
+ - { 
+ - / * Add back the fs since we processed the rest of filestructs * / 
+ - pq . add ( fs ) ; 
+ - } 
+ + while ( ci . hasNext ( ) ) 
+ + { 
+ + CompactionIterator . CompactedRow row = ci . next ( ) ; 
+ + writer . append ( row . key , row . buffer ) ; 
+ + totalkeysWritten + + ; 
+ } 
+ } 
+ - ssTable = writer . closeAndOpenReader ( ) ; 
+ + finally 
+ + { 
+ + ci . close ( ) ; 
+ + } 
+ + 
+ + SSTableReader ssTable = writer . closeAndOpenReader ( ) ; 
+ ssTables _ . add ( ssTable ) ; 
+ ssTables _ . markCompacted ( sstables ) ; 
+ CompactionManager . instance ( ) . submit ( ColumnFamilyStore . this ) ; 
+ 
+ - String format = " Compacted to % s . % d / % d bytes for % d / % d keys read / written . Time : % dms . " ; 
+ + String format = " Compacted to % s . % d / % d bytes for % d keys . Time : % dms . " ; 
+ long dTime = System . currentTimeMillis ( ) - startTime ; 
+ - logger _ . info ( String . format ( format , writer . getFilename ( ) , totalBytesRead , ssTable . length ( ) , totalkeysRead , totalkeysWritten , dTime ) ) ; 
+ + logger _ . info ( String . format ( format , writer . getFilename ( ) , getTotalBytes ( sstables ) , ssTable . length ( ) , totalkeysWritten , dTime ) ) ; 
+ return sstables . size ( ) ; 
+ } 
+ 
+ + private long getTotalBytes ( Iterable < SSTableReader > sstables ) 
+ + { 
+ + long sum = 0 ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + { 
+ + sum + = sstable . length ( ) ; 
+ + } 
+ + return sum ; 
+ + } 
+ + 
+ public static List < Memtable > getUnflushedMemtables ( String cfName ) 
+ { 
+ return new ArrayList < Memtable > ( getMemtablesPendingFlushNotNull ( cfName ) ) ; 
+ @ @ - 1341 , 23 + 1186 , 24 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ / / sstables 
+ for ( SSTableReader sstable : ssTables _ ) 
+ { 
+ - final SSTableScanner fs = sstable . getScanner ( ) ; 
+ - fs . seekTo ( startWith ) ; 
+ - iterators . add ( new Iterator < String > ( ) 
+ + final SSTableScanner scanner = sstable . getScanner ( ) ; 
+ + scanner . seekTo ( startWith ) ; 
+ + Iterator < String > iter = new Iterator < String > ( ) 
+ { 
+ public boolean hasNext ( ) 
+ { 
+ - return fs . hasNext ( ) ; 
+ + return scanner . hasNext ( ) ; 
+ } 
+ public String next ( ) 
+ { 
+ - return fs . next ( ) . getKey ( ) ; 
+ + return scanner . next ( ) . getKey ( ) ; 
+ } 
+ public void remove ( ) 
+ { 
+ throw new UnsupportedOperationException ( ) ; 
+ } 
+ - } ) ; 
+ + } ; 
+ + iterators . add ( iter ) ; 
+ } 
+ 
+ Iterator < String > collated = IteratorUtils . collatedIterator ( comparator , iterators ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / FileStructComparator . java b / src / java / org / apache / cassandra / db / FileStructComparator . java 
+ deleted file mode 100644 
+ index e81a992 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / db / FileStructComparator . java 
+ + + + / dev / null 
+ @ @ - 1 , 31 + 0 , 0 @ @ 
+ - / * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , 
+ - * software distributed under the License is distributed on an 
+ - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ - * KIND , either express or implied . See the License for the 
+ - * specific language governing permissions and limitations 
+ - * under the License . 
+ - * / 
+ - package org . apache . cassandra . db ; 
+ - 
+ - import java . util . Comparator ; 
+ - 
+ - import org . apache . cassandra . io . FileStruct ; 
+ - 
+ - class FileStructComparator implements Comparator < FileStruct > 
+ - { 
+ - public int compare ( FileStruct f , FileStruct f2 ) 
+ - { 
+ - return f . getFileName ( ) . compareTo ( f2 . getFileName ( ) ) ; 
+ - } 
+ - } 
+ \ No newline at end of file 
+ diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java 
+ index d88e004 . . 696ae5a 100644 
+ - - - a / src / java / org / apache / cassandra / db / Memtable . java 
+ + + + b / src / java / org / apache / cassandra / db / Memtable . java 
+ @ @ - 153 , 7 + 153 , 7 @ @ public class Memtable implements Comparable < Memtable > 
+ { 
+ int oldSize = oldCf . size ( ) ; 
+ int oldObjectCount = oldCf . getColumnCount ( ) ; 
+ - oldCf . addColumns ( columnFamily ) ; 
+ + oldCf . addAll ( columnFamily ) ; 
+ int newSize = oldCf . size ( ) ; 
+ int newObjectCount = oldCf . getColumnCount ( ) ; 
+ resolveSize ( oldSize , newSize ) ; 
+ diff - - git a / src / java / org / apache / cassandra / io / CompactionIterator . java b / src / java / org / apache / cassandra / io / CompactionIterator . java 
+ new file mode 100644 
+ index 0000000 . . b65e132 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / io / CompactionIterator . java 
+ @ @ - 0 , 0 + 1 , 113 @ @ 
+ + package org . apache . cassandra . io ; 
+ + 
+ + import java . io . Closeable ; 
+ + import java . io . IOException ; 
+ + import java . util . List ; 
+ + import java . util . ArrayList ; 
+ + import java . util . Comparator ; 
+ + 
+ + import org . apache . commons . collections . iterators . CollatingIterator ; 
+ + 
+ + import org . apache . cassandra . utils . ReducingIterator ; 
+ + import org . apache . cassandra . db . ColumnFamily ; 
+ + 
+ + public class CompactionIterator extends ReducingIterator < IteratingRow , CompactionIterator . CompactedRow > implements Closeable 
+ + { 
+ + private final List < IteratingRow > rows = new ArrayList < IteratingRow > ( ) ; 
+ + 
+ + @ SuppressWarnings ( " unchecked " ) 
+ + public CompactionIterator ( Iterable < SSTableReader > sstables ) throws IOException 
+ + { 
+ + super ( getCollatingIterator ( sstables ) ) ; 
+ + } 
+ + 
+ + @ SuppressWarnings ( " unchecked " ) 
+ + private static CollatingIterator getCollatingIterator ( Iterable < SSTableReader > sstables ) throws IOException 
+ + { 
+ + / / CollatingIterator has a bug that causes NPE when you try to use default comparator . : ( 
+ + CollatingIterator iter = new CollatingIterator ( new Comparator ( ) 
+ + { 
+ + public int compare ( Object o1 , Object o2 ) 
+ + { 
+ + return ( ( Comparable ) o1 ) . compareTo ( o2 ) ; 
+ + } 
+ + } ) ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + { 
+ + iter . addIterator ( sstable . getScanner ( ) ) ; 
+ + } 
+ + return iter ; 
+ + } 
+ + 
+ + @ Override 
+ + protected boolean isEqual ( IteratingRow o1 , IteratingRow o2 ) 
+ + { 
+ + return o1 . getKey ( ) . equals ( o2 . getKey ( ) ) ; 
+ + } 
+ + 
+ + public void reduce ( IteratingRow current ) 
+ + { 
+ + rows . add ( current ) ; 
+ + } 
+ + 
+ + protected CompactedRow getReduced ( ) 
+ + { 
+ + try 
+ + { 
+ + return getReducedRaw ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + protected CompactedRow getReducedRaw ( ) throws IOException 
+ + { 
+ + DataOutputBuffer buffer = new DataOutputBuffer ( ) ; 
+ + String key = rows . get ( 0 ) . getKey ( ) ; 
+ + if ( rows . size ( ) > 1 ) 
+ + { 
+ + ColumnFamily cf = null ; 
+ + for ( IteratingRow row : rows ) 
+ + { 
+ + if ( cf = = null ) 
+ + { 
+ + cf = row . getColumnFamily ( ) ; 
+ + } 
+ + else 
+ + { 
+ + cf . addAll ( row . getColumnFamily ( ) ) ; 
+ + } 
+ + } 
+ + ColumnFamily . serializer ( ) . serializeWithIndexes ( cf , buffer ) ; 
+ + } 
+ + else 
+ + { 
+ + assert rows . size ( ) = = 1 ; 
+ + rows . get ( 0 ) . echoData ( buffer ) ; 
+ + } 
+ + rows . clear ( ) ; 
+ + return new CompactedRow ( key , buffer ) ; 
+ + } 
+ + 
+ + public void close ( ) throws IOException 
+ + { 
+ + for ( Object o : ( ( CollatingIterator ) source ) . getIterators ( ) ) 
+ + { 
+ + ( ( SSTableScanner ) o ) . close ( ) ; 
+ + } 
+ + } 
+ + 
+ + public static class CompactedRow 
+ + { 
+ + public final String key ; 
+ + public final DataOutputBuffer buffer ; 
+ + 
+ + public CompactedRow ( String key , DataOutputBuffer buffer ) 
+ + { 
+ + this . key = key ; 
+ + this . buffer = buffer ; 
+ + } 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / io / FileStruct . java b / src / java / org / apache / cassandra / io / FileStruct . java 
+ deleted file mode 100644 
+ index b561239 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / io / FileStruct . java 
+ + + + / dev / null 
+ @ @ - 1 , 195 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . io ; 
+ - 
+ - import java . io . IOException ; 
+ - import java . io . File ; 
+ - import java . util . Iterator ; 
+ - 
+ - import org . apache . cassandra . db . IColumn ; 
+ - import org . apache . cassandra . db . ColumnFamily ; 
+ - import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - 
+ - import org . apache . log4j . Logger ; 
+ - import com . google . common . collect . AbstractIterator ; 
+ - 
+ - 
+ - public class FileStruct implements Comparable < FileStruct > , Iterator < String > 
+ - { 
+ - private static Logger logger = Logger . getLogger ( FileStruct . class ) ; 
+ - 
+ - private IteratingRow row ; 
+ - private boolean exhausted = false ; 
+ - private BufferedRandomAccessFile file ; 
+ - private SSTableReader sstable ; 
+ - private FileStructIterator iterator ; 
+ - 
+ - FileStruct ( SSTableReader sstable ) throws IOException 
+ - { 
+ - / / TODO this is used for both compactions and key ranges . the buffer sizes we want 
+ - / / to use for these ops are very different . here we are leaning towards the key - range 
+ - / / use case since that is more common . What we really want is to split those 
+ - / / two uses of this class up . 
+ - this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , 256 * 1024 ) ; 
+ - this . sstable = sstable ; 
+ - } 
+ - 
+ - public String getFileName ( ) 
+ - { 
+ - return file . getPath ( ) ; 
+ - } 
+ - 
+ - public void close ( ) throws IOException 
+ - { 
+ - file . close ( ) ; 
+ - } 
+ - 
+ - public boolean isExhausted ( ) 
+ - { 
+ - return exhausted ; 
+ - } 
+ - 
+ - public String getKey ( ) 
+ - { 
+ - return row . getKey ( ) ; 
+ - } 
+ - 
+ - public ColumnFamily getColumnFamily ( ) 
+ - { 
+ - return row . getEmptyColumnFamily ( ) ; 
+ - } 
+ - 
+ - public int compareTo ( FileStruct f ) 
+ - { 
+ - return sstable . getPartitioner ( ) . getDecoratedKeyComparator ( ) . compare ( getKey ( ) , f . getKey ( ) ) ; 
+ - } 
+ - 
+ - public void seekTo ( String seekKey ) 
+ - { 
+ - try 
+ - { 
+ - long position = sstable . getNearestPosition ( seekKey ) ; 
+ - if ( position < 0 ) 
+ - { 
+ - exhausted = true ; 
+ - return ; 
+ - } 
+ - file . seek ( position ) ; 
+ - advance ( false ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( " corrupt sstable " , e ) ; 
+ - } 
+ - } 
+ - 
+ - / * 
+ - * Read the next key from the data file . 
+ - * Caller must check isExhausted after each call to see if further 
+ - * reads are valid . 
+ - * Do not mix with calls to the iterator interface ( next / hasnext ) . 
+ - * @ deprecated - - prefer the iterator interface . 
+ - * / 
+ - public void advance ( boolean materialize ) throws IOException 
+ - { 
+ - / / TODO r / m materialize option - - use iterableness ! 
+ - if ( exhausted ) 
+ - { 
+ - throw new IndexOutOfBoundsException ( ) ; 
+ - } 
+ - 
+ - if ( file . isEOF ( ) ) 
+ - { 
+ - file . close ( ) ; 
+ - exhausted = true ; 
+ - return ; 
+ - } 
+ - 
+ - row = new IteratingRow ( file , sstable ) ; 
+ - if ( materialize ) 
+ - { 
+ - while ( row . hasNext ( ) ) 
+ - { 
+ - IColumn column = row . next ( ) ; 
+ - row . getEmptyColumnFamily ( ) . addColumn ( column ) ; 
+ - } 
+ - } 
+ - else 
+ - { 
+ - row . skipRemaining ( ) ; 
+ - } 
+ - } 
+ - 
+ - public boolean hasNext ( ) 
+ - { 
+ - if ( iterator = = null ) 
+ - iterator = new FileStructIterator ( ) ; 
+ - return iterator . hasNext ( ) ; 
+ - } 
+ - 
+ - / * * do not mix with manual calls to advance ( ) . * / 
+ - public String next ( ) 
+ - { 
+ - if ( iterator = = null ) 
+ - iterator = new FileStructIterator ( ) ; 
+ - return iterator . next ( ) ; 
+ - } 
+ - 
+ - public void remove ( ) 
+ - { 
+ - throw new UnsupportedOperationException ( ) ; 
+ - } 
+ - 
+ - private class FileStructIterator extends AbstractIterator < String > 
+ - { 
+ - public FileStructIterator ( ) 
+ - { 
+ - if ( row = = null ) 
+ - { 
+ - if ( ! isExhausted ( ) ) 
+ - { 
+ - forward ( ) ; 
+ - } 
+ - } 
+ - } 
+ - 
+ - private void forward ( ) 
+ - { 
+ - try 
+ - { 
+ - advance ( false ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ - } 
+ - 
+ - protected String computeNext ( ) 
+ - { 
+ - if ( isExhausted ( ) ) 
+ - { 
+ - return endOfData ( ) ; 
+ - } 
+ - String oldKey = getKey ( ) ; 
+ - forward ( ) ; 
+ - return oldKey ; 
+ - } 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / io / IteratingRow . java b / src / java / org / apache / cassandra / io / IteratingRow . java 
+ index 5ace95f . . 628fe50 100644 
+ - - - a / src / java / org / apache / cassandra / io / IteratingRow . java 
+ + + + b / src / java / org / apache / cassandra / io / IteratingRow . java 
+ @ @ - 37 , 7 + 37 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl 
+ { 
+ private final String key ; 
+ private final long finishedAt ; 
+ - private final ColumnFamily emptyColumnFamily ; 
+ private final BufferedRandomAccessFile file ; 
+ private SSTableReader sstable ; 
+ private long dataStart ; 
+ @ @ - 51 , 10 + 50 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl 
+ int dataSize = file . readInt ( ) ; 
+ dataStart = file . getFilePointer ( ) ; 
+ finishedAt = dataStart + dataSize ; 
+ - / / legacy stuff to support FileStruct : 
+ - IndexHelper . skipBloomFilterAndIndex ( file ) ; 
+ - emptyColumnFamily = ColumnFamily . serializer ( ) . deserializeFromSSTableNoColumns ( sstable . makeColumnFamily ( ) , file ) ; 
+ - file . readInt ( ) ; 
+ } 
+ 
+ public String getKey ( ) 
+ @ @ - 62 , 11 + 57 , 6 @ @ public class IteratingRow extends AbstractIterator < IColumn > implements Comparabl 
+ return key ; 
+ } 
+ 
+ - public ColumnFamily getEmptyColumnFamily ( ) 
+ - { 
+ - return emptyColumnFamily ; 
+ - } 
+ - 
+ public void echoData ( DataOutput out ) throws IOException 
+ { 
+ file . seek ( dataStart ) ; 
+ diff - - git a / src / java / org / apache / cassandra / io / SSTableReader . java b / src / java / org / apache / cassandra / io / SSTableReader . java 
+ index fc94fca . . 81a71fd 100644 
+ - - - a / src / java / org / apache / cassandra / io / SSTableReader . java 
+ + + + b / src / java / org / apache / cassandra / io / SSTableReader . java 
+ @ @ - 333 , 11 + 333 , 6 @ @ public class SSTableReader extends SSTable implements Comparable < SSTableReader > 
+ return partitioner ; 
+ } 
+ 
+ - public FileStruct getFileStruct ( ) throws IOException 
+ - { 
+ - return new FileStruct ( this ) ; 
+ - } 
+ - 
+ public SSTableScanner getScanner ( ) throws IOException 
+ { 
+ return new SSTableScanner ( this ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java b / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java 
+ index 40e5889 . . 4219ff9 100644 
+ - - - a / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / ColumnFamilyTest . java 
+ @ @ - 20 , 8 + 20 , 6 @ @ package org . apache . cassandra . db ; 
+ 
+ import java . io . IOException ; 
+ import java . util . Arrays ; 
+ - import java . util . HashSet ; 
+ - import java . util . Random ; 
+ import java . util . TreeMap ; 
+ 
+ import org . junit . Test ; 
+ @ @ - 125 , 8 + 123 , 8 @ @ public class ColumnFamilyTest 
+ cf _ old . addColumn ( QueryPath . column ( " col2 " . getBytes ( ) ) , val2 , 1 ) ; 
+ cf _ old . addColumn ( QueryPath . column ( " col3 " . getBytes ( ) ) , val2 , 2 ) ; 
+ 
+ - cf _ result . addColumns ( cf _ new ) ; 
+ - cf _ result . addColumns ( cf _ old ) ; 
+ + cf _ result . addAll ( cf _ new ) ; 
+ + cf _ result . addAll ( cf _ old ) ; 
+ 
+ assert 3 = = cf _ result . getColumnCount ( ) : " Count is " + cf _ new . getColumnCount ( ) ; 
+ / / addcolumns will only add if timestamp > = old timestamp

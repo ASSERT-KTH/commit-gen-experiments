@@ -1,0 +1,525 @@
+BLEU SCORE: 0.03283637368030199
+
+TEST MSG: Fix up chunk cache handling of metrics
+GENERATED MSG: merge from 1 . 2
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index d906879 . . 5fa28f5 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 4 . 0 <nl> + * Fix up chunk cache handling of metrics ( CASSANDRA - 14628 ) <nl> * Extend IAuthenticator to accept peer SSL certificates ( CASSANDRA - 14652 ) <nl> * Incomplete handling of exceptions when decoding incoming messages ( CASSANDRA - 14574 ) <nl> * Add diagnostic events for user audit logging ( CASSANDRA - 13668 ) <nl> diff - - git a / src / java / org / apache / cassandra / cache / ChunkCache . java b / src / java / org / apache / cassandra / cache / ChunkCache . java <nl> index 9284377 . . 0edb681 100644 <nl> - - - a / src / java / org / apache / cassandra / cache / ChunkCache . java <nl> + + + b / src / java / org / apache / cassandra / cache / ChunkCache . java <nl> @ @ - 29 , 11 + 29 , 10 @ @ import com . google . common . collect . Iterables ; <nl> import com . google . common . util . concurrent . MoreExecutors ; <nl> <nl> import com . github . benmanes . caffeine . cache . * ; <nl> - import com . codahale . metrics . Timer ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . io . sstable . CorruptSSTableException ; <nl> import org . apache . cassandra . io . util . * ; <nl> - import org . apache . cassandra . metrics . CacheMissMetrics ; <nl> + import org . apache . cassandra . metrics . ChunkCacheMetrics ; <nl> import org . apache . cassandra . utils . memory . BufferPool ; <nl> <nl> public class ChunkCache <nl> @ @ - 47 , 7 + 46 , 7 @ @ public class ChunkCache <nl> public static final ChunkCache instance = enabled ? new ChunkCache ( ) : null ; <nl> <nl> private final LoadingCache < Key , Buffer > cache ; <nl> - public final CacheMissMetrics metrics ; <nl> + public final ChunkCacheMetrics metrics ; <nl> <nl> static class Key <nl> { <nl> @ @ - 135 , 29 + 134 , 25 @ @ public class ChunkCache <nl> } <nl> } <nl> <nl> - public ChunkCache ( ) <nl> + private ChunkCache ( ) <nl> { <nl> + metrics = new ChunkCacheMetrics ( this ) ; <nl> cache = Caffeine . newBuilder ( ) <nl> - . maximumWeight ( cacheSize ) <nl> - . executor ( MoreExecutors . directExecutor ( ) ) <nl> - . weigher ( ( key , buffer ) - > ( ( Buffer ) buffer ) . buffer . capacity ( ) ) <nl> - . removalListener ( this ) <nl> - . build ( this ) ; <nl> - metrics = new CacheMissMetrics ( " ChunkCache " , this ) ; <nl> + . maximumWeight ( cacheSize ) <nl> + . executor ( MoreExecutors . directExecutor ( ) ) <nl> + . weigher ( ( key , buffer ) - > ( ( Buffer ) buffer ) . buffer . capacity ( ) ) <nl> + . removalListener ( this ) <nl> + . recordStats ( ( ) - > metrics ) <nl> + . build ( this ) ; <nl> } <nl> <nl> @ Override <nl> - public Buffer load ( Key key ) throws Exception <nl> + public Buffer load ( Key key ) <nl> { <nl> - ChunkReader rebufferer = key . file ; <nl> - metrics . misses . mark ( ) ; <nl> - try ( Timer . Context ctx = metrics . missLatency . time ( ) ) <nl> - { <nl> - ByteBuffer buffer = BufferPool . get ( key . file . chunkSize ( ) , key . file . preferredBufferType ( ) ) ; <nl> - assert buffer ! = null ; <nl> - rebufferer . readChunk ( key . position , buffer ) ; <nl> - return new Buffer ( buffer , key . position ) ; <nl> - } <nl> + ByteBuffer buffer = BufferPool . get ( key . file . chunkSize ( ) , key . file . preferredBufferType ( ) ) ; <nl> + assert buffer ! = null ; <nl> + key . file . readChunk ( key . position , buffer ) ; <nl> + return new Buffer ( buffer , key . position ) ; <nl> } <nl> <nl> @ Override <nl> @ @ - 229 , 7 + 224 , 6 @ @ public class ChunkCache <nl> { <nl> try <nl> { <nl> - metrics . requests . mark ( ) ; <nl> long pageAlignedPos = position & alignmentMask ; <nl> Buffer buf ; <nl> do <nl> diff - - git a / src / java / org / apache / cassandra / cache / InstrumentingCache . java b / src / java / org / apache / cassandra / cache / InstrumentingCache . java <nl> index c8728fd . . e28766f 100644 <nl> - - - a / src / java / org / apache / cassandra / cache / InstrumentingCache . java <nl> + + + b / src / java / org / apache / cassandra / cache / InstrumentingCache . java <nl> @ @ - 56 , 9 + 56 , 10 @ @ public class InstrumentingCache < K , V > <nl> public V get ( K key ) <nl> { <nl> V v = map . get ( key ) ; <nl> - metrics . requests . mark ( ) ; <nl> if ( v ! = null ) <nl> metrics . hits . mark ( ) ; <nl> + else <nl> + metrics . misses . mark ( ) ; <nl> return v ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / metrics / CacheMetrics . java b / src / java / org / apache / cassandra / metrics / CacheMetrics . java <nl> index e623dcb . . d4a00aa 100644 <nl> - - - a / src / java / org / apache / cassandra / metrics / CacheMetrics . java <nl> + + + b / src / java / org / apache / cassandra / metrics / CacheMetrics . java <nl> @ @ - 17 , 10 + 17 , 10 @ @ <nl> * / <nl> package org . apache . cassandra . metrics ; <nl> <nl> - import com . codahale . metrics . Gauge ; <nl> - import com . codahale . metrics . Meter ; <nl> - import com . codahale . metrics . RatioGauge ; <nl> - import org . apache . cassandra . cache . ICache ; <nl> + import java . util . function . DoubleSupplier ; <nl> + <nl> + import com . codahale . metrics . * ; <nl> + import org . apache . cassandra . cache . CacheSize ; <nl> <nl> import static org . apache . cassandra . metrics . CassandraMetricsRegistry . Metrics ; <nl> <nl> @ @ - 31 , 10 + 31 , 18 @ @ public class CacheMetrics <nl> { <nl> / * * Cache capacity in bytes * / <nl> public final Gauge < Long > capacity ; <nl> + / * * Total size of cache , in bytes * / <nl> + public final Gauge < Long > size ; <nl> + / * * Total number of cache entries * / <nl> + public final Gauge < Integer > entries ; <nl> + <nl> / * * Total number of cache hits * / <nl> public final Meter hits ; <nl> + / * * Total number of cache misses * / <nl> + public final Meter misses ; <nl> / * * Total number of cache requests * / <nl> - public final Meter requests ; <nl> + public final Metered requests ; <nl> + <nl> / * * all time cache hit rate * / <nl> public final Gauge < Double > hitRate ; <nl> / * * 1m hit rate * / <nl> @ @ - 43 , 10 + 51 , 8 @ @ public class CacheMetrics <nl> public final Gauge < Double > fiveMinuteHitRate ; <nl> / * * 15m hit rate * / <nl> public final Gauge < Double > fifteenMinuteHitRate ; <nl> - / * * Total size of cache , in bytes * / <nl> - public final Gauge < Long > size ; <nl> - / * * Total number of cache entries * / <nl> - public final Gauge < Integer > entries ; <nl> + <nl> + protected final MetricNameFactory factory ; <nl> <nl> / * * <nl> * Create metrics for given cache . <nl> @ @ - 54 , 61 + 60 , 77 @ @ public class CacheMetrics <nl> * @ param type Type of Cache to identify metrics . <nl> * @ param cache Cache to measure metrics <nl> * / <nl> - public CacheMetrics ( String type , final ICache < ? , ? > cache ) <nl> + public CacheMetrics ( String type , CacheSize cache ) <nl> { <nl> - MetricNameFactory factory = new DefaultNameFactory ( " Cache " , type ) ; <nl> + factory = new DefaultNameFactory ( " Cache " , type ) ; <nl> + <nl> + capacity = Metrics . register ( factory . createMetricName ( " Capacity " ) , cache : : capacity ) ; <nl> + size = Metrics . register ( factory . createMetricName ( " Size " ) , cache : : weightedSize ) ; <nl> + entries = Metrics . register ( factory . createMetricName ( " Entries " ) , cache : : size ) ; <nl> <nl> - capacity = Metrics . register ( factory . createMetricName ( " Capacity " ) , new Gauge < Long > ( ) <nl> - { <nl> - public Long getValue ( ) <nl> - { <nl> - return cache . capacity ( ) ; <nl> - } <nl> - } ) ; <nl> hits = Metrics . meter ( factory . createMetricName ( " Hits " ) ) ; <nl> - requests = Metrics . meter ( factory . createMetricName ( " Requests " ) ) ; <nl> - hitRate = Metrics . register ( factory . createMetricName ( " HitRate " ) , new RatioGauge ( ) <nl> + misses = Metrics . meter ( factory . createMetricName ( " Misses " ) ) ; <nl> + requests = Metrics . register ( factory . createMetricName ( " Requests " ) , sumMeters ( hits , misses ) ) ; <nl> + <nl> + hitRate = <nl> + Metrics . register ( factory . createMetricName ( " HitRate " ) , <nl> + ratioGauge ( hits : : getCount , requests : : getCount ) ) ; <nl> + oneMinuteHitRate = <nl> + Metrics . register ( factory . createMetricName ( " OneMinuteHitRate " ) , <nl> + ratioGauge ( hits : : getOneMinuteRate , requests : : getOneMinuteRate ) ) ; <nl> + fiveMinuteHitRate = <nl> + Metrics . register ( factory . createMetricName ( " FiveMinuteHitRate " ) , <nl> + ratioGauge ( hits : : getFiveMinuteRate , requests : : getFiveMinuteRate ) ) ; <nl> + fifteenMinuteHitRate = <nl> + Metrics . register ( factory . createMetricName ( " FifteenMinuteHitRate " ) , <nl> + ratioGauge ( hits : : getFifteenMinuteRate , requests : : getFifteenMinuteRate ) ) ; <nl> + } <nl> + <nl> + private static Metered sumMeters ( Metered first , Metered second ) <nl> + { <nl> + return new Metered ( ) <nl> { <nl> @ Override <nl> - public Ratio getRatio ( ) <nl> + public long getCount ( ) <nl> { <nl> - return Ratio . of ( hits . getCount ( ) , requests . getCount ( ) ) ; <nl> + return first . getCount ( ) + second . getCount ( ) ; <nl> } <nl> - } ) ; <nl> - oneMinuteHitRate = Metrics . register ( factory . createMetricName ( " OneMinuteHitRate " ) , new RatioGauge ( ) <nl> - { <nl> - protected Ratio getRatio ( ) <nl> + <nl> + @ Override <nl> + public double getMeanRate ( ) <nl> { <nl> - return Ratio . of ( hits . getOneMinuteRate ( ) , requests . getOneMinuteRate ( ) ) ; <nl> + return first . getMeanRate ( ) + second . getMeanRate ( ) ; <nl> } <nl> - } ) ; <nl> - fiveMinuteHitRate = Metrics . register ( factory . createMetricName ( " FiveMinuteHitRate " ) , new RatioGauge ( ) <nl> - { <nl> - protected Ratio getRatio ( ) <nl> + <nl> + @ Override <nl> + public double getOneMinuteRate ( ) <nl> { <nl> - return Ratio . of ( hits . getFiveMinuteRate ( ) , requests . getFiveMinuteRate ( ) ) ; <nl> + return first . getOneMinuteRate ( ) + second . getOneMinuteRate ( ) ; <nl> } <nl> - } ) ; <nl> - fifteenMinuteHitRate = Metrics . register ( factory . createMetricName ( " FifteenMinuteHitRate " ) , new RatioGauge ( ) <nl> - { <nl> - protected Ratio getRatio ( ) <nl> + <nl> + @ Override <nl> + public double getFiveMinuteRate ( ) <nl> { <nl> - return Ratio . of ( hits . getFifteenMinuteRate ( ) , requests . getFifteenMinuteRate ( ) ) ; <nl> + return first . getFiveMinuteRate ( ) + second . getFiveMinuteRate ( ) ; <nl> } <nl> - } ) ; <nl> - size = Metrics . register ( factory . createMetricName ( " Size " ) , new Gauge < Long > ( ) <nl> - { <nl> - public Long getValue ( ) <nl> + <nl> + @ Override <nl> + public double getFifteenMinuteRate ( ) <nl> { <nl> - return cache . weightedSize ( ) ; <nl> + return first . getFifteenMinuteRate ( ) + second . getFifteenMinuteRate ( ) ; <nl> } <nl> - } ) ; <nl> - entries = Metrics . register ( factory . createMetricName ( " Entries " ) , new Gauge < Integer > ( ) <nl> + } ; <nl> + } <nl> + <nl> + private static RatioGauge ratioGauge ( DoubleSupplier numeratorSupplier , DoubleSupplier denominatorSupplier ) <nl> + { <nl> + return new RatioGauge ( ) <nl> { <nl> - public Integer getValue ( ) <nl> + @ Override <nl> + public Ratio getRatio ( ) <nl> { <nl> - return cache . size ( ) ; <nl> + return Ratio . of ( numeratorSupplier . getAsDouble ( ) , denominatorSupplier . getAsDouble ( ) ) ; <nl> } <nl> - } ) ; <nl> + } ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / metrics / CacheMissMetrics . java b / src / java / org / apache / cassandra / metrics / CacheMissMetrics . java <nl> deleted file mode 100644 <nl> index 19d61ef . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / metrics / CacheMissMetrics . java <nl> + + + / dev / null <nl> @ @ - 1 , 114 + 0 , 0 @ @ <nl> - / * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - package org . apache . cassandra . metrics ; <nl> - <nl> - import com . codahale . metrics . Gauge ; <nl> - import com . codahale . metrics . Meter ; <nl> - import com . codahale . metrics . RatioGauge ; <nl> - import com . codahale . metrics . Timer ; <nl> - import org . apache . cassandra . cache . CacheSize ; <nl> - <nl> - import static org . apache . cassandra . metrics . CassandraMetricsRegistry . Metrics ; <nl> - <nl> - / * * <nl> - * Metrics for { @ code ICache } . <nl> - * / <nl> - public class CacheMissMetrics <nl> - { <nl> - / * * Cache capacity in bytes * / <nl> - public final Gauge < Long > capacity ; <nl> - / * * Total number of cache hits * / <nl> - public final Meter misses ; <nl> - / * * Total number of cache requests * / <nl> - public final Meter requests ; <nl> - / * * Latency of misses * / <nl> - public final Timer missLatency ; <nl> - / * * all time cache hit rate * / <nl> - public final Gauge < Double > hitRate ; <nl> - / * * 1m hit rate * / <nl> - public final Gauge < Double > oneMinuteHitRate ; <nl> - / * * 5m hit rate * / <nl> - public final Gauge < Double > fiveMinuteHitRate ; <nl> - / * * 15m hit rate * / <nl> - public final Gauge < Double > fifteenMinuteHitRate ; <nl> - / * * Total size of cache , in bytes * / <nl> - public final Gauge < Long > size ; <nl> - / * * Total number of cache entries * / <nl> - public final Gauge < Integer > entries ; <nl> - <nl> - / * * <nl> - * Create metrics for given cache . <nl> - * <nl> - * @ param type Type of Cache to identify metrics . <nl> - * @ param cache Cache to measure metrics <nl> - * / <nl> - public CacheMissMetrics ( String type , final CacheSize cache ) <nl> - { <nl> - MetricNameFactory factory = new DefaultNameFactory ( " Cache " , type ) ; <nl> - <nl> - capacity = Metrics . register ( factory . createMetricName ( " Capacity " ) , ( Gauge < Long > ) cache : : capacity ) ; <nl> - misses = Metrics . meter ( factory . createMetricName ( " Misses " ) ) ; <nl> - requests = Metrics . meter ( factory . createMetricName ( " Requests " ) ) ; <nl> - missLatency = Metrics . timer ( factory . createMetricName ( " MissLatency " ) ) ; <nl> - hitRate = Metrics . register ( factory . createMetricName ( " HitRate " ) , new RatioGauge ( ) <nl> - { <nl> - @ Override <nl> - public Ratio getRatio ( ) <nl> - { <nl> - long req = requests . getCount ( ) ; <nl> - long mis = misses . getCount ( ) ; <nl> - return Ratio . of ( req - mis , req ) ; <nl> - } <nl> - } ) ; <nl> - oneMinuteHitRate = Metrics . register ( factory . createMetricName ( " OneMinuteHitRate " ) , new RatioGauge ( ) <nl> - { <nl> - protected Ratio getRatio ( ) <nl> - { <nl> - double req = requests . getOneMinuteRate ( ) ; <nl> - double mis = misses . getOneMinuteRate ( ) ; <nl> - return Ratio . of ( req - mis , req ) ; <nl> - } <nl> - } ) ; <nl> - fiveMinuteHitRate = Metrics . register ( factory . createMetricName ( " FiveMinuteHitRate " ) , new RatioGauge ( ) <nl> - { <nl> - protected Ratio getRatio ( ) <nl> - { <nl> - double req = requests . getFiveMinuteRate ( ) ; <nl> - double mis = misses . getFiveMinuteRate ( ) ; <nl> - return Ratio . of ( req - mis , req ) ; <nl> - } <nl> - } ) ; <nl> - fifteenMinuteHitRate = Metrics . register ( factory . createMetricName ( " FifteenMinuteHitRate " ) , new RatioGauge ( ) <nl> - { <nl> - protected Ratio getRatio ( ) <nl> - { <nl> - double req = requests . getFifteenMinuteRate ( ) ; <nl> - double mis = misses . getFifteenMinuteRate ( ) ; <nl> - return Ratio . of ( req - mis , req ) ; <nl> - } <nl> - } ) ; <nl> - size = Metrics . register ( factory . createMetricName ( " Size " ) , ( Gauge < Long > ) cache : : weightedSize ) ; <nl> - entries = Metrics . register ( factory . createMetricName ( " Entries " ) , ( Gauge < Integer > ) cache : : size ) ; <nl> - } <nl> - <nl> - public void reset ( ) <nl> - { <nl> - requests . mark ( - requests . getCount ( ) ) ; <nl> - misses . mark ( - misses . getCount ( ) ) ; <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / metrics / ChunkCacheMetrics . java b / src / java / org / apache / cassandra / metrics / ChunkCacheMetrics . java <nl> new file mode 100644 <nl> index 0000000 . . a3a6928 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / metrics / ChunkCacheMetrics . java <nl> @ @ - 0 , 0 + 1 , 92 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . metrics ; <nl> + <nl> + import java . util . concurrent . TimeUnit ; <nl> + import javax . annotation . Nonnull ; <nl> + <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> + <nl> + import com . codahale . metrics . Timer ; <nl> + import com . github . benmanes . caffeine . cache . stats . CacheStats ; <nl> + import com . github . benmanes . caffeine . cache . stats . StatsCounter ; <nl> + import org . apache . cassandra . cache . ChunkCache ; <nl> + <nl> + import static org . apache . cassandra . metrics . CassandraMetricsRegistry . Metrics ; <nl> + <nl> + / * * <nl> + * Metrics for { @ code ICache } . <nl> + * / <nl> + public class ChunkCacheMetrics extends CacheMetrics implements StatsCounter <nl> + { <nl> + / * * Latency of misses * / <nl> + public final Timer missLatency ; <nl> + <nl> + / * * <nl> + * Create metrics for the provided chunk cache . <nl> + * <nl> + * @ param cache Chunk cache to measure metrics <nl> + * / <nl> + public ChunkCacheMetrics ( ChunkCache cache ) <nl> + { <nl> + super ( " ChunkCache " , cache ) ; <nl> + missLatency = Metrics . timer ( factory . createMetricName ( " MissLatency " ) ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void recordHits ( int count ) <nl> + { <nl> + hits . mark ( count ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void recordMisses ( int count ) <nl> + { <nl> + misses . mark ( count ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void recordLoadSuccess ( long loadTime ) <nl> + { <nl> + missLatency . update ( loadTime , TimeUnit . NANOSECONDS ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void recordLoadFailure ( long loadTime ) <nl> + { <nl> + } <nl> + <nl> + @ Override <nl> + public void recordEviction ( ) <nl> + { <nl> + } <nl> + <nl> + @ Nonnull <nl> + @ Override <nl> + public CacheStats snapshot ( ) <nl> + { <nl> + return new CacheStats ( hits . getCount ( ) , misses . getCount ( ) , missLatency . getCount ( ) , 0L , missLatency . getCount ( ) , 0L , 0L ) ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + public void reset ( ) <nl> + { <nl> + hits . mark ( - hits . getCount ( ) ) ; <nl> + misses . mark ( - misses . getCount ( ) ) ; <nl> + } <nl> + }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index b935425 . . 7f5a487 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 1 . 2 - rc1 <nl> + * fix cqlsh rendering of blob fields ( CASSANDRA - 4970 ) <nl> * fix cqlsh DESCRIBE command ( CASSANDRA - 4913 ) <nl> * save truncation position in system table ( CASSANDRA - 4906 ) <nl> * Move CompressionMetadata off - heap ( CASSANDRA - 4937 ) <nl> diff - - git a / pylib / cqlshlib / formatting . py b / pylib / cqlshlib / formatting . py <nl> index d15c083 . . bab3506 100644 <nl> - - - a / pylib / cqlshlib / formatting . py <nl> + + + b / pylib / cqlshlib / formatting . py <nl> @ @ - 88 , 8 + 88 , 8 @ @ def formatter _ for ( typname ) : <nl> return f <nl> return registrator <nl> <nl> - @ formatter _ for ( ' bytes ' ) <nl> - def format _ value _ bytes ( val , colormap , * * _ ) : <nl> + @ formatter _ for ( ' blob ' ) <nl> + def format _ value _ blob ( val , colormap , * * _ ) : <nl> bval = ' ' . join ( ' % 02x ' % ord ( c ) for c in val ) <nl> return colorme ( bval , colormap , ' hex ' ) <nl>
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index d906879 . . 5fa28f5 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 4 . 0 
+ + * Fix up chunk cache handling of metrics ( CASSANDRA - 14628 ) 
+ * Extend IAuthenticator to accept peer SSL certificates ( CASSANDRA - 14652 ) 
+ * Incomplete handling of exceptions when decoding incoming messages ( CASSANDRA - 14574 ) 
+ * Add diagnostic events for user audit logging ( CASSANDRA - 13668 ) 
+ diff - - git a / src / java / org / apache / cassandra / cache / ChunkCache . java b / src / java / org / apache / cassandra / cache / ChunkCache . java 
+ index 9284377 . . 0edb681 100644 
+ - - - a / src / java / org / apache / cassandra / cache / ChunkCache . java 
+ + + + b / src / java / org / apache / cassandra / cache / ChunkCache . java 
+ @ @ - 29 , 11 + 29 , 10 @ @ import com . google . common . collect . Iterables ; 
+ import com . google . common . util . concurrent . MoreExecutors ; 
+ 
+ import com . github . benmanes . caffeine . cache . * ; 
+ - import com . codahale . metrics . Timer ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . io . sstable . CorruptSSTableException ; 
+ import org . apache . cassandra . io . util . * ; 
+ - import org . apache . cassandra . metrics . CacheMissMetrics ; 
+ + import org . apache . cassandra . metrics . ChunkCacheMetrics ; 
+ import org . apache . cassandra . utils . memory . BufferPool ; 
+ 
+ public class ChunkCache 
+ @ @ - 47 , 7 + 46 , 7 @ @ public class ChunkCache 
+ public static final ChunkCache instance = enabled ? new ChunkCache ( ) : null ; 
+ 
+ private final LoadingCache < Key , Buffer > cache ; 
+ - public final CacheMissMetrics metrics ; 
+ + public final ChunkCacheMetrics metrics ; 
+ 
+ static class Key 
+ { 
+ @ @ - 135 , 29 + 134 , 25 @ @ public class ChunkCache 
+ } 
+ } 
+ 
+ - public ChunkCache ( ) 
+ + private ChunkCache ( ) 
+ { 
+ + metrics = new ChunkCacheMetrics ( this ) ; 
+ cache = Caffeine . newBuilder ( ) 
+ - . maximumWeight ( cacheSize ) 
+ - . executor ( MoreExecutors . directExecutor ( ) ) 
+ - . weigher ( ( key , buffer ) - > ( ( Buffer ) buffer ) . buffer . capacity ( ) ) 
+ - . removalListener ( this ) 
+ - . build ( this ) ; 
+ - metrics = new CacheMissMetrics ( " ChunkCache " , this ) ; 
+ + . maximumWeight ( cacheSize ) 
+ + . executor ( MoreExecutors . directExecutor ( ) ) 
+ + . weigher ( ( key , buffer ) - > ( ( Buffer ) buffer ) . buffer . capacity ( ) ) 
+ + . removalListener ( this ) 
+ + . recordStats ( ( ) - > metrics ) 
+ + . build ( this ) ; 
+ } 
+ 
+ @ Override 
+ - public Buffer load ( Key key ) throws Exception 
+ + public Buffer load ( Key key ) 
+ { 
+ - ChunkReader rebufferer = key . file ; 
+ - metrics . misses . mark ( ) ; 
+ - try ( Timer . Context ctx = metrics . missLatency . time ( ) ) 
+ - { 
+ - ByteBuffer buffer = BufferPool . get ( key . file . chunkSize ( ) , key . file . preferredBufferType ( ) ) ; 
+ - assert buffer ! = null ; 
+ - rebufferer . readChunk ( key . position , buffer ) ; 
+ - return new Buffer ( buffer , key . position ) ; 
+ - } 
+ + ByteBuffer buffer = BufferPool . get ( key . file . chunkSize ( ) , key . file . preferredBufferType ( ) ) ; 
+ + assert buffer ! = null ; 
+ + key . file . readChunk ( key . position , buffer ) ; 
+ + return new Buffer ( buffer , key . position ) ; 
+ } 
+ 
+ @ Override 
+ @ @ - 229 , 7 + 224 , 6 @ @ public class ChunkCache 
+ { 
+ try 
+ { 
+ - metrics . requests . mark ( ) ; 
+ long pageAlignedPos = position & alignmentMask ; 
+ Buffer buf ; 
+ do 
+ diff - - git a / src / java / org / apache / cassandra / cache / InstrumentingCache . java b / src / java / org / apache / cassandra / cache / InstrumentingCache . java 
+ index c8728fd . . e28766f 100644 
+ - - - a / src / java / org / apache / cassandra / cache / InstrumentingCache . java 
+ + + + b / src / java / org / apache / cassandra / cache / InstrumentingCache . java 
+ @ @ - 56 , 9 + 56 , 10 @ @ public class InstrumentingCache < K , V > 
+ public V get ( K key ) 
+ { 
+ V v = map . get ( key ) ; 
+ - metrics . requests . mark ( ) ; 
+ if ( v ! = null ) 
+ metrics . hits . mark ( ) ; 
+ + else 
+ + metrics . misses . mark ( ) ; 
+ return v ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / metrics / CacheMetrics . java b / src / java / org / apache / cassandra / metrics / CacheMetrics . java 
+ index e623dcb . . d4a00aa 100644 
+ - - - a / src / java / org / apache / cassandra / metrics / CacheMetrics . java 
+ + + + b / src / java / org / apache / cassandra / metrics / CacheMetrics . java 
+ @ @ - 17 , 10 + 17 , 10 @ @ 
+ * / 
+ package org . apache . cassandra . metrics ; 
+ 
+ - import com . codahale . metrics . Gauge ; 
+ - import com . codahale . metrics . Meter ; 
+ - import com . codahale . metrics . RatioGauge ; 
+ - import org . apache . cassandra . cache . ICache ; 
+ + import java . util . function . DoubleSupplier ; 
+ + 
+ + import com . codahale . metrics . * ; 
+ + import org . apache . cassandra . cache . CacheSize ; 
+ 
+ import static org . apache . cassandra . metrics . CassandraMetricsRegistry . Metrics ; 
+ 
+ @ @ - 31 , 10 + 31 , 18 @ @ public class CacheMetrics 
+ { 
+ / * * Cache capacity in bytes * / 
+ public final Gauge < Long > capacity ; 
+ + / * * Total size of cache , in bytes * / 
+ + public final Gauge < Long > size ; 
+ + / * * Total number of cache entries * / 
+ + public final Gauge < Integer > entries ; 
+ + 
+ / * * Total number of cache hits * / 
+ public final Meter hits ; 
+ + / * * Total number of cache misses * / 
+ + public final Meter misses ; 
+ / * * Total number of cache requests * / 
+ - public final Meter requests ; 
+ + public final Metered requests ; 
+ + 
+ / * * all time cache hit rate * / 
+ public final Gauge < Double > hitRate ; 
+ / * * 1m hit rate * / 
+ @ @ - 43 , 10 + 51 , 8 @ @ public class CacheMetrics 
+ public final Gauge < Double > fiveMinuteHitRate ; 
+ / * * 15m hit rate * / 
+ public final Gauge < Double > fifteenMinuteHitRate ; 
+ - / * * Total size of cache , in bytes * / 
+ - public final Gauge < Long > size ; 
+ - / * * Total number of cache entries * / 
+ - public final Gauge < Integer > entries ; 
+ + 
+ + protected final MetricNameFactory factory ; 
+ 
+ / * * 
+ * Create metrics for given cache . 
+ @ @ - 54 , 61 + 60 , 77 @ @ public class CacheMetrics 
+ * @ param type Type of Cache to identify metrics . 
+ * @ param cache Cache to measure metrics 
+ * / 
+ - public CacheMetrics ( String type , final ICache < ? , ? > cache ) 
+ + public CacheMetrics ( String type , CacheSize cache ) 
+ { 
+ - MetricNameFactory factory = new DefaultNameFactory ( " Cache " , type ) ; 
+ + factory = new DefaultNameFactory ( " Cache " , type ) ; 
+ + 
+ + capacity = Metrics . register ( factory . createMetricName ( " Capacity " ) , cache : : capacity ) ; 
+ + size = Metrics . register ( factory . createMetricName ( " Size " ) , cache : : weightedSize ) ; 
+ + entries = Metrics . register ( factory . createMetricName ( " Entries " ) , cache : : size ) ; 
+ 
+ - capacity = Metrics . register ( factory . createMetricName ( " Capacity " ) , new Gauge < Long > ( ) 
+ - { 
+ - public Long getValue ( ) 
+ - { 
+ - return cache . capacity ( ) ; 
+ - } 
+ - } ) ; 
+ hits = Metrics . meter ( factory . createMetricName ( " Hits " ) ) ; 
+ - requests = Metrics . meter ( factory . createMetricName ( " Requests " ) ) ; 
+ - hitRate = Metrics . register ( factory . createMetricName ( " HitRate " ) , new RatioGauge ( ) 
+ + misses = Metrics . meter ( factory . createMetricName ( " Misses " ) ) ; 
+ + requests = Metrics . register ( factory . createMetricName ( " Requests " ) , sumMeters ( hits , misses ) ) ; 
+ + 
+ + hitRate = 
+ + Metrics . register ( factory . createMetricName ( " HitRate " ) , 
+ + ratioGauge ( hits : : getCount , requests : : getCount ) ) ; 
+ + oneMinuteHitRate = 
+ + Metrics . register ( factory . createMetricName ( " OneMinuteHitRate " ) , 
+ + ratioGauge ( hits : : getOneMinuteRate , requests : : getOneMinuteRate ) ) ; 
+ + fiveMinuteHitRate = 
+ + Metrics . register ( factory . createMetricName ( " FiveMinuteHitRate " ) , 
+ + ratioGauge ( hits : : getFiveMinuteRate , requests : : getFiveMinuteRate ) ) ; 
+ + fifteenMinuteHitRate = 
+ + Metrics . register ( factory . createMetricName ( " FifteenMinuteHitRate " ) , 
+ + ratioGauge ( hits : : getFifteenMinuteRate , requests : : getFifteenMinuteRate ) ) ; 
+ + } 
+ + 
+ + private static Metered sumMeters ( Metered first , Metered second ) 
+ + { 
+ + return new Metered ( ) 
+ { 
+ @ Override 
+ - public Ratio getRatio ( ) 
+ + public long getCount ( ) 
+ { 
+ - return Ratio . of ( hits . getCount ( ) , requests . getCount ( ) ) ; 
+ + return first . getCount ( ) + second . getCount ( ) ; 
+ } 
+ - } ) ; 
+ - oneMinuteHitRate = Metrics . register ( factory . createMetricName ( " OneMinuteHitRate " ) , new RatioGauge ( ) 
+ - { 
+ - protected Ratio getRatio ( ) 
+ + 
+ + @ Override 
+ + public double getMeanRate ( ) 
+ { 
+ - return Ratio . of ( hits . getOneMinuteRate ( ) , requests . getOneMinuteRate ( ) ) ; 
+ + return first . getMeanRate ( ) + second . getMeanRate ( ) ; 
+ } 
+ - } ) ; 
+ - fiveMinuteHitRate = Metrics . register ( factory . createMetricName ( " FiveMinuteHitRate " ) , new RatioGauge ( ) 
+ - { 
+ - protected Ratio getRatio ( ) 
+ + 
+ + @ Override 
+ + public double getOneMinuteRate ( ) 
+ { 
+ - return Ratio . of ( hits . getFiveMinuteRate ( ) , requests . getFiveMinuteRate ( ) ) ; 
+ + return first . getOneMinuteRate ( ) + second . getOneMinuteRate ( ) ; 
+ } 
+ - } ) ; 
+ - fifteenMinuteHitRate = Metrics . register ( factory . createMetricName ( " FifteenMinuteHitRate " ) , new RatioGauge ( ) 
+ - { 
+ - protected Ratio getRatio ( ) 
+ + 
+ + @ Override 
+ + public double getFiveMinuteRate ( ) 
+ { 
+ - return Ratio . of ( hits . getFifteenMinuteRate ( ) , requests . getFifteenMinuteRate ( ) ) ; 
+ + return first . getFiveMinuteRate ( ) + second . getFiveMinuteRate ( ) ; 
+ } 
+ - } ) ; 
+ - size = Metrics . register ( factory . createMetricName ( " Size " ) , new Gauge < Long > ( ) 
+ - { 
+ - public Long getValue ( ) 
+ + 
+ + @ Override 
+ + public double getFifteenMinuteRate ( ) 
+ { 
+ - return cache . weightedSize ( ) ; 
+ + return first . getFifteenMinuteRate ( ) + second . getFifteenMinuteRate ( ) ; 
+ } 
+ - } ) ; 
+ - entries = Metrics . register ( factory . createMetricName ( " Entries " ) , new Gauge < Integer > ( ) 
+ + } ; 
+ + } 
+ + 
+ + private static RatioGauge ratioGauge ( DoubleSupplier numeratorSupplier , DoubleSupplier denominatorSupplier ) 
+ + { 
+ + return new RatioGauge ( ) 
+ { 
+ - public Integer getValue ( ) 
+ + @ Override 
+ + public Ratio getRatio ( ) 
+ { 
+ - return cache . size ( ) ; 
+ + return Ratio . of ( numeratorSupplier . getAsDouble ( ) , denominatorSupplier . getAsDouble ( ) ) ; 
+ } 
+ - } ) ; 
+ + } ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / metrics / CacheMissMetrics . java b / src / java / org / apache / cassandra / metrics / CacheMissMetrics . java 
+ deleted file mode 100644 
+ index 19d61ef . . 0000000 
+ - - - a / src / java / org / apache / cassandra / metrics / CacheMissMetrics . java 
+ + + + / dev / null 
+ @ @ - 1 , 114 + 0 , 0 @ @ 
+ - / * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - package org . apache . cassandra . metrics ; 
+ - 
+ - import com . codahale . metrics . Gauge ; 
+ - import com . codahale . metrics . Meter ; 
+ - import com . codahale . metrics . RatioGauge ; 
+ - import com . codahale . metrics . Timer ; 
+ - import org . apache . cassandra . cache . CacheSize ; 
+ - 
+ - import static org . apache . cassandra . metrics . CassandraMetricsRegistry . Metrics ; 
+ - 
+ - / * * 
+ - * Metrics for { @ code ICache } . 
+ - * / 
+ - public class CacheMissMetrics 
+ - { 
+ - / * * Cache capacity in bytes * / 
+ - public final Gauge < Long > capacity ; 
+ - / * * Total number of cache hits * / 
+ - public final Meter misses ; 
+ - / * * Total number of cache requests * / 
+ - public final Meter requests ; 
+ - / * * Latency of misses * / 
+ - public final Timer missLatency ; 
+ - / * * all time cache hit rate * / 
+ - public final Gauge < Double > hitRate ; 
+ - / * * 1m hit rate * / 
+ - public final Gauge < Double > oneMinuteHitRate ; 
+ - / * * 5m hit rate * / 
+ - public final Gauge < Double > fiveMinuteHitRate ; 
+ - / * * 15m hit rate * / 
+ - public final Gauge < Double > fifteenMinuteHitRate ; 
+ - / * * Total size of cache , in bytes * / 
+ - public final Gauge < Long > size ; 
+ - / * * Total number of cache entries * / 
+ - public final Gauge < Integer > entries ; 
+ - 
+ - / * * 
+ - * Create metrics for given cache . 
+ - * 
+ - * @ param type Type of Cache to identify metrics . 
+ - * @ param cache Cache to measure metrics 
+ - * / 
+ - public CacheMissMetrics ( String type , final CacheSize cache ) 
+ - { 
+ - MetricNameFactory factory = new DefaultNameFactory ( " Cache " , type ) ; 
+ - 
+ - capacity = Metrics . register ( factory . createMetricName ( " Capacity " ) , ( Gauge < Long > ) cache : : capacity ) ; 
+ - misses = Metrics . meter ( factory . createMetricName ( " Misses " ) ) ; 
+ - requests = Metrics . meter ( factory . createMetricName ( " Requests " ) ) ; 
+ - missLatency = Metrics . timer ( factory . createMetricName ( " MissLatency " ) ) ; 
+ - hitRate = Metrics . register ( factory . createMetricName ( " HitRate " ) , new RatioGauge ( ) 
+ - { 
+ - @ Override 
+ - public Ratio getRatio ( ) 
+ - { 
+ - long req = requests . getCount ( ) ; 
+ - long mis = misses . getCount ( ) ; 
+ - return Ratio . of ( req - mis , req ) ; 
+ - } 
+ - } ) ; 
+ - oneMinuteHitRate = Metrics . register ( factory . createMetricName ( " OneMinuteHitRate " ) , new RatioGauge ( ) 
+ - { 
+ - protected Ratio getRatio ( ) 
+ - { 
+ - double req = requests . getOneMinuteRate ( ) ; 
+ - double mis = misses . getOneMinuteRate ( ) ; 
+ - return Ratio . of ( req - mis , req ) ; 
+ - } 
+ - } ) ; 
+ - fiveMinuteHitRate = Metrics . register ( factory . createMetricName ( " FiveMinuteHitRate " ) , new RatioGauge ( ) 
+ - { 
+ - protected Ratio getRatio ( ) 
+ - { 
+ - double req = requests . getFiveMinuteRate ( ) ; 
+ - double mis = misses . getFiveMinuteRate ( ) ; 
+ - return Ratio . of ( req - mis , req ) ; 
+ - } 
+ - } ) ; 
+ - fifteenMinuteHitRate = Metrics . register ( factory . createMetricName ( " FifteenMinuteHitRate " ) , new RatioGauge ( ) 
+ - { 
+ - protected Ratio getRatio ( ) 
+ - { 
+ - double req = requests . getFifteenMinuteRate ( ) ; 
+ - double mis = misses . getFifteenMinuteRate ( ) ; 
+ - return Ratio . of ( req - mis , req ) ; 
+ - } 
+ - } ) ; 
+ - size = Metrics . register ( factory . createMetricName ( " Size " ) , ( Gauge < Long > ) cache : : weightedSize ) ; 
+ - entries = Metrics . register ( factory . createMetricName ( " Entries " ) , ( Gauge < Integer > ) cache : : size ) ; 
+ - } 
+ - 
+ - public void reset ( ) 
+ - { 
+ - requests . mark ( - requests . getCount ( ) ) ; 
+ - misses . mark ( - misses . getCount ( ) ) ; 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / metrics / ChunkCacheMetrics . java b / src / java / org / apache / cassandra / metrics / ChunkCacheMetrics . java 
+ new file mode 100644 
+ index 0000000 . . a3a6928 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / metrics / ChunkCacheMetrics . java 
+ @ @ - 0 , 0 + 1 , 92 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . metrics ; 
+ + 
+ + import java . util . concurrent . TimeUnit ; 
+ + import javax . annotation . Nonnull ; 
+ + 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ + 
+ + import com . codahale . metrics . Timer ; 
+ + import com . github . benmanes . caffeine . cache . stats . CacheStats ; 
+ + import com . github . benmanes . caffeine . cache . stats . StatsCounter ; 
+ + import org . apache . cassandra . cache . ChunkCache ; 
+ + 
+ + import static org . apache . cassandra . metrics . CassandraMetricsRegistry . Metrics ; 
+ + 
+ + / * * 
+ + * Metrics for { @ code ICache } . 
+ + * / 
+ + public class ChunkCacheMetrics extends CacheMetrics implements StatsCounter 
+ + { 
+ + / * * Latency of misses * / 
+ + public final Timer missLatency ; 
+ + 
+ + / * * 
+ + * Create metrics for the provided chunk cache . 
+ + * 
+ + * @ param cache Chunk cache to measure metrics 
+ + * / 
+ + public ChunkCacheMetrics ( ChunkCache cache ) 
+ + { 
+ + super ( " ChunkCache " , cache ) ; 
+ + missLatency = Metrics . timer ( factory . createMetricName ( " MissLatency " ) ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void recordHits ( int count ) 
+ + { 
+ + hits . mark ( count ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void recordMisses ( int count ) 
+ + { 
+ + misses . mark ( count ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void recordLoadSuccess ( long loadTime ) 
+ + { 
+ + missLatency . update ( loadTime , TimeUnit . NANOSECONDS ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void recordLoadFailure ( long loadTime ) 
+ + { 
+ + } 
+ + 
+ + @ Override 
+ + public void recordEviction ( ) 
+ + { 
+ + } 
+ + 
+ + @ Nonnull 
+ + @ Override 
+ + public CacheStats snapshot ( ) 
+ + { 
+ + return new CacheStats ( hits . getCount ( ) , misses . getCount ( ) , missLatency . getCount ( ) , 0L , missLatency . getCount ( ) , 0L , 0L ) ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + public void reset ( ) 
+ + { 
+ + hits . mark ( - hits . getCount ( ) ) ; 
+ + misses . mark ( - misses . getCount ( ) ) ; 
+ + } 
+ + }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index b935425 . . 7f5a487 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 1 . 2 - rc1 
+ + * fix cqlsh rendering of blob fields ( CASSANDRA - 4970 ) 
+ * fix cqlsh DESCRIBE command ( CASSANDRA - 4913 ) 
+ * save truncation position in system table ( CASSANDRA - 4906 ) 
+ * Move CompressionMetadata off - heap ( CASSANDRA - 4937 ) 
+ diff - - git a / pylib / cqlshlib / formatting . py b / pylib / cqlshlib / formatting . py 
+ index d15c083 . . bab3506 100644 
+ - - - a / pylib / cqlshlib / formatting . py 
+ + + + b / pylib / cqlshlib / formatting . py 
+ @ @ - 88 , 8 + 88 , 8 @ @ def formatter _ for ( typname ) : 
+ return f 
+ return registrator 
+ 
+ - @ formatter _ for ( ' bytes ' ) 
+ - def format _ value _ bytes ( val , colormap , * * _ ) : 
+ + @ formatter _ for ( ' blob ' ) 
+ + def format _ value _ blob ( val , colormap , * * _ ) : 
+ bval = ' ' . join ( ' % 02x ' % ord ( c ) for c in val ) 
+ return colorme ( bval , colormap , ' hex ' ) 
+

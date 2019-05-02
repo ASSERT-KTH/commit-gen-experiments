@@ -1,0 +1,682 @@
+BLEU SCORE: 0.03089055318156698
+
+TEST MSG: Fix bad skip of sstables on slice query with composite start / finish
+GENERATED MSG: Stop reading from sstables once we know we have the most recent columns
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 483ee0b . . 3cc9937 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 40 , 6 + 40 , 7 @ @ <nl> * Fix LIMT with static columns ( CASSANDRA - 6956 ) <nl> * Fix clash with CQL column name in thrift validation ( CASSANDRA - 6892 ) <nl> * Fix error with super columns in mixed 1 . 2 - 2 . 0 clusters ( CASSANDRA - 6966 ) <nl> + * Fix bad skip of sstables on slice query with composite start / finish ( CASSANDRA - 6825 ) <nl> Merged from 1 . 2 : <nl> * Add UNLOGGED , COUNTER options to BATCH documentation ( CASSANDRA - 6816 ) <nl> * add extra SSL cipher suites ( CASSANDRA - 6613 ) <nl> diff - - git a / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java b / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java <nl> index 53b2c05 . . 56e87e8 100644 <nl> - - - a / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java <nl> + + + b / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java <nl> @ @ - 22 , 9 + 22 , 7 @ @ import java . util . * ; <nl> <nl> import com . google . common . base . Objects ; <nl> import com . google . common . base . Predicate ; <nl> - import com . google . common . collect . AbstractIterator ; <nl> import com . google . common . collect . Iterables ; <nl> - import com . google . common . collect . Lists ; <nl> <nl> import org . github . jamm . MemoryMeter ; <nl> <nl> @ @ - 53 , 6 + 51 , 8 @ @ import org . apache . cassandra . serializers . MarshalException ; <nl> import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . Pair ; <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> <nl> / * * <nl> * Encapsulates a completely parsed SELECT query , including the target <nl> @ @ - 61 , 6 + 61 , 8 @ @ import org . apache . cassandra . utils . Pair ; <nl> * / <nl> public class SelectStatement implements CQLStatement , MeasurableForPreparedCache <nl> { <nl> + private static final Logger logger = LoggerFactory . getLogger ( SelectStatement . class ) ; <nl> + <nl> private static final int DEFAULT _ COUNT _ PAGE _ SIZE = 10000 ; <nl> <nl> private final int boundTerms ; <nl> @ @ - 257 , 6 + 259 , 7 @ @ public class SelectStatement implements CQLStatement , MeasurableForPreparedCache <nl> while ( ! pager . isExhausted ( ) ) <nl> { <nl> int maxLimit = pager . maxRemaining ( ) ; <nl> + logger . debug ( " New maxLimit for paged count query is { } " , maxLimit ) ; <nl> ResultSet rset = process ( pager . fetchPage ( pageSize ) , variables , maxLimit , now ) ; <nl> count + = rset . rows . size ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / marshal / CompositeType . java b / src / java / org / apache / cassandra / db / marshal / CompositeType . java <nl> index 83e3b97 . . 7f08219 100644 <nl> - - - a / src / java / org / apache / cassandra / db / marshal / CompositeType . java <nl> + + + b / src / java / org / apache / cassandra / db / marshal / CompositeType . java <nl> @ @ - 264 , 26 + 264 , 54 @ @ public class CompositeType extends AbstractCompositeType <nl> public boolean intersects ( List < ByteBuffer > minColumnNames , List < ByteBuffer > maxColumnNames , SliceQueryFilter filter ) <nl> { <nl> assert minColumnNames . size ( ) = = maxColumnNames . size ( ) ; <nl> + <nl> + / / If any of the slices in the filter intersect , return true <nl> outer : <nl> for ( ColumnSlice slice : filter . slices ) <nl> { <nl> - / / This slices intersects if all component intersect . And we don ' t intersect <nl> - / / only if no slice intersects <nl> ByteBuffer [ ] start = split ( filter . isReversed ( ) ? slice . finish : slice . start ) ; <nl> ByteBuffer [ ] finish = split ( filter . isReversed ( ) ? slice . start : slice . finish ) ; <nl> - for ( int i = 0 ; i < minColumnNames . size ( ) ; i + + ) <nl> + <nl> + if ( compare ( start , maxColumnNames , true ) > 0 | | compare ( finish , minColumnNames , false ) < 0 ) <nl> + continue ; / / slice does not intersect <nl> + <nl> + / / We could safely return true here , but there ' s a minor optimization : if the first component is restricted <nl> + / / to a single value , we can check that the second component falls within the min / max for that component <nl> + / / ( and repeat for all components ) . <nl> + for ( int i = 0 ; i < Math . min ( Math . min ( start . length , finish . length ) , minColumnNames . size ( ) ) ; i + + ) <nl> { <nl> AbstractType < ? > t = types . get ( i ) ; <nl> - ByteBuffer s = i < start . length ? start [ i ] : ByteBufferUtil . EMPTY _ BYTE _ BUFFER ; <nl> - ByteBuffer f = i < finish . length ? finish [ i ] : ByteBufferUtil . EMPTY _ BYTE _ BUFFER ; <nl> - if ( ! t . intersects ( minColumnNames . get ( i ) , maxColumnNames . get ( i ) , s , f ) ) <nl> + <nl> + / / we already know the first component falls within its min / max range ( otherwise we wouldn ' t get here ) <nl> + if ( i > 0 & & ! t . intersects ( minColumnNames . get ( i ) , maxColumnNames . get ( i ) , start [ i ] , finish [ i ] ) ) <nl> continue outer ; <nl> + <nl> + / / if this component isn ' t equal in the start and finish , we don ' t need to check any more <nl> + if ( t . compare ( start [ i ] , finish [ i ] ) ! = 0 ) <nl> + break ; <nl> } <nl> return true ; <nl> } <nl> + <nl> + / / none of the slices intersected <nl> return false ; <nl> } <nl> <nl> + / * * Helper method for intersects ( ) * / <nl> + private int compare ( ByteBuffer [ ] sliceBounds , List < ByteBuffer > sstableBounds , boolean isSliceStart ) <nl> + { <nl> + for ( int i = 0 ; i < sstableBounds . size ( ) ; i + + ) <nl> + { <nl> + if ( i > = sliceBounds . length ) <nl> + return isSliceStart ? - 1 : 1 ; <nl> + <nl> + int comparison = types . get ( i ) . compare ( sliceBounds [ i ] , sstableBounds . get ( i ) ) ; <nl> + if ( comparison ! = 0 ) <nl> + return comparison ; <nl> + } <nl> + return 0 ; <nl> + } <nl> + <nl> private static class StaticParsedComparator implements ParsedComparator <nl> { <nl> final AbstractType < ? > type ; <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java b / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java <nl> index 1b4bdbd . . 4210296 100644 <nl> - - - a / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java <nl> + + + b / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java <nl> @ @ - 32 , 9 + 32 , 13 @ @ import org . apache . cassandra . db . filter . ColumnCounter ; <nl> import org . apache . cassandra . db . filter . IDiskAtomFilter ; <nl> import org . apache . cassandra . exceptions . RequestExecutionException ; <nl> import org . apache . cassandra . exceptions . RequestValidationException ; <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> <nl> abstract class AbstractQueryPager implements QueryPager <nl> { <nl> + private static final Logger logger = LoggerFactory . getLogger ( AbstractQueryPager . class ) ; <nl> + <nl> private final ConsistencyLevel consistencyLevel ; <nl> private final boolean localQuery ; <nl> <nl> @ @ - 85 , 11 + 89 , 13 @ @ abstract class AbstractQueryPager implements QueryPager <nl> <nl> if ( rows . isEmpty ( ) ) <nl> { <nl> + logger . debug ( " Got empty set of rows , considering pager exhausted " ) ; <nl> exhausted = true ; <nl> return Collections . emptyList ( ) ; <nl> } <nl> <nl> int liveCount = getPageLiveCount ( rows ) ; <nl> + logger . debug ( " Fetched { } live rows " , liveCount ) ; <nl> <nl> / / Because SP . getRangeSlice doesn ' t trim the result ( see SP . trim ( ) ) , liveCount may be greater than what asked <nl> / / ( currentPageSize ) . This would throw off the paging logic so we trim the excess . It ' s not extremely efficient <nl> @ @ - 105 , 7 + 111 , 10 @ @ abstract class AbstractQueryPager implements QueryPager <nl> / / If we ' ve got less than requested , there is no more query to do ( but <nl> / / we still need to return the current page ) <nl> if ( liveCount < currentPageSize ) <nl> + { <nl> + logger . debug ( " Got result ( { } ) smaller than page size ( { } ) , considering pager exhausted " , liveCount , currentPageSize ) ; <nl> exhausted = true ; <nl> + } <nl> <nl> / / If it ' s not the first query and the first column is the last one returned ( likely <nl> / / but not certain since paging can race with deletes / expiration ) , then remove the <nl> @ @ - 124 , 6 + 133 , 8 @ @ abstract class AbstractQueryPager implements QueryPager <nl> remaining + + ; <nl> } <nl> <nl> + logger . debug ( " Remaining rows to page : { } " , remaining ) ; <nl> + <nl> if ( ! isExhausted ( ) ) <nl> lastWasRecorded = recordLast ( rows . get ( rows . size ( ) - 1 ) ) ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java b / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java <nl> index c94f7f6 . . ec229cb 100644 <nl> - - - a / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java <nl> + + + b / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java <nl> @ @ - 26 , 12 + 26 , 16 @ @ import org . apache . cassandra . db . filter . SliceQueryFilter ; <nl> import org . apache . cassandra . exceptions . RequestValidationException ; <nl> import org . apache . cassandra . exceptions . RequestExecutionException ; <nl> import org . apache . cassandra . service . StorageProxy ; <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> <nl> / * * <nl> * Pager over a SliceFromReadCommand . <nl> * / <nl> public class SliceQueryPager extends AbstractQueryPager implements SinglePartitionPager <nl> { <nl> + private static final Logger logger = LoggerFactory . getLogger ( SliceQueryPager . class ) ; <nl> + <nl> private final SliceFromReadCommand command ; <nl> <nl> private volatile ByteBuffer lastReturned ; <nl> @ @ - 73 , 6 + 77 , 7 @ @ public class SliceQueryPager extends AbstractQueryPager implements SinglePartiti <nl> if ( lastReturned ! = null ) <nl> filter = filter . withUpdatedStart ( lastReturned , cfm . comparator ) ; <nl> <nl> + logger . debug ( " Querying next page of slice query ; new filter : { } " , filter ) ; <nl> ReadCommand pageCmd = command . withUpdatedFilter ( filter ) ; <nl> return localQuery <nl> ? Collections . singletonList ( pageCmd . getRow ( Keyspace . open ( command . ksName ) ) ) <nl> diff - - git a / test / unit / org / apache / cassandra / db / marshal / CompositeTypeTest . java b / test / unit / org / apache / cassandra / db / marshal / CompositeTypeTest . java <nl> index 1039fb6 . . 20cb5ef 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / marshal / CompositeTypeTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / marshal / CompositeTypeTest . java <nl> @ @ - 24 , 10 + 24 , 14 @ @ import java . util . Iterator ; <nl> import java . util . List ; <nl> import java . util . UUID ; <nl> <nl> + import org . apache . cassandra . db . filter . ColumnSlice ; <nl> + import org . apache . cassandra . db . filter . SliceQueryFilter ; <nl> import org . apache . cassandra . serializers . MarshalException ; <nl> import org . junit . Test ; <nl> import static org . junit . Assert . fail ; <nl> import static org . junit . Assert . assertEquals ; <nl> + import static org . junit . Assert . assertFalse ; <nl> + import static org . junit . Assert . assertTrue ; <nl> <nl> import org . apache . cassandra . SchemaLoader ; <nl> import org . apache . cassandra . Util ; <nl> @ @ - 255 , 6 + 259 , 296 @ @ public class CompositeTypeTest extends SchemaLoader <nl> } <nl> } <nl> <nl> + @ Test <nl> + public void testIntersectsSingleSlice ( ) <nl> + { <nl> + CompositeType comparator = CompositeType . getInstance ( Int32Type . instance , Int32Type . instance , Int32Type . instance ) ; <nl> + <nl> + / / filter falls entirely before sstable <nl> + SliceQueryFilter filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 1 , 0 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with empty start <nl> + filter = new SliceQueryFilter ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER , composite ( 1 , 0 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing components for start <nl> + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 0 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing components for start and end <nl> + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + <nl> + / / end of slice matches start of sstable for the first component , but not the second component <nl> + filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 1 , 0 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing components for start <nl> + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 0 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing components for start and end <nl> + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / first two components match , but not the last <nl> + filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 1 , 1 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 1 ) , columnNames ( 3 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + / / all three components in slice end match the start of the sstable <nl> + filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 1 , 1 ) , columnNames ( 3 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + <nl> + / / filter falls entirely after sstable <nl> + filter = new SliceQueryFilter ( composite ( 4 , 0 , 0 ) , composite ( 4 , 0 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with empty end <nl> + filter = new SliceQueryFilter ( composite ( 4 , 0 , 0 ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing components for end <nl> + filter = new SliceQueryFilter ( composite ( 4 , 0 , 0 ) , composite ( 1 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing components for start and end <nl> + filter = new SliceQueryFilter ( composite ( 4 , 0 ) , composite ( 1 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + <nl> + / / start of slice matches end of sstable for the first component , but not the second component <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 1 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / start of slice matches end of sstable for the first two components , but not the last component <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 1 , 1 , 0 ) , filter ) ) ; <nl> + <nl> + / / all three components in the slice start match the end of the sstable <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + <nl> + / / slice covers entire sstable ( with no matching edges ) <nl> + filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + / / same case , but with empty ends <nl> + filter = new SliceQueryFilter ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing components <nl> + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 2 , 0 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + / / slice covers entire sstable ( with matching start ) <nl> + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + / / slice covers entire sstable ( with matching end ) <nl> + filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + / / slice covers entire sstable ( with matching start and end ) <nl> + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + <nl> + / / slice falls entirely within sstable ( with matching start ) <nl> + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 1 , 1 , 0 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + / / same case , but with a missing end component <nl> + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + / / slice falls entirely within sstable ( with matching end ) <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 , 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + / / same case , but with a missing start component <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; <nl> + <nl> + <nl> + / / slice falls entirely within sstable <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 , 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 2 , 2 ) , filter ) ) ; <nl> + <nl> + / / same case , but with a missing start component <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 2 , 2 ) , filter ) ) ; <nl> + <nl> + / / same case , but with a missing start and end components <nl> + filter = new SliceQueryFilter ( composite ( 1 ) , composite ( 1 , 2 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 2 , 2 ) , filter ) ) ; <nl> + <nl> + / / slice falls entirely within sstable ( slice start and end are the same ) <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 2 , 2 ) , filter ) ) ; <nl> + <nl> + <nl> + / / slice starts within sstable , empty end <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing end components <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 3 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / slice starts within sstable ( matching sstable start ) , empty end <nl> + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing end components <nl> + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 3 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / slice starts within sstable ( matching sstable end ) , empty end <nl> + filter = new SliceQueryFilter ( composite ( 2 , 0 , 0 ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing end components <nl> + filter = new SliceQueryFilter ( composite ( 2 , 0 , 0 ) , composite ( 3 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + <nl> + / / slice ends within sstable , empty end <nl> + filter = new SliceQueryFilter ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER , composite ( 1 , 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing start components <nl> + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / slice ends within sstable ( matching sstable start ) , empty start <nl> + filter = new SliceQueryFilter ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER , composite ( 1 , 0 , 0 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing start components <nl> + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 0 , 0 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / slice ends within sstable ( matching sstable end ) , empty start <nl> + filter = new SliceQueryFilter ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER , composite ( 2 , 0 , 0 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with missing start components <nl> + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + <nl> + / / the slice technically falls within the sstable range , but since the first component is restricted to <nl> + / / a single value , we can check that the second component does not fall within its min / max <nl> + filter = new SliceQueryFilter ( composite ( 1 , 2 , 0 ) , composite ( 1 , 3 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with a missing start component <nl> + filter = new SliceQueryFilter ( composite ( 1 , 2 ) , composite ( 1 , 3 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with a missing end component <nl> + filter = new SliceQueryFilter ( composite ( 1 , 2 , 0 ) , composite ( 1 , 3 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with a missing start and end components <nl> + filter = new SliceQueryFilter ( composite ( 1 , 2 ) , composite ( 1 , 3 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; <nl> + <nl> + <nl> + / / same as the previous set of tests , but the second component is equal in the slice start and end <nl> + filter = new SliceQueryFilter ( composite ( 1 , 2 , 0 ) , composite ( 1 , 2 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with a missing start component <nl> + filter = new SliceQueryFilter ( composite ( 1 , 2 ) , composite ( 1 , 2 , 0 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with a missing end component <nl> + filter = new SliceQueryFilter ( composite ( 1 , 2 , 0 ) , composite ( 1 , 2 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; <nl> + <nl> + / / same case , but with a missing start and end components <nl> + filter = new SliceQueryFilter ( composite ( 1 , 2 ) , composite ( 1 , 2 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; <nl> + <nl> + / / same as the previous tests , but it ' s the third component that doesn ' t fit in its range this time <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 , 2 ) , composite ( 1 , 1 , 3 ) , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 0 ) , columnNames ( 2 , 2 , 1 ) , filter ) ) ; <nl> + <nl> + <nl> + / / basic check on reversed slices <nl> + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 0 , 0 , 0 ) , true , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 0 , 0 , 0 ) , true , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 1 , 1 , 0 ) , true , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 2 , 2 ) , filter ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testIntersectsMultipleSlices ( ) <nl> + { <nl> + CompositeType comparator = CompositeType . getInstance ( Int32Type . instance , Int32Type . instance , Int32Type . instance ) ; <nl> + <nl> + / / all slices intersect <nl> + SliceQueryFilter filter = new SliceQueryFilter ( new ColumnSlice [ ] { <nl> + new ColumnSlice ( composite ( 1 , 0 , 0 ) , composite ( 2 , 0 , 0 ) ) , <nl> + new ColumnSlice ( composite ( 3 , 0 , 0 ) , composite ( 4 , 0 , 0 ) ) , <nl> + new ColumnSlice ( composite ( 5 , 0 , 0 ) , composite ( 6 , 0 , 0 ) ) , <nl> + } , false , 1 ) ; <nl> + <nl> + / / first slice doesn ' t intersect <nl> + assertTrue ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 7 , 0 , 0 ) , filter ) ) ; <nl> + filter = new SliceQueryFilter ( new ColumnSlice [ ] { <nl> + new ColumnSlice ( composite ( 1 , 0 , 0 ) , composite ( 2 , 0 , 0 ) ) , <nl> + new ColumnSlice ( composite ( 3 , 0 , 0 ) , composite ( 4 , 0 , 0 ) ) , <nl> + new ColumnSlice ( composite ( 5 , 0 , 0 ) , composite ( 6 , 0 , 0 ) ) , <nl> + } , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 3 , 0 , 0 ) , columnNames ( 7 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / first two slices don ' t intersect <nl> + assertTrue ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 7 , 0 , 0 ) , filter ) ) ; <nl> + filter = new SliceQueryFilter ( new ColumnSlice [ ] { <nl> + new ColumnSlice ( composite ( 1 , 0 , 0 ) , composite ( 2 , 0 , 0 ) ) , <nl> + new ColumnSlice ( composite ( 3 , 0 , 0 ) , composite ( 4 , 0 , 0 ) ) , <nl> + new ColumnSlice ( composite ( 5 , 0 , 0 ) , composite ( 6 , 0 , 0 ) ) , <nl> + } , false , 1 ) ; <nl> + assertTrue ( comparator . intersects ( columnNames ( 5 , 0 , 0 ) , columnNames ( 7 , 0 , 0 ) , filter ) ) ; <nl> + <nl> + / / none of the slices intersect <nl> + assertTrue ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 7 , 0 , 0 ) , filter ) ) ; <nl> + filter = new SliceQueryFilter ( new ColumnSlice [ ] { <nl> + new ColumnSlice ( composite ( 1 , 0 , 0 ) , composite ( 2 , 0 , 0 ) ) , <nl> + new ColumnSlice ( composite ( 3 , 0 , 0 ) , composite ( 4 , 0 , 0 ) ) , <nl> + new ColumnSlice ( composite ( 5 , 0 , 0 ) , composite ( 6 , 0 , 0 ) ) , <nl> + } , false , 1 ) ; <nl> + assertFalse ( comparator . intersects ( columnNames ( 7 , 0 , 0 ) , columnNames ( 8 , 0 , 0 ) , filter ) ) ; <nl> + } <nl> + <nl> + <nl> + private static ByteBuffer composite ( Integer . . . components ) <nl> + { <nl> + CompositeType comparator = CompositeType . getInstance ( Int32Type . instance , Int32Type . instance , Int32Type . instance ) ; <nl> + CompositeType . Builder builder = comparator . builder ( ) ; <nl> + for ( int component : components ) <nl> + builder . add ( ByteBufferUtil . bytes ( component ) ) ; <nl> + return builder . build ( ) ; <nl> + } <nl> + <nl> + private static List < ByteBuffer > columnNames ( Integer . . . components ) <nl> + { <nl> + List < ByteBuffer > names = new ArrayList < > ( components . length ) ; <nl> + for ( int component : components ) <nl> + names . add ( ByteBufferUtil . bytes ( component ) ) ; <nl> + return names ; <nl> + } <nl> + <nl> private void addColumn ( RowMutation rm , ByteBuffer cname ) <nl> { <nl> rm . add ( cfName , cname , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 0 ) ;
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 70281be . . fd96002 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 37 , 7 + 37 , 7 @ @ <nl> and few other places responsible for work with SSTable files ( CASSANDRA - 3040 ) <nl> * Stop reading from sstables once we know we have the most recent columns , <nl> for query - by - name requests ( CASSANDRA - 2498 ) <nl> - <nl> + * Add query - by - column mode to stress . java ( CASSANDRA - 3064 ) <nl> <nl> 0 . 8 . 5 <nl> * fix NPE when encryption _ options is unspecified ( CASSANDRA - 3007 ) <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / Session . java b / tools / stress / src / org / apache / cassandra / stress / Session . java <nl> index 1508379 . . df0305b 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / Session . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / Session . java <nl> @ @ - 20 , 10 + 20 , 14 @ @ package org . apache . cassandra . stress ; <nl> import java . io . * ; <nl> import java . net . InetAddress ; <nl> import java . net . UnknownHostException ; <nl> + import java . nio . ByteBuffer ; <nl> import java . util . * ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> import java . util . concurrent . atomic . AtomicLong ; <nl> <nl> + import org . apache . cassandra . config . ConfigurationException ; <nl> + import org . apache . cassandra . db . marshal . AbstractType ; <nl> + import org . apache . cassandra . db . marshal . TypeParser ; <nl> import org . apache . commons . cli . * ; <nl> <nl> import org . apache . cassandra . db . ColumnFamilyType ; <nl> @ @ - 41 , 6 + 45 , 9 @ @ public class Session implements Serializable <nl> / / command line options <nl> public static final Options availableOptions = new Options ( ) ; <nl> <nl> + public static final String DEFAULT _ COMPARATOR = " AsciiType " ; <nl> + public static final String DEFAULT _ VALIDATOR = " BytesType " ; <nl> + <nl> public final AtomicInteger operations ; <nl> public final AtomicInteger keys ; <nl> public final AtomicLong latency ; <nl> @ @ - 78 , 6 + 85 , 7 @ @ public class Session implements Serializable <nl> availableOptions . addOption ( " V " , " average - size - values " , false , " Generate column values of average rather than specific size " ) ; <nl> availableOptions . addOption ( " T " , " send - to " , true , " Send this as a request to the stress daemon at specified address . " ) ; <nl> availableOptions . addOption ( " I " , " compression " , false , " Use sstable compression when creating schema " ) ; <nl> + availableOptions . addOption ( " Q " , " query - names " , true , " Comma - separated list of column names to retrieve from each row . " ) ; <nl> } <nl> <nl> private int numKeys = 1000 * 1000 ; <nl> @ @ - 109 , 6 + 117 , 9 @ @ public class Session implements Serializable <nl> private String replicationStrategy = " org . apache . cassandra . locator . SimpleStrategy " ; <nl> private Map < String , String > replicationStrategyOptions = new HashMap < String , String > ( ) ; <nl> <nl> + / / if we know exactly column names that we want to read ( set by - Q option ) <nl> + public final List < ByteBuffer > columnNames ; <nl> + <nl> public final boolean averageSizeValues ; <nl> <nl> / / required by Gaussian distribution . <nl> @ @ - 275 , 11 + 286 , 30 @ @ public class Session implements Serializable <nl> { <nl> throw new RuntimeException ( e ) ; <nl> } <nl> + <nl> + if ( cmd . hasOption ( " Q " ) ) <nl> + { <nl> + AbstractType comparator = TypeParser . parse ( DEFAULT _ COMPARATOR ) ; <nl> + <nl> + String [ ] names = StringUtils . split ( cmd . getOptionValue ( " Q " ) , " , " ) ; <nl> + columnNames = new ArrayList < ByteBuffer > ( names . length ) ; <nl> + <nl> + for ( String columnName : names ) <nl> + columnNames . add ( comparator . fromString ( columnName ) ) ; <nl> + } <nl> + else <nl> + { <nl> + columnNames = null ; <nl> + } <nl> } <nl> catch ( ParseException e ) <nl> { <nl> throw new IllegalArgumentException ( e . getMessage ( ) , e ) ; <nl> } <nl> + catch ( ConfigurationException e ) <nl> + { <nl> + throw new IllegalStateException ( e . getMessage ( ) , e ) ; <nl> + } <nl> <nl> mean = numDifferentKeys / 2 ; <nl> sigma = numDifferentKeys * STDev ; <nl> @ @ - 417 , 8 + 447 , 11 @ @ public class Session implements Serializable <nl> <nl> / / column family for standard columns <nl> CfDef standardCfDef = new CfDef ( " Keyspace1 " , " Standard1 " ) ; <nl> - System . out . println ( " Compression = " + compression ) ; <nl> - standardCfDef . setComparator _ type ( " AsciiType " ) . setDefault _ validation _ class ( " BytesType " ) . setCompression ( compression ) ; <nl> + <nl> + standardCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) <nl> + . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) <nl> + . setCompression ( compression ) ; <nl> + <nl> if ( indexType ! = null ) <nl> { <nl> ColumnDef standardColumn = new ColumnDef ( ByteBufferUtil . bytes ( " C1 " ) , " BytesType " ) ; <nl> @ @ - 428 , 7 + 461 , 10 @ @ public class Session implements Serializable <nl> <nl> / / column family with super columns <nl> CfDef superCfDef = new CfDef ( " Keyspace1 " , " Super1 " ) . setColumn _ type ( " Super " ) ; <nl> - superCfDef . setComparator _ type ( " AsciiType " ) . setSubcomparator _ type ( " AsciiType " ) . setDefault _ validation _ class ( " BytesType " ) . setCompression ( compression ) ; <nl> + superCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) <nl> + . setSubcomparator _ type ( DEFAULT _ COMPARATOR ) <nl> + . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) <nl> + . setCompression ( compression ) ; <nl> <nl> / / column family for standard counters <nl> CfDef counterCfDef = new CfDef ( " Keyspace1 " , " Counter1 " ) . setDefault _ validation _ class ( " CounterColumnType " ) . setReplicate _ on _ write ( replicateOnWrite ) . setCompression ( compression ) ; <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / operations / Reader . java b / tools / stress / src / org / apache / cassandra / stress / operations / Reader . java <nl> index 6dcd4cd . . b5a8781 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / operations / Reader . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / operations / Reader . java <nl> @ @ - 37 , 16 + 37 , 13 @ @ public class Reader extends Operation <nl> <nl> public void run ( Cassandra . Client client ) throws IOException <nl> { <nl> - SliceRange sliceRange = new SliceRange ( ) ; <nl> - <nl> - / / start / finish <nl> - sliceRange . setStart ( new byte [ ] { } ) . setFinish ( new byte [ ] { } ) ; <nl> - <nl> - / / reversed / count <nl> - sliceRange . setReversed ( false ) . setCount ( session . getColumnsPerKey ( ) ) ; <nl> - <nl> / / initialize SlicePredicate with existing SliceRange <nl> - SlicePredicate predicate = new SlicePredicate ( ) . setSlice _ range ( sliceRange ) ; <nl> + SlicePredicate predicate = new SlicePredicate ( ) ; <nl> + <nl> + if ( session . columnNames = = null ) <nl> + predicate . setSlice _ range ( getSliceRange ( ) ) ; <nl> + else / / see CASSANDRA - 3064 about why this is useful <nl> + predicate . setColumn _ names ( session . columnNames ) ; <nl> <nl> if ( session . getColumnFamilyType ( ) = = ColumnFamilyType . Super ) <nl> { <nl> @ @ - 150 , 4 + 147 , 12 @ @ public class Reader extends Operation <nl> session . latency . getAndAdd ( System . currentTimeMillis ( ) - start ) ; <nl> } <nl> <nl> + private SliceRange getSliceRange ( ) <nl> + { <nl> + return new SliceRange ( ) <nl> + . setStart ( new byte [ ] { } ) <nl> + . setFinish ( new byte [ ] { } ) <nl> + . setReversed ( false ) <nl> + . setCount ( session . getColumnsPerKey ( ) ) ; <nl> + } <nl> }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 483ee0b . . 3cc9937 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 40 , 6 + 40 , 7 @ @ 
+ * Fix LIMT with static columns ( CASSANDRA - 6956 ) 
+ * Fix clash with CQL column name in thrift validation ( CASSANDRA - 6892 ) 
+ * Fix error with super columns in mixed 1 . 2 - 2 . 0 clusters ( CASSANDRA - 6966 ) 
+ + * Fix bad skip of sstables on slice query with composite start / finish ( CASSANDRA - 6825 ) 
+ Merged from 1 . 2 : 
+ * Add UNLOGGED , COUNTER options to BATCH documentation ( CASSANDRA - 6816 ) 
+ * add extra SSL cipher suites ( CASSANDRA - 6613 ) 
+ diff - - git a / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java b / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java 
+ index 53b2c05 . . 56e87e8 100644 
+ - - - a / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java 
+ + + + b / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java 
+ @ @ - 22 , 9 + 22 , 7 @ @ import java . util . * ; 
+ 
+ import com . google . common . base . Objects ; 
+ import com . google . common . base . Predicate ; 
+ - import com . google . common . collect . AbstractIterator ; 
+ import com . google . common . collect . Iterables ; 
+ - import com . google . common . collect . Lists ; 
+ 
+ import org . github . jamm . MemoryMeter ; 
+ 
+ @ @ - 53 , 6 + 51 , 8 @ @ import org . apache . cassandra . serializers . MarshalException ; 
+ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . Pair ; 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ 
+ / * * 
+ * Encapsulates a completely parsed SELECT query , including the target 
+ @ @ - 61 , 6 + 61 , 8 @ @ import org . apache . cassandra . utils . Pair ; 
+ * / 
+ public class SelectStatement implements CQLStatement , MeasurableForPreparedCache 
+ { 
+ + private static final Logger logger = LoggerFactory . getLogger ( SelectStatement . class ) ; 
+ + 
+ private static final int DEFAULT _ COUNT _ PAGE _ SIZE = 10000 ; 
+ 
+ private final int boundTerms ; 
+ @ @ - 257 , 6 + 259 , 7 @ @ public class SelectStatement implements CQLStatement , MeasurableForPreparedCache 
+ while ( ! pager . isExhausted ( ) ) 
+ { 
+ int maxLimit = pager . maxRemaining ( ) ; 
+ + logger . debug ( " New maxLimit for paged count query is { } " , maxLimit ) ; 
+ ResultSet rset = process ( pager . fetchPage ( pageSize ) , variables , maxLimit , now ) ; 
+ count + = rset . rows . size ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / marshal / CompositeType . java b / src / java / org / apache / cassandra / db / marshal / CompositeType . java 
+ index 83e3b97 . . 7f08219 100644 
+ - - - a / src / java / org / apache / cassandra / db / marshal / CompositeType . java 
+ + + + b / src / java / org / apache / cassandra / db / marshal / CompositeType . java 
+ @ @ - 264 , 26 + 264 , 54 @ @ public class CompositeType extends AbstractCompositeType 
+ public boolean intersects ( List < ByteBuffer > minColumnNames , List < ByteBuffer > maxColumnNames , SliceQueryFilter filter ) 
+ { 
+ assert minColumnNames . size ( ) = = maxColumnNames . size ( ) ; 
+ + 
+ + / / If any of the slices in the filter intersect , return true 
+ outer : 
+ for ( ColumnSlice slice : filter . slices ) 
+ { 
+ - / / This slices intersects if all component intersect . And we don ' t intersect 
+ - / / only if no slice intersects 
+ ByteBuffer [ ] start = split ( filter . isReversed ( ) ? slice . finish : slice . start ) ; 
+ ByteBuffer [ ] finish = split ( filter . isReversed ( ) ? slice . start : slice . finish ) ; 
+ - for ( int i = 0 ; i < minColumnNames . size ( ) ; i + + ) 
+ + 
+ + if ( compare ( start , maxColumnNames , true ) > 0 | | compare ( finish , minColumnNames , false ) < 0 ) 
+ + continue ; / / slice does not intersect 
+ + 
+ + / / We could safely return true here , but there ' s a minor optimization : if the first component is restricted 
+ + / / to a single value , we can check that the second component falls within the min / max for that component 
+ + / / ( and repeat for all components ) . 
+ + for ( int i = 0 ; i < Math . min ( Math . min ( start . length , finish . length ) , minColumnNames . size ( ) ) ; i + + ) 
+ { 
+ AbstractType < ? > t = types . get ( i ) ; 
+ - ByteBuffer s = i < start . length ? start [ i ] : ByteBufferUtil . EMPTY _ BYTE _ BUFFER ; 
+ - ByteBuffer f = i < finish . length ? finish [ i ] : ByteBufferUtil . EMPTY _ BYTE _ BUFFER ; 
+ - if ( ! t . intersects ( minColumnNames . get ( i ) , maxColumnNames . get ( i ) , s , f ) ) 
+ + 
+ + / / we already know the first component falls within its min / max range ( otherwise we wouldn ' t get here ) 
+ + if ( i > 0 & & ! t . intersects ( minColumnNames . get ( i ) , maxColumnNames . get ( i ) , start [ i ] , finish [ i ] ) ) 
+ continue outer ; 
+ + 
+ + / / if this component isn ' t equal in the start and finish , we don ' t need to check any more 
+ + if ( t . compare ( start [ i ] , finish [ i ] ) ! = 0 ) 
+ + break ; 
+ } 
+ return true ; 
+ } 
+ + 
+ + / / none of the slices intersected 
+ return false ; 
+ } 
+ 
+ + / * * Helper method for intersects ( ) * / 
+ + private int compare ( ByteBuffer [ ] sliceBounds , List < ByteBuffer > sstableBounds , boolean isSliceStart ) 
+ + { 
+ + for ( int i = 0 ; i < sstableBounds . size ( ) ; i + + ) 
+ + { 
+ + if ( i > = sliceBounds . length ) 
+ + return isSliceStart ? - 1 : 1 ; 
+ + 
+ + int comparison = types . get ( i ) . compare ( sliceBounds [ i ] , sstableBounds . get ( i ) ) ; 
+ + if ( comparison ! = 0 ) 
+ + return comparison ; 
+ + } 
+ + return 0 ; 
+ + } 
+ + 
+ private static class StaticParsedComparator implements ParsedComparator 
+ { 
+ final AbstractType < ? > type ; 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java b / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java 
+ index 1b4bdbd . . 4210296 100644 
+ - - - a / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java 
+ + + + b / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java 
+ @ @ - 32 , 9 + 32 , 13 @ @ import org . apache . cassandra . db . filter . ColumnCounter ; 
+ import org . apache . cassandra . db . filter . IDiskAtomFilter ; 
+ import org . apache . cassandra . exceptions . RequestExecutionException ; 
+ import org . apache . cassandra . exceptions . RequestValidationException ; 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ 
+ abstract class AbstractQueryPager implements QueryPager 
+ { 
+ + private static final Logger logger = LoggerFactory . getLogger ( AbstractQueryPager . class ) ; 
+ + 
+ private final ConsistencyLevel consistencyLevel ; 
+ private final boolean localQuery ; 
+ 
+ @ @ - 85 , 11 + 89 , 13 @ @ abstract class AbstractQueryPager implements QueryPager 
+ 
+ if ( rows . isEmpty ( ) ) 
+ { 
+ + logger . debug ( " Got empty set of rows , considering pager exhausted " ) ; 
+ exhausted = true ; 
+ return Collections . emptyList ( ) ; 
+ } 
+ 
+ int liveCount = getPageLiveCount ( rows ) ; 
+ + logger . debug ( " Fetched { } live rows " , liveCount ) ; 
+ 
+ / / Because SP . getRangeSlice doesn ' t trim the result ( see SP . trim ( ) ) , liveCount may be greater than what asked 
+ / / ( currentPageSize ) . This would throw off the paging logic so we trim the excess . It ' s not extremely efficient 
+ @ @ - 105 , 7 + 111 , 10 @ @ abstract class AbstractQueryPager implements QueryPager 
+ / / If we ' ve got less than requested , there is no more query to do ( but 
+ / / we still need to return the current page ) 
+ if ( liveCount < currentPageSize ) 
+ + { 
+ + logger . debug ( " Got result ( { } ) smaller than page size ( { } ) , considering pager exhausted " , liveCount , currentPageSize ) ; 
+ exhausted = true ; 
+ + } 
+ 
+ / / If it ' s not the first query and the first column is the last one returned ( likely 
+ / / but not certain since paging can race with deletes / expiration ) , then remove the 
+ @ @ - 124 , 6 + 133 , 8 @ @ abstract class AbstractQueryPager implements QueryPager 
+ remaining + + ; 
+ } 
+ 
+ + logger . debug ( " Remaining rows to page : { } " , remaining ) ; 
+ + 
+ if ( ! isExhausted ( ) ) 
+ lastWasRecorded = recordLast ( rows . get ( rows . size ( ) - 1 ) ) ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java b / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java 
+ index c94f7f6 . . ec229cb 100644 
+ - - - a / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java 
+ + + + b / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java 
+ @ @ - 26 , 12 + 26 , 16 @ @ import org . apache . cassandra . db . filter . SliceQueryFilter ; 
+ import org . apache . cassandra . exceptions . RequestValidationException ; 
+ import org . apache . cassandra . exceptions . RequestExecutionException ; 
+ import org . apache . cassandra . service . StorageProxy ; 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ 
+ / * * 
+ * Pager over a SliceFromReadCommand . 
+ * / 
+ public class SliceQueryPager extends AbstractQueryPager implements SinglePartitionPager 
+ { 
+ + private static final Logger logger = LoggerFactory . getLogger ( SliceQueryPager . class ) ; 
+ + 
+ private final SliceFromReadCommand command ; 
+ 
+ private volatile ByteBuffer lastReturned ; 
+ @ @ - 73 , 6 + 77 , 7 @ @ public class SliceQueryPager extends AbstractQueryPager implements SinglePartiti 
+ if ( lastReturned ! = null ) 
+ filter = filter . withUpdatedStart ( lastReturned , cfm . comparator ) ; 
+ 
+ + logger . debug ( " Querying next page of slice query ; new filter : { } " , filter ) ; 
+ ReadCommand pageCmd = command . withUpdatedFilter ( filter ) ; 
+ return localQuery 
+ ? Collections . singletonList ( pageCmd . getRow ( Keyspace . open ( command . ksName ) ) ) 
+ diff - - git a / test / unit / org / apache / cassandra / db / marshal / CompositeTypeTest . java b / test / unit / org / apache / cassandra / db / marshal / CompositeTypeTest . java 
+ index 1039fb6 . . 20cb5ef 100644 
+ - - - a / test / unit / org / apache / cassandra / db / marshal / CompositeTypeTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / marshal / CompositeTypeTest . java 
+ @ @ - 24 , 10 + 24 , 14 @ @ import java . util . Iterator ; 
+ import java . util . List ; 
+ import java . util . UUID ; 
+ 
+ + import org . apache . cassandra . db . filter . ColumnSlice ; 
+ + import org . apache . cassandra . db . filter . SliceQueryFilter ; 
+ import org . apache . cassandra . serializers . MarshalException ; 
+ import org . junit . Test ; 
+ import static org . junit . Assert . fail ; 
+ import static org . junit . Assert . assertEquals ; 
+ + import static org . junit . Assert . assertFalse ; 
+ + import static org . junit . Assert . assertTrue ; 
+ 
+ import org . apache . cassandra . SchemaLoader ; 
+ import org . apache . cassandra . Util ; 
+ @ @ - 255 , 6 + 259 , 296 @ @ public class CompositeTypeTest extends SchemaLoader 
+ } 
+ } 
+ 
+ + @ Test 
+ + public void testIntersectsSingleSlice ( ) 
+ + { 
+ + CompositeType comparator = CompositeType . getInstance ( Int32Type . instance , Int32Type . instance , Int32Type . instance ) ; 
+ + 
+ + / / filter falls entirely before sstable 
+ + SliceQueryFilter filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 1 , 0 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with empty start 
+ + filter = new SliceQueryFilter ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER , composite ( 1 , 0 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing components for start 
+ + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 0 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing components for start and end 
+ + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + 
+ + / / end of slice matches start of sstable for the first component , but not the second component 
+ + filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 1 , 0 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing components for start 
+ + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 0 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing components for start and end 
+ + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / first two components match , but not the last 
+ + filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 1 , 1 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 1 ) , columnNames ( 3 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + / / all three components in slice end match the start of the sstable 
+ + filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 1 , 1 ) , columnNames ( 3 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + 
+ + / / filter falls entirely after sstable 
+ + filter = new SliceQueryFilter ( composite ( 4 , 0 , 0 ) , composite ( 4 , 0 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with empty end 
+ + filter = new SliceQueryFilter ( composite ( 4 , 0 , 0 ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing components for end 
+ + filter = new SliceQueryFilter ( composite ( 4 , 0 , 0 ) , composite ( 1 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing components for start and end 
+ + filter = new SliceQueryFilter ( composite ( 4 , 0 ) , composite ( 1 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + 
+ + / / start of slice matches end of sstable for the first component , but not the second component 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 1 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / start of slice matches end of sstable for the first two components , but not the last component 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 1 , 1 , 0 ) , filter ) ) ; 
+ + 
+ + / / all three components in the slice start match the end of the sstable 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + 
+ + / / slice covers entire sstable ( with no matching edges ) 
+ + filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + / / same case , but with empty ends 
+ + filter = new SliceQueryFilter ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing components 
+ + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 2 , 0 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + / / slice covers entire sstable ( with matching start ) 
+ + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + / / slice covers entire sstable ( with matching end ) 
+ + filter = new SliceQueryFilter ( composite ( 0 , 0 , 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + / / slice covers entire sstable ( with matching start and end ) 
+ + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + 
+ + / / slice falls entirely within sstable ( with matching start ) 
+ + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 1 , 1 , 0 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + / / same case , but with a missing end component 
+ + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + / / slice falls entirely within sstable ( with matching end ) 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 , 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + / / same case , but with a missing start component 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 1 , 1 , 1 ) , filter ) ) ; 
+ + 
+ + 
+ + / / slice falls entirely within sstable 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 , 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 2 , 2 ) , filter ) ) ; 
+ + 
+ + / / same case , but with a missing start component 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 2 , 2 ) , filter ) ) ; 
+ + 
+ + / / same case , but with a missing start and end components 
+ + filter = new SliceQueryFilter ( composite ( 1 ) , composite ( 1 , 2 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 2 , 2 ) , filter ) ) ; 
+ + 
+ + / / slice falls entirely within sstable ( slice start and end are the same ) 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 2 , 2 ) , filter ) ) ; 
+ + 
+ + 
+ + / / slice starts within sstable , empty end 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing end components 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 3 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / slice starts within sstable ( matching sstable start ) , empty end 
+ + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing end components 
+ + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 3 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / slice starts within sstable ( matching sstable end ) , empty end 
+ + filter = new SliceQueryFilter ( composite ( 2 , 0 , 0 ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing end components 
+ + filter = new SliceQueryFilter ( composite ( 2 , 0 , 0 ) , composite ( 3 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + 
+ + / / slice ends within sstable , empty end 
+ + filter = new SliceQueryFilter ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER , composite ( 1 , 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing start components 
+ + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 1 , 1 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / slice ends within sstable ( matching sstable start ) , empty start 
+ + filter = new SliceQueryFilter ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER , composite ( 1 , 0 , 0 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing start components 
+ + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 1 , 0 , 0 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / slice ends within sstable ( matching sstable end ) , empty start 
+ + filter = new SliceQueryFilter ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER , composite ( 2 , 0 , 0 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with missing start components 
+ + filter = new SliceQueryFilter ( composite ( 0 ) , composite ( 2 , 0 , 0 ) , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + 
+ + / / the slice technically falls within the sstable range , but since the first component is restricted to 
+ + / / a single value , we can check that the second component does not fall within its min / max 
+ + filter = new SliceQueryFilter ( composite ( 1 , 2 , 0 ) , composite ( 1 , 3 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with a missing start component 
+ + filter = new SliceQueryFilter ( composite ( 1 , 2 ) , composite ( 1 , 3 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with a missing end component 
+ + filter = new SliceQueryFilter ( composite ( 1 , 2 , 0 ) , composite ( 1 , 3 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with a missing start and end components 
+ + filter = new SliceQueryFilter ( composite ( 1 , 2 ) , composite ( 1 , 3 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; 
+ + 
+ + 
+ + / / same as the previous set of tests , but the second component is equal in the slice start and end 
+ + filter = new SliceQueryFilter ( composite ( 1 , 2 , 0 ) , composite ( 1 , 2 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with a missing start component 
+ + filter = new SliceQueryFilter ( composite ( 1 , 2 ) , composite ( 1 , 2 , 0 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with a missing end component 
+ + filter = new SliceQueryFilter ( composite ( 1 , 2 , 0 ) , composite ( 1 , 2 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; 
+ + 
+ + / / same case , but with a missing start and end components 
+ + filter = new SliceQueryFilter ( composite ( 1 , 2 ) , composite ( 1 , 2 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 1 , 0 ) , filter ) ) ; 
+ + 
+ + / / same as the previous tests , but it ' s the third component that doesn ' t fit in its range this time 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 , 2 ) , composite ( 1 , 1 , 3 ) , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 0 ) , columnNames ( 2 , 2 , 1 ) , filter ) ) ; 
+ + 
+ + 
+ + / / basic check on reversed slices 
+ + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 0 , 0 , 0 ) , true , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 2 , 0 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + filter = new SliceQueryFilter ( composite ( 1 , 0 , 0 ) , composite ( 0 , 0 , 0 ) , true , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 1 , 1 , 0 ) , columnNames ( 3 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + filter = new SliceQueryFilter ( composite ( 1 , 1 , 1 ) , composite ( 1 , 1 , 0 ) , true , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 1 , 0 , 0 ) , columnNames ( 2 , 2 , 2 ) , filter ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testIntersectsMultipleSlices ( ) 
+ + { 
+ + CompositeType comparator = CompositeType . getInstance ( Int32Type . instance , Int32Type . instance , Int32Type . instance ) ; 
+ + 
+ + / / all slices intersect 
+ + SliceQueryFilter filter = new SliceQueryFilter ( new ColumnSlice [ ] { 
+ + new ColumnSlice ( composite ( 1 , 0 , 0 ) , composite ( 2 , 0 , 0 ) ) , 
+ + new ColumnSlice ( composite ( 3 , 0 , 0 ) , composite ( 4 , 0 , 0 ) ) , 
+ + new ColumnSlice ( composite ( 5 , 0 , 0 ) , composite ( 6 , 0 , 0 ) ) , 
+ + } , false , 1 ) ; 
+ + 
+ + / / first slice doesn ' t intersect 
+ + assertTrue ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 7 , 0 , 0 ) , filter ) ) ; 
+ + filter = new SliceQueryFilter ( new ColumnSlice [ ] { 
+ + new ColumnSlice ( composite ( 1 , 0 , 0 ) , composite ( 2 , 0 , 0 ) ) , 
+ + new ColumnSlice ( composite ( 3 , 0 , 0 ) , composite ( 4 , 0 , 0 ) ) , 
+ + new ColumnSlice ( composite ( 5 , 0 , 0 ) , composite ( 6 , 0 , 0 ) ) , 
+ + } , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 3 , 0 , 0 ) , columnNames ( 7 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / first two slices don ' t intersect 
+ + assertTrue ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 7 , 0 , 0 ) , filter ) ) ; 
+ + filter = new SliceQueryFilter ( new ColumnSlice [ ] { 
+ + new ColumnSlice ( composite ( 1 , 0 , 0 ) , composite ( 2 , 0 , 0 ) ) , 
+ + new ColumnSlice ( composite ( 3 , 0 , 0 ) , composite ( 4 , 0 , 0 ) ) , 
+ + new ColumnSlice ( composite ( 5 , 0 , 0 ) , composite ( 6 , 0 , 0 ) ) , 
+ + } , false , 1 ) ; 
+ + assertTrue ( comparator . intersects ( columnNames ( 5 , 0 , 0 ) , columnNames ( 7 , 0 , 0 ) , filter ) ) ; 
+ + 
+ + / / none of the slices intersect 
+ + assertTrue ( comparator . intersects ( columnNames ( 0 , 0 , 0 ) , columnNames ( 7 , 0 , 0 ) , filter ) ) ; 
+ + filter = new SliceQueryFilter ( new ColumnSlice [ ] { 
+ + new ColumnSlice ( composite ( 1 , 0 , 0 ) , composite ( 2 , 0 , 0 ) ) , 
+ + new ColumnSlice ( composite ( 3 , 0 , 0 ) , composite ( 4 , 0 , 0 ) ) , 
+ + new ColumnSlice ( composite ( 5 , 0 , 0 ) , composite ( 6 , 0 , 0 ) ) , 
+ + } , false , 1 ) ; 
+ + assertFalse ( comparator . intersects ( columnNames ( 7 , 0 , 0 ) , columnNames ( 8 , 0 , 0 ) , filter ) ) ; 
+ + } 
+ + 
+ + 
+ + private static ByteBuffer composite ( Integer . . . components ) 
+ + { 
+ + CompositeType comparator = CompositeType . getInstance ( Int32Type . instance , Int32Type . instance , Int32Type . instance ) ; 
+ + CompositeType . Builder builder = comparator . builder ( ) ; 
+ + for ( int component : components ) 
+ + builder . add ( ByteBufferUtil . bytes ( component ) ) ; 
+ + return builder . build ( ) ; 
+ + } 
+ + 
+ + private static List < ByteBuffer > columnNames ( Integer . . . components ) 
+ + { 
+ + List < ByteBuffer > names = new ArrayList < > ( components . length ) ; 
+ + for ( int component : components ) 
+ + names . add ( ByteBufferUtil . bytes ( component ) ) ; 
+ + return names ; 
+ + } 
+ + 
+ private void addColumn ( RowMutation rm , ByteBuffer cname ) 
+ { 
+ rm . add ( cfName , cname , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 0 ) ;
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 70281be . . fd96002 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 37 , 7 + 37 , 7 @ @ 
+ and few other places responsible for work with SSTable files ( CASSANDRA - 3040 ) 
+ * Stop reading from sstables once we know we have the most recent columns , 
+ for query - by - name requests ( CASSANDRA - 2498 ) 
+ - 
+ + * Add query - by - column mode to stress . java ( CASSANDRA - 3064 ) 
+ 
+ 0 . 8 . 5 
+ * fix NPE when encryption _ options is unspecified ( CASSANDRA - 3007 ) 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / Session . java b / tools / stress / src / org / apache / cassandra / stress / Session . java 
+ index 1508379 . . df0305b 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / Session . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / Session . java 
+ @ @ - 20 , 10 + 20 , 14 @ @ package org . apache . cassandra . stress ; 
+ import java . io . * ; 
+ import java . net . InetAddress ; 
+ import java . net . UnknownHostException ; 
+ + import java . nio . ByteBuffer ; 
+ import java . util . * ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ import java . util . concurrent . atomic . AtomicLong ; 
+ 
+ + import org . apache . cassandra . config . ConfigurationException ; 
+ + import org . apache . cassandra . db . marshal . AbstractType ; 
+ + import org . apache . cassandra . db . marshal . TypeParser ; 
+ import org . apache . commons . cli . * ; 
+ 
+ import org . apache . cassandra . db . ColumnFamilyType ; 
+ @ @ - 41 , 6 + 45 , 9 @ @ public class Session implements Serializable 
+ / / command line options 
+ public static final Options availableOptions = new Options ( ) ; 
+ 
+ + public static final String DEFAULT _ COMPARATOR = " AsciiType " ; 
+ + public static final String DEFAULT _ VALIDATOR = " BytesType " ; 
+ + 
+ public final AtomicInteger operations ; 
+ public final AtomicInteger keys ; 
+ public final AtomicLong latency ; 
+ @ @ - 78 , 6 + 85 , 7 @ @ public class Session implements Serializable 
+ availableOptions . addOption ( " V " , " average - size - values " , false , " Generate column values of average rather than specific size " ) ; 
+ availableOptions . addOption ( " T " , " send - to " , true , " Send this as a request to the stress daemon at specified address . " ) ; 
+ availableOptions . addOption ( " I " , " compression " , false , " Use sstable compression when creating schema " ) ; 
+ + availableOptions . addOption ( " Q " , " query - names " , true , " Comma - separated list of column names to retrieve from each row . " ) ; 
+ } 
+ 
+ private int numKeys = 1000 * 1000 ; 
+ @ @ - 109 , 6 + 117 , 9 @ @ public class Session implements Serializable 
+ private String replicationStrategy = " org . apache . cassandra . locator . SimpleStrategy " ; 
+ private Map < String , String > replicationStrategyOptions = new HashMap < String , String > ( ) ; 
+ 
+ + / / if we know exactly column names that we want to read ( set by - Q option ) 
+ + public final List < ByteBuffer > columnNames ; 
+ + 
+ public final boolean averageSizeValues ; 
+ 
+ / / required by Gaussian distribution . 
+ @ @ - 275 , 11 + 286 , 30 @ @ public class Session implements Serializable 
+ { 
+ throw new RuntimeException ( e ) ; 
+ } 
+ + 
+ + if ( cmd . hasOption ( " Q " ) ) 
+ + { 
+ + AbstractType comparator = TypeParser . parse ( DEFAULT _ COMPARATOR ) ; 
+ + 
+ + String [ ] names = StringUtils . split ( cmd . getOptionValue ( " Q " ) , " , " ) ; 
+ + columnNames = new ArrayList < ByteBuffer > ( names . length ) ; 
+ + 
+ + for ( String columnName : names ) 
+ + columnNames . add ( comparator . fromString ( columnName ) ) ; 
+ + } 
+ + else 
+ + { 
+ + columnNames = null ; 
+ + } 
+ } 
+ catch ( ParseException e ) 
+ { 
+ throw new IllegalArgumentException ( e . getMessage ( ) , e ) ; 
+ } 
+ + catch ( ConfigurationException e ) 
+ + { 
+ + throw new IllegalStateException ( e . getMessage ( ) , e ) ; 
+ + } 
+ 
+ mean = numDifferentKeys / 2 ; 
+ sigma = numDifferentKeys * STDev ; 
+ @ @ - 417 , 8 + 447 , 11 @ @ public class Session implements Serializable 
+ 
+ / / column family for standard columns 
+ CfDef standardCfDef = new CfDef ( " Keyspace1 " , " Standard1 " ) ; 
+ - System . out . println ( " Compression = " + compression ) ; 
+ - standardCfDef . setComparator _ type ( " AsciiType " ) . setDefault _ validation _ class ( " BytesType " ) . setCompression ( compression ) ; 
+ + 
+ + standardCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) 
+ + . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) 
+ + . setCompression ( compression ) ; 
+ + 
+ if ( indexType ! = null ) 
+ { 
+ ColumnDef standardColumn = new ColumnDef ( ByteBufferUtil . bytes ( " C1 " ) , " BytesType " ) ; 
+ @ @ - 428 , 7 + 461 , 10 @ @ public class Session implements Serializable 
+ 
+ / / column family with super columns 
+ CfDef superCfDef = new CfDef ( " Keyspace1 " , " Super1 " ) . setColumn _ type ( " Super " ) ; 
+ - superCfDef . setComparator _ type ( " AsciiType " ) . setSubcomparator _ type ( " AsciiType " ) . setDefault _ validation _ class ( " BytesType " ) . setCompression ( compression ) ; 
+ + superCfDef . setComparator _ type ( DEFAULT _ COMPARATOR ) 
+ + . setSubcomparator _ type ( DEFAULT _ COMPARATOR ) 
+ + . setDefault _ validation _ class ( DEFAULT _ VALIDATOR ) 
+ + . setCompression ( compression ) ; 
+ 
+ / / column family for standard counters 
+ CfDef counterCfDef = new CfDef ( " Keyspace1 " , " Counter1 " ) . setDefault _ validation _ class ( " CounterColumnType " ) . setReplicate _ on _ write ( replicateOnWrite ) . setCompression ( compression ) ; 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / operations / Reader . java b / tools / stress / src / org / apache / cassandra / stress / operations / Reader . java 
+ index 6dcd4cd . . b5a8781 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / operations / Reader . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / operations / Reader . java 
+ @ @ - 37 , 16 + 37 , 13 @ @ public class Reader extends Operation 
+ 
+ public void run ( Cassandra . Client client ) throws IOException 
+ { 
+ - SliceRange sliceRange = new SliceRange ( ) ; 
+ - 
+ - / / start / finish 
+ - sliceRange . setStart ( new byte [ ] { } ) . setFinish ( new byte [ ] { } ) ; 
+ - 
+ - / / reversed / count 
+ - sliceRange . setReversed ( false ) . setCount ( session . getColumnsPerKey ( ) ) ; 
+ - 
+ / / initialize SlicePredicate with existing SliceRange 
+ - SlicePredicate predicate = new SlicePredicate ( ) . setSlice _ range ( sliceRange ) ; 
+ + SlicePredicate predicate = new SlicePredicate ( ) ; 
+ + 
+ + if ( session . columnNames = = null ) 
+ + predicate . setSlice _ range ( getSliceRange ( ) ) ; 
+ + else / / see CASSANDRA - 3064 about why this is useful 
+ + predicate . setColumn _ names ( session . columnNames ) ; 
+ 
+ if ( session . getColumnFamilyType ( ) = = ColumnFamilyType . Super ) 
+ { 
+ @ @ - 150 , 4 + 147 , 12 @ @ public class Reader extends Operation 
+ session . latency . getAndAdd ( System . currentTimeMillis ( ) - start ) ; 
+ } 
+ 
+ + private SliceRange getSliceRange ( ) 
+ + { 
+ + return new SliceRange ( ) 
+ + . setStart ( new byte [ ] { } ) 
+ + . setFinish ( new byte [ ] { } ) 
+ + . setReversed ( false ) 
+ + . setCount ( session . getColumnsPerKey ( ) ) ; 
+ + } 
+ }

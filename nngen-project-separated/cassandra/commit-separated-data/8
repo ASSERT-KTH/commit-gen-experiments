@@ -1,0 +1,517 @@
+BLEU SCORE: 0.06567274736060397
+
+TEST MSG: Bootstrap replace produce correct pending range calculations
+GENERATED MSG: Calculate pending ranges asynchronously .
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 7e1b5eb . . 2254452 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 4 . 0 <nl> + * Calculate pending ranges for BOOTSTRAP _ REPLACE correctly ( CASSANDRA - 14802 ) <nl> * Make TableCQLHelper reuse the single quote pattern ( CASSANDRA - 15033 ) <nl> * Add Zstd compressor ( CASSANDRA - 14482 ) <nl> * Fix IR prepare anti - compaction race ( CASSANDRA - 15027 ) <nl> diff - - git a / src / java / org / apache / cassandra / locator / TokenMetadata . java b / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> index cb189c8 . . c16538b 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> + + + b / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> @ @ - 906 , 19 + 906 , 23 @ @ public class TokenMetadata <nl> / / At this stage newPendingRanges has been updated according to leave operations . We can <nl> / / now continue the calculation by checking bootstrapping nodes . <nl> <nl> - / / For each of the bootstrapping nodes , simply add and remove them one by one to <nl> - / / allLeftMetadata and check in between what their ranges would be . <nl> + / / For each of the bootstrapping nodes , simply add to the allLeftMetadata and check what their <nl> + / / ranges would be . We actually need to clone allLeftMetadata each time as resetting its state <nl> + / / after getting the new pending ranges is not as simple as just removing the bootstrapping <nl> + / / endpoint . If the bootstrapping endpoint constitutes a replacement , removing it after checking <nl> + / / the newly pending ranges means there are now fewer endpoints that there were originally and <nl> + / / causes its next neighbour to take over its primary range which affects the next RF endpoints <nl> + / / in the ring . <nl> Multimap < InetAddressAndPort , Token > bootstrapAddresses = bootstrapTokens . inverse ( ) ; <nl> for ( InetAddressAndPort endpoint : bootstrapAddresses . keySet ( ) ) <nl> { <nl> Collection < Token > tokens = bootstrapAddresses . get ( endpoint ) ; <nl> - <nl> - allLeftMetadata . updateNormalTokens ( tokens , endpoint ) ; <nl> - for ( Replica replica : strategy . getAddressReplicas ( allLeftMetadata , endpoint ) ) <nl> + TokenMetadata cloned = allLeftMetadata . cloneOnlyTokenMap ( ) ; <nl> + cloned . updateNormalTokens ( tokens , endpoint ) ; <nl> + for ( Replica replica : strategy . getAddressReplicas ( cloned , endpoint ) ) <nl> { <nl> newPendingRanges . addPendingRange ( replica . range ( ) , replica ) ; <nl> } <nl> - allLeftMetadata . removeEndpoint ( endpoint ) ; <nl> } <nl> <nl> / / At this stage newPendingRanges has been updated according to leaving and bootstrapping nodes . <nl> diff - - git a / test / unit / org / apache / cassandra / locator / PendingRangesTest . java b / test / unit / org / apache / cassandra / locator / PendingRangesTest . java <nl> new file mode 100644 <nl> index 0000000 . . 48bf546 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / locator / PendingRangesTest . java <nl> @ @ - 0 , 0 + 1 , 260 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + <nl> + package org . apache . cassandra . locator ; <nl> + <nl> + import java . net . UnknownHostException ; <nl> + import java . util . Collections ; <nl> + <nl> + import com . google . common . collect . * ; <nl> + import org . junit . BeforeClass ; <nl> + import org . junit . Test ; <nl> + <nl> + <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . dht . Murmur3Partitioner ; <nl> + import org . apache . cassandra . dht . Token ; <nl> + <nl> + import static org . junit . Assert . assertEquals ; <nl> + import static org . junit . Assert . assertTrue ; <nl> + <nl> + public class PendingRangesTest <nl> + { <nl> + private static final String RACK1 = " RACK1 " ; <nl> + private static final String DC1 = " DC1 " ; <nl> + private static final String KEYSPACE = " ks " ; <nl> + private static final InetAddressAndPort PEER1 = peer ( 1 ) ; <nl> + private static final InetAddressAndPort PEER2 = peer ( 2 ) ; <nl> + private static final InetAddressAndPort PEER3 = peer ( 3 ) ; <nl> + private static final InetAddressAndPort PEER4 = peer ( 4 ) ; <nl> + private static final InetAddressAndPort PEER5 = peer ( 5 ) ; <nl> + private static final InetAddressAndPort PEER6 = peer ( 6 ) ; <nl> + <nl> + private static final InetAddressAndPort PEER1A = peer ( 11 ) ; <nl> + private static final InetAddressAndPort PEER4A = peer ( 14 ) ; <nl> + <nl> + private static final Token TOKEN1 = token ( 0 ) ; <nl> + private static final Token TOKEN2 = token ( 10 ) ; <nl> + private static final Token TOKEN3 = token ( 20 ) ; <nl> + private static final Token TOKEN4 = token ( 30 ) ; <nl> + private static final Token TOKEN5 = token ( 40 ) ; <nl> + private static final Token TOKEN6 = token ( 50 ) ; <nl> + <nl> + @ BeforeClass <nl> + public static void beforeClass ( ) throws Throwable <nl> + { <nl> + DatabaseDescriptor . daemonInitialization ( ) ; <nl> + IEndpointSnitch snitch = snitch ( ) ; <nl> + DatabaseDescriptor . setEndpointSnitch ( snitch ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void calculatePendingRangesForConcurrentReplacements ( ) <nl> + { <nl> + / * <nl> + * As described in CASSANDRA - 14802 , concurrent range movements can generate pending ranges <nl> + * which are far larger than strictly required , which in turn can impact availability . <nl> + * <nl> + * In the narrow case of straight replacement , the pending ranges should mirror the owned ranges <nl> + * of the nodes being replaced . <nl> + * <nl> + * Note : the following example is purely illustrative as the iteration order for processing <nl> + * bootstrapping endpoints is not guaranteed . Because of this , precisely which endpoints ' pending <nl> + * ranges are correct / incorrect depends on the specifics of the ring . Concretely , the bootstrap tokens <nl> + * are ultimately backed by a HashMap , so iteration of bootstrapping nodes is based on the hashcodes <nl> + * of the endpoints . <nl> + * <nl> + * E . g . a 6 node cluster with tokens : <nl> + * <nl> + * nodeA : 0 <nl> + * nodeB : 10 <nl> + * nodeC : 20 <nl> + * nodeD : 30 <nl> + * nodeE : 40 <nl> + * nodeF : 50 <nl> + * <nl> + * with an RF of 3 , this gives an initial ring of : <nl> + * <nl> + * nodeA : ( 50 , 0 ] , ( 40 , 50 ] , ( 30 , 40 ] <nl> + * nodeB : ( 0 , 10 ] , ( 50 , 0 ] , ( 40 , 50 ] <nl> + * nodeC : ( 10 , 20 ] , ( 0 , 10 ] , ( 50 , 0 ] <nl> + * nodeD : ( 20 , 30 ] , ( 10 , 20 ] , ( 0 , 10 ] <nl> + * nodeE : ( 30 , 40 ] , ( 20 , 30 ] , ( 10 , 20 ] <nl> + * nodeF : ( 40 , 50 ] , ( 30 , 40 ] , ( 20 , 30 ] <nl> + * <nl> + * If nodeA is replaced by node1A , then the pending ranges map should be : <nl> + * { <nl> + * ( 50 , 0 ] : [ node1A ] , <nl> + * ( 40 , 50 ] : [ node1A ] , <nl> + * ( 30 , 40 ] : [ node1A ] <nl> + * } <nl> + * <nl> + * Starting a second concurrent replacement of a node with non - overlapping ranges <nl> + * ( i . e . node4 for node4A ) should result in a pending range map of : <nl> + * { <nl> + * ( 50 , 0 ] : [ node1A ] , <nl> + * ( 40 , 50 ] : [ node1A ] , <nl> + * ( 30 , 40 ] : [ node1A ] , <nl> + * ( 20 , 30 ] : [ node4A ] , <nl> + * ( 10 , 20 ] : [ node4A ] , <nl> + * ( 0 , 10 ] : [ node4A ] <nl> + * } <nl> + * <nl> + * But , the bug in CASSANDRA - 14802 causes it to be : <nl> + * { <nl> + * ( 50 , 0 ] : [ node1A ] , <nl> + * ( 40 , 50 ] : [ node1A ] , <nl> + * ( 30 , 40 ] : [ node1A ] , <nl> + * ( 20 , 30 ] : [ node4A ] , <nl> + * ( 10 , 20 ] : [ node4A ] , <nl> + * ( 50 , 10 ] : [ node4A ] <nl> + * } <nl> + * <nl> + * so node4A incorrectly becomes a pending endpoint for an additional sub - range : ( 50 , 0 ) . <nl> + * <nl> + * / <nl> + TokenMetadata tm = new TokenMetadata ( ) ; <nl> + AbstractReplicationStrategy replicationStrategy = simpleStrategy ( tm , 3 ) ; <nl> + <nl> + / / setup initial ring <nl> + addNode ( tm , PEER1 , TOKEN1 ) ; <nl> + addNode ( tm , PEER2 , TOKEN2 ) ; <nl> + addNode ( tm , PEER3 , TOKEN3 ) ; <nl> + addNode ( tm , PEER4 , TOKEN4 ) ; <nl> + addNode ( tm , PEER5 , TOKEN5 ) ; <nl> + addNode ( tm , PEER6 , TOKEN6 ) ; <nl> + <nl> + / / no pending ranges before any replacements <nl> + tm . calculatePendingRanges ( replicationStrategy , KEYSPACE ) ; <nl> + assertEquals ( 0 , Iterators . size ( tm . getPendingRanges ( KEYSPACE ) . iterator ( ) ) ) ; <nl> + <nl> + / / Ranges initially owned by PEER1 and PEER4 <nl> + RangesAtEndpoint peer1Ranges = replicationStrategy . getAddressReplicas ( tm ) . get ( PEER1 ) ; <nl> + RangesAtEndpoint peer4Ranges = replicationStrategy . getAddressReplicas ( tm ) . get ( PEER4 ) ; <nl> + / / Replace PEER1 with PEER1A <nl> + replace ( PEER1 , PEER1A , TOKEN1 , tm , replicationStrategy ) ; <nl> + / / The only pending ranges should be the ones previously belonging to PEER1 <nl> + / / and these should have a single pending endpoint , PEER1A <nl> + RangesByEndpoint . Builder b1 = new RangesByEndpoint . Builder ( ) ; <nl> + peer1Ranges . iterator ( ) . forEachRemaining ( replica - > b1 . put ( PEER1A , new Replica ( PEER1A , replica . range ( ) , replica . isFull ( ) ) ) ) ; <nl> + RangesByEndpoint expected = b1 . build ( ) ; <nl> + assertPendingRanges ( tm . getPendingRanges ( KEYSPACE ) , expected ) ; <nl> + / / Also verify the Multimap variant of getPendingRanges <nl> + assertPendingRanges ( tm . getPendingRangesMM ( KEYSPACE ) , expected ) ; <nl> + <nl> + / / Replace PEER4 with PEER4A <nl> + replace ( PEER4 , PEER4A , TOKEN4 , tm , replicationStrategy ) ; <nl> + / / Pending ranges should now include the ranges originally belonging <nl> + / / to PEER1 ( now pending for PEER1A ) and the ranges originally belonging to PEER4 <nl> + / / ( now pending for PEER4A ) . <nl> + RangesByEndpoint . Builder b2 = new RangesByEndpoint . Builder ( ) ; <nl> + peer1Ranges . iterator ( ) . forEachRemaining ( replica - > b2 . put ( PEER1A , new Replica ( PEER1A , replica . range ( ) , replica . isFull ( ) ) ) ) ; <nl> + peer4Ranges . iterator ( ) . forEachRemaining ( replica - > b2 . put ( PEER4A , new Replica ( PEER4A , replica . range ( ) , replica . isFull ( ) ) ) ) ; <nl> + expected = b2 . build ( ) ; <nl> + assertPendingRanges ( tm . getPendingRanges ( KEYSPACE ) , expected ) ; <nl> + assertPendingRanges ( tm . getPendingRangesMM ( KEYSPACE ) , expected ) ; <nl> + } <nl> + <nl> + <nl> + private void assertPendingRanges ( PendingRangeMaps pending , RangesByEndpoint expected ) <nl> + { <nl> + RangesByEndpoint . Builder actual = new RangesByEndpoint . Builder ( ) ; <nl> + pending . iterator ( ) . forEachRemaining ( pendingRange - > { <nl> + Replica replica = Iterators . getOnlyElement ( pendingRange . getValue ( ) . iterator ( ) ) ; <nl> + actual . put ( replica . endpoint ( ) , replica ) ; <nl> + } ) ; <nl> + assertRangesByEndpoint ( expected , actual . build ( ) ) ; <nl> + } <nl> + <nl> + private void assertPendingRanges ( EndpointsByRange pending , RangesByEndpoint expected ) <nl> + { <nl> + RangesByEndpoint . Builder actual = new RangesByEndpoint . Builder ( ) ; <nl> + pending . flattenEntries ( ) . forEach ( entry - > actual . put ( entry . getValue ( ) . endpoint ( ) , entry . getValue ( ) ) ) ; <nl> + assertRangesByEndpoint ( expected , actual . build ( ) ) ; <nl> + } <nl> + <nl> + <nl> + private void assertRangesByEndpoint ( RangesByEndpoint expected , RangesByEndpoint actual ) <nl> + { <nl> + assertEquals ( expected . keySet ( ) , actual . keySet ( ) ) ; <nl> + for ( InetAddressAndPort endpoint : expected . keySet ( ) ) <nl> + { <nl> + RangesAtEndpoint expectedReplicas = expected . get ( endpoint ) ; <nl> + RangesAtEndpoint actualReplicas = actual . get ( endpoint ) ; <nl> + assertEquals ( expectedReplicas . size ( ) , actualReplicas . size ( ) ) ; <nl> + assertTrue ( Iterables . all ( expectedReplicas , actualReplicas : : contains ) ) ; <nl> + } <nl> + } <nl> + <nl> + private void addNode ( TokenMetadata tm , InetAddressAndPort replica , Token token ) <nl> + { <nl> + tm . updateNormalTokens ( Collections . singleton ( token ) , replica ) ; <nl> + } <nl> + <nl> + private void replace ( InetAddressAndPort toReplace , <nl> + InetAddressAndPort replacement , <nl> + Token token , <nl> + TokenMetadata tm , <nl> + AbstractReplicationStrategy replicationStrategy ) <nl> + { <nl> + assertEquals ( toReplace , tm . getEndpoint ( token ) ) ; <nl> + tm . addReplaceTokens ( Collections . singleton ( token ) , replacement , toReplace ) ; <nl> + tm . calculatePendingRanges ( replicationStrategy , KEYSPACE ) ; <nl> + } <nl> + <nl> + private static Token token ( long token ) <nl> + { <nl> + return Murmur3Partitioner . instance . getTokenFactory ( ) . fromString ( Long . toString ( token ) ) ; <nl> + } <nl> + <nl> + private static InetAddressAndPort peer ( int addressSuffix ) <nl> + { <nl> + try <nl> + { <nl> + return InetAddressAndPort . getByAddress ( new byte [ ] { 127 , 0 , 0 , ( byte ) addressSuffix } ) ; <nl> + } <nl> + catch ( UnknownHostException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + private static IEndpointSnitch snitch ( ) <nl> + { <nl> + return new AbstractNetworkTopologySnitch ( ) <nl> + { <nl> + public String getRack ( InetAddressAndPort endpoint ) <nl> + { <nl> + return RACK1 ; <nl> + } <nl> + <nl> + public String getDatacenter ( InetAddressAndPort endpoint ) <nl> + { <nl> + return DC1 ; <nl> + } <nl> + } ; <nl> + } <nl> + <nl> + private static AbstractReplicationStrategy simpleStrategy ( TokenMetadata tokenMetadata , int replicationFactor ) <nl> + { <nl> + return new SimpleStrategy ( KEYSPACE , <nl> + tokenMetadata , <nl> + DatabaseDescriptor . getEndpointSnitch ( ) , <nl> + Collections . singletonMap ( " replication _ factor " , Integer . toString ( replicationFactor ) ) ) ; <nl> + } <nl> + } <nl> \ No newline at end of file
+NEAREST DIFF (one line): diff - - git a / test / unit / org / apache / cassandra / service / LeaveAndBootstrapTest . java b / test / unit / org / apache / cassandra / service / LeaveAndBootstrapTest . java <nl> index faa9e18 . . c2eae5c 100644 <nl> - - - a / test / unit / org / apache / cassandra / service / LeaveAndBootstrapTest . java <nl> + + + b / test / unit / org / apache / cassandra / service / LeaveAndBootstrapTest . java <nl> @ @ - 84 , 6 + 84 , 7 @ @ public class LeaveAndBootstrapTest <nl> List < InetAddress > hosts = new ArrayList < InetAddress > ( ) ; <nl> <nl> Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , RING _ SIZE ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> Map < Token , List < InetAddress > > expectedEndpoints = new HashMap < Token , List < InetAddress > > ( ) ; <nl> for ( String table : Schema . instance . getNonSystemTables ( ) ) <nl> @ @ - 104 , 6 + 105 , 7 @ @ public class LeaveAndBootstrapTest <nl> ss . onChange ( hosts . get ( LEAVING _ NODE ) , <nl> ApplicationState . STATUS , <nl> valueFactory . leaving ( endpointTokens . get ( LEAVING _ NODE ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> assertTrue ( tmd . isLeaving ( hosts . get ( LEAVING _ NODE ) ) ) ; <nl> <nl> AbstractReplicationStrategy strategy ; <nl> @ @ - 152 , 18 + 154 , 20 @ @ public class LeaveAndBootstrapTest <nl> <nl> / / create a ring or 10 nodes <nl> Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , RING _ SIZE ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> / / nodes 6 , 8 and 9 leave <nl> final int [ ] LEAVING = new int [ ] { 6 , 8 , 9 } ; <nl> for ( int leaving : LEAVING ) <nl> ss . onChange ( hosts . get ( leaving ) , ApplicationState . STATUS , valueFactory . leaving ( endpointTokens . get ( leaving ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> / / boot two new nodes with keyTokens . get ( 5 ) and keyTokens . get ( 7 ) <nl> InetAddress boot1 = InetAddress . getByName ( " 127 . 0 . 1 . 1 " ) ; <nl> ss . onChange ( boot1 , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 5 ) ) ) ; <nl> InetAddress boot2 = InetAddress . getByName ( " 127 . 0 . 1 . 2 " ) ; <nl> ss . onChange ( boot2 , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 7 ) ) ) ; <nl> - <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> Collection < InetAddress > endpoints = null ; <nl> <nl> / * don ' t require test update every time a new keyspace is added to test / conf / cassandra . yaml * / <nl> @ @ - 316 , 9 + 320 , 12 @ @ public class LeaveAndBootstrapTest <nl> / / leaving and boot2 in progress <nl> ss . onChange ( hosts . get ( LEAVING [ 0 ] ) , ApplicationState . STATUS , <nl> valueFactory . left ( endpointTokens . get ( LEAVING [ 0 ] ) , Gossiper . computeExpireTime ( ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> ss . onChange ( hosts . get ( LEAVING [ 2 ] ) , ApplicationState . STATUS , <nl> valueFactory . left ( endpointTokens . get ( LEAVING [ 2 ] ) , Gossiper . computeExpireTime ( ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> ss . onChange ( boot1 , ApplicationState . STATUS , valueFactory . normal ( keyTokens . get ( 5 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> / / adjust precalcuated results . this changes what the epected endpoints are . <nl> expectedEndpoints . get ( " Keyspace1 " ) . get ( new BigIntegerToken ( " 55 " ) ) . removeAll ( makeAddrs ( " 127 . 0 . 0 . 7 " , " 127 . 0 . 0 . 8 " ) ) ; <nl> @ @ - 340 , 6 + 347 , 7 @ @ public class LeaveAndBootstrapTest <nl> expectedEndpoints . get ( " Keyspace4 " ) . get ( new BigIntegerToken ( " 75 " ) ) . removeAll ( makeAddrs ( " 127 . 0 . 0 . 10 " ) ) ; <nl> expectedEndpoints . get ( " Keyspace4 " ) . get ( new BigIntegerToken ( " 85 " ) ) . removeAll ( makeAddrs ( " 127 . 0 . 0 . 10 " ) ) ; <nl> <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> for ( Map . Entry < String , AbstractReplicationStrategy > tableStrategy : tableStrategyMap . entrySet ( ) ) <nl> { <nl> String table = tableStrategy . getKey ( ) ; <nl> @ @ - 437 , 9 + 445 , 11 @ @ public class LeaveAndBootstrapTest <nl> <nl> / / create a ring or 5 nodes <nl> Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , 7 ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> / / node 2 leaves <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . leaving ( endpointTokens . get ( 2 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> / / don ' t bother to test pending ranges here , that is extensively tested by other <nl> / / tests . Just check that the node is in appropriate lists . <nl> @ @ - 449 , 6 + 459 , 7 @ @ public class LeaveAndBootstrapTest <nl> <nl> / / Bootstrap the node immedidiately to keyTokens . get ( 4 ) without going through STATE _ LEFT <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 4 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertFalse ( tmd . isMember ( hosts . get ( 2 ) ) ) ; <nl> assertFalse ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; <nl> @ @ - 456 , 6 + 467 , 7 @ @ public class LeaveAndBootstrapTest <nl> <nl> / / Bootstrap node hosts . get ( 3 ) to keyTokens . get ( 1 ) <nl> ss . onChange ( hosts . get ( 3 ) , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 1 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertFalse ( tmd . isMember ( hosts . get ( 3 ) ) ) ; <nl> assertFalse ( tmd . isLeaving ( hosts . get ( 3 ) ) ) ; <nl> @ @ - 473 , 7 + 485 , 9 @ @ public class LeaveAndBootstrapTest <nl> <nl> / / Go to normal again for both nodes <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . normal ( keyTokens . get ( 3 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> ss . onChange ( hosts . get ( 3 ) , ApplicationState . STATUS , valueFactory . normal ( keyTokens . get ( 2 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertTrue ( tmd . isMember ( hosts . get ( 2 ) ) ) ; <nl> assertFalse ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; <nl> @ @ - 500 , 24 + 514 , 30 @ @ public class LeaveAndBootstrapTest <nl> <nl> / / create a ring or 5 nodes <nl> Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , 6 ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> / / node 2 leaves <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . leaving ( endpointTokens . get ( 2 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertTrue ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; <nl> assertTrue ( tmd . getToken ( hosts . get ( 2 ) ) . equals ( endpointTokens . get ( 2 ) ) ) ; <nl> <nl> / / back to normal <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . normal ( keyTokens . get ( 2 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertTrue ( tmd . getLeavingEndpoints ( ) . isEmpty ( ) ) ; <nl> assertTrue ( tmd . getToken ( hosts . get ( 2 ) ) . equals ( keyTokens . get ( 2 ) ) ) ; <nl> <nl> / / node 3 goes through leave and left and then jumps to normal at its new token <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . leaving ( keyTokens . get ( 2 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , <nl> valueFactory . left ( keyTokens . get ( 2 ) , Gossiper . computeExpireTime ( ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . normal ( keyTokens . get ( 4 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertTrue ( tmd . getBootstrapTokens ( ) . isEmpty ( ) ) ; <nl> assertTrue ( tmd . getLeavingEndpoints ( ) . isEmpty ( ) ) ; <nl> @ @ - 539 , 9 + 559 , 11 @ @ public class LeaveAndBootstrapTest <nl> <nl> / / create a ring or 5 nodes <nl> Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , 6 ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> / / node 2 leaves with _ different _ token <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . leaving ( keyTokens . get ( 0 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertTrue ( tmd . getToken ( hosts . get ( 2 ) ) . equals ( keyTokens . get ( 0 ) ) ) ; <nl> assertTrue ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; <nl> @ @ - 549 , 6 + 571 , 7 @ @ public class LeaveAndBootstrapTest <nl> <nl> / / go to boostrap <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 1 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertFalse ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; <nl> assertTrue ( tmd . getBootstrapTokens ( ) . size ( ) = = 1 ) ; <nl> @ @ - 556 , 6 + 579 , 7 @ @ public class LeaveAndBootstrapTest <nl> <nl> / / jump to leaving again <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . leaving ( keyTokens . get ( 1 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertTrue ( tmd . getEndpoint ( keyTokens . get ( 1 ) ) . equals ( hosts . get ( 2 ) ) ) ; <nl> assertTrue ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; <nl> @ @ - 564 , 6 + 588 , 7 @ @ public class LeaveAndBootstrapTest <nl> / / go to state left <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , <nl> valueFactory . left ( keyTokens . get ( 1 ) , Gossiper . computeExpireTime ( ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertFalse ( tmd . isMember ( hosts . get ( 2 ) ) ) ; <nl> assertFalse ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; <nl> @ @ - 584 , 15 + 609 , 18 @ @ public class LeaveAndBootstrapTest <nl> <nl> / / create a ring of 6 nodes <nl> Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , 7 ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> / / node hosts . get ( 2 ) goes jumps to left <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , <nl> valueFactory . left ( endpointTokens . get ( 2 ) , Gossiper . computeExpireTime ( ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertFalse ( tmd . isMember ( hosts . get ( 2 ) ) ) ; <nl> <nl> / / node hosts . get ( 4 ) goes to bootstrap <nl> ss . onChange ( hosts . get ( 3 ) , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 1 ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertFalse ( tmd . isMember ( hosts . get ( 3 ) ) ) ; <nl> assertTrue ( tmd . getBootstrapTokens ( ) . size ( ) = = 1 ) ; <nl> @ @ - 601 , 6 + 629 , 7 @ @ public class LeaveAndBootstrapTest <nl> / / and then directly to ' left ' <nl> ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , <nl> valueFactory . left ( keyTokens . get ( 1 ) , Gossiper . computeExpireTime ( ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> <nl> assertTrue ( tmd . getBootstrapTokens ( ) . size ( ) = = 0 ) ; <nl> assertFalse ( tmd . isMember ( hosts . get ( 2 ) ) ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 7e1b5eb . . 2254452 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 4 . 0 
+ + * Calculate pending ranges for BOOTSTRAP _ REPLACE correctly ( CASSANDRA - 14802 ) 
+ * Make TableCQLHelper reuse the single quote pattern ( CASSANDRA - 15033 ) 
+ * Add Zstd compressor ( CASSANDRA - 14482 ) 
+ * Fix IR prepare anti - compaction race ( CASSANDRA - 15027 ) 
+ diff - - git a / src / java / org / apache / cassandra / locator / TokenMetadata . java b / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ index cb189c8 . . c16538b 100644 
+ - - - a / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ + + + b / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ @ @ - 906 , 19 + 906 , 23 @ @ public class TokenMetadata 
+ / / At this stage newPendingRanges has been updated according to leave operations . We can 
+ / / now continue the calculation by checking bootstrapping nodes . 
+ 
+ - / / For each of the bootstrapping nodes , simply add and remove them one by one to 
+ - / / allLeftMetadata and check in between what their ranges would be . 
+ + / / For each of the bootstrapping nodes , simply add to the allLeftMetadata and check what their 
+ + / / ranges would be . We actually need to clone allLeftMetadata each time as resetting its state 
+ + / / after getting the new pending ranges is not as simple as just removing the bootstrapping 
+ + / / endpoint . If the bootstrapping endpoint constitutes a replacement , removing it after checking 
+ + / / the newly pending ranges means there are now fewer endpoints that there were originally and 
+ + / / causes its next neighbour to take over its primary range which affects the next RF endpoints 
+ + / / in the ring . 
+ Multimap < InetAddressAndPort , Token > bootstrapAddresses = bootstrapTokens . inverse ( ) ; 
+ for ( InetAddressAndPort endpoint : bootstrapAddresses . keySet ( ) ) 
+ { 
+ Collection < Token > tokens = bootstrapAddresses . get ( endpoint ) ; 
+ - 
+ - allLeftMetadata . updateNormalTokens ( tokens , endpoint ) ; 
+ - for ( Replica replica : strategy . getAddressReplicas ( allLeftMetadata , endpoint ) ) 
+ + TokenMetadata cloned = allLeftMetadata . cloneOnlyTokenMap ( ) ; 
+ + cloned . updateNormalTokens ( tokens , endpoint ) ; 
+ + for ( Replica replica : strategy . getAddressReplicas ( cloned , endpoint ) ) 
+ { 
+ newPendingRanges . addPendingRange ( replica . range ( ) , replica ) ; 
+ } 
+ - allLeftMetadata . removeEndpoint ( endpoint ) ; 
+ } 
+ 
+ / / At this stage newPendingRanges has been updated according to leaving and bootstrapping nodes . 
+ diff - - git a / test / unit / org / apache / cassandra / locator / PendingRangesTest . java b / test / unit / org / apache / cassandra / locator / PendingRangesTest . java 
+ new file mode 100644 
+ index 0000000 . . 48bf546 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / locator / PendingRangesTest . java 
+ @ @ - 0 , 0 + 1 , 260 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + 
+ + package org . apache . cassandra . locator ; 
+ + 
+ + import java . net . UnknownHostException ; 
+ + import java . util . Collections ; 
+ + 
+ + import com . google . common . collect . * ; 
+ + import org . junit . BeforeClass ; 
+ + import org . junit . Test ; 
+ + 
+ + 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . dht . Murmur3Partitioner ; 
+ + import org . apache . cassandra . dht . Token ; 
+ + 
+ + import static org . junit . Assert . assertEquals ; 
+ + import static org . junit . Assert . assertTrue ; 
+ + 
+ + public class PendingRangesTest 
+ + { 
+ + private static final String RACK1 = " RACK1 " ; 
+ + private static final String DC1 = " DC1 " ; 
+ + private static final String KEYSPACE = " ks " ; 
+ + private static final InetAddressAndPort PEER1 = peer ( 1 ) ; 
+ + private static final InetAddressAndPort PEER2 = peer ( 2 ) ; 
+ + private static final InetAddressAndPort PEER3 = peer ( 3 ) ; 
+ + private static final InetAddressAndPort PEER4 = peer ( 4 ) ; 
+ + private static final InetAddressAndPort PEER5 = peer ( 5 ) ; 
+ + private static final InetAddressAndPort PEER6 = peer ( 6 ) ; 
+ + 
+ + private static final InetAddressAndPort PEER1A = peer ( 11 ) ; 
+ + private static final InetAddressAndPort PEER4A = peer ( 14 ) ; 
+ + 
+ + private static final Token TOKEN1 = token ( 0 ) ; 
+ + private static final Token TOKEN2 = token ( 10 ) ; 
+ + private static final Token TOKEN3 = token ( 20 ) ; 
+ + private static final Token TOKEN4 = token ( 30 ) ; 
+ + private static final Token TOKEN5 = token ( 40 ) ; 
+ + private static final Token TOKEN6 = token ( 50 ) ; 
+ + 
+ + @ BeforeClass 
+ + public static void beforeClass ( ) throws Throwable 
+ + { 
+ + DatabaseDescriptor . daemonInitialization ( ) ; 
+ + IEndpointSnitch snitch = snitch ( ) ; 
+ + DatabaseDescriptor . setEndpointSnitch ( snitch ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void calculatePendingRangesForConcurrentReplacements ( ) 
+ + { 
+ + / * 
+ + * As described in CASSANDRA - 14802 , concurrent range movements can generate pending ranges 
+ + * which are far larger than strictly required , which in turn can impact availability . 
+ + * 
+ + * In the narrow case of straight replacement , the pending ranges should mirror the owned ranges 
+ + * of the nodes being replaced . 
+ + * 
+ + * Note : the following example is purely illustrative as the iteration order for processing 
+ + * bootstrapping endpoints is not guaranteed . Because of this , precisely which endpoints ' pending 
+ + * ranges are correct / incorrect depends on the specifics of the ring . Concretely , the bootstrap tokens 
+ + * are ultimately backed by a HashMap , so iteration of bootstrapping nodes is based on the hashcodes 
+ + * of the endpoints . 
+ + * 
+ + * E . g . a 6 node cluster with tokens : 
+ + * 
+ + * nodeA : 0 
+ + * nodeB : 10 
+ + * nodeC : 20 
+ + * nodeD : 30 
+ + * nodeE : 40 
+ + * nodeF : 50 
+ + * 
+ + * with an RF of 3 , this gives an initial ring of : 
+ + * 
+ + * nodeA : ( 50 , 0 ] , ( 40 , 50 ] , ( 30 , 40 ] 
+ + * nodeB : ( 0 , 10 ] , ( 50 , 0 ] , ( 40 , 50 ] 
+ + * nodeC : ( 10 , 20 ] , ( 0 , 10 ] , ( 50 , 0 ] 
+ + * nodeD : ( 20 , 30 ] , ( 10 , 20 ] , ( 0 , 10 ] 
+ + * nodeE : ( 30 , 40 ] , ( 20 , 30 ] , ( 10 , 20 ] 
+ + * nodeF : ( 40 , 50 ] , ( 30 , 40 ] , ( 20 , 30 ] 
+ + * 
+ + * If nodeA is replaced by node1A , then the pending ranges map should be : 
+ + * { 
+ + * ( 50 , 0 ] : [ node1A ] , 
+ + * ( 40 , 50 ] : [ node1A ] , 
+ + * ( 30 , 40 ] : [ node1A ] 
+ + * } 
+ + * 
+ + * Starting a second concurrent replacement of a node with non - overlapping ranges 
+ + * ( i . e . node4 for node4A ) should result in a pending range map of : 
+ + * { 
+ + * ( 50 , 0 ] : [ node1A ] , 
+ + * ( 40 , 50 ] : [ node1A ] , 
+ + * ( 30 , 40 ] : [ node1A ] , 
+ + * ( 20 , 30 ] : [ node4A ] , 
+ + * ( 10 , 20 ] : [ node4A ] , 
+ + * ( 0 , 10 ] : [ node4A ] 
+ + * } 
+ + * 
+ + * But , the bug in CASSANDRA - 14802 causes it to be : 
+ + * { 
+ + * ( 50 , 0 ] : [ node1A ] , 
+ + * ( 40 , 50 ] : [ node1A ] , 
+ + * ( 30 , 40 ] : [ node1A ] , 
+ + * ( 20 , 30 ] : [ node4A ] , 
+ + * ( 10 , 20 ] : [ node4A ] , 
+ + * ( 50 , 10 ] : [ node4A ] 
+ + * } 
+ + * 
+ + * so node4A incorrectly becomes a pending endpoint for an additional sub - range : ( 50 , 0 ) . 
+ + * 
+ + * / 
+ + TokenMetadata tm = new TokenMetadata ( ) ; 
+ + AbstractReplicationStrategy replicationStrategy = simpleStrategy ( tm , 3 ) ; 
+ + 
+ + / / setup initial ring 
+ + addNode ( tm , PEER1 , TOKEN1 ) ; 
+ + addNode ( tm , PEER2 , TOKEN2 ) ; 
+ + addNode ( tm , PEER3 , TOKEN3 ) ; 
+ + addNode ( tm , PEER4 , TOKEN4 ) ; 
+ + addNode ( tm , PEER5 , TOKEN5 ) ; 
+ + addNode ( tm , PEER6 , TOKEN6 ) ; 
+ + 
+ + / / no pending ranges before any replacements 
+ + tm . calculatePendingRanges ( replicationStrategy , KEYSPACE ) ; 
+ + assertEquals ( 0 , Iterators . size ( tm . getPendingRanges ( KEYSPACE ) . iterator ( ) ) ) ; 
+ + 
+ + / / Ranges initially owned by PEER1 and PEER4 
+ + RangesAtEndpoint peer1Ranges = replicationStrategy . getAddressReplicas ( tm ) . get ( PEER1 ) ; 
+ + RangesAtEndpoint peer4Ranges = replicationStrategy . getAddressReplicas ( tm ) . get ( PEER4 ) ; 
+ + / / Replace PEER1 with PEER1A 
+ + replace ( PEER1 , PEER1A , TOKEN1 , tm , replicationStrategy ) ; 
+ + / / The only pending ranges should be the ones previously belonging to PEER1 
+ + / / and these should have a single pending endpoint , PEER1A 
+ + RangesByEndpoint . Builder b1 = new RangesByEndpoint . Builder ( ) ; 
+ + peer1Ranges . iterator ( ) . forEachRemaining ( replica - > b1 . put ( PEER1A , new Replica ( PEER1A , replica . range ( ) , replica . isFull ( ) ) ) ) ; 
+ + RangesByEndpoint expected = b1 . build ( ) ; 
+ + assertPendingRanges ( tm . getPendingRanges ( KEYSPACE ) , expected ) ; 
+ + / / Also verify the Multimap variant of getPendingRanges 
+ + assertPendingRanges ( tm . getPendingRangesMM ( KEYSPACE ) , expected ) ; 
+ + 
+ + / / Replace PEER4 with PEER4A 
+ + replace ( PEER4 , PEER4A , TOKEN4 , tm , replicationStrategy ) ; 
+ + / / Pending ranges should now include the ranges originally belonging 
+ + / / to PEER1 ( now pending for PEER1A ) and the ranges originally belonging to PEER4 
+ + / / ( now pending for PEER4A ) . 
+ + RangesByEndpoint . Builder b2 = new RangesByEndpoint . Builder ( ) ; 
+ + peer1Ranges . iterator ( ) . forEachRemaining ( replica - > b2 . put ( PEER1A , new Replica ( PEER1A , replica . range ( ) , replica . isFull ( ) ) ) ) ; 
+ + peer4Ranges . iterator ( ) . forEachRemaining ( replica - > b2 . put ( PEER4A , new Replica ( PEER4A , replica . range ( ) , replica . isFull ( ) ) ) ) ; 
+ + expected = b2 . build ( ) ; 
+ + assertPendingRanges ( tm . getPendingRanges ( KEYSPACE ) , expected ) ; 
+ + assertPendingRanges ( tm . getPendingRangesMM ( KEYSPACE ) , expected ) ; 
+ + } 
+ + 
+ + 
+ + private void assertPendingRanges ( PendingRangeMaps pending , RangesByEndpoint expected ) 
+ + { 
+ + RangesByEndpoint . Builder actual = new RangesByEndpoint . Builder ( ) ; 
+ + pending . iterator ( ) . forEachRemaining ( pendingRange - > { 
+ + Replica replica = Iterators . getOnlyElement ( pendingRange . getValue ( ) . iterator ( ) ) ; 
+ + actual . put ( replica . endpoint ( ) , replica ) ; 
+ + } ) ; 
+ + assertRangesByEndpoint ( expected , actual . build ( ) ) ; 
+ + } 
+ + 
+ + private void assertPendingRanges ( EndpointsByRange pending , RangesByEndpoint expected ) 
+ + { 
+ + RangesByEndpoint . Builder actual = new RangesByEndpoint . Builder ( ) ; 
+ + pending . flattenEntries ( ) . forEach ( entry - > actual . put ( entry . getValue ( ) . endpoint ( ) , entry . getValue ( ) ) ) ; 
+ + assertRangesByEndpoint ( expected , actual . build ( ) ) ; 
+ + } 
+ + 
+ + 
+ + private void assertRangesByEndpoint ( RangesByEndpoint expected , RangesByEndpoint actual ) 
+ + { 
+ + assertEquals ( expected . keySet ( ) , actual . keySet ( ) ) ; 
+ + for ( InetAddressAndPort endpoint : expected . keySet ( ) ) 
+ + { 
+ + RangesAtEndpoint expectedReplicas = expected . get ( endpoint ) ; 
+ + RangesAtEndpoint actualReplicas = actual . get ( endpoint ) ; 
+ + assertEquals ( expectedReplicas . size ( ) , actualReplicas . size ( ) ) ; 
+ + assertTrue ( Iterables . all ( expectedReplicas , actualReplicas : : contains ) ) ; 
+ + } 
+ + } 
+ + 
+ + private void addNode ( TokenMetadata tm , InetAddressAndPort replica , Token token ) 
+ + { 
+ + tm . updateNormalTokens ( Collections . singleton ( token ) , replica ) ; 
+ + } 
+ + 
+ + private void replace ( InetAddressAndPort toReplace , 
+ + InetAddressAndPort replacement , 
+ + Token token , 
+ + TokenMetadata tm , 
+ + AbstractReplicationStrategy replicationStrategy ) 
+ + { 
+ + assertEquals ( toReplace , tm . getEndpoint ( token ) ) ; 
+ + tm . addReplaceTokens ( Collections . singleton ( token ) , replacement , toReplace ) ; 
+ + tm . calculatePendingRanges ( replicationStrategy , KEYSPACE ) ; 
+ + } 
+ + 
+ + private static Token token ( long token ) 
+ + { 
+ + return Murmur3Partitioner . instance . getTokenFactory ( ) . fromString ( Long . toString ( token ) ) ; 
+ + } 
+ + 
+ + private static InetAddressAndPort peer ( int addressSuffix ) 
+ + { 
+ + try 
+ + { 
+ + return InetAddressAndPort . getByAddress ( new byte [ ] { 127 , 0 , 0 , ( byte ) addressSuffix } ) ; 
+ + } 
+ + catch ( UnknownHostException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + private static IEndpointSnitch snitch ( ) 
+ + { 
+ + return new AbstractNetworkTopologySnitch ( ) 
+ + { 
+ + public String getRack ( InetAddressAndPort endpoint ) 
+ + { 
+ + return RACK1 ; 
+ + } 
+ + 
+ + public String getDatacenter ( InetAddressAndPort endpoint ) 
+ + { 
+ + return DC1 ; 
+ + } 
+ + } ; 
+ + } 
+ + 
+ + private static AbstractReplicationStrategy simpleStrategy ( TokenMetadata tokenMetadata , int replicationFactor ) 
+ + { 
+ + return new SimpleStrategy ( KEYSPACE , 
+ + tokenMetadata , 
+ + DatabaseDescriptor . getEndpointSnitch ( ) , 
+ + Collections . singletonMap ( " replication _ factor " , Integer . toString ( replicationFactor ) ) ) ; 
+ + } 
+ + } 
+ \ No newline at end of file
+
+NEAREST DIFF:
+diff - - git a / test / unit / org / apache / cassandra / service / LeaveAndBootstrapTest . java b / test / unit / org / apache / cassandra / service / LeaveAndBootstrapTest . java 
+ index faa9e18 . . c2eae5c 100644 
+ - - - a / test / unit / org / apache / cassandra / service / LeaveAndBootstrapTest . java 
+ + + + b / test / unit / org / apache / cassandra / service / LeaveAndBootstrapTest . java 
+ @ @ - 84 , 6 + 84 , 7 @ @ public class LeaveAndBootstrapTest 
+ List < InetAddress > hosts = new ArrayList < InetAddress > ( ) ; 
+ 
+ Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , RING _ SIZE ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ Map < Token , List < InetAddress > > expectedEndpoints = new HashMap < Token , List < InetAddress > > ( ) ; 
+ for ( String table : Schema . instance . getNonSystemTables ( ) ) 
+ @ @ - 104 , 6 + 105 , 7 @ @ public class LeaveAndBootstrapTest 
+ ss . onChange ( hosts . get ( LEAVING _ NODE ) , 
+ ApplicationState . STATUS , 
+ valueFactory . leaving ( endpointTokens . get ( LEAVING _ NODE ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ assertTrue ( tmd . isLeaving ( hosts . get ( LEAVING _ NODE ) ) ) ; 
+ 
+ AbstractReplicationStrategy strategy ; 
+ @ @ - 152 , 18 + 154 , 20 @ @ public class LeaveAndBootstrapTest 
+ 
+ / / create a ring or 10 nodes 
+ Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , RING _ SIZE ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ / / nodes 6 , 8 and 9 leave 
+ final int [ ] LEAVING = new int [ ] { 6 , 8 , 9 } ; 
+ for ( int leaving : LEAVING ) 
+ ss . onChange ( hosts . get ( leaving ) , ApplicationState . STATUS , valueFactory . leaving ( endpointTokens . get ( leaving ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ / / boot two new nodes with keyTokens . get ( 5 ) and keyTokens . get ( 7 ) 
+ InetAddress boot1 = InetAddress . getByName ( " 127 . 0 . 1 . 1 " ) ; 
+ ss . onChange ( boot1 , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 5 ) ) ) ; 
+ InetAddress boot2 = InetAddress . getByName ( " 127 . 0 . 1 . 2 " ) ; 
+ ss . onChange ( boot2 , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 7 ) ) ) ; 
+ - 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ Collection < InetAddress > endpoints = null ; 
+ 
+ / * don ' t require test update every time a new keyspace is added to test / conf / cassandra . yaml * / 
+ @ @ - 316 , 9 + 320 , 12 @ @ public class LeaveAndBootstrapTest 
+ / / leaving and boot2 in progress 
+ ss . onChange ( hosts . get ( LEAVING [ 0 ] ) , ApplicationState . STATUS , 
+ valueFactory . left ( endpointTokens . get ( LEAVING [ 0 ] ) , Gossiper . computeExpireTime ( ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ ss . onChange ( hosts . get ( LEAVING [ 2 ] ) , ApplicationState . STATUS , 
+ valueFactory . left ( endpointTokens . get ( LEAVING [ 2 ] ) , Gossiper . computeExpireTime ( ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ ss . onChange ( boot1 , ApplicationState . STATUS , valueFactory . normal ( keyTokens . get ( 5 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ / / adjust precalcuated results . this changes what the epected endpoints are . 
+ expectedEndpoints . get ( " Keyspace1 " ) . get ( new BigIntegerToken ( " 55 " ) ) . removeAll ( makeAddrs ( " 127 . 0 . 0 . 7 " , " 127 . 0 . 0 . 8 " ) ) ; 
+ @ @ - 340 , 6 + 347 , 7 @ @ public class LeaveAndBootstrapTest 
+ expectedEndpoints . get ( " Keyspace4 " ) . get ( new BigIntegerToken ( " 75 " ) ) . removeAll ( makeAddrs ( " 127 . 0 . 0 . 10 " ) ) ; 
+ expectedEndpoints . get ( " Keyspace4 " ) . get ( new BigIntegerToken ( " 85 " ) ) . removeAll ( makeAddrs ( " 127 . 0 . 0 . 10 " ) ) ; 
+ 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ for ( Map . Entry < String , AbstractReplicationStrategy > tableStrategy : tableStrategyMap . entrySet ( ) ) 
+ { 
+ String table = tableStrategy . getKey ( ) ; 
+ @ @ - 437 , 9 + 445 , 11 @ @ public class LeaveAndBootstrapTest 
+ 
+ / / create a ring or 5 nodes 
+ Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , 7 ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ / / node 2 leaves 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . leaving ( endpointTokens . get ( 2 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ / / don ' t bother to test pending ranges here , that is extensively tested by other 
+ / / tests . Just check that the node is in appropriate lists . 
+ @ @ - 449 , 6 + 459 , 7 @ @ public class LeaveAndBootstrapTest 
+ 
+ / / Bootstrap the node immedidiately to keyTokens . get ( 4 ) without going through STATE _ LEFT 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 4 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertFalse ( tmd . isMember ( hosts . get ( 2 ) ) ) ; 
+ assertFalse ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; 
+ @ @ - 456 , 6 + 467 , 7 @ @ public class LeaveAndBootstrapTest 
+ 
+ / / Bootstrap node hosts . get ( 3 ) to keyTokens . get ( 1 ) 
+ ss . onChange ( hosts . get ( 3 ) , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 1 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertFalse ( tmd . isMember ( hosts . get ( 3 ) ) ) ; 
+ assertFalse ( tmd . isLeaving ( hosts . get ( 3 ) ) ) ; 
+ @ @ - 473 , 7 + 485 , 9 @ @ public class LeaveAndBootstrapTest 
+ 
+ / / Go to normal again for both nodes 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . normal ( keyTokens . get ( 3 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ ss . onChange ( hosts . get ( 3 ) , ApplicationState . STATUS , valueFactory . normal ( keyTokens . get ( 2 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertTrue ( tmd . isMember ( hosts . get ( 2 ) ) ) ; 
+ assertFalse ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; 
+ @ @ - 500 , 24 + 514 , 30 @ @ public class LeaveAndBootstrapTest 
+ 
+ / / create a ring or 5 nodes 
+ Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , 6 ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ / / node 2 leaves 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . leaving ( endpointTokens . get ( 2 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertTrue ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; 
+ assertTrue ( tmd . getToken ( hosts . get ( 2 ) ) . equals ( endpointTokens . get ( 2 ) ) ) ; 
+ 
+ / / back to normal 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . normal ( keyTokens . get ( 2 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertTrue ( tmd . getLeavingEndpoints ( ) . isEmpty ( ) ) ; 
+ assertTrue ( tmd . getToken ( hosts . get ( 2 ) ) . equals ( keyTokens . get ( 2 ) ) ) ; 
+ 
+ / / node 3 goes through leave and left and then jumps to normal at its new token 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . leaving ( keyTokens . get ( 2 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , 
+ valueFactory . left ( keyTokens . get ( 2 ) , Gossiper . computeExpireTime ( ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . normal ( keyTokens . get ( 4 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertTrue ( tmd . getBootstrapTokens ( ) . isEmpty ( ) ) ; 
+ assertTrue ( tmd . getLeavingEndpoints ( ) . isEmpty ( ) ) ; 
+ @ @ - 539 , 9 + 559 , 11 @ @ public class LeaveAndBootstrapTest 
+ 
+ / / create a ring or 5 nodes 
+ Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , 6 ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ / / node 2 leaves with _ different _ token 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . leaving ( keyTokens . get ( 0 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertTrue ( tmd . getToken ( hosts . get ( 2 ) ) . equals ( keyTokens . get ( 0 ) ) ) ; 
+ assertTrue ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; 
+ @ @ - 549 , 6 + 571 , 7 @ @ public class LeaveAndBootstrapTest 
+ 
+ / / go to boostrap 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 1 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertFalse ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; 
+ assertTrue ( tmd . getBootstrapTokens ( ) . size ( ) = = 1 ) ; 
+ @ @ - 556 , 6 + 579 , 7 @ @ public class LeaveAndBootstrapTest 
+ 
+ / / jump to leaving again 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , valueFactory . leaving ( keyTokens . get ( 1 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertTrue ( tmd . getEndpoint ( keyTokens . get ( 1 ) ) . equals ( hosts . get ( 2 ) ) ) ; 
+ assertTrue ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; 
+ @ @ - 564 , 6 + 588 , 7 @ @ public class LeaveAndBootstrapTest 
+ / / go to state left 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , 
+ valueFactory . left ( keyTokens . get ( 1 ) , Gossiper . computeExpireTime ( ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertFalse ( tmd . isMember ( hosts . get ( 2 ) ) ) ; 
+ assertFalse ( tmd . isLeaving ( hosts . get ( 2 ) ) ) ; 
+ @ @ - 584 , 15 + 609 , 18 @ @ public class LeaveAndBootstrapTest 
+ 
+ / / create a ring of 6 nodes 
+ Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , 7 ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ / / node hosts . get ( 2 ) goes jumps to left 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , 
+ valueFactory . left ( endpointTokens . get ( 2 ) , Gossiper . computeExpireTime ( ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertFalse ( tmd . isMember ( hosts . get ( 2 ) ) ) ; 
+ 
+ / / node hosts . get ( 4 ) goes to bootstrap 
+ ss . onChange ( hosts . get ( 3 ) , ApplicationState . STATUS , valueFactory . bootstrapping ( keyTokens . get ( 1 ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertFalse ( tmd . isMember ( hosts . get ( 3 ) ) ) ; 
+ assertTrue ( tmd . getBootstrapTokens ( ) . size ( ) = = 1 ) ; 
+ @ @ - 601 , 6 + 629 , 7 @ @ public class LeaveAndBootstrapTest 
+ / / and then directly to ' left ' 
+ ss . onChange ( hosts . get ( 2 ) , ApplicationState . STATUS , 
+ valueFactory . left ( keyTokens . get ( 1 ) , Gossiper . computeExpireTime ( ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ 
+ assertTrue ( tmd . getBootstrapTokens ( ) . size ( ) = = 0 ) ; 
+ assertFalse ( tmd . isMember ( hosts . get ( 2 ) ) ) ;

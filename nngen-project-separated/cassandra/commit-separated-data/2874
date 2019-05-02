@@ -1,0 +1,285 @@
+BLEU SCORE: 0.027611988917697356
+
+TEST MSG: Fix infinite loop when paging queries with IN
+GENERATED MSG: merge from 1 . 2
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 80ed481 . . 5a124ab 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 12 , 6 + 12 , 7 @ @ <nl> * Expose a total memtable size metric for a CF ( CASSANDRA - 6391 ) <nl> * cqlsh : handle symlinks properly ( CASSANDRA - 6425 ) <nl> * Don ' t resubmit counter mutation runnables internally ( CASSANDRA - 6427 ) <nl> + * Fix potential infinite loop when paging query with IN ( CASSANDRA - 6464 ) <nl> Merged from 1 . 2 : <nl> * Improved error message on bad properties in DDL queries ( CASSANDRA - 6453 ) <nl> * Randomize batchlog candidates selection ( CASSANDRA - 6481 ) <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java b / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java <nl> index 9372665 . . 6f6772c 100644 <nl> - - - a / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java <nl> + + + b / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java <nl> @ @ - 40 , 9 + 40 , 9 @ @ abstract class AbstractQueryPager implements QueryPager <nl> protected final IDiskAtomFilter columnFilter ; <nl> private final long timestamp ; <nl> <nl> - private volatile int remaining ; <nl> - private volatile boolean exhausted ; <nl> - private volatile boolean lastWasRecorded ; <nl> + private int remaining ; <nl> + private boolean exhausted ; <nl> + private boolean lastWasRecorded ; <nl> <nl> protected AbstractQueryPager ( ConsistencyLevel consistencyLevel , <nl> int toFetch , <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / MultiPartitionPager . java b / src / java / org / apache / cassandra / service / pager / MultiPartitionPager . java <nl> index 2615e9b . . 35d6752 100644 <nl> - - - a / src / java / org / apache / cassandra / service / pager / MultiPartitionPager . java <nl> + + + b / src / java / org / apache / cassandra / service / pager / MultiPartitionPager . java <nl> @ @ - 43 , 44 + 43 , 72 @ @ class MultiPartitionPager implements QueryPager <nl> private final SinglePartitionPager [ ] pagers ; <nl> private final long timestamp ; <nl> <nl> - private volatile int current ; <nl> - <nl> - MultiPartitionPager ( List < ReadCommand > commands , ConsistencyLevel consistencyLevel , boolean localQuery ) <nl> - { <nl> - this ( commands , consistencyLevel , localQuery , null ) ; <nl> - } <nl> + private int remaining ; <nl> + private int current ; <nl> <nl> MultiPartitionPager ( List < ReadCommand > commands , ConsistencyLevel consistencyLevel , boolean localQuery , PagingState state ) <nl> { <nl> - this . pagers = new SinglePartitionPager [ commands . size ( ) ] ; <nl> + int i = 0 ; <nl> + / / If it ' s not the beginning ( state ! = null ) , we need to find where we were and skip previous commands <nl> + / / since they are done . <nl> + if ( state ! = null ) <nl> + for ( ; i < commands . size ( ) ; i + + ) <nl> + if ( commands . get ( i ) . key . equals ( state . partitionKey ) ) <nl> + break ; <nl> + <nl> + if ( i > = commands . size ( ) ) <nl> + { <nl> + pagers = null ; <nl> + timestamp = - 1 ; <nl> + return ; <nl> + } <nl> + <nl> + pagers = new SinglePartitionPager [ commands . size ( ) - i ] ; <nl> + / / ' i ' is on the first non exhausted pager for the previous page ( or the first one ) <nl> + pagers [ 0 ] = makePager ( commands . get ( i ) , consistencyLevel , localQuery , state ) ; <nl> + timestamp = commands . get ( i ) . timestamp ; <nl> <nl> - long tstamp = - 1 ; <nl> - for ( int i = 0 ; i < commands . size ( ) ; i + + ) <nl> + / / Following ones haven ' t been started yet <nl> + for ( int j = i + 1 ; j < commands . size ( ) ; j + + ) <nl> { <nl> - ReadCommand command = commands . get ( i ) ; <nl> - if ( tstamp = = - 1 ) <nl> - tstamp = command . timestamp ; <nl> - else if ( tstamp ! = command . timestamp ) <nl> + ReadCommand command = commands . get ( j ) ; <nl> + if ( command . timestamp ! = timestamp ) <nl> throw new IllegalArgumentException ( " All commands must have the same timestamp or weird results may happen . " ) ; <nl> - <nl> - PagingState tmpState = state ! = null & & command . key . equals ( state . partitionKey ) ? state : null ; <nl> - pagers [ i ] = command instanceof SliceFromReadCommand <nl> - ? new SliceQueryPager ( ( SliceFromReadCommand ) command , consistencyLevel , localQuery , tmpState ) <nl> - : new NamesQueryPager ( ( SliceByNamesReadCommand ) command , consistencyLevel , localQuery , tmpState ) ; <nl> + pagers [ j - i ] = makePager ( command , consistencyLevel , localQuery , null ) ; <nl> } <nl> - timestamp = tstamp ; <nl> + remaining = state = = null ? computeRemaining ( pagers ) : state . remaining ; <nl> + } <nl> + <nl> + private static SinglePartitionPager makePager ( ReadCommand command , ConsistencyLevel consistencyLevel , boolean localQuery , PagingState state ) <nl> + { <nl> + return command instanceof SliceFromReadCommand <nl> + ? new SliceQueryPager ( ( SliceFromReadCommand ) command , consistencyLevel , localQuery , state ) <nl> + : new NamesQueryPager ( ( SliceByNamesReadCommand ) command , consistencyLevel , localQuery ) ; <nl> + } <nl> + <nl> + private static int computeRemaining ( SinglePartitionPager [ ] pagers ) <nl> + { <nl> + long remaining = 0 ; <nl> + for ( SinglePartitionPager pager : pagers ) <nl> + remaining + = pager . maxRemaining ( ) ; <nl> + return remaining > Integer . MAX _ VALUE ? Integer . MAX _ VALUE : ( int ) remaining ; <nl> } <nl> <nl> public PagingState state ( ) <nl> { <nl> + / / Sets current to the first non - exhausted pager <nl> + if ( isExhausted ( ) ) <nl> + return null ; <nl> + <nl> PagingState state = pagers [ current ] . state ( ) ; <nl> - return state = = null <nl> - ? null <nl> - : new PagingState ( state . partitionKey , state . cellName , maxRemaining ( ) ) ; <nl> + return new PagingState ( pagers [ current ] . key ( ) , state = = null ? null : state . cellName , remaining ) ; <nl> } <nl> <nl> public boolean isExhausted ( ) <nl> { <nl> + if ( remaining < = 0 | | pagers = = null ) <nl> + return true ; <nl> + <nl> while ( current < pagers . length ) <nl> { <nl> if ( ! pagers [ current ] . isExhausted ( ) ) <nl> @ @ - 93 , 18 + 121 , 20 @ @ class MultiPartitionPager implements QueryPager <nl> <nl> public List < Row > fetchPage ( int pageSize ) throws RequestValidationException , RequestExecutionException <nl> { <nl> - int remaining = pageSize ; <nl> List < Row > result = new ArrayList < Row > ( ) ; <nl> <nl> - while ( ! isExhausted ( ) & & remaining > 0 ) <nl> + int remainingThisQuery = pageSize ; <nl> + while ( remainingThisQuery > 0 & & ! isExhausted ( ) ) <nl> { <nl> - / / Exhausted also sets us on the first non - exhausted pager <nl> - List < Row > page = pagers [ current ] . fetchPage ( remaining ) ; <nl> + / / isExhausted has set us on the first non - exhausted pager <nl> + List < Row > page = pagers [ current ] . fetchPage ( remainingThisQuery ) ; <nl> if ( page . isEmpty ( ) ) <nl> continue ; <nl> <nl> Row row = page . get ( 0 ) ; <nl> - remaining - = pagers [ current ] . columnCounter ( ) . countAll ( row . cf ) . live ( ) ; <nl> + int fetched = pagers [ current ] . columnCounter ( ) . countAll ( row . cf ) . live ( ) ; <nl> + remaining - = fetched ; <nl> + remainingThisQuery - = fetched ; <nl> result . add ( row ) ; <nl> } <nl> <nl> @ @ - 113 , 10 + 143 , 7 @ @ class MultiPartitionPager implements QueryPager <nl> <nl> public int maxRemaining ( ) <nl> { <nl> - int max = 0 ; <nl> - for ( int i = current ; i < pagers . length ; i + + ) <nl> - max + = pagers [ i ] . maxRemaining ( ) ; <nl> - return max ; <nl> + return remaining ; <nl> } <nl> <nl> public long timestamp ( ) <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / NamesQueryPager . java b / src / java / org / apache / cassandra / service / pager / NamesQueryPager . java <nl> index ede1e91 . . 663db22 100644 <nl> - - - a / src / java / org / apache / cassandra / service / pager / NamesQueryPager . java <nl> + + + b / src / java / org / apache / cassandra / service / pager / NamesQueryPager . java <nl> @ @ - 17 , 6 + 17 , 7 @ @ <nl> * / <nl> package org . apache . cassandra . service . pager ; <nl> <nl> + import java . nio . ByteBuffer ; <nl> import java . util . Collections ; <nl> import java . util . List ; <nl> <nl> @ @ - 55 , 9 + 56 , 9 @ @ public class NamesQueryPager implements SinglePartitionPager <nl> this . localQuery = localQuery ; <nl> } <nl> <nl> - NamesQueryPager ( SliceByNamesReadCommand command , ConsistencyLevel consistencyLevel , boolean localQuery , PagingState state ) <nl> + public ByteBuffer key ( ) <nl> { <nl> - this ( command , consistencyLevel , localQuery ) ; <nl> + return command . key ; <nl> } <nl> <nl> public ColumnCounter columnCounter ( ) <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / QueryPagers . java b / src / java / org / apache / cassandra / service / pager / QueryPagers . java <nl> index 1601ff6 . . c353536 100644 <nl> - - - a / src / java / org / apache / cassandra / service / pager / QueryPagers . java <nl> + + + b / src / java / org / apache / cassandra / service / pager / QueryPagers . java <nl> @ @ - 57 , 7 + 57 , 8 @ @ public class QueryPagers <nl> { <nl> List < ReadCommand > commands = ( ( Pageable . ReadCommands ) command ) . commands ; <nl> <nl> - int maxQueried = 0 ; <nl> + / / Using long on purpose , as we could overflow otherwise <nl> + long maxQueried = 0 ; <nl> for ( ReadCommand readCmd : commands ) <nl> maxQueried + = maxQueried ( readCmd ) ; <nl> <nl> @ @ - 78 , 7 + 79 , 7 @ @ public class QueryPagers <nl> private static QueryPager pager ( ReadCommand command , ConsistencyLevel consistencyLevel , boolean local , PagingState state ) <nl> { <nl> if ( command instanceof SliceByNamesReadCommand ) <nl> - return new NamesQueryPager ( ( SliceByNamesReadCommand ) command , consistencyLevel , local , state ) ; <nl> + return new NamesQueryPager ( ( SliceByNamesReadCommand ) command , consistencyLevel , local ) ; <nl> else <nl> return new SliceQueryPager ( ( SliceFromReadCommand ) command , consistencyLevel , local , state ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / SinglePartitionPager . java b / src / java / org / apache / cassandra / service / pager / SinglePartitionPager . java <nl> index 693a20e . . 51bbf90 100644 <nl> - - - a / src / java / org / apache / cassandra / service / pager / SinglePartitionPager . java <nl> + + + b / src / java / org / apache / cassandra / service / pager / SinglePartitionPager . java <nl> @ @ - 17 , 6 + 17 , 8 @ @ <nl> * / <nl> package org . apache . cassandra . service . pager ; <nl> <nl> + import java . nio . ByteBuffer ; <nl> + <nl> import org . apache . cassandra . db . filter . ColumnCounter ; <nl> <nl> / * * <nl> @ @ - 26 , 5 + 28 , 6 @ @ import org . apache . cassandra . db . filter . ColumnCounter ; <nl> * / <nl> public interface SinglePartitionPager extends QueryPager <nl> { <nl> + public ByteBuffer key ( ) ; <nl> public ColumnCounter columnCounter ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java b / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java <nl> index e3825a9 . . cd0c069 100644 <nl> - - - a / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java <nl> + + + b / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java <nl> @ @ - 54 , 6 + 54 , 11 @ @ public class SliceQueryPager extends AbstractQueryPager implements SinglePartiti <nl> } <nl> } <nl> <nl> + public ByteBuffer key ( ) <nl> + { <nl> + return command . key ; <nl> + } <nl> + <nl> public PagingState state ( ) <nl> { <nl> return lastReturned = = null
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index b935425 . . 7f5a487 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 1 . 2 - rc1 <nl> + * fix cqlsh rendering of blob fields ( CASSANDRA - 4970 ) <nl> * fix cqlsh DESCRIBE command ( CASSANDRA - 4913 ) <nl> * save truncation position in system table ( CASSANDRA - 4906 ) <nl> * Move CompressionMetadata off - heap ( CASSANDRA - 4937 ) <nl> diff - - git a / pylib / cqlshlib / formatting . py b / pylib / cqlshlib / formatting . py <nl> index d15c083 . . bab3506 100644 <nl> - - - a / pylib / cqlshlib / formatting . py <nl> + + + b / pylib / cqlshlib / formatting . py <nl> @ @ - 88 , 8 + 88 , 8 @ @ def formatter _ for ( typname ) : <nl> return f <nl> return registrator <nl> <nl> - @ formatter _ for ( ' bytes ' ) <nl> - def format _ value _ bytes ( val , colormap , * * _ ) : <nl> + @ formatter _ for ( ' blob ' ) <nl> + def format _ value _ blob ( val , colormap , * * _ ) : <nl> bval = ' ' . join ( ' % 02x ' % ord ( c ) for c in val ) <nl> return colorme ( bval , colormap , ' hex ' ) <nl>
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 80ed481 . . 5a124ab 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 12 , 6 + 12 , 7 @ @ 
+ * Expose a total memtable size metric for a CF ( CASSANDRA - 6391 ) 
+ * cqlsh : handle symlinks properly ( CASSANDRA - 6425 ) 
+ * Don ' t resubmit counter mutation runnables internally ( CASSANDRA - 6427 ) 
+ + * Fix potential infinite loop when paging query with IN ( CASSANDRA - 6464 ) 
+ Merged from 1 . 2 : 
+ * Improved error message on bad properties in DDL queries ( CASSANDRA - 6453 ) 
+ * Randomize batchlog candidates selection ( CASSANDRA - 6481 ) 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java b / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java 
+ index 9372665 . . 6f6772c 100644 
+ - - - a / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java 
+ + + + b / src / java / org / apache / cassandra / service / pager / AbstractQueryPager . java 
+ @ @ - 40 , 9 + 40 , 9 @ @ abstract class AbstractQueryPager implements QueryPager 
+ protected final IDiskAtomFilter columnFilter ; 
+ private final long timestamp ; 
+ 
+ - private volatile int remaining ; 
+ - private volatile boolean exhausted ; 
+ - private volatile boolean lastWasRecorded ; 
+ + private int remaining ; 
+ + private boolean exhausted ; 
+ + private boolean lastWasRecorded ; 
+ 
+ protected AbstractQueryPager ( ConsistencyLevel consistencyLevel , 
+ int toFetch , 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / MultiPartitionPager . java b / src / java / org / apache / cassandra / service / pager / MultiPartitionPager . java 
+ index 2615e9b . . 35d6752 100644 
+ - - - a / src / java / org / apache / cassandra / service / pager / MultiPartitionPager . java 
+ + + + b / src / java / org / apache / cassandra / service / pager / MultiPartitionPager . java 
+ @ @ - 43 , 44 + 43 , 72 @ @ class MultiPartitionPager implements QueryPager 
+ private final SinglePartitionPager [ ] pagers ; 
+ private final long timestamp ; 
+ 
+ - private volatile int current ; 
+ - 
+ - MultiPartitionPager ( List < ReadCommand > commands , ConsistencyLevel consistencyLevel , boolean localQuery ) 
+ - { 
+ - this ( commands , consistencyLevel , localQuery , null ) ; 
+ - } 
+ + private int remaining ; 
+ + private int current ; 
+ 
+ MultiPartitionPager ( List < ReadCommand > commands , ConsistencyLevel consistencyLevel , boolean localQuery , PagingState state ) 
+ { 
+ - this . pagers = new SinglePartitionPager [ commands . size ( ) ] ; 
+ + int i = 0 ; 
+ + / / If it ' s not the beginning ( state ! = null ) , we need to find where we were and skip previous commands 
+ + / / since they are done . 
+ + if ( state ! = null ) 
+ + for ( ; i < commands . size ( ) ; i + + ) 
+ + if ( commands . get ( i ) . key . equals ( state . partitionKey ) ) 
+ + break ; 
+ + 
+ + if ( i > = commands . size ( ) ) 
+ + { 
+ + pagers = null ; 
+ + timestamp = - 1 ; 
+ + return ; 
+ + } 
+ + 
+ + pagers = new SinglePartitionPager [ commands . size ( ) - i ] ; 
+ + / / ' i ' is on the first non exhausted pager for the previous page ( or the first one ) 
+ + pagers [ 0 ] = makePager ( commands . get ( i ) , consistencyLevel , localQuery , state ) ; 
+ + timestamp = commands . get ( i ) . timestamp ; 
+ 
+ - long tstamp = - 1 ; 
+ - for ( int i = 0 ; i < commands . size ( ) ; i + + ) 
+ + / / Following ones haven ' t been started yet 
+ + for ( int j = i + 1 ; j < commands . size ( ) ; j + + ) 
+ { 
+ - ReadCommand command = commands . get ( i ) ; 
+ - if ( tstamp = = - 1 ) 
+ - tstamp = command . timestamp ; 
+ - else if ( tstamp ! = command . timestamp ) 
+ + ReadCommand command = commands . get ( j ) ; 
+ + if ( command . timestamp ! = timestamp ) 
+ throw new IllegalArgumentException ( " All commands must have the same timestamp or weird results may happen . " ) ; 
+ - 
+ - PagingState tmpState = state ! = null & & command . key . equals ( state . partitionKey ) ? state : null ; 
+ - pagers [ i ] = command instanceof SliceFromReadCommand 
+ - ? new SliceQueryPager ( ( SliceFromReadCommand ) command , consistencyLevel , localQuery , tmpState ) 
+ - : new NamesQueryPager ( ( SliceByNamesReadCommand ) command , consistencyLevel , localQuery , tmpState ) ; 
+ + pagers [ j - i ] = makePager ( command , consistencyLevel , localQuery , null ) ; 
+ } 
+ - timestamp = tstamp ; 
+ + remaining = state = = null ? computeRemaining ( pagers ) : state . remaining ; 
+ + } 
+ + 
+ + private static SinglePartitionPager makePager ( ReadCommand command , ConsistencyLevel consistencyLevel , boolean localQuery , PagingState state ) 
+ + { 
+ + return command instanceof SliceFromReadCommand 
+ + ? new SliceQueryPager ( ( SliceFromReadCommand ) command , consistencyLevel , localQuery , state ) 
+ + : new NamesQueryPager ( ( SliceByNamesReadCommand ) command , consistencyLevel , localQuery ) ; 
+ + } 
+ + 
+ + private static int computeRemaining ( SinglePartitionPager [ ] pagers ) 
+ + { 
+ + long remaining = 0 ; 
+ + for ( SinglePartitionPager pager : pagers ) 
+ + remaining + = pager . maxRemaining ( ) ; 
+ + return remaining > Integer . MAX _ VALUE ? Integer . MAX _ VALUE : ( int ) remaining ; 
+ } 
+ 
+ public PagingState state ( ) 
+ { 
+ + / / Sets current to the first non - exhausted pager 
+ + if ( isExhausted ( ) ) 
+ + return null ; 
+ + 
+ PagingState state = pagers [ current ] . state ( ) ; 
+ - return state = = null 
+ - ? null 
+ - : new PagingState ( state . partitionKey , state . cellName , maxRemaining ( ) ) ; 
+ + return new PagingState ( pagers [ current ] . key ( ) , state = = null ? null : state . cellName , remaining ) ; 
+ } 
+ 
+ public boolean isExhausted ( ) 
+ { 
+ + if ( remaining < = 0 | | pagers = = null ) 
+ + return true ; 
+ + 
+ while ( current < pagers . length ) 
+ { 
+ if ( ! pagers [ current ] . isExhausted ( ) ) 
+ @ @ - 93 , 18 + 121 , 20 @ @ class MultiPartitionPager implements QueryPager 
+ 
+ public List < Row > fetchPage ( int pageSize ) throws RequestValidationException , RequestExecutionException 
+ { 
+ - int remaining = pageSize ; 
+ List < Row > result = new ArrayList < Row > ( ) ; 
+ 
+ - while ( ! isExhausted ( ) & & remaining > 0 ) 
+ + int remainingThisQuery = pageSize ; 
+ + while ( remainingThisQuery > 0 & & ! isExhausted ( ) ) 
+ { 
+ - / / Exhausted also sets us on the first non - exhausted pager 
+ - List < Row > page = pagers [ current ] . fetchPage ( remaining ) ; 
+ + / / isExhausted has set us on the first non - exhausted pager 
+ + List < Row > page = pagers [ current ] . fetchPage ( remainingThisQuery ) ; 
+ if ( page . isEmpty ( ) ) 
+ continue ; 
+ 
+ Row row = page . get ( 0 ) ; 
+ - remaining - = pagers [ current ] . columnCounter ( ) . countAll ( row . cf ) . live ( ) ; 
+ + int fetched = pagers [ current ] . columnCounter ( ) . countAll ( row . cf ) . live ( ) ; 
+ + remaining - = fetched ; 
+ + remainingThisQuery - = fetched ; 
+ result . add ( row ) ; 
+ } 
+ 
+ @ @ - 113 , 10 + 143 , 7 @ @ class MultiPartitionPager implements QueryPager 
+ 
+ public int maxRemaining ( ) 
+ { 
+ - int max = 0 ; 
+ - for ( int i = current ; i < pagers . length ; i + + ) 
+ - max + = pagers [ i ] . maxRemaining ( ) ; 
+ - return max ; 
+ + return remaining ; 
+ } 
+ 
+ public long timestamp ( ) 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / NamesQueryPager . java b / src / java / org / apache / cassandra / service / pager / NamesQueryPager . java 
+ index ede1e91 . . 663db22 100644 
+ - - - a / src / java / org / apache / cassandra / service / pager / NamesQueryPager . java 
+ + + + b / src / java / org / apache / cassandra / service / pager / NamesQueryPager . java 
+ @ @ - 17 , 6 + 17 , 7 @ @ 
+ * / 
+ package org . apache . cassandra . service . pager ; 
+ 
+ + import java . nio . ByteBuffer ; 
+ import java . util . Collections ; 
+ import java . util . List ; 
+ 
+ @ @ - 55 , 9 + 56 , 9 @ @ public class NamesQueryPager implements SinglePartitionPager 
+ this . localQuery = localQuery ; 
+ } 
+ 
+ - NamesQueryPager ( SliceByNamesReadCommand command , ConsistencyLevel consistencyLevel , boolean localQuery , PagingState state ) 
+ + public ByteBuffer key ( ) 
+ { 
+ - this ( command , consistencyLevel , localQuery ) ; 
+ + return command . key ; 
+ } 
+ 
+ public ColumnCounter columnCounter ( ) 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / QueryPagers . java b / src / java / org / apache / cassandra / service / pager / QueryPagers . java 
+ index 1601ff6 . . c353536 100644 
+ - - - a / src / java / org / apache / cassandra / service / pager / QueryPagers . java 
+ + + + b / src / java / org / apache / cassandra / service / pager / QueryPagers . java 
+ @ @ - 57 , 7 + 57 , 8 @ @ public class QueryPagers 
+ { 
+ List < ReadCommand > commands = ( ( Pageable . ReadCommands ) command ) . commands ; 
+ 
+ - int maxQueried = 0 ; 
+ + / / Using long on purpose , as we could overflow otherwise 
+ + long maxQueried = 0 ; 
+ for ( ReadCommand readCmd : commands ) 
+ maxQueried + = maxQueried ( readCmd ) ; 
+ 
+ @ @ - 78 , 7 + 79 , 7 @ @ public class QueryPagers 
+ private static QueryPager pager ( ReadCommand command , ConsistencyLevel consistencyLevel , boolean local , PagingState state ) 
+ { 
+ if ( command instanceof SliceByNamesReadCommand ) 
+ - return new NamesQueryPager ( ( SliceByNamesReadCommand ) command , consistencyLevel , local , state ) ; 
+ + return new NamesQueryPager ( ( SliceByNamesReadCommand ) command , consistencyLevel , local ) ; 
+ else 
+ return new SliceQueryPager ( ( SliceFromReadCommand ) command , consistencyLevel , local , state ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / SinglePartitionPager . java b / src / java / org / apache / cassandra / service / pager / SinglePartitionPager . java 
+ index 693a20e . . 51bbf90 100644 
+ - - - a / src / java / org / apache / cassandra / service / pager / SinglePartitionPager . java 
+ + + + b / src / java / org / apache / cassandra / service / pager / SinglePartitionPager . java 
+ @ @ - 17 , 6 + 17 , 8 @ @ 
+ * / 
+ package org . apache . cassandra . service . pager ; 
+ 
+ + import java . nio . ByteBuffer ; 
+ + 
+ import org . apache . cassandra . db . filter . ColumnCounter ; 
+ 
+ / * * 
+ @ @ - 26 , 5 + 28 , 6 @ @ import org . apache . cassandra . db . filter . ColumnCounter ; 
+ * / 
+ public interface SinglePartitionPager extends QueryPager 
+ { 
+ + public ByteBuffer key ( ) ; 
+ public ColumnCounter columnCounter ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java b / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java 
+ index e3825a9 . . cd0c069 100644 
+ - - - a / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java 
+ + + + b / src / java / org / apache / cassandra / service / pager / SliceQueryPager . java 
+ @ @ - 54 , 6 + 54 , 11 @ @ public class SliceQueryPager extends AbstractQueryPager implements SinglePartiti 
+ } 
+ } 
+ 
+ + public ByteBuffer key ( ) 
+ + { 
+ + return command . key ; 
+ + } 
+ + 
+ public PagingState state ( ) 
+ { 
+ return lastReturned = = null
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index b935425 . . 7f5a487 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 1 . 2 - rc1 
+ + * fix cqlsh rendering of blob fields ( CASSANDRA - 4970 ) 
+ * fix cqlsh DESCRIBE command ( CASSANDRA - 4913 ) 
+ * save truncation position in system table ( CASSANDRA - 4906 ) 
+ * Move CompressionMetadata off - heap ( CASSANDRA - 4937 ) 
+ diff - - git a / pylib / cqlshlib / formatting . py b / pylib / cqlshlib / formatting . py 
+ index d15c083 . . bab3506 100644 
+ - - - a / pylib / cqlshlib / formatting . py 
+ + + + b / pylib / cqlshlib / formatting . py 
+ @ @ - 88 , 8 + 88 , 8 @ @ def formatter _ for ( typname ) : 
+ return f 
+ return registrator 
+ 
+ - @ formatter _ for ( ' bytes ' ) 
+ - def format _ value _ bytes ( val , colormap , * * _ ) : 
+ + @ formatter _ for ( ' blob ' ) 
+ + def format _ value _ blob ( val , colormap , * * _ ) : 
+ bval = ' ' . join ( ' % 02x ' % ord ( c ) for c in val ) 
+ return colorme ( bval , colormap , ' hex ' ) 
+

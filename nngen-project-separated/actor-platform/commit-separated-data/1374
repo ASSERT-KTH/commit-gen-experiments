@@ -1,0 +1,182 @@
+BLEU SCORE: 0.10600313379512592
+
+TEST MSG: refactor ( server : stickers ) : enhance sticker collection updates
+GENERATED MSG: fix ( server ) : smarter group migrator
+
+TEST DIFF (one line): diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / stickers / StickersExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / stickers / StickersExtension . scala < nl > index 0ad008c . . b797889 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / stickers / StickersExtension . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / stickers / StickersExtension . scala < nl > @ @ - 3 , 7 + 3 , 7 @ @ package im . actor . server . stickers < nl > import akka . actor . _ < nl > import cats . data . Xor < nl > import im . actor . api . rpc . stickers . { ApiStickerCollection , UpdateOwnStickersChanged , UpdateStickerCollectionsChanged } < nl > - import im . actor . concurrent . FutureResultCats < nl > + import im . actor . concurrent . { FutureExt , FutureResultCats } < nl > import im . actor . server . acl . ACLUtils < nl > import im . actor . server . db . DbExtension < nl > import im . actor . server . model . { StickerData , StickerPack } < nl > @ @ - 82 , 9 + 82 , 7 @ @ final class StickersExtensionImpl ( _ system : ActorSystem ) < nl > image512FileHash = image512 map ( _ . fileLocation . accessHash ) , < nl > image512FileSize = image512 map ( _ . fileSize ) ) < nl > _ ← fromFuture ( db . run ( StickerDataRepo . create ( sticker ) ) ) < nl > - packUserIds ← fromFuture ( db . run ( getPackUserIds ( pack ) ) ) < nl > - apiPack ← fromFuture ( db . run ( getApiStickerPack ( pack ) ) ) < nl > - _ ← fromFuture ( seqExt . broadcastSingleUpdate ( packUserIds . toSet , UpdateStickerCollectionsChanged ( Vector ( apiPack ) ) ) ) < nl > + _ = deliverStickerCollectionChanged ( pack ) < nl > } yield ( ) ) . value < nl > < nl > def getStickerPacks ( ownerUserId : Int ) : Future [ Seq [ StickerPack ] ] = < nl > @ @ - 102 , 9 + 100 , 7 @ @ final class StickersExtensionImpl ( _ system : ActorSystem ) < nl > pack ← fromFutureOption ( NotFound ) ( db . run ( StickerPackRepo . find ( packId ) ) ) < nl > _ ← fromBoolean ( NotFound ) ( pack . ownerUserId = = ownerUserId ) < nl > _ ← fromFuture ( db . run ( StickerDataRepo . delete ( packId , stickerId ) ) ) < nl > - packUserIds ← fromFuture ( db . run ( getPackUserIds ( pack ) ) ) < nl > - apiPack ← fromFuture ( db . run ( getApiStickerPack ( pack ) ) ) < nl > - _ ← fromFuture ( seqExt . broadcastSingleUpdate ( packUserIds . toSet , UpdateStickerCollectionsChanged ( Vector ( apiPack ) ) ) ) < nl > + _ = deliverStickerCollectionChanged ( pack ) < nl > } yield ( ) ) . value < nl > < nl > def getPackUserIds ( pack : StickerPack ) : DBIO [ Seq [ Int ] ] = < nl > @ @ - 141 , 8 + 137 , 36 @ @ final class StickersExtensionImpl ( _ system : ActorSystem ) < nl > _ = system . log . debug ( " sticker pack : { } " , pack ) < nl > _ ← fromBoolean ( isDefaultError ( toggleTo ) ) ( pack . isDefault ! = toggleTo ) < nl > _ ← fromFuture ( db . run ( StickerPackRepo . setDefault ( packId , isDefault = toggleTo ) ) ) < nl > + _ = broadcastOwnStickersChanged ( ) < nl > } yield ( ) ) . value < nl > < nl > + / * * < nl > + * Broadcast ` UpdateOwnStickersChanged ` to all users . < nl > + * This will happen when admin makes / unmakes sticker pack default < nl > + * / < nl > + private def broadcastOwnStickersChanged ( ) : Future [ Unit ] = for { < nl > + allUsersIds ← db . run ( UserRepo . activeUsersIds ) < nl > + _ ← FutureExt . ftraverse ( allUsersIds ) { uid ⇒ < nl > + db . run ( getOwnApiStickerPacks ( uid ) ) flatMap { packs ⇒ < nl > + seqExt . deliverSingleUpdate ( uid , UpdateOwnStickersChanged ( packs ) ) < nl > + } < nl > + } < nl > + } yield ( ) < nl > + < nl > + / * * < nl > + * Deliver ` UpdateStickerCollectionsChanged ` to those users , < nl > + * who have given sticker pack in their sticker collection < nl > + * < nl > + * @ param pack sticker pack that changed < nl > + * / < nl > + private def deliverStickerCollectionChanged ( pack : StickerPack ) : Future [ Unit ] = for { < nl > + packUserIds ← db . run ( getPackUserIds ( pack ) ) < nl > + apiPack ← db . run ( getApiStickerPack ( pack ) ) < nl > + _ ← FutureExt . ftraverse ( packUserIds ) { uid ⇒ < nl > + seqExt . deliverSingleUpdate ( uid , UpdateStickerCollectionsChanged ( Vector ( apiPack ) ) ) < nl > + } < nl > + } yield ( ) < nl > + < nl > } < nl > < nl > object StickersExtension extends ExtensionId [ StickersExtensionImpl ] with ExtensionIdProvider {
+NEAREST DIFF (one line): diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / migrations / HiddenGroupMigrator . scala b / actor - server / actor - core / src / main / scala / im / actor / server / migrations / HiddenGroupMigrator . scala < nl > index 7cb8f39 . . cc0b9b7 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / migrations / HiddenGroupMigrator . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / migrations / HiddenGroupMigrator . scala < nl > @ @ - 1 , 34 + 1 , 80 @ @ < nl > package im . actor . server . migrations < nl > < nl > - import akka . actor . ActorSystem < nl > + import akka . actor . { ActorLogging , ActorSystem , PoisonPill , Props } < nl > + import akka . persistence . { PersistentActor , RecoveryCompleted } < nl > + import im . actor . concurrent . FutureExt . _ < nl > import im . actor . server . db . DbExtension < nl > - import im . actor . server . group . GroupExtension < nl > - import im . actor . server . persist < nl > + import im . actor . server . event . TSEvent < nl > + import im . actor . server . group . GroupOffice < nl > + import im . actor . server . { persist = > p } < nl > import slick . driver . PostgresDriver < nl > < nl > import scala . concurrent . duration . _ < nl > - import scala . concurrent . { ExecutionContext , Future } < nl > + import scala . concurrent . { ExecutionContext , Future , Promise } < nl > + import scala . util . { Failure , Success } < nl > < nl > object HiddenGroupMigrator extends Migration { < nl > + < nl > + private case object Migrate < nl > + < nl > override protected def migrationName : String = " PutHiddenGroupsToSQL " < nl > < nl > override protected def migrationTimeout : Duration = 15 . minutes < nl > < nl > override protected def startMigration ( ) ( implicit system : ActorSystem , db : PostgresDriver . api . Database , ec : ExecutionContext ) : Future [ Unit ] = { < nl > for { < nl > - ids ← db . run ( persist . Group . findAllIds ) < nl > - _ ← Future . sequence ( ids map migrateGroup ) < nl > + ids ← db . run ( p . Group . findAllIds ) < nl > + _ ← ftraverse ( ids ) ( migrateGroup ) < nl > } yield ( ) < nl > } < nl > < nl > private def migrateGroup ( id : Int ) ( implicit system : ActorSystem , ec : ExecutionContext ) : Future [ Unit ] = { < nl > - val db = DbExtension ( system ) . db < nl > - val groupExt = GroupExtension ( system ) < nl > - groupExt . getApiStruct ( id , 0 ) flatMap { group ⇒ < nl > - if ( group . isHidden . contains ( true ) ) < nl > - db . run ( persist . Group . makeHidden ( id ) ) map ( _ ⇒ ( ) ) < nl > - else < nl > - Future . successful ( ( ) ) < nl > + val promise = Promise [ Unit ] ( ) < nl > + system . actorOf ( Props ( new HiddenGroupMigrator ( promise , id ) ) , s " hidden _ group _ migrator _ $ id " ) < nl > + promise . future onFailure { < nl > + case e = > system . log . error ( e , s " Failed to migrate $ id " ) < nl > + } < nl > + promise . future < nl > + } < nl > + } < nl > + < nl > + private final class HiddenGroupMigrator ( promise : Promise [ Unit ] , groupId : Int ) extends PersistentActor with ActorLogging { < nl > + < nl > + import HiddenGroupMigrator . _ < nl > + import im . actor . server . group . GroupEvents . _ < nl > + import context . dispatcher < nl > + < nl > + val db = DbExtension ( context . system ) . db < nl > + < nl > + override def persistenceId = GroupOffice . persistenceIdFor ( groupId ) < nl > + < nl > + var isHidden = false < nl > + < nl > + private def migrate ( ) : Unit = { < nl > + if ( isHidden ) { < nl > + db . run ( p . Group . makeHidden ( groupId ) ) onComplete { < nl > + case Failure ( e ) = > < nl > + promise . failure ( e ) < nl > + self ! PoisonPill < nl > + case Success ( _ ) = > < nl > + promise . success ( ( ) ) < nl > + self ! PoisonPill < nl > + } < nl > + } else { < nl > + promise . success ( ( ) ) < nl > + context stop self < nl > } < nl > } < nl > + < nl > + def receiveCommand = { < nl > + case Migrate = > < nl > + migrate ( ) < nl > + } < nl > + < nl > + def receiveRecover = { < nl > + case TSEvent ( _ , e : Created ) = > < nl > + isHidden = e . isHidden . getOrElse ( false ) < nl > + case RecoveryCompleted = > < nl > + self ! Migrate < nl > + } < nl > } < nl > \ No newline at end of file
+
+TEST DIFF:
+diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / stickers / StickersExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / stickers / StickersExtension . scala 
+ index 0ad008c . . b797889 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / stickers / StickersExtension . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / stickers / StickersExtension . scala 
+ @ @ - 3 , 7 + 3 , 7 @ @ package im . actor . server . stickers 
+ import akka . actor . _ 
+ import cats . data . Xor 
+ import im . actor . api . rpc . stickers . { ApiStickerCollection , UpdateOwnStickersChanged , UpdateStickerCollectionsChanged } 
+ - import im . actor . concurrent . FutureResultCats 
+ + import im . actor . concurrent . { FutureExt , FutureResultCats } 
+ import im . actor . server . acl . ACLUtils 
+ import im . actor . server . db . DbExtension 
+ import im . actor . server . model . { StickerData , StickerPack } 
+ @ @ - 82 , 9 + 82 , 7 @ @ final class StickersExtensionImpl ( _ system : ActorSystem ) 
+ image512FileHash = image512 map ( _ . fileLocation . accessHash ) , 
+ image512FileSize = image512 map ( _ . fileSize ) ) 
+ _ ← fromFuture ( db . run ( StickerDataRepo . create ( sticker ) ) ) 
+ - packUserIds ← fromFuture ( db . run ( getPackUserIds ( pack ) ) ) 
+ - apiPack ← fromFuture ( db . run ( getApiStickerPack ( pack ) ) ) 
+ - _ ← fromFuture ( seqExt . broadcastSingleUpdate ( packUserIds . toSet , UpdateStickerCollectionsChanged ( Vector ( apiPack ) ) ) ) 
+ + _ = deliverStickerCollectionChanged ( pack ) 
+ } yield ( ) ) . value 
+ 
+ def getStickerPacks ( ownerUserId : Int ) : Future [ Seq [ StickerPack ] ] = 
+ @ @ - 102 , 9 + 100 , 7 @ @ final class StickersExtensionImpl ( _ system : ActorSystem ) 
+ pack ← fromFutureOption ( NotFound ) ( db . run ( StickerPackRepo . find ( packId ) ) ) 
+ _ ← fromBoolean ( NotFound ) ( pack . ownerUserId = = ownerUserId ) 
+ _ ← fromFuture ( db . run ( StickerDataRepo . delete ( packId , stickerId ) ) ) 
+ - packUserIds ← fromFuture ( db . run ( getPackUserIds ( pack ) ) ) 
+ - apiPack ← fromFuture ( db . run ( getApiStickerPack ( pack ) ) ) 
+ - _ ← fromFuture ( seqExt . broadcastSingleUpdate ( packUserIds . toSet , UpdateStickerCollectionsChanged ( Vector ( apiPack ) ) ) ) 
+ + _ = deliverStickerCollectionChanged ( pack ) 
+ } yield ( ) ) . value 
+ 
+ def getPackUserIds ( pack : StickerPack ) : DBIO [ Seq [ Int ] ] = 
+ @ @ - 141 , 8 + 137 , 36 @ @ final class StickersExtensionImpl ( _ system : ActorSystem ) 
+ _ = system . log . debug ( " sticker pack : { } " , pack ) 
+ _ ← fromBoolean ( isDefaultError ( toggleTo ) ) ( pack . isDefault ! = toggleTo ) 
+ _ ← fromFuture ( db . run ( StickerPackRepo . setDefault ( packId , isDefault = toggleTo ) ) ) 
+ + _ = broadcastOwnStickersChanged ( ) 
+ } yield ( ) ) . value 
+ 
+ + / * * 
+ + * Broadcast ` UpdateOwnStickersChanged ` to all users . 
+ + * This will happen when admin makes / unmakes sticker pack default 
+ + * / 
+ + private def broadcastOwnStickersChanged ( ) : Future [ Unit ] = for { 
+ + allUsersIds ← db . run ( UserRepo . activeUsersIds ) 
+ + _ ← FutureExt . ftraverse ( allUsersIds ) { uid ⇒ 
+ + db . run ( getOwnApiStickerPacks ( uid ) ) flatMap { packs ⇒ 
+ + seqExt . deliverSingleUpdate ( uid , UpdateOwnStickersChanged ( packs ) ) 
+ + } 
+ + } 
+ + } yield ( ) 
+ + 
+ + / * * 
+ + * Deliver ` UpdateStickerCollectionsChanged ` to those users , 
+ + * who have given sticker pack in their sticker collection 
+ + * 
+ + * @ param pack sticker pack that changed 
+ + * / 
+ + private def deliverStickerCollectionChanged ( pack : StickerPack ) : Future [ Unit ] = for { 
+ + packUserIds ← db . run ( getPackUserIds ( pack ) ) 
+ + apiPack ← db . run ( getApiStickerPack ( pack ) ) 
+ + _ ← FutureExt . ftraverse ( packUserIds ) { uid ⇒ 
+ + seqExt . deliverSingleUpdate ( uid , UpdateStickerCollectionsChanged ( Vector ( apiPack ) ) ) 
+ + } 
+ + } yield ( ) 
+ + 
+ } 
+ 
+ object StickersExtension extends ExtensionId [ StickersExtensionImpl ] with ExtensionIdProvider {
+
+NEAREST DIFF:
+diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / migrations / HiddenGroupMigrator . scala b / actor - server / actor - core / src / main / scala / im / actor / server / migrations / HiddenGroupMigrator . scala 
+ index 7cb8f39 . . cc0b9b7 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / migrations / HiddenGroupMigrator . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / migrations / HiddenGroupMigrator . scala 
+ @ @ - 1 , 34 + 1 , 80 @ @ 
+ package im . actor . server . migrations 
+ 
+ - import akka . actor . ActorSystem 
+ + import akka . actor . { ActorLogging , ActorSystem , PoisonPill , Props } 
+ + import akka . persistence . { PersistentActor , RecoveryCompleted } 
+ + import im . actor . concurrent . FutureExt . _ 
+ import im . actor . server . db . DbExtension 
+ - import im . actor . server . group . GroupExtension 
+ - import im . actor . server . persist 
+ + import im . actor . server . event . TSEvent 
+ + import im . actor . server . group . GroupOffice 
+ + import im . actor . server . { persist = > p } 
+ import slick . driver . PostgresDriver 
+ 
+ import scala . concurrent . duration . _ 
+ - import scala . concurrent . { ExecutionContext , Future } 
+ + import scala . concurrent . { ExecutionContext , Future , Promise } 
+ + import scala . util . { Failure , Success } 
+ 
+ object HiddenGroupMigrator extends Migration { 
+ + 
+ + private case object Migrate 
+ + 
+ override protected def migrationName : String = " PutHiddenGroupsToSQL " 
+ 
+ override protected def migrationTimeout : Duration = 15 . minutes 
+ 
+ override protected def startMigration ( ) ( implicit system : ActorSystem , db : PostgresDriver . api . Database , ec : ExecutionContext ) : Future [ Unit ] = { 
+ for { 
+ - ids ← db . run ( persist . Group . findAllIds ) 
+ - _ ← Future . sequence ( ids map migrateGroup ) 
+ + ids ← db . run ( p . Group . findAllIds ) 
+ + _ ← ftraverse ( ids ) ( migrateGroup ) 
+ } yield ( ) 
+ } 
+ 
+ private def migrateGroup ( id : Int ) ( implicit system : ActorSystem , ec : ExecutionContext ) : Future [ Unit ] = { 
+ - val db = DbExtension ( system ) . db 
+ - val groupExt = GroupExtension ( system ) 
+ - groupExt . getApiStruct ( id , 0 ) flatMap { group ⇒ 
+ - if ( group . isHidden . contains ( true ) ) 
+ - db . run ( persist . Group . makeHidden ( id ) ) map ( _ ⇒ ( ) ) 
+ - else 
+ - Future . successful ( ( ) ) 
+ + val promise = Promise [ Unit ] ( ) 
+ + system . actorOf ( Props ( new HiddenGroupMigrator ( promise , id ) ) , s " hidden _ group _ migrator _ $ id " ) 
+ + promise . future onFailure { 
+ + case e = > system . log . error ( e , s " Failed to migrate $ id " ) 
+ + } 
+ + promise . future 
+ + } 
+ + } 
+ + 
+ + private final class HiddenGroupMigrator ( promise : Promise [ Unit ] , groupId : Int ) extends PersistentActor with ActorLogging { 
+ + 
+ + import HiddenGroupMigrator . _ 
+ + import im . actor . server . group . GroupEvents . _ 
+ + import context . dispatcher 
+ + 
+ + val db = DbExtension ( context . system ) . db 
+ + 
+ + override def persistenceId = GroupOffice . persistenceIdFor ( groupId ) 
+ + 
+ + var isHidden = false 
+ + 
+ + private def migrate ( ) : Unit = { 
+ + if ( isHidden ) { 
+ + db . run ( p . Group . makeHidden ( groupId ) ) onComplete { 
+ + case Failure ( e ) = > 
+ + promise . failure ( e ) 
+ + self ! PoisonPill 
+ + case Success ( _ ) = > 
+ + promise . success ( ( ) ) 
+ + self ! PoisonPill 
+ + } 
+ + } else { 
+ + promise . success ( ( ) ) 
+ + context stop self 
+ } 
+ } 
+ + 
+ + def receiveCommand = { 
+ + case Migrate = > 
+ + migrate ( ) 
+ + } 
+ + 
+ + def receiveRecover = { 
+ + case TSEvent ( _ , e : Created ) = > 
+ + isHidden = e . isHidden . getOrElse ( false ) 
+ + case RecoveryCompleted = > 
+ + self ! Migrate 
+ + } 
+ } 
+ \ No newline at end of file

@@ -1,0 +1,169 @@
+BLEU SCORE: 0.026279617104084448
+
+TEST MSG: Include high level sstables in lower level compactions if not compacted for a while .
+GENERATED MSG: fix bug in sstable blacklisting with LCS
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index e722392 . . e88753f 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 4 , 6 + 4 , 7 @ @ <nl> operations to incorrect become full QUORUM ( CASSANDRA - 7345 ) <nl> * Properly handle unrecognized opcodes and flags ( CASSANDRA - 7440 ) <nl> * ( Hadoop ) close CqlRecordWriter clients when finished ( CASSANDRA - 7459 ) <nl> + * Make sure high level sstables get compacted ( CASSANDRA - 7414 ) <nl> <nl> <nl> 2 . 0 . 9 <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java b / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java <nl> index a78a867 . . 1118ddc 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java <nl> @ @ - 38 , 6 + 38 , 7 @ @ import org . apache . cassandra . config . Schema ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . db . RowPosition ; <nl> import org . apache . cassandra . dht . Bounds ; <nl> + import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . io . sstable . * ; <nl> import org . apache . cassandra . io . util . FileUtils ; <nl> @ @ - 56 , 12 + 57 , 19 @ @ public class LeveledManifest <nl> * or even OOMing when compacting highly overlapping sstables <nl> * / <nl> private static final int MAX _ COMPACTING _ L0 = 32 ; <nl> + / * * <nl> + * If we go this many rounds without compacting <nl> + * in the highest level , we start bringing in sstables from <nl> + * that level into lower level compactions <nl> + * / <nl> + private static final int NO _ COMPACTION _ LIMIT = 25 ; <nl> <nl> private final ColumnFamilyStore cfs ; <nl> private final List < SSTableReader > [ ] generations ; <nl> private final RowPosition [ ] lastCompactedKeys ; <nl> private final int maxSSTableSizeInBytes ; <nl> private final SizeTieredCompactionStrategyOptions options ; <nl> + private final int [ ] compactionCounter ; <nl> <nl> private LeveledManifest ( ColumnFamilyStore cfs , int maxSSTableSizeInMB , SizeTieredCompactionStrategyOptions options ) <nl> { <nl> @ @ - 80 , 6 + 88 , 7 @ @ public class LeveledManifest <nl> generations [ i ] = new ArrayList < SSTableReader > ( ) ; <nl> lastCompactedKeys [ i ] = cfs . partitioner . getMinimumToken ( ) . minKeyBound ( ) ; <nl> } <nl> + compactionCounter = new int [ n ] ; <nl> } <nl> <nl> public static LeveledManifest create ( ColumnFamilyStore cfs , int maxSSTableSize , List < SSTableReader > sstables ) <nl> @ @ - 276 , 10 + 285 , 18 @ @ public class LeveledManifest <nl> <nl> / / L0 is fine , proceed with this level <nl> Collection < SSTableReader > candidates = getCandidatesFor ( i ) ; <nl> - if ( logger . isDebugEnabled ( ) ) <nl> - logger . debug ( " Compaction candidates for L { } are { } " , i , toString ( candidates ) ) ; <nl> if ( ! candidates . isEmpty ( ) ) <nl> - return new CompactionCandidate ( candidates , getNextLevel ( candidates ) , cfs . getCompactionStrategy ( ) . getMaxSSTableBytes ( ) ) ; <nl> + { <nl> + int nextLevel = getNextLevel ( candidates ) ; <nl> + candidates = getOverlappingStarvedSSTables ( nextLevel , candidates ) ; <nl> + if ( logger . isDebugEnabled ( ) ) <nl> + logger . debug ( " Compaction candidates for L { } are { } " , i , toString ( candidates ) ) ; <nl> + return new CompactionCandidate ( candidates , nextLevel , cfs . getCompactionStrategy ( ) . getMaxSSTableBytes ( ) ) ; <nl> + } <nl> + else <nl> + { <nl> + logger . debug ( " No compaction candidates for L { } " , i ) ; <nl> + } <nl> } <nl> } <nl> <nl> @ @ - 292 , 6 + 309 , 69 @ @ public class LeveledManifest <nl> return new CompactionCandidate ( candidates , getNextLevel ( candidates ) , cfs . getCompactionStrategy ( ) . getMaxSSTableBytes ( ) ) ; <nl> } <nl> <nl> + / * * <nl> + * If we do something that makes many levels contain too little data ( cleanup , change sstable size ) we will " never " <nl> + * compact the high levels . <nl> + * <nl> + * This method finds if we have gone many compaction rounds without doing any high - level compaction , if so <nl> + * we start bringing in one sstable from the highest level until that level is either empty or is doing compaction . <nl> + * <nl> + * @ param targetLevel the level the candidates will be compacted into <nl> + * @ param candidates the original sstables to compact <nl> + * @ return <nl> + * / <nl> + private Collection < SSTableReader > getOverlappingStarvedSSTables ( int targetLevel , Collection < SSTableReader > candidates ) <nl> + { <nl> + Set < SSTableReader > withStarvedCandidate = new HashSet < > ( candidates ) ; <nl> + <nl> + for ( int i = generations . length - 1 ; i > 0 ; i - - ) <nl> + compactionCounter [ i ] + + ; <nl> + compactionCounter [ targetLevel ] = 0 ; <nl> + if ( logger . isDebugEnabled ( ) ) <nl> + { <nl> + for ( int j = 0 ; j < compactionCounter . length ; j + + ) <nl> + logger . debug ( " CompactionCounter : { } : { } " , j , compactionCounter [ j ] ) ; <nl> + } <nl> + <nl> + for ( int i = generations . length - 1 ; i > 0 ; i - - ) <nl> + { <nl> + if ( getLevelSize ( i ) > 0 ) <nl> + { <nl> + if ( compactionCounter [ i ] > NO _ COMPACTION _ LIMIT ) <nl> + { <nl> + / / we try to find an sstable that is fully contained within the boundaries we are compacting ; <nl> + / / say we are compacting 3 sstables : 0 - > 30 in L1 and 0 - > 12 , 12 - > 33 in L2 <nl> + / / this means that we will not create overlap in L2 if we add an sstable <nl> + / / contained within 0 - > 33 to the compaction <nl> + RowPosition max = null ; <nl> + RowPosition min = null ; <nl> + for ( SSTableReader candidate : candidates ) <nl> + { <nl> + if ( min = = null | | candidate . first . compareTo ( min ) < 0 ) <nl> + min = candidate . first ; <nl> + if ( max = = null | | candidate . last . compareTo ( max ) > 0 ) <nl> + max = candidate . last ; <nl> + } <nl> + Set < SSTableReader > compacting = cfs . getDataTracker ( ) . getCompacting ( ) ; <nl> + Range < RowPosition > boundaries = new Range < > ( min , max ) ; <nl> + for ( SSTableReader sstable : getLevel ( i ) ) <nl> + { <nl> + Range < RowPosition > r = new Range < RowPosition > ( sstable . first , sstable . last ) ; <nl> + if ( boundaries . contains ( r ) & & ! compacting . contains ( sstable ) ) <nl> + { <nl> + logger . info ( " Adding high - level ( L { } ) { } to candidates " , sstable . getSSTableLevel ( ) , sstable ) ; <nl> + withStarvedCandidate . add ( sstable ) ; <nl> + return withStarvedCandidate ; <nl> + } <nl> + } <nl> + } <nl> + return candidates ; <nl> + } <nl> + } <nl> + <nl> + return candidates ; <nl> + } <nl> + <nl> public synchronized int getLevelSize ( int i ) <nl> { <nl> if ( i > = generations . length )
+NEAREST DIFF (one line): diff - - git a / build . xml b / build . xml <nl> index 2f005f7 . . c5778ff 100644 <nl> - - - a / build . xml <nl> + + + b / build . xml <nl> @ @ - 997 , 7 + 997 , 8 @ @ <nl> < javac <nl> debug = " true " <nl> debuglevel = " $ { debuglevel } " <nl> - destdir = " $ { test . classes } " > <nl> + destdir = " $ { test . classes } " <nl> + includeantruntime = " false " > <nl> < classpath > <nl> < path refid = " cassandra . classpath " / > <nl> < / classpath >
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index e722392 . . e88753f 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 4 , 6 + 4 , 7 @ @ 
+ operations to incorrect become full QUORUM ( CASSANDRA - 7345 ) 
+ * Properly handle unrecognized opcodes and flags ( CASSANDRA - 7440 ) 
+ * ( Hadoop ) close CqlRecordWriter clients when finished ( CASSANDRA - 7459 ) 
+ + * Make sure high level sstables get compacted ( CASSANDRA - 7414 ) 
+ 
+ 
+ 2 . 0 . 9 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java b / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java 
+ index a78a867 . . 1118ddc 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / LeveledManifest . java 
+ @ @ - 38 , 6 + 38 , 7 @ @ import org . apache . cassandra . config . Schema ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . db . RowPosition ; 
+ import org . apache . cassandra . dht . Bounds ; 
+ + import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . io . sstable . * ; 
+ import org . apache . cassandra . io . util . FileUtils ; 
+ @ @ - 56 , 12 + 57 , 19 @ @ public class LeveledManifest 
+ * or even OOMing when compacting highly overlapping sstables 
+ * / 
+ private static final int MAX _ COMPACTING _ L0 = 32 ; 
+ + / * * 
+ + * If we go this many rounds without compacting 
+ + * in the highest level , we start bringing in sstables from 
+ + * that level into lower level compactions 
+ + * / 
+ + private static final int NO _ COMPACTION _ LIMIT = 25 ; 
+ 
+ private final ColumnFamilyStore cfs ; 
+ private final List < SSTableReader > [ ] generations ; 
+ private final RowPosition [ ] lastCompactedKeys ; 
+ private final int maxSSTableSizeInBytes ; 
+ private final SizeTieredCompactionStrategyOptions options ; 
+ + private final int [ ] compactionCounter ; 
+ 
+ private LeveledManifest ( ColumnFamilyStore cfs , int maxSSTableSizeInMB , SizeTieredCompactionStrategyOptions options ) 
+ { 
+ @ @ - 80 , 6 + 88 , 7 @ @ public class LeveledManifest 
+ generations [ i ] = new ArrayList < SSTableReader > ( ) ; 
+ lastCompactedKeys [ i ] = cfs . partitioner . getMinimumToken ( ) . minKeyBound ( ) ; 
+ } 
+ + compactionCounter = new int [ n ] ; 
+ } 
+ 
+ public static LeveledManifest create ( ColumnFamilyStore cfs , int maxSSTableSize , List < SSTableReader > sstables ) 
+ @ @ - 276 , 10 + 285 , 18 @ @ public class LeveledManifest 
+ 
+ / / L0 is fine , proceed with this level 
+ Collection < SSTableReader > candidates = getCandidatesFor ( i ) ; 
+ - if ( logger . isDebugEnabled ( ) ) 
+ - logger . debug ( " Compaction candidates for L { } are { } " , i , toString ( candidates ) ) ; 
+ if ( ! candidates . isEmpty ( ) ) 
+ - return new CompactionCandidate ( candidates , getNextLevel ( candidates ) , cfs . getCompactionStrategy ( ) . getMaxSSTableBytes ( ) ) ; 
+ + { 
+ + int nextLevel = getNextLevel ( candidates ) ; 
+ + candidates = getOverlappingStarvedSSTables ( nextLevel , candidates ) ; 
+ + if ( logger . isDebugEnabled ( ) ) 
+ + logger . debug ( " Compaction candidates for L { } are { } " , i , toString ( candidates ) ) ; 
+ + return new CompactionCandidate ( candidates , nextLevel , cfs . getCompactionStrategy ( ) . getMaxSSTableBytes ( ) ) ; 
+ + } 
+ + else 
+ + { 
+ + logger . debug ( " No compaction candidates for L { } " , i ) ; 
+ + } 
+ } 
+ } 
+ 
+ @ @ - 292 , 6 + 309 , 69 @ @ public class LeveledManifest 
+ return new CompactionCandidate ( candidates , getNextLevel ( candidates ) , cfs . getCompactionStrategy ( ) . getMaxSSTableBytes ( ) ) ; 
+ } 
+ 
+ + / * * 
+ + * If we do something that makes many levels contain too little data ( cleanup , change sstable size ) we will " never " 
+ + * compact the high levels . 
+ + * 
+ + * This method finds if we have gone many compaction rounds without doing any high - level compaction , if so 
+ + * we start bringing in one sstable from the highest level until that level is either empty or is doing compaction . 
+ + * 
+ + * @ param targetLevel the level the candidates will be compacted into 
+ + * @ param candidates the original sstables to compact 
+ + * @ return 
+ + * / 
+ + private Collection < SSTableReader > getOverlappingStarvedSSTables ( int targetLevel , Collection < SSTableReader > candidates ) 
+ + { 
+ + Set < SSTableReader > withStarvedCandidate = new HashSet < > ( candidates ) ; 
+ + 
+ + for ( int i = generations . length - 1 ; i > 0 ; i - - ) 
+ + compactionCounter [ i ] + + ; 
+ + compactionCounter [ targetLevel ] = 0 ; 
+ + if ( logger . isDebugEnabled ( ) ) 
+ + { 
+ + for ( int j = 0 ; j < compactionCounter . length ; j + + ) 
+ + logger . debug ( " CompactionCounter : { } : { } " , j , compactionCounter [ j ] ) ; 
+ + } 
+ + 
+ + for ( int i = generations . length - 1 ; i > 0 ; i - - ) 
+ + { 
+ + if ( getLevelSize ( i ) > 0 ) 
+ + { 
+ + if ( compactionCounter [ i ] > NO _ COMPACTION _ LIMIT ) 
+ + { 
+ + / / we try to find an sstable that is fully contained within the boundaries we are compacting ; 
+ + / / say we are compacting 3 sstables : 0 - > 30 in L1 and 0 - > 12 , 12 - > 33 in L2 
+ + / / this means that we will not create overlap in L2 if we add an sstable 
+ + / / contained within 0 - > 33 to the compaction 
+ + RowPosition max = null ; 
+ + RowPosition min = null ; 
+ + for ( SSTableReader candidate : candidates ) 
+ + { 
+ + if ( min = = null | | candidate . first . compareTo ( min ) < 0 ) 
+ + min = candidate . first ; 
+ + if ( max = = null | | candidate . last . compareTo ( max ) > 0 ) 
+ + max = candidate . last ; 
+ + } 
+ + Set < SSTableReader > compacting = cfs . getDataTracker ( ) . getCompacting ( ) ; 
+ + Range < RowPosition > boundaries = new Range < > ( min , max ) ; 
+ + for ( SSTableReader sstable : getLevel ( i ) ) 
+ + { 
+ + Range < RowPosition > r = new Range < RowPosition > ( sstable . first , sstable . last ) ; 
+ + if ( boundaries . contains ( r ) & & ! compacting . contains ( sstable ) ) 
+ + { 
+ + logger . info ( " Adding high - level ( L { } ) { } to candidates " , sstable . getSSTableLevel ( ) , sstable ) ; 
+ + withStarvedCandidate . add ( sstable ) ; 
+ + return withStarvedCandidate ; 
+ + } 
+ + } 
+ + } 
+ + return candidates ; 
+ + } 
+ + } 
+ + 
+ + return candidates ; 
+ + } 
+ + 
+ public synchronized int getLevelSize ( int i ) 
+ { 
+ if ( i > = generations . length )
+
+NEAREST DIFF:
+diff - - git a / build . xml b / build . xml 
+ index 2f005f7 . . c5778ff 100644 
+ - - - a / build . xml 
+ + + + b / build . xml 
+ @ @ - 997 , 7 + 997 , 8 @ @ 
+ < javac 
+ debug = " true " 
+ debuglevel = " $ { debuglevel } " 
+ - destdir = " $ { test . classes } " > 
+ + destdir = " $ { test . classes } " 
+ + includeantruntime = " false " > 
+ < classpath > 
+ < path refid = " cassandra . classpath " / > 
+ < / classpath >

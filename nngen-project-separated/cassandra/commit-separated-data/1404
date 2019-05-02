@@ -1,0 +1,208 @@
+BLEU SCORE: 0.05522397783539471
+
+TEST MSG: Remove identity sstable from Lifecycle transaction on cancel
+GENERATED MSG: acquire references on overlapped sstables
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / lifecycle / LifecycleTransaction . java b / src / java / org / apache / cassandra / db / lifecycle / LifecycleTransaction . java <nl> index e14e2a1 . . dfa30c7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / lifecycle / LifecycleTransaction . java <nl> + + + b / src / java / org / apache / cassandra / db / lifecycle / LifecycleTransaction . java <nl> @ @ - 386 , 6 + 386 , 7 @ @ public class LifecycleTransaction extends Transactional . AbstractTransactional <nl> assert ! ( staged . contains ( cancel ) | | logged . contains ( cancel ) ) : " may only cancel a reader that has not been updated or obsoleted in this transaction : " + cancel ; <nl> originals . remove ( cancel ) ; <nl> marked . remove ( cancel ) ; <nl> + identities . remove ( cancel . instanceId ) ; <nl> maybeFail ( unmarkCompacting ( singleton ( cancel ) , null ) ) ; <nl> } <nl> <nl> @ @ - 515 , 4 + 516 , 4 @ @ public class LifecycleTransaction extends Transactional . AbstractTransactional <nl> { <nl> return originals . toString ( ) ; <nl> } <nl> - } <nl> \ No newline at end of file <nl> + } <nl> diff - - git a / test / unit / org / apache / cassandra / db / lifecycle / LifecycleTransactionTest . java b / test / unit / org / apache / cassandra / db / lifecycle / LifecycleTransactionTest . java <nl> index aaa9999 . . f13d1b7 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / lifecycle / LifecycleTransactionTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / lifecycle / LifecycleTransactionTest . java <nl> @ @ - 185 , 9 + 185 , 10 @ @ public class LifecycleTransactionTest extends AbstractTransactionalTest <nl> { <nl> ColumnFamilyStore cfs = MockSchema . newCFS ( ) ; <nl> Tracker tracker = new Tracker ( null , false ) ; <nl> - List < SSTableReader > readers = readers ( 0 , 3 , cfs ) ; <nl> + List < SSTableReader > readers = readers ( 0 , 4 , cfs ) ; <nl> tracker . addInitialSSTables ( readers ) ; <nl> LifecycleTransaction txn = tracker . tryModify ( readers , OperationType . UNKNOWN ) ; <nl> + txn . cancel ( readers . get ( 3 ) ) ; <nl> LifecycleTransaction txn2 = txn . split ( readers . subList ( 0 , 1 ) ) ; <nl> Assert . assertEquals ( 2 , txn . originals ( ) . size ( ) ) ; <nl> Assert . assertTrue ( all ( readers . subList ( 1 , 3 ) , in ( txn . originals ( ) ) ) ) ;
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 3b80885 . . f6769fe 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 1 . 2 - rc1 <nl> + * Fix rare race condition in getExpireTimeForEndpoint ( CASSANDRA - 4402 ) <nl> * acquire references to overlapping sstables during compaction so bloom filter <nl> doesn ' t get free ' d prematurely ( CASSANDRA - 4934 ) <nl> * Don ' t share slice query filter in CQL3 SelectStatement ( CASSANDRA - 4928 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / Table . java b / src / java / org / apache / cassandra / db / Table . java <nl> index 85611de . . 18b7e4b 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Table . java <nl> + + + b / src / java / org / apache / cassandra / db / Table . java <nl> @ @ - 22 , 6 + 22 , 7 @ @ import java . io . IOException ; <nl> import java . nio . ByteBuffer ; <nl> import java . util . * ; <nl> import java . util . concurrent . ConcurrentHashMap ; <nl> + import java . util . concurrent . ConcurrentMap ; <nl> import java . util . concurrent . ExecutionException ; <nl> import java . util . concurrent . Future ; <nl> import java . util . concurrent . locks . ReentrantReadWriteLock ; <nl> @ @ - 71 , 7 + 72 , 7 @ @ public class Table <nl> / * Table name . * / <nl> public final String name ; <nl> / * ColumnFamilyStore per column family * / <nl> - private final Map < UUID , ColumnFamilyStore > columnFamilyStores = new ConcurrentHashMap < UUID , ColumnFamilyStore > ( ) ; <nl> + private final ConcurrentMap < UUID , ColumnFamilyStore > columnFamilyStores = new ConcurrentHashMap < UUID , ColumnFamilyStore > ( ) ; <nl> private final Object [ ] indexLocks ; <nl> private volatile AbstractReplicationStrategy replicationStrategy ; <nl> <nl> @ @ - 319 , 19 + 320 , 25 @ @ public class Table <nl> * / <nl> public void initCf ( UUID cfId , String cfName , boolean loadSSTables ) <nl> { <nl> - if ( columnFamilyStores . containsKey ( cfId ) ) <nl> - { <nl> - / / this is the case when you reset local schema <nl> - / / just reload metadata <nl> - ColumnFamilyStore cfs = columnFamilyStores . get ( cfId ) ; <nl> - assert cfs . getColumnFamilyName ( ) . equals ( cfName ) ; <nl> + ColumnFamilyStore cfs = columnFamilyStores . get ( cfId ) ; <nl> <nl> - cfs . metadata . reload ( ) ; <nl> - cfs . reload ( ) ; <nl> + if ( cfs = = null ) <nl> + { <nl> + / / CFS being created for the first time , either on server startup or new CF being added . <nl> + / / We don ' t worry about races here ; startup is safe , and adding multiple idential CFs <nl> + / / simultaneously is a " don ' t do that " scenario . <nl> + ColumnFamilyStore oldCfs = columnFamilyStores . putIfAbsent ( cfId , ColumnFamilyStore . createColumnFamilyStore ( this , cfName , loadSSTables ) ) ; <nl> + / / CFS mbean instantiation will error out before we hit this , but in case that changes . . . <nl> + if ( oldCfs ! = null ) <nl> + throw new IllegalStateException ( " added multiple mappings for cf id " + cfId ) ; <nl> } <nl> else <nl> { <nl> - columnFamilyStores . put ( cfId , ColumnFamilyStore . createColumnFamilyStore ( this , cfName , loadSSTables ) ) ; <nl> + / / re - initializing an existing CF . This will happen if you cleared the schema <nl> + / / on this node and it ' s getting repopulated from the rest of the cluster . <nl> + assert cfs . getColumnFamilyName ( ) . equals ( cfName ) ; <nl> + cfs . metadata . reload ( ) ; <nl> + cfs . reload ( ) ; <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / gms / Gossiper . java b / src / java / org / apache / cassandra / gms / Gossiper . java <nl> index e49a6b3 . . 5880210 100644 <nl> - - - a / src / java / org / apache / cassandra / gms / Gossiper . java <nl> + + + b / src / java / org / apache / cassandra / gms / Gossiper . java <nl> @ @ - 26 , 6 + 26 , 7 @ @ import java . util . concurrent . * ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . ObjectName ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 90 , 7 + 91 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean <nl> private final Set < InetAddress > seeds = new ConcurrentSkipListSet < InetAddress > ( inetcomparator ) ; <nl> <nl> / * map where key is the endpoint and value is the state associated with the endpoint * / <nl> - final Map < InetAddress , EndpointState > endpointStateMap = new ConcurrentHashMap < InetAddress , EndpointState > ( ) ; <nl> + final ConcurrentMap < InetAddress , EndpointState > endpointStateMap = new ConcurrentHashMap < InetAddress , EndpointState > ( ) ; <nl> <nl> / * map where key is endpoint and value is timestamp when this endpoint was removed from <nl> * gossip . We will ignore any gossip regarding these endpoints for QUARANTINE _ DELAY time <nl> @ @ - 601 , 12 + 602 , 8 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean <nl> protected long getExpireTimeForEndpoint ( InetAddress endpoint ) <nl> { <nl> / * default expireTime is aVeryLongTime * / <nl> - long expireTime = computeExpireTime ( ) ; <nl> - if ( expireTimeEndpointMap . containsKey ( endpoint ) ) <nl> - { <nl> - expireTime = expireTimeEndpointMap . get ( endpoint ) ; <nl> - } <nl> - return expireTime ; <nl> + Long storedTime = expireTimeEndpointMap . get ( endpoint ) ; <nl> + return storedTime = = null ? computeExpireTime ( ) : storedTime ; <nl> } <nl> <nl> public EndpointState getEndpointStateForEndpoint ( InetAddress ep ) <nl> @ @ - 1031 , 17 + 1028 , 13 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean <nl> TimeUnit . MILLISECONDS ) ; <nl> } <nl> <nl> - / / initialize local HB state if needed . <nl> + / / initialize local HB state if needed , i . e . , if gossiper has never been started before . <nl> public void maybeInitializeLocalState ( int generationNbr ) <nl> { <nl> - EndpointState localState = endpointStateMap . get ( FBUtilities . getBroadcastAddress ( ) ) ; <nl> - if ( localState = = null ) <nl> - { <nl> - HeartBeatState hbState = new HeartBeatState ( generationNbr ) ; <nl> - localState = new EndpointState ( hbState ) ; <nl> - localState . markAlive ( ) ; <nl> - endpointStateMap . put ( FBUtilities . getBroadcastAddress ( ) , localState ) ; <nl> - } <nl> + HeartBeatState hbState = new HeartBeatState ( generationNbr ) ; <nl> + EndpointState localState = new EndpointState ( hbState ) ; <nl> + localState . markAlive ( ) ; <nl> + endpointStateMap . putIfAbsent ( FBUtilities . getBroadcastAddress ( ) , localState ) ; <nl> } <nl> <nl> <nl> @ @ - 1093 , 27 + 1086 , 20 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean <nl> return ( scheduledGossipTask ! = null ) & & ( ! scheduledGossipTask . isCancelled ( ) ) ; <nl> } <nl> <nl> - / * * <nl> - * This should * only * be used for testing purposes . <nl> - * / <nl> - public void initializeNodeUnsafe ( InetAddress addr , UUID uuid , int generationNbr ) { <nl> - / * initialize the heartbeat state for this localEndpoint * / <nl> - EndpointState localState = endpointStateMap . get ( addr ) ; <nl> - if ( localState = = null ) <nl> - { <nl> - HeartBeatState hbState = new HeartBeatState ( generationNbr ) ; <nl> - localState = new EndpointState ( hbState ) ; <nl> - localState . markAlive ( ) ; <nl> - endpointStateMap . put ( addr , localState ) ; <nl> - } <nl> + @ VisibleForTesting <nl> + public void initializeNodeUnsafe ( InetAddress addr , UUID uuid , int generationNbr ) <nl> + { <nl> + HeartBeatState hbState = new HeartBeatState ( generationNbr ) ; <nl> + EndpointState localState = new EndpointState ( hbState ) ; <nl> + localState . markAlive ( ) ; <nl> + endpointStateMap . putIfAbsent ( addr , localState ) ; <nl> + <nl> / / always add the version state <nl> localState . addApplicationState ( ApplicationState . NET _ VERSION , StorageService . instance . valueFactory . networkVersion ( ) ) ; <nl> localState . addApplicationState ( ApplicationState . HOST _ ID , StorageService . instance . valueFactory . hostId ( uuid ) ) ; <nl> } <nl> <nl> - / * * <nl> - * This should * only * be used for testing purposes <nl> - * / <nl> + @ VisibleForTesting <nl> public void injectApplicationState ( InetAddress endpoint , ApplicationState state , VersionedValue value ) <nl> { <nl> EndpointState localState = endpointStateMap . get ( endpoint ) ;
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / lifecycle / LifecycleTransaction . java b / src / java / org / apache / cassandra / db / lifecycle / LifecycleTransaction . java 
+ index e14e2a1 . . dfa30c7 100644 
+ - - - a / src / java / org / apache / cassandra / db / lifecycle / LifecycleTransaction . java 
+ + + + b / src / java / org / apache / cassandra / db / lifecycle / LifecycleTransaction . java 
+ @ @ - 386 , 6 + 386 , 7 @ @ public class LifecycleTransaction extends Transactional . AbstractTransactional 
+ assert ! ( staged . contains ( cancel ) | | logged . contains ( cancel ) ) : " may only cancel a reader that has not been updated or obsoleted in this transaction : " + cancel ; 
+ originals . remove ( cancel ) ; 
+ marked . remove ( cancel ) ; 
+ + identities . remove ( cancel . instanceId ) ; 
+ maybeFail ( unmarkCompacting ( singleton ( cancel ) , null ) ) ; 
+ } 
+ 
+ @ @ - 515 , 4 + 516 , 4 @ @ public class LifecycleTransaction extends Transactional . AbstractTransactional 
+ { 
+ return originals . toString ( ) ; 
+ } 
+ - } 
+ \ No newline at end of file 
+ + } 
+ diff - - git a / test / unit / org / apache / cassandra / db / lifecycle / LifecycleTransactionTest . java b / test / unit / org / apache / cassandra / db / lifecycle / LifecycleTransactionTest . java 
+ index aaa9999 . . f13d1b7 100644 
+ - - - a / test / unit / org / apache / cassandra / db / lifecycle / LifecycleTransactionTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / lifecycle / LifecycleTransactionTest . java 
+ @ @ - 185 , 9 + 185 , 10 @ @ public class LifecycleTransactionTest extends AbstractTransactionalTest 
+ { 
+ ColumnFamilyStore cfs = MockSchema . newCFS ( ) ; 
+ Tracker tracker = new Tracker ( null , false ) ; 
+ - List < SSTableReader > readers = readers ( 0 , 3 , cfs ) ; 
+ + List < SSTableReader > readers = readers ( 0 , 4 , cfs ) ; 
+ tracker . addInitialSSTables ( readers ) ; 
+ LifecycleTransaction txn = tracker . tryModify ( readers , OperationType . UNKNOWN ) ; 
+ + txn . cancel ( readers . get ( 3 ) ) ; 
+ LifecycleTransaction txn2 = txn . split ( readers . subList ( 0 , 1 ) ) ; 
+ Assert . assertEquals ( 2 , txn . originals ( ) . size ( ) ) ; 
+ Assert . assertTrue ( all ( readers . subList ( 1 , 3 ) , in ( txn . originals ( ) ) ) ) ;
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 3b80885 . . f6769fe 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 1 . 2 - rc1 
+ + * Fix rare race condition in getExpireTimeForEndpoint ( CASSANDRA - 4402 ) 
+ * acquire references to overlapping sstables during compaction so bloom filter 
+ doesn ' t get free ' d prematurely ( CASSANDRA - 4934 ) 
+ * Don ' t share slice query filter in CQL3 SelectStatement ( CASSANDRA - 4928 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / Table . java b / src / java / org / apache / cassandra / db / Table . java 
+ index 85611de . . 18b7e4b 100644 
+ - - - a / src / java / org / apache / cassandra / db / Table . java 
+ + + + b / src / java / org / apache / cassandra / db / Table . java 
+ @ @ - 22 , 6 + 22 , 7 @ @ import java . io . IOException ; 
+ import java . nio . ByteBuffer ; 
+ import java . util . * ; 
+ import java . util . concurrent . ConcurrentHashMap ; 
+ + import java . util . concurrent . ConcurrentMap ; 
+ import java . util . concurrent . ExecutionException ; 
+ import java . util . concurrent . Future ; 
+ import java . util . concurrent . locks . ReentrantReadWriteLock ; 
+ @ @ - 71 , 7 + 72 , 7 @ @ public class Table 
+ / * Table name . * / 
+ public final String name ; 
+ / * ColumnFamilyStore per column family * / 
+ - private final Map < UUID , ColumnFamilyStore > columnFamilyStores = new ConcurrentHashMap < UUID , ColumnFamilyStore > ( ) ; 
+ + private final ConcurrentMap < UUID , ColumnFamilyStore > columnFamilyStores = new ConcurrentHashMap < UUID , ColumnFamilyStore > ( ) ; 
+ private final Object [ ] indexLocks ; 
+ private volatile AbstractReplicationStrategy replicationStrategy ; 
+ 
+ @ @ - 319 , 19 + 320 , 25 @ @ public class Table 
+ * / 
+ public void initCf ( UUID cfId , String cfName , boolean loadSSTables ) 
+ { 
+ - if ( columnFamilyStores . containsKey ( cfId ) ) 
+ - { 
+ - / / this is the case when you reset local schema 
+ - / / just reload metadata 
+ - ColumnFamilyStore cfs = columnFamilyStores . get ( cfId ) ; 
+ - assert cfs . getColumnFamilyName ( ) . equals ( cfName ) ; 
+ + ColumnFamilyStore cfs = columnFamilyStores . get ( cfId ) ; 
+ 
+ - cfs . metadata . reload ( ) ; 
+ - cfs . reload ( ) ; 
+ + if ( cfs = = null ) 
+ + { 
+ + / / CFS being created for the first time , either on server startup or new CF being added . 
+ + / / We don ' t worry about races here ; startup is safe , and adding multiple idential CFs 
+ + / / simultaneously is a " don ' t do that " scenario . 
+ + ColumnFamilyStore oldCfs = columnFamilyStores . putIfAbsent ( cfId , ColumnFamilyStore . createColumnFamilyStore ( this , cfName , loadSSTables ) ) ; 
+ + / / CFS mbean instantiation will error out before we hit this , but in case that changes . . . 
+ + if ( oldCfs ! = null ) 
+ + throw new IllegalStateException ( " added multiple mappings for cf id " + cfId ) ; 
+ } 
+ else 
+ { 
+ - columnFamilyStores . put ( cfId , ColumnFamilyStore . createColumnFamilyStore ( this , cfName , loadSSTables ) ) ; 
+ + / / re - initializing an existing CF . This will happen if you cleared the schema 
+ + / / on this node and it ' s getting repopulated from the rest of the cluster . 
+ + assert cfs . getColumnFamilyName ( ) . equals ( cfName ) ; 
+ + cfs . metadata . reload ( ) ; 
+ + cfs . reload ( ) ; 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / gms / Gossiper . java b / src / java / org / apache / cassandra / gms / Gossiper . java 
+ index e49a6b3 . . 5880210 100644 
+ - - - a / src / java / org / apache / cassandra / gms / Gossiper . java 
+ + + + b / src / java / org / apache / cassandra / gms / Gossiper . java 
+ @ @ - 26 , 6 + 26 , 7 @ @ import java . util . concurrent . * ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . ObjectName ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 90 , 7 + 91 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean 
+ private final Set < InetAddress > seeds = new ConcurrentSkipListSet < InetAddress > ( inetcomparator ) ; 
+ 
+ / * map where key is the endpoint and value is the state associated with the endpoint * / 
+ - final Map < InetAddress , EndpointState > endpointStateMap = new ConcurrentHashMap < InetAddress , EndpointState > ( ) ; 
+ + final ConcurrentMap < InetAddress , EndpointState > endpointStateMap = new ConcurrentHashMap < InetAddress , EndpointState > ( ) ; 
+ 
+ / * map where key is endpoint and value is timestamp when this endpoint was removed from 
+ * gossip . We will ignore any gossip regarding these endpoints for QUARANTINE _ DELAY time 
+ @ @ - 601 , 12 + 602 , 8 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean 
+ protected long getExpireTimeForEndpoint ( InetAddress endpoint ) 
+ { 
+ / * default expireTime is aVeryLongTime * / 
+ - long expireTime = computeExpireTime ( ) ; 
+ - if ( expireTimeEndpointMap . containsKey ( endpoint ) ) 
+ - { 
+ - expireTime = expireTimeEndpointMap . get ( endpoint ) ; 
+ - } 
+ - return expireTime ; 
+ + Long storedTime = expireTimeEndpointMap . get ( endpoint ) ; 
+ + return storedTime = = null ? computeExpireTime ( ) : storedTime ; 
+ } 
+ 
+ public EndpointState getEndpointStateForEndpoint ( InetAddress ep ) 
+ @ @ - 1031 , 17 + 1028 , 13 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean 
+ TimeUnit . MILLISECONDS ) ; 
+ } 
+ 
+ - / / initialize local HB state if needed . 
+ + / / initialize local HB state if needed , i . e . , if gossiper has never been started before . 
+ public void maybeInitializeLocalState ( int generationNbr ) 
+ { 
+ - EndpointState localState = endpointStateMap . get ( FBUtilities . getBroadcastAddress ( ) ) ; 
+ - if ( localState = = null ) 
+ - { 
+ - HeartBeatState hbState = new HeartBeatState ( generationNbr ) ; 
+ - localState = new EndpointState ( hbState ) ; 
+ - localState . markAlive ( ) ; 
+ - endpointStateMap . put ( FBUtilities . getBroadcastAddress ( ) , localState ) ; 
+ - } 
+ + HeartBeatState hbState = new HeartBeatState ( generationNbr ) ; 
+ + EndpointState localState = new EndpointState ( hbState ) ; 
+ + localState . markAlive ( ) ; 
+ + endpointStateMap . putIfAbsent ( FBUtilities . getBroadcastAddress ( ) , localState ) ; 
+ } 
+ 
+ 
+ @ @ - 1093 , 27 + 1086 , 20 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean 
+ return ( scheduledGossipTask ! = null ) & & ( ! scheduledGossipTask . isCancelled ( ) ) ; 
+ } 
+ 
+ - / * * 
+ - * This should * only * be used for testing purposes . 
+ - * / 
+ - public void initializeNodeUnsafe ( InetAddress addr , UUID uuid , int generationNbr ) { 
+ - / * initialize the heartbeat state for this localEndpoint * / 
+ - EndpointState localState = endpointStateMap . get ( addr ) ; 
+ - if ( localState = = null ) 
+ - { 
+ - HeartBeatState hbState = new HeartBeatState ( generationNbr ) ; 
+ - localState = new EndpointState ( hbState ) ; 
+ - localState . markAlive ( ) ; 
+ - endpointStateMap . put ( addr , localState ) ; 
+ - } 
+ + @ VisibleForTesting 
+ + public void initializeNodeUnsafe ( InetAddress addr , UUID uuid , int generationNbr ) 
+ + { 
+ + HeartBeatState hbState = new HeartBeatState ( generationNbr ) ; 
+ + EndpointState localState = new EndpointState ( hbState ) ; 
+ + localState . markAlive ( ) ; 
+ + endpointStateMap . putIfAbsent ( addr , localState ) ; 
+ + 
+ / / always add the version state 
+ localState . addApplicationState ( ApplicationState . NET _ VERSION , StorageService . instance . valueFactory . networkVersion ( ) ) ; 
+ localState . addApplicationState ( ApplicationState . HOST _ ID , StorageService . instance . valueFactory . hostId ( uuid ) ) ; 
+ } 
+ 
+ - / * * 
+ - * This should * only * be used for testing purposes 
+ - * / 
+ + @ VisibleForTesting 
+ public void injectApplicationState ( InetAddress endpoint , ApplicationState state , VersionedValue value ) 
+ { 
+ EndpointState localState = endpointStateMap . get ( endpoint ) ;

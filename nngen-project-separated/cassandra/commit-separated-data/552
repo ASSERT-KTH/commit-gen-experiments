@@ -1,0 +1,272 @@
+BLEU SCORE: 0.034353182138500235
+
+TEST MSG: CQL often queries static columns unnecessarily
+GENERATED MSG: Reenable ALTER TABLE DROP with new semantics
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 5242adf . . 21cf5be 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 11 <nl> + * CQL often queries static columns unnecessarily ( CASSANDRA - 12768 ) <nl> * Make sure sstables only get committed when it ' s safe to discard commit log records ( CASSANDRA - 12956 ) <nl> * Reject default _ time _ to _ live option when creating or altering MVs ( CASSANDRA - 12868 ) <nl> * Nodetool should use a more sane max heap size ( CASSANDRA - 12739 ) <nl> diff - - git a / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java b / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java <nl> index aca6146 . . f2aa030 100644 <nl> - - - a / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java <nl> + + + b / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java <nl> @ @ - 141 , 13 + 141 , 19 @ @ public class SelectStatement implements CQLStatement <nl> if ( selection . isWildcard ( ) ) <nl> return ColumnFilter . all ( cfm ) ; <nl> <nl> - ColumnFilter . Builder builder = ColumnFilter . allColumnsBuilder ( cfm ) ; <nl> + ColumnFilter . Builder builder = ColumnFilter . allRegularColumnsBuilder ( cfm ) ; <nl> / / Adds all selected columns <nl> for ( ColumnDefinition def : selection . getColumns ( ) ) <nl> if ( ! def . isPrimaryKeyColumn ( ) ) <nl> builder . add ( def ) ; <nl> / / as well as any restricted column ( so we can actually apply the restriction ) <nl> builder . addAll ( restrictions . nonPKRestrictedColumns ( true ) ) ; <nl> + <nl> + / / In a number of cases , we want to distinguish between a partition truly empty and one with only static content <nl> + / / ( but no rows ) . In those cases , we should force querying all static columns ( to make the distinction ) . <nl> + if ( cfm . hasStaticColumns ( ) & & returnStaticContentOnPartitionWithNoRows ( ) ) <nl> + builder . addAll ( cfm . partitionColumns ( ) . statics ) ; <nl> + <nl> return builder . build ( ) ; <nl> } <nl> <nl> @ @ - 734 , 6 + 740 , 20 @ @ public class SelectStatement implements CQLStatement <nl> } <nl> } <nl> <nl> + / / Determines whether , when we have a partition result with not rows , we still return the static content ( as a <nl> + / / result set row with null for all other regular columns . ) <nl> + private boolean returnStaticContentOnPartitionWithNoRows ( ) <nl> + { <nl> + / / The general rational is that if some rows are specifically selected by the query , we ignore partitions that <nl> + / / are empty outside of static content , but if it ' s a full partition query , then we include that content . <nl> + / / In practice , we consider rows are specifically selected if either there is some restrictions on the <nl> + / / clustering columns or it ' s a 2ndary index query ( the later is debatable but historical ) . An exception however <nl> + / / is ' static compact ' table , for which 2ndary index indexes full partition ( and so for which we consider 2ndary <nl> + / / indexquery to be full partition query ) . <nl> + return ! restrictions . hasClusteringColumnsRestriction ( ) <nl> + & & ( ! restrictions . usesSecondaryIndexing ( ) | | cfm . isStaticCompactTable ( ) ) ; <nl> + } <nl> + <nl> / / Used by ModificationStatement for CAS operations <nl> void processPartition ( RowIterator partition , QueryOptions options , Selection . ResultSetBuilder result , int nowInSec ) <nl> throws InvalidRequestException <nl> @ @ - 744 , 12 + 764 , 10 @ @ public class SelectStatement implements CQLStatement <nl> <nl> Row staticRow = partition . staticRow ( ) ; <nl> / / If there is no rows , then provided the select was a full partition selection <nl> - / / ( i . e . not a 2ndary index search and there was no condition on clustering columns ) , <nl> / / we want to include static columns and we ' re done . <nl> if ( ! partition . hasNext ( ) ) <nl> { <nl> - if ( ! staticRow . isEmpty ( ) & & ( ! restrictions . usesSecondaryIndexing ( ) | | cfm . isStaticCompactTable ( ) ) <nl> - & & ! restrictions . hasClusteringColumnsRestriction ( ) ) <nl> + if ( ! staticRow . isEmpty ( ) & & returnStaticContentOnPartitionWithNoRows ( ) ) <nl> { <nl> result . newRow ( protocolVersion ) ; <nl> for ( ColumnDefinition def : selection . getColumns ( ) ) <nl> diff - - git a / src / java / org / apache / cassandra / db / filter / ClusteringIndexNamesFilter . java b / src / java / org / apache / cassandra / db / filter / ClusteringIndexNamesFilter . java <nl> index a81a7a6 . . ea5cf55 100644 <nl> - - - a / src / java / org / apache / cassandra / db / filter / ClusteringIndexNamesFilter . java <nl> + + + b / src / java / org / apache / cassandra / db / filter / ClusteringIndexNamesFilter . java <nl> @ @ - 178 , 12 + 178 , 12 @ @ public class ClusteringIndexNamesFilter extends AbstractClusteringIndexFilter <nl> { <nl> final SearchIterator < Clustering , Row > searcher = partition . searchIterator ( columnFilter , reversed ) ; <nl> return new AbstractUnfilteredRowIterator ( partition . metadata ( ) , <nl> - partition . partitionKey ( ) , <nl> - partition . partitionLevelDeletion ( ) , <nl> - columnFilter . fetchedColumns ( ) , <nl> - searcher . next ( Clustering . STATIC _ CLUSTERING ) , <nl> - reversed , <nl> - partition . stats ( ) ) <nl> + partition . partitionKey ( ) , <nl> + partition . partitionLevelDeletion ( ) , <nl> + columnFilter . fetchedColumns ( ) , <nl> + searcher . next ( Clustering . STATIC _ CLUSTERING ) , <nl> + reversed , <nl> + partition . stats ( ) ) <nl> { <nl> private final Iterator < Clustering > clusteringIter = clusteringsInQueryOrder . iterator ( ) ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / filter / ColumnFilter . java b / src / java / org / apache / cassandra / db / filter / ColumnFilter . java <nl> index 05eade5 . . 8d4f8b8 100644 <nl> - - - a / src / java / org / apache / cassandra / db / filter / ColumnFilter . java <nl> + + + b / src / java / org / apache / cassandra / db / filter / ColumnFilter . java <nl> @ @ - 37 , 8 + 37 , 8 @ @ import org . apache . cassandra . io . util . DataOutputPlus ; <nl> * by a query . <nl> * <nl> * In practice , this class cover 2 main cases : <nl> - * 1 ) most user queries have to internally query all columns , because the CQL semantic requires us to know if <nl> - * a row is live or not even if it has no values for the columns requested by the user ( see # 6588for more <nl> + * 1 ) most user queries have to internally query all ( regular ) columns , because the CQL semantic requires us to know <nl> + * if a row is live or not even if it has no values for the columns requested by the user ( see # 6588 for more <nl> * details ) . However , while we need to know for columns if it has live values , we can actually save from <nl> * sending the values for those columns that will not be returned to the user . <nl> * 2 ) for some internal queries ( and for queries using # 6588 if we introduce it ) , we ' re actually fine only <nl> @ @ - 51 , 8 + 51 , 11 @ @ public class ColumnFilter <nl> { <nl> public static final Serializer serializer = new Serializer ( ) ; <nl> <nl> - / / Distinguish between the 2 cases described above : if ' isFetchAll ' is true , then all columns will be retrieved <nl> - / / by the query , but the values for column / cells not selected by ' selection ' and ' subSelections ' will be skipped . <nl> + / / Distinguish between the 2 cases described above : if ' isFetchAll ' is true , then all regular columns will be <nl> + / / retrieved by the query . If selection is also null , then all static columns will be fetched too . If ' isFetchAll ' <nl> + / / is true and selection is not null , then 1 ) for static columns , only the ones in selection are read and 2 ) for <nl> + / / regular columns , while all are fetches , the values for column / cells not selected by ' selection ' and <nl> + / / ' subSelections ' will be skipped . <nl> / / Otherwise , only the column / cells returned by ' selection ' and ' subSelections ' will be returned at all . <nl> private final boolean isFetchAll ; <nl> <nl> @ @ - 102 , 12 + 105 , 21 @ @ public class ColumnFilter <nl> * / <nl> public PartitionColumns fetchedColumns ( ) <nl> { <nl> - return isFetchAll ? metadata . partitionColumns ( ) : selection ; <nl> + if ( ! isFetchAll ) <nl> + return selection ; <nl> + <nl> + / / We always fetch all regulars , but only fetch the statics in selection . Unless selection is null , in which <nl> + / / case it ' s a wildcard and we fetch everything . <nl> + PartitionColumns all = metadata . partitionColumns ( ) ; <nl> + return selection = = null | | all . statics . isEmpty ( ) <nl> + ? all <nl> + : new PartitionColumns ( selection . statics , all . regulars ) ; <nl> } <nl> <nl> - public boolean includesAllColumns ( ) <nl> + public boolean includesAllColumns ( boolean isStatic ) <nl> { <nl> - return isFetchAll ; <nl> + / / Static columns are never all included , unless selection = = null <nl> + return isStatic ? selection = = null : isFetchAll ; <nl> } <nl> <nl> / * * <nl> @ @ - 115 , 6 + 127 , 11 @ @ public class ColumnFilter <nl> * / <nl> public boolean includes ( ColumnDefinition column ) <nl> { <nl> + / / For statics , it is included only if it ' s part of selection , or if selection is null ( wildcard query ) . <nl> + if ( column . isStatic ( ) ) <nl> + return selection = = null | | selection . contains ( column ) ; <nl> + <nl> + / / For regulars , if ' isFetchAll ' , then it ' s included automatically . Otherwise , it depends on ' selection ' . <nl> return isFetchAll | | selection . contains ( column ) ; <nl> } <nl> <nl> @ @ - 166 , 8 + 183 , 13 @ @ public class ColumnFilter <nl> } <nl> <nl> / * * <nl> - * Creates a new { @ code Tester } to efficiently test the inclusion of cells of complex column <nl> - * { @ code column } . <nl> + * Creates a new { @ code Tester } to efficiently test the inclusion of cells <nl> + * of an included complex column . <nl> + * <nl> + * @ param column the complex column , which * must * be included by this <nl> + * filter ( that is , we must have { @ code this . includes ( column ) } ) . <nl> + * @ retun the created tester or { @ code null } if all the cells from { @ code <nl> + * column } are included . <nl> * / <nl> public Tester newTester ( ColumnDefinition column ) <nl> { <nl> @ @ - 178 , 14 + 200 , 15 @ @ public class ColumnFilter <nl> if ( s . isEmpty ( ) ) <nl> return null ; <nl> <nl> - return new Tester ( isFetchAll , s . iterator ( ) ) ; <nl> + / / isFetchAll only imply everything if fetches for regular <nl> + return new Tester ( isFetchAll & & ! column . isStatic ( ) , s . iterator ( ) ) ; <nl> } <nl> <nl> / * * <nl> * Returns a { @ code ColumnFilter } } builder that includes all columns ( so the selections <nl> * added to the builder are the columns / cells for which we shouldn ' t skip the values ) . <nl> * / <nl> - public static Builder allColumnsBuilder ( CFMetaData metadata ) <nl> + public static Builder allRegularColumnsBuilder ( CFMetaData metadata ) <nl> { <nl> return new Builder ( metadata ) ; <nl> } <nl> @ @ - 201 , 24 + 224 , 36 @ @ public class ColumnFilter <nl> <nl> public static class Tester <nl> { <nl> - private final boolean isFetchAll ; <nl> + private final boolean isFetched ; / / if true , all cells are included <nl> private ColumnSubselection current ; <nl> private final Iterator < ColumnSubselection > iterator ; <nl> <nl> - private Tester ( boolean isFetchAll , Iterator < ColumnSubselection > iterator ) <nl> + private Tester ( boolean isFetched , Iterator < ColumnSubselection > iterator ) <nl> { <nl> - this . isFetchAll = isFetchAll ; <nl> + this . isFetched = isFetched ; <nl> this . iterator = iterator ; <nl> } <nl> <nl> public boolean includes ( CellPath path ) <nl> { <nl> - return isFetchAll | | includedBySubselection ( path ) ; <nl> + / / It ' s included if either all cells are fetched ( because it ' s a <nl> + / / regular column and the filter has ' isFetchAll = = true ' ) , or if <nl> + / / it ' s explicitely selected . <nl> + return isFetched | | includedBySubselection ( path ) ; <nl> } <nl> <nl> + / * * <nl> + * Must only be called if { @ code includes ( path ) = = true } . <nl> + * / <nl> public boolean canSkipValue ( CellPath path ) <nl> { <nl> - return isFetchAll & & ! includedBySubselection ( path ) ; <nl> + / / We can skip the value of an included column only if it ' s a <nl> + / / regular column included due to the ' isFetchAll ' flag , but which <nl> + / / isn ' t explicitely selected . In practice , it ' s enough to not have <nl> + / / the path explicitly selected as it implies the column was <nl> + / / included due to ' isFetchAll ' ( since we require includes ( path ) to <nl> + / / be called first ) . <nl> + return ! includedBySubselection ( path ) ; <nl> } <nl> <nl> private boolean includedBySubselection ( CellPath path ) <nl> diff - - git a / src / java / org / apache / cassandra / db / rows / BTreeRow . java b / src / java / org / apache / cassandra / db / rows / BTreeRow . java <nl> index ea1d9e0 . . 18f3dec 100644 <nl> - - - a / src / java / org / apache / cassandra / db / rows / BTreeRow . java <nl> + + + b / src / java / org / apache / cassandra / db / rows / BTreeRow . java <nl> @ @ - 237 , 7 + 237 , 7 @ @ public class BTreeRow extends AbstractRow <nl> { <nl> Map < ByteBuffer , CFMetaData . DroppedColumn > droppedColumns = metadata . getDroppedColumns ( ) ; <nl> <nl> - if ( filter . includesAllColumns ( ) & & ( activeDeletion . isLive ( ) | | deletion . supersedes ( activeDeletion ) ) & & droppedColumns . isEmpty ( ) ) <nl> + if ( filter . includesAllColumns ( isStatic ( ) ) & & ( activeDeletion . isLive ( ) | | deletion . supersedes ( activeDeletion ) ) & & droppedColumns . isEmpty ( ) ) <nl> return this ; <nl> <nl> boolean mayHaveShadowed = activeDeletion . supersedes ( deletion . time ( ) ) ;
+NEAREST DIFF (one line): diff - - git a / debian / changelog b / debian / changelog <nl> index 739e38a . . 76bac83 100644 <nl> - - - a / debian / changelog <nl> + + + b / debian / changelog <nl> @ @ - 2 , 7 + 2 , 7 @ @ cassandra ( 1 . 1 . 11 ) unstable ; urgency = low <nl> <nl> * New release <nl> <nl> - - - Eric Evans < eevans @ apache . org > , 16 Apr 2013 18 : 56 : 03 - 0500 <nl> + - - Eric Evans < eevans @ apache . org > Tue , 16 Apr 2013 18 : 56 : 03 - 0500 <nl> <nl> cassandra ( 1 . 1 . 10 ) unstable ; urgency = low <nl>
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 5242adf . . 21cf5be 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 11 
+ + * CQL often queries static columns unnecessarily ( CASSANDRA - 12768 ) 
+ * Make sure sstables only get committed when it ' s safe to discard commit log records ( CASSANDRA - 12956 ) 
+ * Reject default _ time _ to _ live option when creating or altering MVs ( CASSANDRA - 12868 ) 
+ * Nodetool should use a more sane max heap size ( CASSANDRA - 12739 ) 
+ diff - - git a / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java b / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java 
+ index aca6146 . . f2aa030 100644 
+ - - - a / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java 
+ + + + b / src / java / org / apache / cassandra / cql3 / statements / SelectStatement . java 
+ @ @ - 141 , 13 + 141 , 19 @ @ public class SelectStatement implements CQLStatement 
+ if ( selection . isWildcard ( ) ) 
+ return ColumnFilter . all ( cfm ) ; 
+ 
+ - ColumnFilter . Builder builder = ColumnFilter . allColumnsBuilder ( cfm ) ; 
+ + ColumnFilter . Builder builder = ColumnFilter . allRegularColumnsBuilder ( cfm ) ; 
+ / / Adds all selected columns 
+ for ( ColumnDefinition def : selection . getColumns ( ) ) 
+ if ( ! def . isPrimaryKeyColumn ( ) ) 
+ builder . add ( def ) ; 
+ / / as well as any restricted column ( so we can actually apply the restriction ) 
+ builder . addAll ( restrictions . nonPKRestrictedColumns ( true ) ) ; 
+ + 
+ + / / In a number of cases , we want to distinguish between a partition truly empty and one with only static content 
+ + / / ( but no rows ) . In those cases , we should force querying all static columns ( to make the distinction ) . 
+ + if ( cfm . hasStaticColumns ( ) & & returnStaticContentOnPartitionWithNoRows ( ) ) 
+ + builder . addAll ( cfm . partitionColumns ( ) . statics ) ; 
+ + 
+ return builder . build ( ) ; 
+ } 
+ 
+ @ @ - 734 , 6 + 740 , 20 @ @ public class SelectStatement implements CQLStatement 
+ } 
+ } 
+ 
+ + / / Determines whether , when we have a partition result with not rows , we still return the static content ( as a 
+ + / / result set row with null for all other regular columns . ) 
+ + private boolean returnStaticContentOnPartitionWithNoRows ( ) 
+ + { 
+ + / / The general rational is that if some rows are specifically selected by the query , we ignore partitions that 
+ + / / are empty outside of static content , but if it ' s a full partition query , then we include that content . 
+ + / / In practice , we consider rows are specifically selected if either there is some restrictions on the 
+ + / / clustering columns or it ' s a 2ndary index query ( the later is debatable but historical ) . An exception however 
+ + / / is ' static compact ' table , for which 2ndary index indexes full partition ( and so for which we consider 2ndary 
+ + / / indexquery to be full partition query ) . 
+ + return ! restrictions . hasClusteringColumnsRestriction ( ) 
+ + & & ( ! restrictions . usesSecondaryIndexing ( ) | | cfm . isStaticCompactTable ( ) ) ; 
+ + } 
+ + 
+ / / Used by ModificationStatement for CAS operations 
+ void processPartition ( RowIterator partition , QueryOptions options , Selection . ResultSetBuilder result , int nowInSec ) 
+ throws InvalidRequestException 
+ @ @ - 744 , 12 + 764 , 10 @ @ public class SelectStatement implements CQLStatement 
+ 
+ Row staticRow = partition . staticRow ( ) ; 
+ / / If there is no rows , then provided the select was a full partition selection 
+ - / / ( i . e . not a 2ndary index search and there was no condition on clustering columns ) , 
+ / / we want to include static columns and we ' re done . 
+ if ( ! partition . hasNext ( ) ) 
+ { 
+ - if ( ! staticRow . isEmpty ( ) & & ( ! restrictions . usesSecondaryIndexing ( ) | | cfm . isStaticCompactTable ( ) ) 
+ - & & ! restrictions . hasClusteringColumnsRestriction ( ) ) 
+ + if ( ! staticRow . isEmpty ( ) & & returnStaticContentOnPartitionWithNoRows ( ) ) 
+ { 
+ result . newRow ( protocolVersion ) ; 
+ for ( ColumnDefinition def : selection . getColumns ( ) ) 
+ diff - - git a / src / java / org / apache / cassandra / db / filter / ClusteringIndexNamesFilter . java b / src / java / org / apache / cassandra / db / filter / ClusteringIndexNamesFilter . java 
+ index a81a7a6 . . ea5cf55 100644 
+ - - - a / src / java / org / apache / cassandra / db / filter / ClusteringIndexNamesFilter . java 
+ + + + b / src / java / org / apache / cassandra / db / filter / ClusteringIndexNamesFilter . java 
+ @ @ - 178 , 12 + 178 , 12 @ @ public class ClusteringIndexNamesFilter extends AbstractClusteringIndexFilter 
+ { 
+ final SearchIterator < Clustering , Row > searcher = partition . searchIterator ( columnFilter , reversed ) ; 
+ return new AbstractUnfilteredRowIterator ( partition . metadata ( ) , 
+ - partition . partitionKey ( ) , 
+ - partition . partitionLevelDeletion ( ) , 
+ - columnFilter . fetchedColumns ( ) , 
+ - searcher . next ( Clustering . STATIC _ CLUSTERING ) , 
+ - reversed , 
+ - partition . stats ( ) ) 
+ + partition . partitionKey ( ) , 
+ + partition . partitionLevelDeletion ( ) , 
+ + columnFilter . fetchedColumns ( ) , 
+ + searcher . next ( Clustering . STATIC _ CLUSTERING ) , 
+ + reversed , 
+ + partition . stats ( ) ) 
+ { 
+ private final Iterator < Clustering > clusteringIter = clusteringsInQueryOrder . iterator ( ) ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / filter / ColumnFilter . java b / src / java / org / apache / cassandra / db / filter / ColumnFilter . java 
+ index 05eade5 . . 8d4f8b8 100644 
+ - - - a / src / java / org / apache / cassandra / db / filter / ColumnFilter . java 
+ + + + b / src / java / org / apache / cassandra / db / filter / ColumnFilter . java 
+ @ @ - 37 , 8 + 37 , 8 @ @ import org . apache . cassandra . io . util . DataOutputPlus ; 
+ * by a query . 
+ * 
+ * In practice , this class cover 2 main cases : 
+ - * 1 ) most user queries have to internally query all columns , because the CQL semantic requires us to know if 
+ - * a row is live or not even if it has no values for the columns requested by the user ( see # 6588for more 
+ + * 1 ) most user queries have to internally query all ( regular ) columns , because the CQL semantic requires us to know 
+ + * if a row is live or not even if it has no values for the columns requested by the user ( see # 6588 for more 
+ * details ) . However , while we need to know for columns if it has live values , we can actually save from 
+ * sending the values for those columns that will not be returned to the user . 
+ * 2 ) for some internal queries ( and for queries using # 6588 if we introduce it ) , we ' re actually fine only 
+ @ @ - 51 , 8 + 51 , 11 @ @ public class ColumnFilter 
+ { 
+ public static final Serializer serializer = new Serializer ( ) ; 
+ 
+ - / / Distinguish between the 2 cases described above : if ' isFetchAll ' is true , then all columns will be retrieved 
+ - / / by the query , but the values for column / cells not selected by ' selection ' and ' subSelections ' will be skipped . 
+ + / / Distinguish between the 2 cases described above : if ' isFetchAll ' is true , then all regular columns will be 
+ + / / retrieved by the query . If selection is also null , then all static columns will be fetched too . If ' isFetchAll ' 
+ + / / is true and selection is not null , then 1 ) for static columns , only the ones in selection are read and 2 ) for 
+ + / / regular columns , while all are fetches , the values for column / cells not selected by ' selection ' and 
+ + / / ' subSelections ' will be skipped . 
+ / / Otherwise , only the column / cells returned by ' selection ' and ' subSelections ' will be returned at all . 
+ private final boolean isFetchAll ; 
+ 
+ @ @ - 102 , 12 + 105 , 21 @ @ public class ColumnFilter 
+ * / 
+ public PartitionColumns fetchedColumns ( ) 
+ { 
+ - return isFetchAll ? metadata . partitionColumns ( ) : selection ; 
+ + if ( ! isFetchAll ) 
+ + return selection ; 
+ + 
+ + / / We always fetch all regulars , but only fetch the statics in selection . Unless selection is null , in which 
+ + / / case it ' s a wildcard and we fetch everything . 
+ + PartitionColumns all = metadata . partitionColumns ( ) ; 
+ + return selection = = null | | all . statics . isEmpty ( ) 
+ + ? all 
+ + : new PartitionColumns ( selection . statics , all . regulars ) ; 
+ } 
+ 
+ - public boolean includesAllColumns ( ) 
+ + public boolean includesAllColumns ( boolean isStatic ) 
+ { 
+ - return isFetchAll ; 
+ + / / Static columns are never all included , unless selection = = null 
+ + return isStatic ? selection = = null : isFetchAll ; 
+ } 
+ 
+ / * * 
+ @ @ - 115 , 6 + 127 , 11 @ @ public class ColumnFilter 
+ * / 
+ public boolean includes ( ColumnDefinition column ) 
+ { 
+ + / / For statics , it is included only if it ' s part of selection , or if selection is null ( wildcard query ) . 
+ + if ( column . isStatic ( ) ) 
+ + return selection = = null | | selection . contains ( column ) ; 
+ + 
+ + / / For regulars , if ' isFetchAll ' , then it ' s included automatically . Otherwise , it depends on ' selection ' . 
+ return isFetchAll | | selection . contains ( column ) ; 
+ } 
+ 
+ @ @ - 166 , 8 + 183 , 13 @ @ public class ColumnFilter 
+ } 
+ 
+ / * * 
+ - * Creates a new { @ code Tester } to efficiently test the inclusion of cells of complex column 
+ - * { @ code column } . 
+ + * Creates a new { @ code Tester } to efficiently test the inclusion of cells 
+ + * of an included complex column . 
+ + * 
+ + * @ param column the complex column , which * must * be included by this 
+ + * filter ( that is , we must have { @ code this . includes ( column ) } ) . 
+ + * @ retun the created tester or { @ code null } if all the cells from { @ code 
+ + * column } are included . 
+ * / 
+ public Tester newTester ( ColumnDefinition column ) 
+ { 
+ @ @ - 178 , 14 + 200 , 15 @ @ public class ColumnFilter 
+ if ( s . isEmpty ( ) ) 
+ return null ; 
+ 
+ - return new Tester ( isFetchAll , s . iterator ( ) ) ; 
+ + / / isFetchAll only imply everything if fetches for regular 
+ + return new Tester ( isFetchAll & & ! column . isStatic ( ) , s . iterator ( ) ) ; 
+ } 
+ 
+ / * * 
+ * Returns a { @ code ColumnFilter } } builder that includes all columns ( so the selections 
+ * added to the builder are the columns / cells for which we shouldn ' t skip the values ) . 
+ * / 
+ - public static Builder allColumnsBuilder ( CFMetaData metadata ) 
+ + public static Builder allRegularColumnsBuilder ( CFMetaData metadata ) 
+ { 
+ return new Builder ( metadata ) ; 
+ } 
+ @ @ - 201 , 24 + 224 , 36 @ @ public class ColumnFilter 
+ 
+ public static class Tester 
+ { 
+ - private final boolean isFetchAll ; 
+ + private final boolean isFetched ; / / if true , all cells are included 
+ private ColumnSubselection current ; 
+ private final Iterator < ColumnSubselection > iterator ; 
+ 
+ - private Tester ( boolean isFetchAll , Iterator < ColumnSubselection > iterator ) 
+ + private Tester ( boolean isFetched , Iterator < ColumnSubselection > iterator ) 
+ { 
+ - this . isFetchAll = isFetchAll ; 
+ + this . isFetched = isFetched ; 
+ this . iterator = iterator ; 
+ } 
+ 
+ public boolean includes ( CellPath path ) 
+ { 
+ - return isFetchAll | | includedBySubselection ( path ) ; 
+ + / / It ' s included if either all cells are fetched ( because it ' s a 
+ + / / regular column and the filter has ' isFetchAll = = true ' ) , or if 
+ + / / it ' s explicitely selected . 
+ + return isFetched | | includedBySubselection ( path ) ; 
+ } 
+ 
+ + / * * 
+ + * Must only be called if { @ code includes ( path ) = = true } . 
+ + * / 
+ public boolean canSkipValue ( CellPath path ) 
+ { 
+ - return isFetchAll & & ! includedBySubselection ( path ) ; 
+ + / / We can skip the value of an included column only if it ' s a 
+ + / / regular column included due to the ' isFetchAll ' flag , but which 
+ + / / isn ' t explicitely selected . In practice , it ' s enough to not have 
+ + / / the path explicitly selected as it implies the column was 
+ + / / included due to ' isFetchAll ' ( since we require includes ( path ) to 
+ + / / be called first ) . 
+ + return ! includedBySubselection ( path ) ; 
+ } 
+ 
+ private boolean includedBySubselection ( CellPath path ) 
+ diff - - git a / src / java / org / apache / cassandra / db / rows / BTreeRow . java b / src / java / org / apache / cassandra / db / rows / BTreeRow . java 
+ index ea1d9e0 . . 18f3dec 100644 
+ - - - a / src / java / org / apache / cassandra / db / rows / BTreeRow . java 
+ + + + b / src / java / org / apache / cassandra / db / rows / BTreeRow . java 
+ @ @ - 237 , 7 + 237 , 7 @ @ public class BTreeRow extends AbstractRow 
+ { 
+ Map < ByteBuffer , CFMetaData . DroppedColumn > droppedColumns = metadata . getDroppedColumns ( ) ; 
+ 
+ - if ( filter . includesAllColumns ( ) & & ( activeDeletion . isLive ( ) | | deletion . supersedes ( activeDeletion ) ) & & droppedColumns . isEmpty ( ) ) 
+ + if ( filter . includesAllColumns ( isStatic ( ) ) & & ( activeDeletion . isLive ( ) | | deletion . supersedes ( activeDeletion ) ) & & droppedColumns . isEmpty ( ) ) 
+ return this ; 
+ 
+ boolean mayHaveShadowed = activeDeletion . supersedes ( deletion . time ( ) ) ;
+
+NEAREST DIFF:
+diff - - git a / debian / changelog b / debian / changelog 
+ index 739e38a . . 76bac83 100644 
+ - - - a / debian / changelog 
+ + + + b / debian / changelog 
+ @ @ - 2 , 7 + 2 , 7 @ @ cassandra ( 1 . 1 . 11 ) unstable ; urgency = low 
+ 
+ * New release 
+ 
+ - - - Eric Evans < eevans @ apache . org > , 16 Apr 2013 18 : 56 : 03 - 0500 
+ + - - Eric Evans < eevans @ apache . org > Tue , 16 Apr 2013 18 : 56 : 03 - 0500 
+ 
+ cassandra ( 1 . 1 . 10 ) unstable ; urgency = low 
+

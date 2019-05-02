@@ -1,0 +1,202 @@
+BLEU SCORE: 0.007952776003571096
+
+TEST MSG: Add unordered PITR test
+GENERATED MSG: Additional NEWS and test fixes for 2 . 0 ( part of CASSANDRA - 5909 )
+
+TEST DIFF (one line): diff - - git a / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java b / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java <nl> index d14d184 . . cc24111 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java <nl> @ @ - 129 , 4 + 129 , 40 @ @ public class RecoveryManagerTest extends SchemaLoader <nl> ColumnFamily cf = Util . getColumnFamily ( keyspace1 , dk , " Standard1 " ) ; <nl> Assert . assertEquals ( 6 , cf . getColumnCount ( ) ) ; <nl> } <nl> + <nl> + <nl> + @ Test <nl> + public void testRecoverPITUnordered ( ) throws Exception <nl> + { <nl> + Date date = CommitLogArchiver . format . parse ( " 2112 : 12 : 12 12 : 12 : 12 " ) ; <nl> + long timeMS = date . getTime ( ) ; <nl> + <nl> + Keyspace keyspace1 = Keyspace . open ( KEYSPACE1 ) ; <nl> + DecoratedKey dk = Util . dk ( " dkey " ) ; <nl> + <nl> + / / Col 0 and 9 are the only ones to be recovered <nl> + for ( int i = 0 ; i < 10 ; + + i ) <nl> + { <nl> + long ts ; <nl> + if ( i = = 9 ) <nl> + ts = TimeUnit . MILLISECONDS . toMicros ( timeMS - 1000 ) ; <nl> + else <nl> + ts = TimeUnit . MILLISECONDS . toMicros ( timeMS + ( i * 1000 ) ) ; <nl> + <nl> + ColumnFamily cf = ArrayBackedSortedColumns . factory . create ( KEYSPACE1 , " Standard1 " ) ; <nl> + cf . addColumn ( column ( " name - " + i , " value " , ts ) ) ; <nl> + Mutation rm = new Mutation ( KEYSPACE1 , dk . getKey ( ) , cf ) ; <nl> + rm . apply ( ) ; <nl> + } <nl> + <nl> + ColumnFamily cf = Util . getColumnFamily ( keyspace1 , dk , " Standard1 " ) ; <nl> + Assert . assertEquals ( 10 , cf . getColumnCount ( ) ) ; <nl> + <nl> + keyspace1 . getColumnFamilyStore ( " Standard1 " ) . clearUnsafe ( ) ; <nl> + CommitLog . instance . resetUnsafe ( ) ; / / disassociate segments from live CL <nl> + CommitLog . instance . recover ( ) ; <nl> + <nl> + cf = Util . getColumnFamily ( keyspace1 , dk , " Standard1 " ) ; <nl> + Assert . assertEquals ( 2 , cf . getColumnCount ( ) ) ; <nl> + } <nl> }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 9e3c25a . . 5517cee 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 15 , 7 + 15 , 7 @ @ <nl> * Require superuser status for adding triggers ( CASSANDRA - 5963 ) <nl> * Make standalone scrubber handle old and new style leveled manifest <nl> ( CASSANDRA - 6005 ) <nl> - * Fix paxos not always replaying when it should ( CASSANDRA - 6012 ) <nl> + * Fix paxos bugs ( CASSANDRA - 6012 , 6013 ) <nl> Merged from 1 . 2 : <nl> 1 . 2 . 10 <nl> * Fix possible divide - by - zero in HHOM ( CASSANDRA - 5990 ) <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index aa50d02 . . 3e716f5 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 24 , 7 + 24 , 6 @ @ import java . nio . ByteBuffer ; <nl> import java . util . * ; <nl> import java . util . concurrent . * ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> - import java . util . concurrent . atomic . AtomicLong ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . ObjectName ; <nl> <nl> @ @ - 255 , 7 + 254 , 7 @ @ public class StorageProxy implements StorageProxyMBean <nl> / / TODO turn null updates into delete ? <nl> Commit proposal = Commit . newProposal ( key , ballot , updates ) ; <nl> Tracing . trace ( " CAS precondition is met ; proposing client - requested updates for { } " , ballot ) ; <nl> - if ( proposePaxos ( proposal , liveEndpoints , requiredParticipants ) ) <nl> + if ( proposePaxos ( proposal , liveEndpoints , requiredParticipants , true ) ) <nl> { <nl> if ( consistencyForCommit = = ConsistencyLevel . ANY ) <nl> sendCommit ( proposal , liveEndpoints ) ; <nl> @ @ - 380 , 7 + 379 , 7 @ @ public class StorageProxy implements StorageProxyMBean <nl> { <nl> Tracing . trace ( " Finishing incomplete paxos round { } " , inProgress ) ; <nl> Commit refreshedInProgress = Commit . newProposal ( inProgress . key , ballot , inProgress . update ) ; <nl> - if ( proposePaxos ( refreshedInProgress , liveEndpoints , requiredParticipants ) ) <nl> + if ( proposePaxos ( refreshedInProgress , liveEndpoints , requiredParticipants , false ) ) <nl> { <nl> commitPaxos ( refreshedInProgress , ConsistencyLevel . QUORUM ) ; <nl> } <nl> @ @ - 436 , 16 + 435 , 23 @ @ public class StorageProxy implements StorageProxyMBean <nl> return callback ; <nl> } <nl> <nl> - private static boolean proposePaxos ( Commit proposal , List < InetAddress > endpoints , int requiredParticipants ) <nl> + private static boolean proposePaxos ( Commit proposal , List < InetAddress > endpoints , int requiredParticipants , boolean timeoutIfPartial ) <nl> throws WriteTimeoutException <nl> { <nl> - ProposeCallback callback = new ProposeCallback ( requiredParticipants ) ; <nl> + ProposeCallback callback = new ProposeCallback ( endpoints . size ( ) , requiredParticipants , ! timeoutIfPartial ) ; <nl> MessageOut < Commit > message = new MessageOut < Commit > ( MessagingService . Verb . PAXOS _ PROPOSE , proposal , Commit . serializer ) ; <nl> for ( InetAddress target : endpoints ) <nl> MessagingService . instance ( ) . sendRR ( message , target , callback ) ; <nl> + <nl> callback . await ( ) ; <nl> <nl> - return callback . getSuccessful ( ) > = requiredParticipants ; <nl> + if ( callback . isSuccessful ( ) ) <nl> + return true ; <nl> + <nl> + if ( timeoutIfPartial & & ! callback . isFullyRefused ( ) ) <nl> + throw new WriteTimeoutException ( WriteType . CAS , ConsistencyLevel . SERIAL , callback . getAcceptCount ( ) , requiredParticipants ) ; <nl> + <nl> + return false ; <nl> } <nl> <nl> private static void commitPaxos ( Commit proposal , ConsistencyLevel consistencyLevel ) throws WriteTimeoutException <nl> diff - - git a / src / java / org / apache / cassandra / service / paxos / ProposeCallback . java b / src / java / org / apache / cassandra / service / paxos / ProposeCallback . java <nl> index 67aed45 . . 0075840 100644 <nl> - - - a / src / java / org / apache / cassandra / service / paxos / ProposeCallback . java <nl> + + + b / src / java / org / apache / cassandra / service / paxos / ProposeCallback . java <nl> @ @ - 28 , 15 + 28 , 32 @ @ import org . slf4j . LoggerFactory ; <nl> <nl> import org . apache . cassandra . net . MessageIn ; <nl> <nl> + / * * <nl> + * ProposeCallback has two modes of operation , controlled by the failFast parameter . <nl> + * <nl> + * In failFast mode , we will return a failure as soon as a majority of nodes reject <nl> + * the proposal . This is used when replaying a proposal from an earlier leader . <nl> + * <nl> + * Otherwise , we wait for either all replicas to reply or until we achieve <nl> + * the desired quorum . We continue to wait for all replicas even after we know we cannot succeed <nl> + * because we need to know if no node at all have accepted or if at least one has . <nl> + * In the former case , a proposer is guaranteed no - one will <nl> + * replay its value ; in the latter we don ' t , so we must timeout in case another <nl> + * leader replays it before we can ; see CASSANDRA - 6013 <nl> + * / <nl> public class ProposeCallback extends AbstractPaxosCallback < Boolean > <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( ProposeCallback . class ) ; <nl> <nl> - private final AtomicInteger successful = new AtomicInteger ( 0 ) ; <nl> + private final AtomicInteger accepts = new AtomicInteger ( 0 ) ; <nl> + private final int requiredAccepts ; <nl> + private final boolean failFast ; <nl> <nl> - public ProposeCallback ( int targets ) <nl> + public ProposeCallback ( int totalTargets , int requiredTargets , boolean failFast ) <nl> { <nl> - super ( targets ) ; <nl> + super ( totalTargets ) ; <nl> + this . requiredAccepts = requiredTargets ; <nl> + this . failFast = failFast ; <nl> } <nl> <nl> public void response ( MessageIn < Boolean > msg ) <nl> @ @ - 44 , 12 + 61 , 32 @ @ public class ProposeCallback extends AbstractPaxosCallback < Boolean > <nl> logger . debug ( " Propose response { } from { } " , msg . payload , msg . from ) ; <nl> <nl> if ( msg . payload ) <nl> - successful . incrementAndGet ( ) ; <nl> + accepts . incrementAndGet ( ) ; <nl> + <nl> latch . countDown ( ) ; <nl> + <nl> + if ( isSuccessful ( ) | | ( failFast & & ( latch . getCount ( ) + accepts . get ( ) < requiredAccepts ) ) ) <nl> + { <nl> + while ( latch . getCount ( ) > 0 ) <nl> + latch . countDown ( ) ; <nl> + } <nl> + } <nl> + <nl> + public int getAcceptCount ( ) <nl> + { <nl> + return accepts . get ( ) ; <nl> + } <nl> + <nl> + public boolean isSuccessful ( ) <nl> + { <nl> + return accepts . get ( ) > = requiredAccepts ; <nl> } <nl> <nl> - public int getSuccessful ( ) <nl> + / / Note : this is only reliable if ! failFast <nl> + public boolean isFullyRefused ( ) <nl> { <nl> - return successful . get ( ) ; <nl> + / / We need to check the latch first to avoid racing with a late arrival <nl> + / / between the latch check and the accepts one <nl> + return latch . getCount ( ) = = 0 & & accepts . get ( ) = = 0 ; <nl> } <nl> }
+
+TEST DIFF:
+diff - - git a / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java b / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java 
+ index d14d184 . . cc24111 100644 
+ - - - a / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java 
+ @ @ - 129 , 4 + 129 , 40 @ @ public class RecoveryManagerTest extends SchemaLoader 
+ ColumnFamily cf = Util . getColumnFamily ( keyspace1 , dk , " Standard1 " ) ; 
+ Assert . assertEquals ( 6 , cf . getColumnCount ( ) ) ; 
+ } 
+ + 
+ + 
+ + @ Test 
+ + public void testRecoverPITUnordered ( ) throws Exception 
+ + { 
+ + Date date = CommitLogArchiver . format . parse ( " 2112 : 12 : 12 12 : 12 : 12 " ) ; 
+ + long timeMS = date . getTime ( ) ; 
+ + 
+ + Keyspace keyspace1 = Keyspace . open ( KEYSPACE1 ) ; 
+ + DecoratedKey dk = Util . dk ( " dkey " ) ; 
+ + 
+ + / / Col 0 and 9 are the only ones to be recovered 
+ + for ( int i = 0 ; i < 10 ; + + i ) 
+ + { 
+ + long ts ; 
+ + if ( i = = 9 ) 
+ + ts = TimeUnit . MILLISECONDS . toMicros ( timeMS - 1000 ) ; 
+ + else 
+ + ts = TimeUnit . MILLISECONDS . toMicros ( timeMS + ( i * 1000 ) ) ; 
+ + 
+ + ColumnFamily cf = ArrayBackedSortedColumns . factory . create ( KEYSPACE1 , " Standard1 " ) ; 
+ + cf . addColumn ( column ( " name - " + i , " value " , ts ) ) ; 
+ + Mutation rm = new Mutation ( KEYSPACE1 , dk . getKey ( ) , cf ) ; 
+ + rm . apply ( ) ; 
+ + } 
+ + 
+ + ColumnFamily cf = Util . getColumnFamily ( keyspace1 , dk , " Standard1 " ) ; 
+ + Assert . assertEquals ( 10 , cf . getColumnCount ( ) ) ; 
+ + 
+ + keyspace1 . getColumnFamilyStore ( " Standard1 " ) . clearUnsafe ( ) ; 
+ + CommitLog . instance . resetUnsafe ( ) ; / / disassociate segments from live CL 
+ + CommitLog . instance . recover ( ) ; 
+ + 
+ + cf = Util . getColumnFamily ( keyspace1 , dk , " Standard1 " ) ; 
+ + Assert . assertEquals ( 2 , cf . getColumnCount ( ) ) ; 
+ + } 
+ }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 9e3c25a . . 5517cee 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 15 , 7 + 15 , 7 @ @ 
+ * Require superuser status for adding triggers ( CASSANDRA - 5963 ) 
+ * Make standalone scrubber handle old and new style leveled manifest 
+ ( CASSANDRA - 6005 ) 
+ - * Fix paxos not always replaying when it should ( CASSANDRA - 6012 ) 
+ + * Fix paxos bugs ( CASSANDRA - 6012 , 6013 ) 
+ Merged from 1 . 2 : 
+ 1 . 2 . 10 
+ * Fix possible divide - by - zero in HHOM ( CASSANDRA - 5990 ) 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index aa50d02 . . 3e716f5 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 24 , 7 + 24 , 6 @ @ import java . nio . ByteBuffer ; 
+ import java . util . * ; 
+ import java . util . concurrent . * ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ - import java . util . concurrent . atomic . AtomicLong ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . ObjectName ; 
+ 
+ @ @ - 255 , 7 + 254 , 7 @ @ public class StorageProxy implements StorageProxyMBean 
+ / / TODO turn null updates into delete ? 
+ Commit proposal = Commit . newProposal ( key , ballot , updates ) ; 
+ Tracing . trace ( " CAS precondition is met ; proposing client - requested updates for { } " , ballot ) ; 
+ - if ( proposePaxos ( proposal , liveEndpoints , requiredParticipants ) ) 
+ + if ( proposePaxos ( proposal , liveEndpoints , requiredParticipants , true ) ) 
+ { 
+ if ( consistencyForCommit = = ConsistencyLevel . ANY ) 
+ sendCommit ( proposal , liveEndpoints ) ; 
+ @ @ - 380 , 7 + 379 , 7 @ @ public class StorageProxy implements StorageProxyMBean 
+ { 
+ Tracing . trace ( " Finishing incomplete paxos round { } " , inProgress ) ; 
+ Commit refreshedInProgress = Commit . newProposal ( inProgress . key , ballot , inProgress . update ) ; 
+ - if ( proposePaxos ( refreshedInProgress , liveEndpoints , requiredParticipants ) ) 
+ + if ( proposePaxos ( refreshedInProgress , liveEndpoints , requiredParticipants , false ) ) 
+ { 
+ commitPaxos ( refreshedInProgress , ConsistencyLevel . QUORUM ) ; 
+ } 
+ @ @ - 436 , 16 + 435 , 23 @ @ public class StorageProxy implements StorageProxyMBean 
+ return callback ; 
+ } 
+ 
+ - private static boolean proposePaxos ( Commit proposal , List < InetAddress > endpoints , int requiredParticipants ) 
+ + private static boolean proposePaxos ( Commit proposal , List < InetAddress > endpoints , int requiredParticipants , boolean timeoutIfPartial ) 
+ throws WriteTimeoutException 
+ { 
+ - ProposeCallback callback = new ProposeCallback ( requiredParticipants ) ; 
+ + ProposeCallback callback = new ProposeCallback ( endpoints . size ( ) , requiredParticipants , ! timeoutIfPartial ) ; 
+ MessageOut < Commit > message = new MessageOut < Commit > ( MessagingService . Verb . PAXOS _ PROPOSE , proposal , Commit . serializer ) ; 
+ for ( InetAddress target : endpoints ) 
+ MessagingService . instance ( ) . sendRR ( message , target , callback ) ; 
+ + 
+ callback . await ( ) ; 
+ 
+ - return callback . getSuccessful ( ) > = requiredParticipants ; 
+ + if ( callback . isSuccessful ( ) ) 
+ + return true ; 
+ + 
+ + if ( timeoutIfPartial & & ! callback . isFullyRefused ( ) ) 
+ + throw new WriteTimeoutException ( WriteType . CAS , ConsistencyLevel . SERIAL , callback . getAcceptCount ( ) , requiredParticipants ) ; 
+ + 
+ + return false ; 
+ } 
+ 
+ private static void commitPaxos ( Commit proposal , ConsistencyLevel consistencyLevel ) throws WriteTimeoutException 
+ diff - - git a / src / java / org / apache / cassandra / service / paxos / ProposeCallback . java b / src / java / org / apache / cassandra / service / paxos / ProposeCallback . java 
+ index 67aed45 . . 0075840 100644 
+ - - - a / src / java / org / apache / cassandra / service / paxos / ProposeCallback . java 
+ + + + b / src / java / org / apache / cassandra / service / paxos / ProposeCallback . java 
+ @ @ - 28 , 15 + 28 , 32 @ @ import org . slf4j . LoggerFactory ; 
+ 
+ import org . apache . cassandra . net . MessageIn ; 
+ 
+ + / * * 
+ + * ProposeCallback has two modes of operation , controlled by the failFast parameter . 
+ + * 
+ + * In failFast mode , we will return a failure as soon as a majority of nodes reject 
+ + * the proposal . This is used when replaying a proposal from an earlier leader . 
+ + * 
+ + * Otherwise , we wait for either all replicas to reply or until we achieve 
+ + * the desired quorum . We continue to wait for all replicas even after we know we cannot succeed 
+ + * because we need to know if no node at all have accepted or if at least one has . 
+ + * In the former case , a proposer is guaranteed no - one will 
+ + * replay its value ; in the latter we don ' t , so we must timeout in case another 
+ + * leader replays it before we can ; see CASSANDRA - 6013 
+ + * / 
+ public class ProposeCallback extends AbstractPaxosCallback < Boolean > 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( ProposeCallback . class ) ; 
+ 
+ - private final AtomicInteger successful = new AtomicInteger ( 0 ) ; 
+ + private final AtomicInteger accepts = new AtomicInteger ( 0 ) ; 
+ + private final int requiredAccepts ; 
+ + private final boolean failFast ; 
+ 
+ - public ProposeCallback ( int targets ) 
+ + public ProposeCallback ( int totalTargets , int requiredTargets , boolean failFast ) 
+ { 
+ - super ( targets ) ; 
+ + super ( totalTargets ) ; 
+ + this . requiredAccepts = requiredTargets ; 
+ + this . failFast = failFast ; 
+ } 
+ 
+ public void response ( MessageIn < Boolean > msg ) 
+ @ @ - 44 , 12 + 61 , 32 @ @ public class ProposeCallback extends AbstractPaxosCallback < Boolean > 
+ logger . debug ( " Propose response { } from { } " , msg . payload , msg . from ) ; 
+ 
+ if ( msg . payload ) 
+ - successful . incrementAndGet ( ) ; 
+ + accepts . incrementAndGet ( ) ; 
+ + 
+ latch . countDown ( ) ; 
+ + 
+ + if ( isSuccessful ( ) | | ( failFast & & ( latch . getCount ( ) + accepts . get ( ) < requiredAccepts ) ) ) 
+ + { 
+ + while ( latch . getCount ( ) > 0 ) 
+ + latch . countDown ( ) ; 
+ + } 
+ + } 
+ + 
+ + public int getAcceptCount ( ) 
+ + { 
+ + return accepts . get ( ) ; 
+ + } 
+ + 
+ + public boolean isSuccessful ( ) 
+ + { 
+ + return accepts . get ( ) > = requiredAccepts ; 
+ } 
+ 
+ - public int getSuccessful ( ) 
+ + / / Note : this is only reliable if ! failFast 
+ + public boolean isFullyRefused ( ) 
+ { 
+ - return successful . get ( ) ; 
+ + / / We need to check the latch first to avoid racing with a late arrival 
+ + / / between the latch check and the accepts one 
+ + return latch . getCount ( ) = = 0 & & accepts . get ( ) = = 0 ; 
+ } 
+ }

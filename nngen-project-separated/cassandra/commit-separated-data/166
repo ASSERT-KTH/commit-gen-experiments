@@ -1,0 +1,683 @@
+BLEU SCORE: 0.007869270985473822
+
+TEST MSG: Fix scheduling of speculative retry threshold recalculation
+GENERATED MSG: add pending tasks mbean to all DebuggableTPE . clean out ad - hoc queue length logging .
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index ac5269c . . d4e5e37 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 4 . 0 <nl> + * Fix scheduling of speculative retry threshold recalculation ( CASSANDRA - 14338 ) <nl> * Add support for hybrid MIN ( ) , MAX ( ) speculative retry policies ( CASSANDRA - 14293 ) <nl> * Correct and clarify SSLFactory . getSslContext method and call sites ( CASSANDRA - 14314 ) <nl> * Use zero as default score in DynamicEndpointSnitch ( CASSANDRA - 14252 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 52c280c . . 4f74667 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 77 , 7 + 77 , 6 @ @ import org . apache . cassandra . metrics . TableMetrics ; <nl> import org . apache . cassandra . metrics . TableMetrics . Sampler ; <nl> import org . apache . cassandra . schema . * ; <nl> import org . apache . cassandra . schema . CompactionParams . TombstoneOption ; <nl> - import org . apache . cassandra . service . reads . SpeculativeRetryPolicy ; <nl> import org . apache . cassandra . service . CacheService ; <nl> import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . streaming . TableStreamManager ; <nl> @ @ - 214 , 7 + 213 , 6 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> <nl> public final TableMetrics metric ; <nl> public volatile long sampleLatencyNanos ; <nl> - private final ScheduledFuture < ? > latencyCalculator ; <nl> <nl> private final CassandraStreamManager streamManager ; <nl> <nl> @ @ - 442 , 35 + 440 , 27 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> { <nl> throw new RuntimeException ( e ) ; <nl> } <nl> - <nl> - SpeculativeRetryPolicy retryPolicy = metadata . get ( ) . params . speculativeRetry ; <nl> - logger . trace ( " retryPolicy for { } is { } " , name , retryPolicy ) ; <nl> - if ( ! retryPolicy . isDynamic ( ) ) <nl> - { <nl> - / / avoid scheduling the task in the first place for non - dynamic speculative retry policies <nl> - / / e . g . always and never speculative policies will never change so we can just calculate once <nl> - / / and avoid doing unnecessary work every ReadRpcTimeout ( ) <nl> - sampleLatencyNanos = retryPolicy . calculateThreshold ( metric . coordinatorReadLatency ) ; <nl> - latencyCalculator = null ; <nl> - } <nl> - else <nl> - { <nl> - latencyCalculator = ScheduledExecutors . optionalTasks . scheduleWithFixedDelay ( ( ) - > <nl> - { <nl> - SpeculativeRetryPolicy retryPolicy1 = metadata . get ( ) . params . speculativeRetry ; <nl> - sampleLatencyNanos = retryPolicy1 . calculateThreshold ( metric . coordinatorReadLatency ) ; <nl> - } , DatabaseDescriptor . getReadRpcTimeout ( ) , DatabaseDescriptor . getReadRpcTimeout ( ) , TimeUnit . MILLISECONDS ) ; <nl> - } <nl> } <nl> else <nl> { <nl> - latencyCalculator = ScheduledExecutors . optionalTasks . schedule ( Runnables . doNothing ( ) , 0 , TimeUnit . NANOSECONDS ) ; <nl> mbeanName = null ; <nl> oldMBeanName = null ; <nl> } <nl> streamManager = new CassandraStreamManager ( this ) ; <nl> } <nl> <nl> + public void updateSpeculationThreshold ( ) <nl> + { <nl> + try <nl> + { <nl> + sampleLatencyNanos = metadata ( ) . params . speculativeRetry . calculateThreshold ( metric . coordinatorReadLatency ) ; <nl> + } <nl> + catch ( Throwable e ) <nl> + { <nl> + logger . error ( " Exception caught while calculating speculative retry threshold for { } : { } " , metadata ( ) , e ) ; <nl> + } <nl> + } <nl> + <nl> public TableStreamManager getStreamManager ( ) <nl> { <nl> return streamManager ; <nl> @ @ - 527 , 9 + 517 , 6 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> } <nl> } <nl> <nl> - if ( latencyCalculator ! = null ) <nl> - latencyCalculator . cancel ( false ) ; <nl> - <nl> compactionStrategyManager . shutdown ( ) ; <nl> SystemKeyspace . removeTruncationRecord ( metadata . id ) ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / service / CassandraDaemon . java b / src / java / org / apache / cassandra / service / CassandraDaemon . java <nl> index 295a33b . . 95dd6ac 100644 <nl> - - - a / src / java / org / apache / cassandra / service / CassandraDaemon . java <nl> + + + b / src / java / org / apache / cassandra / service / CassandraDaemon . java <nl> @ @ - 407 , 6 + 407 , 14 @ @ public class CassandraDaemon <nl> / / due to scheduling errors or race conditions <nl> ScheduledExecutors . optionalTasks . scheduleWithFixedDelay ( ColumnFamilyStore . getBackgroundCompactionTaskSubmitter ( ) , 5 , 1 , TimeUnit . MINUTES ) ; <nl> <nl> + / / schedule periodic recomputation of speculative retry thresholds <nl> + ScheduledExecutors . optionalTasks . scheduleWithFixedDelay ( <nl> + ( ) - > Keyspace . all ( ) . forEach ( k - > k . getColumnFamilyStores ( ) . forEach ( ColumnFamilyStore : : updateSpeculationThreshold ) ) , <nl> + DatabaseDescriptor . getReadRpcTimeout ( ) , <nl> + DatabaseDescriptor . getReadRpcTimeout ( ) , <nl> + TimeUnit . MILLISECONDS <nl> + ) ; <nl> + <nl> / / schedule periodic dumps of table size estimates into SystemKeyspace . SIZE _ ESTIMATES _ CF <nl> / / set cassandra . size _ recorder _ interval to 0 to disable <nl> int sizeRecorderInterval = Integer . getInteger ( " cassandra . size _ recorder _ interval " , 5 * 60 ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / reads / AlwaysSpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / AlwaysSpeculativeRetryPolicy . java <nl> index d054b09 . . 4623cb1 100644 <nl> - - - a / src / java / org / apache / cassandra / service / reads / AlwaysSpeculativeRetryPolicy . java <nl> + + + b / src / java / org / apache / cassandra / service / reads / AlwaysSpeculativeRetryPolicy . java <nl> @ @ - 31 , 12 + 31 , 6 @ @ public class AlwaysSpeculativeRetryPolicy implements SpeculativeRetryPolicy <nl> } <nl> <nl> @ Override <nl> - public boolean isDynamic ( ) <nl> - { <nl> - return false ; <nl> - } <nl> - <nl> - @ Override <nl> public long calculateThreshold ( Timer readLatency ) <nl> { <nl> return 0 ; <nl> diff - - git a / src / java / org / apache / cassandra / service / reads / FixedSpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / FixedSpeculativeRetryPolicy . java <nl> index fb63ac2 . . 2cd9788 100644 <nl> - - - a / src / java / org / apache / cassandra / service / reads / FixedSpeculativeRetryPolicy . java <nl> + + + b / src / java / org / apache / cassandra / service / reads / FixedSpeculativeRetryPolicy . java <nl> @ @ - 34 , 12 + 34 , 6 @ @ public class FixedSpeculativeRetryPolicy implements SpeculativeRetryPolicy <nl> } <nl> <nl> @ Override <nl> - public boolean isDynamic ( ) <nl> - { <nl> - return false ; <nl> - } <nl> - <nl> - @ Override <nl> public long calculateThreshold ( Timer readLatency ) <nl> { <nl> return TimeUnit . MILLISECONDS . toNanos ( speculateAtMilliseconds ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / reads / HybridSpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / HybridSpeculativeRetryPolicy . java <nl> index 78e4fcd . . d49cfe4 100644 <nl> - - - a / src / java / org / apache / cassandra / service / reads / HybridSpeculativeRetryPolicy . java <nl> + + + b / src / java / org / apache / cassandra / service / reads / HybridSpeculativeRetryPolicy . java <nl> @ @ - 43 , 12 + 43 , 6 @ @ public class HybridSpeculativeRetryPolicy implements SpeculativeRetryPolicy <nl> } <nl> <nl> @ Override <nl> - public boolean isDynamic ( ) <nl> - { <nl> - return true ; <nl> - } <nl> - <nl> - @ Override <nl> public long calculateThreshold ( Timer readLatency ) <nl> { <nl> long percentileThreshold = percentilePolicy . calculateThreshold ( readLatency ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / reads / NeverSpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / NeverSpeculativeRetryPolicy . java <nl> index 219adb5 . . c46a899 100644 <nl> - - - a / src / java / org / apache / cassandra / service / reads / NeverSpeculativeRetryPolicy . java <nl> + + + b / src / java / org / apache / cassandra / service / reads / NeverSpeculativeRetryPolicy . java <nl> @ @ - 31 , 12 + 31 , 6 @ @ public class NeverSpeculativeRetryPolicy implements SpeculativeRetryPolicy <nl> } <nl> <nl> @ Override <nl> - public boolean isDynamic ( ) <nl> - { <nl> - return false ; <nl> - } <nl> - <nl> - @ Override <nl> public long calculateThreshold ( Timer readLatency ) <nl> { <nl> return Long . MAX _ VALUE ; <nl> diff - - git a / src / java / org / apache / cassandra / service / reads / PercentileSpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / PercentileSpeculativeRetryPolicy . java <nl> index 6b2cbb0 . . 172cc0c 100644 <nl> - - - a / src / java / org / apache / cassandra / service / reads / PercentileSpeculativeRetryPolicy . java <nl> + + + b / src / java / org / apache / cassandra / service / reads / PercentileSpeculativeRetryPolicy . java <nl> @ @ - 32 , 12 + 32 , 6 @ @ public class PercentileSpeculativeRetryPolicy implements SpeculativeRetryPolicy <nl> } <nl> <nl> @ Override <nl> - public boolean isDynamic ( ) <nl> - { <nl> - return true ; <nl> - } <nl> - <nl> - @ Override <nl> public long calculateThreshold ( Timer readLatency ) <nl> { <nl> return ( long ) readLatency . getSnapshot ( ) . getValue ( percentile / 100 ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / reads / SpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / SpeculativeRetryPolicy . java <nl> index 399f291 . . 225ab26 100644 <nl> - - - a / src / java / org / apache / cassandra / service / reads / SpeculativeRetryPolicy . java <nl> + + + b / src / java / org / apache / cassandra / service / reads / SpeculativeRetryPolicy . java <nl> @ @ - 42 , 8 + 42 , 6 @ @ public interface SpeculativeRetryPolicy <nl> Pattern . CASE _ INSENSITIVE ) ; <nl> public static final SpeculativeRetryPolicy DEFAULT = new PercentileSpeculativeRetryPolicy ( 99 . 0 ) ; <nl> <nl> - boolean isDynamic ( ) ; <nl> - <nl> long calculateThreshold ( Timer readLatency ) ; <nl> <nl> Kind kind ( ) ;
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / concurrent / ContinuationStage . java b / src / java / org / apache / cassandra / concurrent / ContinuationStage . java <nl> index 0c5291d . . d8bdfc0 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / ContinuationStage . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / ContinuationStage . java <nl> @ @ - 85 , 7 + 85 , 7 @ @ public class ContinuationStage implements IStage <nl> return executorService _ . isShutdown ( ) ; <nl> } <nl> <nl> - public long getTaskCount ( ) { <nl> + public long getPendingTasks ( ) { <nl> return ( executorService _ . getTaskCount ( ) - executorService _ . getCompletedTaskCount ( ) ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java <nl> index b72ed35 . . 51faa4c 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java <nl> @ @ - 19 , 10 + 19 , 12 @ @ <nl> package org . apache . cassandra . concurrent ; <nl> <nl> import java . util . concurrent . * ; <nl> + import java . lang . management . ManagementFactory ; <nl> <nl> - import org . apache . cassandra . utils . LogUtil ; <nl> import org . apache . log4j . Logger ; <nl> - import org . apache . cassandra . utils . * ; <nl> + <nl> + import javax . management . MBeanServer ; <nl> + import javax . management . ObjectName ; <nl> <nl> / * * <nl> * This is a wrapper class for the < i > ScheduledThreadPoolExecutor < / i > . It provides an implementation <nl> @ @ - 32 , 7 + 34 , 7 @ @ import org . apache . cassandra . utils . * ; <nl> * Author : Avinash Lakshman ( alakshman @ facebook . com ) & Prashant Malik ( pmalik @ facebook . com ) <nl> * / <nl> <nl> - public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor <nl> + public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements DebuggableThreadPoolExecutorMBean <nl> { <nl> private static Logger logger _ = Logger . getLogger ( DebuggableThreadPoolExecutor . class ) ; <nl> <nl> @ @ - 46 , 12 + 48 , 26 @ @ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor <nl> long keepAliveTime , <nl> TimeUnit unit , <nl> BlockingQueue < Runnable > workQueue , <nl> - ThreadFactory threadFactory ) <nl> + ThreadFactoryImpl threadFactory ) <nl> { <nl> super ( corePoolSize , maximumPoolSize , keepAliveTime , unit , workQueue , threadFactory ) ; <nl> super . prestartAllCoreThreads ( ) ; <nl> + MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; <nl> + try <nl> + { <nl> + mbs . registerMBean ( this , new ObjectName ( " org . apache . cassandra . concurrent : type = " + threadFactory . id _ ) ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> } <nl> - <nl> + <nl> + public long getPendingTasks ( ) <nl> + { <nl> + return getTaskCount ( ) - getCompletedTaskCount ( ) ; <nl> + } <nl> + <nl> / * <nl> * <nl> * ( non - Javadoc ) <nl> diff - - git a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutorMBean . java b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutorMBean . java <nl> new file mode 100644 <nl> index 0000000 . . 798a888 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutorMBean . java <nl> @ @ - 0 , 0 + 1 , 6 @ @ <nl> + package org . apache . cassandra . concurrent ; <nl> + <nl> + public interface DebuggableThreadPoolExecutorMBean <nl> + { <nl> + public long getPendingTasks ( ) ; <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / concurrent / IStage . java b / src / java / org / apache / cassandra / concurrent / IStage . java <nl> index 1ed9fc0 . . f33e3cb 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / IStage . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / IStage . java <nl> @ @ - 116 , 5 + 116 , 5 @ @ public interface IStage <nl> * pending on this stage to be executed . <nl> * @ return task count . <nl> * / <nl> - public long getTaskCount ( ) ; <nl> + public long getPendingTasks ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / concurrent / MultiThreadedStage . java b / src / java / org / apache / cassandra / concurrent / MultiThreadedStage . java <nl> index 75a2789 . . bbdcad6 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / MultiThreadedStage . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / MultiThreadedStage . java <nl> @ @ - 92 , 7 + 92 , 7 @ @ public class MultiThreadedStage implements IStage <nl> return executorService _ . isShutdown ( ) ; <nl> } <nl> <nl> - public long getTaskCount ( ) { <nl> - return ( executorService _ . getTaskCount ( ) - executorService _ . getCompletedTaskCount ( ) ) ; <nl> + public long getPendingTasks ( ) { <nl> + return executorService _ . getPendingTasks ( ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / concurrent / SingleThreadedContinuationStage . java b / src / java / org / apache / cassandra / concurrent / SingleThreadedContinuationStage . java <nl> index 7a4cd33 . . fa1fcff 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / SingleThreadedContinuationStage . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / SingleThreadedContinuationStage . java <nl> @ @ - 92 , 7 + 92 , 7 @ @ public class SingleThreadedContinuationStage implements IStage <nl> return executorService _ . isShutdown ( ) ; <nl> } <nl> <nl> - public long getTaskCount ( ) { <nl> + public long getPendingTasks ( ) { <nl> return ( executorService _ . getTaskCount ( ) - executorService _ . getCompletedTaskCount ( ) ) ; <nl> } <nl> / * Finished implementing the IStage interface methods * / <nl> diff - - git a / src / java / org / apache / cassandra / concurrent / SingleThreadedStage . java b / src / java / org / apache / cassandra / concurrent / SingleThreadedStage . java <nl> index 27ae871 . . 24480d3 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / SingleThreadedStage . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / SingleThreadedStage . java <nl> @ @ - 94 , 8 + 94 , 7 @ @ public class SingleThreadedStage implements IStage <nl> return executorService _ . isShutdown ( ) ; <nl> } <nl> <nl> - public long getTaskCount ( ) { <nl> - return ( executorService _ . getTaskCount ( ) - executorService _ . getCompletedTaskCount ( ) ) ; <nl> + public long getPendingTasks ( ) { <nl> + return executorService _ . getPendingTasks ( ) ; <nl> } <nl> - / * Finished implementing the IStage interface methods * / <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / concurrent / StageManager . java b / src / java / org / apache / cassandra / concurrent / StageManager . java <nl> index c3fc284 . . f771588 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / StageManager . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / StageManager . java <nl> @ @ - 23 , 8 + 23 , 6 @ @ import java . util . Map ; <nl> import java . util . Set ; <nl> import java . util . concurrent . ExecutorService ; <nl> <nl> - import org . apache . cassandra . continuations . Suspendable ; <nl> - <nl> <nl> / * * <nl> * This class manages all stages that exist within a process . The application registers <nl> @ @ - 101 , 7 + 99 , 7 @ @ public class StageManager <nl> * / <nl> public static long getStageTaskCount ( String stage ) <nl> { <nl> - return stageQueues _ . get ( stage ) . getTaskCount ( ) ; <nl> + return stageQueues _ . get ( stage ) . getPendingTasks ( ) ; <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 1f283b6 . . 2787b63 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1432 , 11 + 1432 , 6 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> return memtableSwitchCount ; <nl> } <nl> <nl> - public int getMemtableTasks ( ) <nl> - { <nl> - return memtable _ . get ( ) . getPendingTasks ( ) ; <nl> - } <nl> - <nl> / * * <nl> * clears out all data associated with this ColumnFamily . <nl> * For use in testing . <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java b / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java <nl> index 75840b8 . . 94e91c3 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java <nl> @ @ - 50 , 11 + 50 , 6 @ @ public interface ColumnFamilyStoreMBean <nl> public int getMemtableSwitchCount ( ) ; <nl> <nl> / * * <nl> - * @ return the number of tasks waiting to run on the memtable executor <nl> - * / <nl> - public int getMemtableTasks ( ) ; <nl> - <nl> - / * * <nl> * Triggers an immediate memtable flush . <nl> * / <nl> public void forceFlush ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java <nl> index ae926d8 . . 9eeec34 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Memtable . java <nl> + + + b / src / java / org / apache / cassandra / db / Memtable . java <nl> @ @ - 45 , 7 + 45 , 7 @ @ public class Memtable implements Comparable < Memtable > <nl> { <nl> 	 private static Logger logger _ = Logger . getLogger ( Memtable . class ) ; <nl> private static Set < ExecutorService > runningExecutorServices _ = new NonBlockingHashSet < ExecutorService > ( ) ; <nl> - private boolean isFrozen _ ; <nl> + private static AtomicInteger executorCount _ = new AtomicInteger ( 0 ) ; <nl> <nl> public static void shutdown ( ) <nl> { <nl> @ @ - 56 , 6 + 56 , 7 @ @ public class Memtable implements Comparable < Memtable > <nl> } <nl> <nl> private MemtableThreadPoolExecutor executor _ ; <nl> + private boolean isFrozen _ ; <nl> <nl> private int threshold _ = DatabaseDescriptor . getMemtableSize ( ) * 1024 * 1024 ; <nl> private int thresholdCount _ = ( int ) ( DatabaseDescriptor . getMemtableObjectCount ( ) * 1024 * 1024 ) ; <nl> @ @ - 72 , 12 + 73 , 12 @ @ public class Memtable implements Comparable < Memtable > <nl> <nl> Memtable ( String table , String cfName ) <nl> { <nl> - executor _ = new MemtableThreadPoolExecutor ( ) ; <nl> - runningExecutorServices _ . add ( executor _ ) ; <nl> - <nl> table _ = table ; <nl> cfName _ = cfName ; <nl> creationTime _ = System . currentTimeMillis ( ) ; <nl> + <nl> + executor _ = new MemtableThreadPoolExecutor ( ) ; <nl> + runningExecutorServices _ . add ( executor _ ) ; <nl> } <nl> <nl> class Putter implements Runnable <nl> @ @ - 169 , 11 + 170 , 6 @ @ public class Memtable implements Comparable < Memtable > <nl> 	 return cfName _ ; <nl> } <nl> <nl> - int getPendingTasks ( ) <nl> - { <nl> - 	 return ( int ) ( executor _ . getTaskCount ( ) - executor _ . getCompletedTaskCount ( ) ) ; <nl> - } <nl> - <nl> private synchronized void enqueueFlush ( CommitLog . CommitLogContext cLogCtx ) <nl> { <nl> if ( ! isFrozen _ ) <nl> @ @ - 367 , 7 + 363 , 7 @ @ public class Memtable implements Comparable < Memtable > <nl> <nl> public MemtableThreadPoolExecutor ( ) <nl> { <nl> - super ( " FAST - MEMTABLE - POOL " ) ; <nl> + super ( " MEMTABLE - POOL - " + cfName _ + executorCount _ . addAndGet ( 1 ) ) ; <nl> } <nl> <nl> protected void terminated ( ) <nl> diff - - git a / src / java / org / apache / cassandra / net / MessageDeserializationTask . java b / src / java / org / apache / cassandra / net / MessageDeserializationTask . java <nl> index d21e4c6 . . 0cd6578 100644 <nl> - - - a / src / java / org / apache / cassandra / net / MessageDeserializationTask . java <nl> + + + b / src / java / org / apache / cassandra / net / MessageDeserializationTask . java <nl> @ @ - 48 , 23 + 48 , 20 @ @ class MessageDeserializationTask implements Runnable <nl> <nl> public void run ( ) <nl> { <nl> - 	 / * For DEBUG only . Printing queue length * / <nl> - 	 DebuggableThreadPoolExecutor es = ( DebuggableThreadPoolExecutor ) MessagingService . getDeserilizationExecutor ( ) ; <nl> - logger _ . debug ( " Message Deserialization Task : " + ( es . getTaskCount ( ) - es . getCompletedTaskCount ( ) ) ) ; <nl> - / * END DEBUG * / <nl> + Message message = null ; <nl> try <nl> - { <nl> - Message message = ( Message ) serializer _ . deserialize ( bytes _ ) ; <nl> - <nl> - if ( message ! = null ) <nl> - { <nl> - message = SinkManager . processServerMessageSink ( message ) ; <nl> - MessagingService . receive ( message ) ; <nl> - } <nl> + { <nl> + message = serializer _ . deserialize ( bytes _ ) ; <nl> } <nl> - catch ( IOException ex ) <nl> - { <nl> - logger _ . warn ( LogUtil . throwableToString ( ex ) ) ; <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + <nl> + if ( message ! = null ) <nl> + { <nl> + message = SinkManager . processServerMessageSink ( message ) ; <nl> + MessagingService . receive ( message ) ; <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / net / MessageSerializationTask . java b / src / java / org / apache / cassandra / net / MessageSerializationTask . java <nl> index 9cee314 . . 3078a9a 100644 <nl> - - - a / src / java / org / apache / cassandra / net / MessageSerializationTask . java <nl> + + + b / src / java / org / apache / cassandra / net / MessageSerializationTask . java <nl> @ @ - 52 , 11 + 52 , 6 @ @ class MessageSerializationTask implements Runnable <nl> <nl> public void run ( ) <nl> { <nl> - 	 / * For DEBUG only . Printing queue length * / <nl> - 	 DebuggableThreadPoolExecutor es = ( DebuggableThreadPoolExecutor ) MessagingService . getWriteExecutor ( ) ; <nl> - logger _ . debug ( " Message Serialization Task : " + ( es . getTaskCount ( ) - es . getCompletedTaskCount ( ) ) ) ; <nl> - / * END DEBUG * / <nl> - <nl> / * Adding the message to be serialized in the TLS . For accessing in the afterExecute ( ) * / <nl> Context ctx = new Context ( ) ; <nl> ctx . put ( this . getClass ( ) . getName ( ) , message _ ) ; <nl> diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java <nl> index 33b9e04 . . bdc46d1 100644 <nl> - - - a / src / java / org / apache / cassandra / net / MessagingService . java <nl> + + + b / src / java / org / apache / cassandra / net / MessagingService . java <nl> @ @ - 18 , 43 + 18 , 32 @ @ <nl> <nl> package org . apache . cassandra . net ; <nl> <nl> - import java . io . * ; <nl> - import java . lang . management . ManagementFactory ; <nl> - import java . net . * ; <nl> - import java . security . MessageDigest ; <nl> - import java . util . * ; <nl> - import java . nio . ByteBuffer ; <nl> - import java . util . concurrent . * ; <nl> - import java . util . concurrent . atomic . AtomicBoolean ; <nl> - import java . util . concurrent . locks . ReentrantLock ; <nl> - import java . nio . channels . * ; <nl> import org . apache . cassandra . concurrent . * ; <nl> - import org . apache . cassandra . net . io . * ; <nl> - import org . apache . cassandra . utils . * ; <nl> - import javax . management . MBeanServer ; <nl> - import javax . management . ObjectName ; <nl> - import javax . xml . bind . * ; <nl> - import org . apache . cassandra . concurrent . DebuggableThreadPoolExecutor ; <nl> - import org . apache . cassandra . concurrent . IStage ; <nl> - import org . apache . cassandra . concurrent . MultiThreadedStage ; <nl> - import org . apache . cassandra . concurrent . StageManager ; <nl> - import org . apache . cassandra . concurrent . ThreadFactoryImpl ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . net . http . HttpConnectionHandler ; <nl> import org . apache . cassandra . net . io . SerializerType ; <nl> - import org . apache . cassandra . net . sink . SinkManager ; <nl> - import org . apache . cassandra . utils . Cachetable ; <nl> - import org . apache . cassandra . utils . GuidGenerator ; <nl> - import org . apache . cassandra . utils . HashingSchemes ; <nl> - import org . apache . cassandra . utils . ICachetable ; <nl> - import org . apache . cassandra . utils . LogUtil ; <nl> + import org . apache . cassandra . utils . * ; <nl> import org . apache . log4j . Logger ; <nl> <nl> + import java . io . IOException ; <nl> + import java . net . MulticastSocket ; <nl> + import java . net . ServerSocket ; <nl> + import java . nio . ByteBuffer ; <nl> + import java . nio . channels . SelectionKey ; <nl> + import java . nio . channels . ServerSocketChannel ; <nl> + import java . security . MessageDigest ; <nl> + import java . util . * ; <nl> + import java . util . concurrent . ExecutorService ; <nl> + import java . util . concurrent . LinkedBlockingQueue ; <nl> + import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . atomic . AtomicBoolean ; <nl> + import java . util . concurrent . locks . ReentrantLock ; <nl> + <nl> / * * <nl> * Author : Avinash Lakshman ( alakshman @ facebook . com ) & Prashant Malik ( pmalik @ facebook . com ) <nl> * / <nl> <nl> - public class MessagingService implements IMessagingService , MessagingServiceMBean <nl> + public class MessagingService implements IMessagingService <nl> { <nl> private static boolean debugOn _ = false ; <nl> <nl> @ @ - 243 , 18 + 232 , 6 @ @ public class MessagingService implements IMessagingService , MessagingServiceMBea <nl> return result ; <nl> } <nl> <nl> - public long getMessagingSerializerTaskCount ( ) <nl> - { <nl> - DebuggableThreadPoolExecutor dstp = ( DebuggableThreadPoolExecutor ) messageSerializerExecutor _ ; <nl> - return dstp . getTaskCount ( ) - dstp . getCompletedTaskCount ( ) ; <nl> - } <nl> - <nl> - public long getMessagingReceiverTaskCount ( ) <nl> - { <nl> - DebuggableThreadPoolExecutor dstp = ( DebuggableThreadPoolExecutor ) messageDeserializationExecutor _ ; <nl> - return dstp . getTaskCount ( ) - dstp . getCompletedTaskCount ( ) ; <nl> - } <nl> - <nl> public void listen ( EndPoint localEp , boolean isHttp ) throws IOException <nl> { <nl> ServerSocketChannel serverChannel = ServerSocketChannel . open ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / net / MessagingServiceMBean . java b / src / java / org / apache / cassandra / net / MessagingServiceMBean . java <nl> deleted file mode 100644 <nl> index 3e0a57c . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / net / MessagingServiceMBean . java <nl> + + + / dev / null <nl> @ @ - 1 , 29 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . net ; <nl> - <nl> - / * * <nl> - * Author : Avinash Lakshman ( alakshman @ facebook . com ) & Prashant Malik ( pmalik @ facebook . com ) <nl> - * / <nl> - <nl> - public interface MessagingServiceMBean <nl> - { <nl> - public long getMessagingSerializerTaskCount ( ) ; <nl> - public long getMessagingReceiverTaskCount ( ) ; <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / net / TcpConnection . java b / src / java / org / apache / cassandra / net / TcpConnection . java <nl> index ebd507d . . 814039f 100644 <nl> - - - a / src / java / org / apache / cassandra / net / TcpConnection . java <nl> + + + b / src / java / org / apache / cassandra / net / TcpConnection . java <nl> @ @ - 174 , 7 + 174 , 7 @ @ public class TcpConnection extends SelectionKeyHandler implements Comparable <nl> byte [ ] data = serializer _ . serialize ( message ) ; <nl> if ( data . length > 0 ) <nl> { <nl> - boolean listening = ( message . getFrom ( ) . equals ( EndPoint . randomLocalEndPoint _ ) ) ? false : true ; <nl> + boolean listening = ! message . getFrom ( ) . equals ( EndPoint . randomLocalEndPoint _ ) ; <nl> ByteBuffer buffer = MessagingService . packIt ( data , false , false , listening ) ; <nl> synchronized ( this ) <nl> { <nl> @ @ - 184 , 7 + 184 , 6 @ @ public class TcpConnection extends SelectionKeyHandler implements Comparable <nl> return ; <nl> } <nl> <nl> - logger _ . debug ( " Sending packets of size " + data . length ) ; <nl> socketChannel _ . write ( buffer ) ; <nl> <nl> if ( buffer . remaining ( ) > 0 ) <nl> diff - - git a / src / java / org / apache / cassandra / net / UdpConnection . java b / src / java / org / apache / cassandra / net / UdpConnection . java <nl> index 0ea2aec . . 53fddbb 100644 <nl> - - - a / src / java / org / apache / cassandra / net / UdpConnection . java <nl> + + + b / src / java / org / apache / cassandra / net / UdpConnection . java <nl> @ @ - 78 , 7 + 78 , 7 @ @ public class UdpConnection extends SelectionKeyHandler <nl> byte [ ] data = bos . toByteArray ( ) ; <nl> if ( data . length > 0 ) <nl> { <nl> - logger _ . debug ( " Size of Gossip packet " + data . length ) ; <nl> + logger _ . trace ( " Size of Gossip packet " + data . length ) ; <nl> byte [ ] protocol = BasicUtilities . intToByteArray ( protocol _ ) ; <nl> ByteBuffer buffer = ByteBuffer . allocate ( data . length + protocol . length ) ; <nl> buffer . put ( protocol ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index f8b71e6 . . 8840685 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 263 , 7 + 263 , 6 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> * / <nl> private void init ( ) <nl> { <nl> - / / Register this instance with JMX <nl> try <nl> { <nl> MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index ac5269c . . d4e5e37 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 4 . 0 
+ + * Fix scheduling of speculative retry threshold recalculation ( CASSANDRA - 14338 ) 
+ * Add support for hybrid MIN ( ) , MAX ( ) speculative retry policies ( CASSANDRA - 14293 ) 
+ * Correct and clarify SSLFactory . getSslContext method and call sites ( CASSANDRA - 14314 ) 
+ * Use zero as default score in DynamicEndpointSnitch ( CASSANDRA - 14252 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 52c280c . . 4f74667 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 77 , 7 + 77 , 6 @ @ import org . apache . cassandra . metrics . TableMetrics ; 
+ import org . apache . cassandra . metrics . TableMetrics . Sampler ; 
+ import org . apache . cassandra . schema . * ; 
+ import org . apache . cassandra . schema . CompactionParams . TombstoneOption ; 
+ - import org . apache . cassandra . service . reads . SpeculativeRetryPolicy ; 
+ import org . apache . cassandra . service . CacheService ; 
+ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . streaming . TableStreamManager ; 
+ @ @ - 214 , 7 + 213 , 6 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ 
+ public final TableMetrics metric ; 
+ public volatile long sampleLatencyNanos ; 
+ - private final ScheduledFuture < ? > latencyCalculator ; 
+ 
+ private final CassandraStreamManager streamManager ; 
+ 
+ @ @ - 442 , 35 + 440 , 27 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ { 
+ throw new RuntimeException ( e ) ; 
+ } 
+ - 
+ - SpeculativeRetryPolicy retryPolicy = metadata . get ( ) . params . speculativeRetry ; 
+ - logger . trace ( " retryPolicy for { } is { } " , name , retryPolicy ) ; 
+ - if ( ! retryPolicy . isDynamic ( ) ) 
+ - { 
+ - / / avoid scheduling the task in the first place for non - dynamic speculative retry policies 
+ - / / e . g . always and never speculative policies will never change so we can just calculate once 
+ - / / and avoid doing unnecessary work every ReadRpcTimeout ( ) 
+ - sampleLatencyNanos = retryPolicy . calculateThreshold ( metric . coordinatorReadLatency ) ; 
+ - latencyCalculator = null ; 
+ - } 
+ - else 
+ - { 
+ - latencyCalculator = ScheduledExecutors . optionalTasks . scheduleWithFixedDelay ( ( ) - > 
+ - { 
+ - SpeculativeRetryPolicy retryPolicy1 = metadata . get ( ) . params . speculativeRetry ; 
+ - sampleLatencyNanos = retryPolicy1 . calculateThreshold ( metric . coordinatorReadLatency ) ; 
+ - } , DatabaseDescriptor . getReadRpcTimeout ( ) , DatabaseDescriptor . getReadRpcTimeout ( ) , TimeUnit . MILLISECONDS ) ; 
+ - } 
+ } 
+ else 
+ { 
+ - latencyCalculator = ScheduledExecutors . optionalTasks . schedule ( Runnables . doNothing ( ) , 0 , TimeUnit . NANOSECONDS ) ; 
+ mbeanName = null ; 
+ oldMBeanName = null ; 
+ } 
+ streamManager = new CassandraStreamManager ( this ) ; 
+ } 
+ 
+ + public void updateSpeculationThreshold ( ) 
+ + { 
+ + try 
+ + { 
+ + sampleLatencyNanos = metadata ( ) . params . speculativeRetry . calculateThreshold ( metric . coordinatorReadLatency ) ; 
+ + } 
+ + catch ( Throwable e ) 
+ + { 
+ + logger . error ( " Exception caught while calculating speculative retry threshold for { } : { } " , metadata ( ) , e ) ; 
+ + } 
+ + } 
+ + 
+ public TableStreamManager getStreamManager ( ) 
+ { 
+ return streamManager ; 
+ @ @ - 527 , 9 + 517 , 6 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ } 
+ } 
+ 
+ - if ( latencyCalculator ! = null ) 
+ - latencyCalculator . cancel ( false ) ; 
+ - 
+ compactionStrategyManager . shutdown ( ) ; 
+ SystemKeyspace . removeTruncationRecord ( metadata . id ) ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / service / CassandraDaemon . java b / src / java / org / apache / cassandra / service / CassandraDaemon . java 
+ index 295a33b . . 95dd6ac 100644 
+ - - - a / src / java / org / apache / cassandra / service / CassandraDaemon . java 
+ + + + b / src / java / org / apache / cassandra / service / CassandraDaemon . java 
+ @ @ - 407 , 6 + 407 , 14 @ @ public class CassandraDaemon 
+ / / due to scheduling errors or race conditions 
+ ScheduledExecutors . optionalTasks . scheduleWithFixedDelay ( ColumnFamilyStore . getBackgroundCompactionTaskSubmitter ( ) , 5 , 1 , TimeUnit . MINUTES ) ; 
+ 
+ + / / schedule periodic recomputation of speculative retry thresholds 
+ + ScheduledExecutors . optionalTasks . scheduleWithFixedDelay ( 
+ + ( ) - > Keyspace . all ( ) . forEach ( k - > k . getColumnFamilyStores ( ) . forEach ( ColumnFamilyStore : : updateSpeculationThreshold ) ) , 
+ + DatabaseDescriptor . getReadRpcTimeout ( ) , 
+ + DatabaseDescriptor . getReadRpcTimeout ( ) , 
+ + TimeUnit . MILLISECONDS 
+ + ) ; 
+ + 
+ / / schedule periodic dumps of table size estimates into SystemKeyspace . SIZE _ ESTIMATES _ CF 
+ / / set cassandra . size _ recorder _ interval to 0 to disable 
+ int sizeRecorderInterval = Integer . getInteger ( " cassandra . size _ recorder _ interval " , 5 * 60 ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / reads / AlwaysSpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / AlwaysSpeculativeRetryPolicy . java 
+ index d054b09 . . 4623cb1 100644 
+ - - - a / src / java / org / apache / cassandra / service / reads / AlwaysSpeculativeRetryPolicy . java 
+ + + + b / src / java / org / apache / cassandra / service / reads / AlwaysSpeculativeRetryPolicy . java 
+ @ @ - 31 , 12 + 31 , 6 @ @ public class AlwaysSpeculativeRetryPolicy implements SpeculativeRetryPolicy 
+ } 
+ 
+ @ Override 
+ - public boolean isDynamic ( ) 
+ - { 
+ - return false ; 
+ - } 
+ - 
+ - @ Override 
+ public long calculateThreshold ( Timer readLatency ) 
+ { 
+ return 0 ; 
+ diff - - git a / src / java / org / apache / cassandra / service / reads / FixedSpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / FixedSpeculativeRetryPolicy . java 
+ index fb63ac2 . . 2cd9788 100644 
+ - - - a / src / java / org / apache / cassandra / service / reads / FixedSpeculativeRetryPolicy . java 
+ + + + b / src / java / org / apache / cassandra / service / reads / FixedSpeculativeRetryPolicy . java 
+ @ @ - 34 , 12 + 34 , 6 @ @ public class FixedSpeculativeRetryPolicy implements SpeculativeRetryPolicy 
+ } 
+ 
+ @ Override 
+ - public boolean isDynamic ( ) 
+ - { 
+ - return false ; 
+ - } 
+ - 
+ - @ Override 
+ public long calculateThreshold ( Timer readLatency ) 
+ { 
+ return TimeUnit . MILLISECONDS . toNanos ( speculateAtMilliseconds ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / reads / HybridSpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / HybridSpeculativeRetryPolicy . java 
+ index 78e4fcd . . d49cfe4 100644 
+ - - - a / src / java / org / apache / cassandra / service / reads / HybridSpeculativeRetryPolicy . java 
+ + + + b / src / java / org / apache / cassandra / service / reads / HybridSpeculativeRetryPolicy . java 
+ @ @ - 43 , 12 + 43 , 6 @ @ public class HybridSpeculativeRetryPolicy implements SpeculativeRetryPolicy 
+ } 
+ 
+ @ Override 
+ - public boolean isDynamic ( ) 
+ - { 
+ - return true ; 
+ - } 
+ - 
+ - @ Override 
+ public long calculateThreshold ( Timer readLatency ) 
+ { 
+ long percentileThreshold = percentilePolicy . calculateThreshold ( readLatency ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / reads / NeverSpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / NeverSpeculativeRetryPolicy . java 
+ index 219adb5 . . c46a899 100644 
+ - - - a / src / java / org / apache / cassandra / service / reads / NeverSpeculativeRetryPolicy . java 
+ + + + b / src / java / org / apache / cassandra / service / reads / NeverSpeculativeRetryPolicy . java 
+ @ @ - 31 , 12 + 31 , 6 @ @ public class NeverSpeculativeRetryPolicy implements SpeculativeRetryPolicy 
+ } 
+ 
+ @ Override 
+ - public boolean isDynamic ( ) 
+ - { 
+ - return false ; 
+ - } 
+ - 
+ - @ Override 
+ public long calculateThreshold ( Timer readLatency ) 
+ { 
+ return Long . MAX _ VALUE ; 
+ diff - - git a / src / java / org / apache / cassandra / service / reads / PercentileSpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / PercentileSpeculativeRetryPolicy . java 
+ index 6b2cbb0 . . 172cc0c 100644 
+ - - - a / src / java / org / apache / cassandra / service / reads / PercentileSpeculativeRetryPolicy . java 
+ + + + b / src / java / org / apache / cassandra / service / reads / PercentileSpeculativeRetryPolicy . java 
+ @ @ - 32 , 12 + 32 , 6 @ @ public class PercentileSpeculativeRetryPolicy implements SpeculativeRetryPolicy 
+ } 
+ 
+ @ Override 
+ - public boolean isDynamic ( ) 
+ - { 
+ - return true ; 
+ - } 
+ - 
+ - @ Override 
+ public long calculateThreshold ( Timer readLatency ) 
+ { 
+ return ( long ) readLatency . getSnapshot ( ) . getValue ( percentile / 100 ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / reads / SpeculativeRetryPolicy . java b / src / java / org / apache / cassandra / service / reads / SpeculativeRetryPolicy . java 
+ index 399f291 . . 225ab26 100644 
+ - - - a / src / java / org / apache / cassandra / service / reads / SpeculativeRetryPolicy . java 
+ + + + b / src / java / org / apache / cassandra / service / reads / SpeculativeRetryPolicy . java 
+ @ @ - 42 , 8 + 42 , 6 @ @ public interface SpeculativeRetryPolicy 
+ Pattern . CASE _ INSENSITIVE ) ; 
+ public static final SpeculativeRetryPolicy DEFAULT = new PercentileSpeculativeRetryPolicy ( 99 . 0 ) ; 
+ 
+ - boolean isDynamic ( ) ; 
+ - 
+ long calculateThreshold ( Timer readLatency ) ; 
+ 
+ Kind kind ( ) ;
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / concurrent / ContinuationStage . java b / src / java / org / apache / cassandra / concurrent / ContinuationStage . java 
+ index 0c5291d . . d8bdfc0 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / ContinuationStage . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / ContinuationStage . java 
+ @ @ - 85 , 7 + 85 , 7 @ @ public class ContinuationStage implements IStage 
+ return executorService _ . isShutdown ( ) ; 
+ } 
+ 
+ - public long getTaskCount ( ) { 
+ + public long getPendingTasks ( ) { 
+ return ( executorService _ . getTaskCount ( ) - executorService _ . getCompletedTaskCount ( ) ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java 
+ index b72ed35 . . 51faa4c 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java 
+ @ @ - 19 , 10 + 19 , 12 @ @ 
+ package org . apache . cassandra . concurrent ; 
+ 
+ import java . util . concurrent . * ; 
+ + import java . lang . management . ManagementFactory ; 
+ 
+ - import org . apache . cassandra . utils . LogUtil ; 
+ import org . apache . log4j . Logger ; 
+ - import org . apache . cassandra . utils . * ; 
+ + 
+ + import javax . management . MBeanServer ; 
+ + import javax . management . ObjectName ; 
+ 
+ / * * 
+ * This is a wrapper class for the < i > ScheduledThreadPoolExecutor < / i > . It provides an implementation 
+ @ @ - 32 , 7 + 34 , 7 @ @ import org . apache . cassandra . utils . * ; 
+ * Author : Avinash Lakshman ( alakshman @ facebook . com ) & Prashant Malik ( pmalik @ facebook . com ) 
+ * / 
+ 
+ - public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor 
+ + public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements DebuggableThreadPoolExecutorMBean 
+ { 
+ private static Logger logger _ = Logger . getLogger ( DebuggableThreadPoolExecutor . class ) ; 
+ 
+ @ @ - 46 , 12 + 48 , 26 @ @ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor 
+ long keepAliveTime , 
+ TimeUnit unit , 
+ BlockingQueue < Runnable > workQueue , 
+ - ThreadFactory threadFactory ) 
+ + ThreadFactoryImpl threadFactory ) 
+ { 
+ super ( corePoolSize , maximumPoolSize , keepAliveTime , unit , workQueue , threadFactory ) ; 
+ super . prestartAllCoreThreads ( ) ; 
+ + MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; 
+ + try 
+ + { 
+ + mbs . registerMBean ( this , new ObjectName ( " org . apache . cassandra . concurrent : type = " + threadFactory . id _ ) ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ } 
+ - 
+ + 
+ + public long getPendingTasks ( ) 
+ + { 
+ + return getTaskCount ( ) - getCompletedTaskCount ( ) ; 
+ + } 
+ + 
+ / * 
+ * 
+ * ( non - Javadoc ) 
+ diff - - git a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutorMBean . java b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutorMBean . java 
+ new file mode 100644 
+ index 0000000 . . 798a888 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutorMBean . java 
+ @ @ - 0 , 0 + 1 , 6 @ @ 
+ + package org . apache . cassandra . concurrent ; 
+ + 
+ + public interface DebuggableThreadPoolExecutorMBean 
+ + { 
+ + public long getPendingTasks ( ) ; 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / concurrent / IStage . java b / src / java / org / apache / cassandra / concurrent / IStage . java 
+ index 1ed9fc0 . . f33e3cb 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / IStage . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / IStage . java 
+ @ @ - 116 , 5 + 116 , 5 @ @ public interface IStage 
+ * pending on this stage to be executed . 
+ * @ return task count . 
+ * / 
+ - public long getTaskCount ( ) ; 
+ + public long getPendingTasks ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / concurrent / MultiThreadedStage . java b / src / java / org / apache / cassandra / concurrent / MultiThreadedStage . java 
+ index 75a2789 . . bbdcad6 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / MultiThreadedStage . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / MultiThreadedStage . java 
+ @ @ - 92 , 7 + 92 , 7 @ @ public class MultiThreadedStage implements IStage 
+ return executorService _ . isShutdown ( ) ; 
+ } 
+ 
+ - public long getTaskCount ( ) { 
+ - return ( executorService _ . getTaskCount ( ) - executorService _ . getCompletedTaskCount ( ) ) ; 
+ + public long getPendingTasks ( ) { 
+ + return executorService _ . getPendingTasks ( ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / concurrent / SingleThreadedContinuationStage . java b / src / java / org / apache / cassandra / concurrent / SingleThreadedContinuationStage . java 
+ index 7a4cd33 . . fa1fcff 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / SingleThreadedContinuationStage . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / SingleThreadedContinuationStage . java 
+ @ @ - 92 , 7 + 92 , 7 @ @ public class SingleThreadedContinuationStage implements IStage 
+ return executorService _ . isShutdown ( ) ; 
+ } 
+ 
+ - public long getTaskCount ( ) { 
+ + public long getPendingTasks ( ) { 
+ return ( executorService _ . getTaskCount ( ) - executorService _ . getCompletedTaskCount ( ) ) ; 
+ } 
+ / * Finished implementing the IStage interface methods * / 
+ diff - - git a / src / java / org / apache / cassandra / concurrent / SingleThreadedStage . java b / src / java / org / apache / cassandra / concurrent / SingleThreadedStage . java 
+ index 27ae871 . . 24480d3 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / SingleThreadedStage . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / SingleThreadedStage . java 
+ @ @ - 94 , 8 + 94 , 7 @ @ public class SingleThreadedStage implements IStage 
+ return executorService _ . isShutdown ( ) ; 
+ } 
+ 
+ - public long getTaskCount ( ) { 
+ - return ( executorService _ . getTaskCount ( ) - executorService _ . getCompletedTaskCount ( ) ) ; 
+ + public long getPendingTasks ( ) { 
+ + return executorService _ . getPendingTasks ( ) ; 
+ } 
+ - / * Finished implementing the IStage interface methods * / 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / concurrent / StageManager . java b / src / java / org / apache / cassandra / concurrent / StageManager . java 
+ index c3fc284 . . f771588 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / StageManager . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / StageManager . java 
+ @ @ - 23 , 8 + 23 , 6 @ @ import java . util . Map ; 
+ import java . util . Set ; 
+ import java . util . concurrent . ExecutorService ; 
+ 
+ - import org . apache . cassandra . continuations . Suspendable ; 
+ - 
+ 
+ / * * 
+ * This class manages all stages that exist within a process . The application registers 
+ @ @ - 101 , 7 + 99 , 7 @ @ public class StageManager 
+ * / 
+ public static long getStageTaskCount ( String stage ) 
+ { 
+ - return stageQueues _ . get ( stage ) . getTaskCount ( ) ; 
+ + return stageQueues _ . get ( stage ) . getPendingTasks ( ) ; 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 1f283b6 . . 2787b63 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1432 , 11 + 1432 , 6 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ return memtableSwitchCount ; 
+ } 
+ 
+ - public int getMemtableTasks ( ) 
+ - { 
+ - return memtable _ . get ( ) . getPendingTasks ( ) ; 
+ - } 
+ - 
+ / * * 
+ * clears out all data associated with this ColumnFamily . 
+ * For use in testing . 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java b / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java 
+ index 75840b8 . . 94e91c3 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java 
+ @ @ - 50 , 11 + 50 , 6 @ @ public interface ColumnFamilyStoreMBean 
+ public int getMemtableSwitchCount ( ) ; 
+ 
+ / * * 
+ - * @ return the number of tasks waiting to run on the memtable executor 
+ - * / 
+ - public int getMemtableTasks ( ) ; 
+ - 
+ - / * * 
+ * Triggers an immediate memtable flush . 
+ * / 
+ public void forceFlush ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java 
+ index ae926d8 . . 9eeec34 100644 
+ - - - a / src / java / org / apache / cassandra / db / Memtable . java 
+ + + + b / src / java / org / apache / cassandra / db / Memtable . java 
+ @ @ - 45 , 7 + 45 , 7 @ @ public class Memtable implements Comparable < Memtable > 
+ { 
+ 	 private static Logger logger _ = Logger . getLogger ( Memtable . class ) ; 
+ private static Set < ExecutorService > runningExecutorServices _ = new NonBlockingHashSet < ExecutorService > ( ) ; 
+ - private boolean isFrozen _ ; 
+ + private static AtomicInteger executorCount _ = new AtomicInteger ( 0 ) ; 
+ 
+ public static void shutdown ( ) 
+ { 
+ @ @ - 56 , 6 + 56 , 7 @ @ public class Memtable implements Comparable < Memtable > 
+ } 
+ 
+ private MemtableThreadPoolExecutor executor _ ; 
+ + private boolean isFrozen _ ; 
+ 
+ private int threshold _ = DatabaseDescriptor . getMemtableSize ( ) * 1024 * 1024 ; 
+ private int thresholdCount _ = ( int ) ( DatabaseDescriptor . getMemtableObjectCount ( ) * 1024 * 1024 ) ; 
+ @ @ - 72 , 12 + 73 , 12 @ @ public class Memtable implements Comparable < Memtable > 
+ 
+ Memtable ( String table , String cfName ) 
+ { 
+ - executor _ = new MemtableThreadPoolExecutor ( ) ; 
+ - runningExecutorServices _ . add ( executor _ ) ; 
+ - 
+ table _ = table ; 
+ cfName _ = cfName ; 
+ creationTime _ = System . currentTimeMillis ( ) ; 
+ + 
+ + executor _ = new MemtableThreadPoolExecutor ( ) ; 
+ + runningExecutorServices _ . add ( executor _ ) ; 
+ } 
+ 
+ class Putter implements Runnable 
+ @ @ - 169 , 11 + 170 , 6 @ @ public class Memtable implements Comparable < Memtable > 
+ 	 return cfName _ ; 
+ } 
+ 
+ - int getPendingTasks ( ) 
+ - { 
+ - 	 return ( int ) ( executor _ . getTaskCount ( ) - executor _ . getCompletedTaskCount ( ) ) ; 
+ - } 
+ - 
+ private synchronized void enqueueFlush ( CommitLog . CommitLogContext cLogCtx ) 
+ { 
+ if ( ! isFrozen _ ) 
+ @ @ - 367 , 7 + 363 , 7 @ @ public class Memtable implements Comparable < Memtable > 
+ 
+ public MemtableThreadPoolExecutor ( ) 
+ { 
+ - super ( " FAST - MEMTABLE - POOL " ) ; 
+ + super ( " MEMTABLE - POOL - " + cfName _ + executorCount _ . addAndGet ( 1 ) ) ; 
+ } 
+ 
+ protected void terminated ( ) 
+ diff - - git a / src / java / org / apache / cassandra / net / MessageDeserializationTask . java b / src / java / org / apache / cassandra / net / MessageDeserializationTask . java 
+ index d21e4c6 . . 0cd6578 100644 
+ - - - a / src / java / org / apache / cassandra / net / MessageDeserializationTask . java 
+ + + + b / src / java / org / apache / cassandra / net / MessageDeserializationTask . java 
+ @ @ - 48 , 23 + 48 , 20 @ @ class MessageDeserializationTask implements Runnable 
+ 
+ public void run ( ) 
+ { 
+ - 	 / * For DEBUG only . Printing queue length * / 
+ - 	 DebuggableThreadPoolExecutor es = ( DebuggableThreadPoolExecutor ) MessagingService . getDeserilizationExecutor ( ) ; 
+ - logger _ . debug ( " Message Deserialization Task : " + ( es . getTaskCount ( ) - es . getCompletedTaskCount ( ) ) ) ; 
+ - / * END DEBUG * / 
+ + Message message = null ; 
+ try 
+ - { 
+ - Message message = ( Message ) serializer _ . deserialize ( bytes _ ) ; 
+ - 
+ - if ( message ! = null ) 
+ - { 
+ - message = SinkManager . processServerMessageSink ( message ) ; 
+ - MessagingService . receive ( message ) ; 
+ - } 
+ + { 
+ + message = serializer _ . deserialize ( bytes _ ) ; 
+ } 
+ - catch ( IOException ex ) 
+ - { 
+ - logger _ . warn ( LogUtil . throwableToString ( ex ) ) ; 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + 
+ + if ( message ! = null ) 
+ + { 
+ + message = SinkManager . processServerMessageSink ( message ) ; 
+ + MessagingService . receive ( message ) ; 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / net / MessageSerializationTask . java b / src / java / org / apache / cassandra / net / MessageSerializationTask . java 
+ index 9cee314 . . 3078a9a 100644 
+ - - - a / src / java / org / apache / cassandra / net / MessageSerializationTask . java 
+ + + + b / src / java / org / apache / cassandra / net / MessageSerializationTask . java 
+ @ @ - 52 , 11 + 52 , 6 @ @ class MessageSerializationTask implements Runnable 
+ 
+ public void run ( ) 
+ { 
+ - 	 / * For DEBUG only . Printing queue length * / 
+ - 	 DebuggableThreadPoolExecutor es = ( DebuggableThreadPoolExecutor ) MessagingService . getWriteExecutor ( ) ; 
+ - logger _ . debug ( " Message Serialization Task : " + ( es . getTaskCount ( ) - es . getCompletedTaskCount ( ) ) ) ; 
+ - / * END DEBUG * / 
+ - 
+ / * Adding the message to be serialized in the TLS . For accessing in the afterExecute ( ) * / 
+ Context ctx = new Context ( ) ; 
+ ctx . put ( this . getClass ( ) . getName ( ) , message _ ) ; 
+ diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java 
+ index 33b9e04 . . bdc46d1 100644 
+ - - - a / src / java / org / apache / cassandra / net / MessagingService . java 
+ + + + b / src / java / org / apache / cassandra / net / MessagingService . java 
+ @ @ - 18 , 43 + 18 , 32 @ @ 
+ 
+ package org . apache . cassandra . net ; 
+ 
+ - import java . io . * ; 
+ - import java . lang . management . ManagementFactory ; 
+ - import java . net . * ; 
+ - import java . security . MessageDigest ; 
+ - import java . util . * ; 
+ - import java . nio . ByteBuffer ; 
+ - import java . util . concurrent . * ; 
+ - import java . util . concurrent . atomic . AtomicBoolean ; 
+ - import java . util . concurrent . locks . ReentrantLock ; 
+ - import java . nio . channels . * ; 
+ import org . apache . cassandra . concurrent . * ; 
+ - import org . apache . cassandra . net . io . * ; 
+ - import org . apache . cassandra . utils . * ; 
+ - import javax . management . MBeanServer ; 
+ - import javax . management . ObjectName ; 
+ - import javax . xml . bind . * ; 
+ - import org . apache . cassandra . concurrent . DebuggableThreadPoolExecutor ; 
+ - import org . apache . cassandra . concurrent . IStage ; 
+ - import org . apache . cassandra . concurrent . MultiThreadedStage ; 
+ - import org . apache . cassandra . concurrent . StageManager ; 
+ - import org . apache . cassandra . concurrent . ThreadFactoryImpl ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . net . http . HttpConnectionHandler ; 
+ import org . apache . cassandra . net . io . SerializerType ; 
+ - import org . apache . cassandra . net . sink . SinkManager ; 
+ - import org . apache . cassandra . utils . Cachetable ; 
+ - import org . apache . cassandra . utils . GuidGenerator ; 
+ - import org . apache . cassandra . utils . HashingSchemes ; 
+ - import org . apache . cassandra . utils . ICachetable ; 
+ - import org . apache . cassandra . utils . LogUtil ; 
+ + import org . apache . cassandra . utils . * ; 
+ import org . apache . log4j . Logger ; 
+ 
+ + import java . io . IOException ; 
+ + import java . net . MulticastSocket ; 
+ + import java . net . ServerSocket ; 
+ + import java . nio . ByteBuffer ; 
+ + import java . nio . channels . SelectionKey ; 
+ + import java . nio . channels . ServerSocketChannel ; 
+ + import java . security . MessageDigest ; 
+ + import java . util . * ; 
+ + import java . util . concurrent . ExecutorService ; 
+ + import java . util . concurrent . LinkedBlockingQueue ; 
+ + import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . atomic . AtomicBoolean ; 
+ + import java . util . concurrent . locks . ReentrantLock ; 
+ + 
+ / * * 
+ * Author : Avinash Lakshman ( alakshman @ facebook . com ) & Prashant Malik ( pmalik @ facebook . com ) 
+ * / 
+ 
+ - public class MessagingService implements IMessagingService , MessagingServiceMBean 
+ + public class MessagingService implements IMessagingService 
+ { 
+ private static boolean debugOn _ = false ; 
+ 
+ @ @ - 243 , 18 + 232 , 6 @ @ public class MessagingService implements IMessagingService , MessagingServiceMBea 
+ return result ; 
+ } 
+ 
+ - public long getMessagingSerializerTaskCount ( ) 
+ - { 
+ - DebuggableThreadPoolExecutor dstp = ( DebuggableThreadPoolExecutor ) messageSerializerExecutor _ ; 
+ - return dstp . getTaskCount ( ) - dstp . getCompletedTaskCount ( ) ; 
+ - } 
+ - 
+ - public long getMessagingReceiverTaskCount ( ) 
+ - { 
+ - DebuggableThreadPoolExecutor dstp = ( DebuggableThreadPoolExecutor ) messageDeserializationExecutor _ ; 
+ - return dstp . getTaskCount ( ) - dstp . getCompletedTaskCount ( ) ; 
+ - } 
+ - 
+ public void listen ( EndPoint localEp , boolean isHttp ) throws IOException 
+ { 
+ ServerSocketChannel serverChannel = ServerSocketChannel . open ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / net / MessagingServiceMBean . java b / src / java / org / apache / cassandra / net / MessagingServiceMBean . java 
+ deleted file mode 100644 
+ index 3e0a57c . . 0000000 
+ - - - a / src / java / org / apache / cassandra / net / MessagingServiceMBean . java 
+ + + + / dev / null 
+ @ @ - 1 , 29 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . net ; 
+ - 
+ - / * * 
+ - * Author : Avinash Lakshman ( alakshman @ facebook . com ) & Prashant Malik ( pmalik @ facebook . com ) 
+ - * / 
+ - 
+ - public interface MessagingServiceMBean 
+ - { 
+ - public long getMessagingSerializerTaskCount ( ) ; 
+ - public long getMessagingReceiverTaskCount ( ) ; 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / net / TcpConnection . java b / src / java / org / apache / cassandra / net / TcpConnection . java 
+ index ebd507d . . 814039f 100644 
+ - - - a / src / java / org / apache / cassandra / net / TcpConnection . java 
+ + + + b / src / java / org / apache / cassandra / net / TcpConnection . java 
+ @ @ - 174 , 7 + 174 , 7 @ @ public class TcpConnection extends SelectionKeyHandler implements Comparable 
+ byte [ ] data = serializer _ . serialize ( message ) ; 
+ if ( data . length > 0 ) 
+ { 
+ - boolean listening = ( message . getFrom ( ) . equals ( EndPoint . randomLocalEndPoint _ ) ) ? false : true ; 
+ + boolean listening = ! message . getFrom ( ) . equals ( EndPoint . randomLocalEndPoint _ ) ; 
+ ByteBuffer buffer = MessagingService . packIt ( data , false , false , listening ) ; 
+ synchronized ( this ) 
+ { 
+ @ @ - 184 , 7 + 184 , 6 @ @ public class TcpConnection extends SelectionKeyHandler implements Comparable 
+ return ; 
+ } 
+ 
+ - logger _ . debug ( " Sending packets of size " + data . length ) ; 
+ socketChannel _ . write ( buffer ) ; 
+ 
+ if ( buffer . remaining ( ) > 0 ) 
+ diff - - git a / src / java / org / apache / cassandra / net / UdpConnection . java b / src / java / org / apache / cassandra / net / UdpConnection . java 
+ index 0ea2aec . . 53fddbb 100644 
+ - - - a / src / java / org / apache / cassandra / net / UdpConnection . java 
+ + + + b / src / java / org / apache / cassandra / net / UdpConnection . java 
+ @ @ - 78 , 7 + 78 , 7 @ @ public class UdpConnection extends SelectionKeyHandler 
+ byte [ ] data = bos . toByteArray ( ) ; 
+ if ( data . length > 0 ) 
+ { 
+ - logger _ . debug ( " Size of Gossip packet " + data . length ) ; 
+ + logger _ . trace ( " Size of Gossip packet " + data . length ) ; 
+ byte [ ] protocol = BasicUtilities . intToByteArray ( protocol _ ) ; 
+ ByteBuffer buffer = ByteBuffer . allocate ( data . length + protocol . length ) ; 
+ buffer . put ( protocol ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index f8b71e6 . . 8840685 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 263 , 7 + 263 , 6 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ * / 
+ private void init ( ) 
+ { 
+ - / / Register this instance with JMX 
+ try 
+ { 
+ MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ;

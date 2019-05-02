@@ -1,0 +1,402 @@
+BLEU SCORE: 0.053414136238197775
+
+TEST MSG: bound maximum in - flight commit log replay mutation bytes to 64 megabytes ( tunable via cassandra . commitlog _ max _ outstanding _ replay _ bytes )
+GENERATED MSG: Fail to start if commit log replay encounters an exception
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 1607a66 . . 6c46183 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 2 <nl> + * bound maximum in - flight commit log replay mutation bytes to 64 megabytes ( CASSANDRA - 8639 ) <nl> * Normalize all scripts ( CASSANDRA - 10679 ) <nl> * Make compression ratio much more accurate ( CASSANDRA - 10225 ) <nl> * Optimize building of Clustering object when only one is created ( CASSANDRA - 10409 ) <nl> diff - - git a / NEWS . txt b / NEWS . txt <nl> index 2a5970d . . 8830c99 100644 <nl> - - - a / NEWS . txt <nl> + + + b / NEWS . txt <nl> @ @ - 18 , 7 + 18 , 8 @ @ using the provided ' sstableupgrade ' tool . <nl> <nl> New features <nl> - - - - - - - - - - - - <nl> - <nl> + - bound maximum in - flight commit log replay mutation bytes to 64 megabytes <nl> + tunable via cassandra . commitlog _ max _ outstanding _ replay _ bytes <nl> - Support for type casting has been added to the selection clause . <nl> <nl> Upgrading <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java <nl> index 2668bba . . 5010696 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java <nl> @ @ - 29 , 6 + 29 , 7 @ @ import java . util . concurrent . Future ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> import java . util . zip . CRC32 ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . base . Predicate ; <nl> import com . google . common . collect . HashMultimap ; <nl> import com . google . common . collect . Iterables ; <nl> @ @ - 54 , 7 + 55 , 6 @ @ import org . apache . cassandra . io . compress . ICompressor ; <nl> import org . apache . cassandra . io . util . ChannelProxy ; <nl> import org . apache . cassandra . io . util . DataInputBuffer ; <nl> import org . apache . cassandra . io . util . FileDataInput ; <nl> - import org . apache . cassandra . io . util . NIODataInputStream ; <nl> import org . apache . cassandra . io . util . RandomAccessReader ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . JVMStabilityInspector ; <nl> @ @ - 65 , 13 + 65 , 17 @ @ import static org . apache . cassandra . utils . FBUtilities . updateChecksumInt ; <nl> <nl> public class CommitLogReplayer <nl> { <nl> + @ VisibleForTesting <nl> + public static long MAX _ OUTSTANDING _ REPLAY _ BYTES = Long . getLong ( " cassandra . commitlog _ max _ outstanding _ replay _ bytes " , 1024 * 1024 * 64 ) ; <nl> + @ VisibleForTesting <nl> + public static MutationInitiator mutationInitiator = new MutationInitiator ( ) ; <nl> static final String IGNORE _ REPLAY _ ERRORS _ PROPERTY = " cassandra . commitlog . ignorereplayerrors " ; <nl> private static final Logger logger = LoggerFactory . getLogger ( CommitLogReplayer . class ) ; <nl> private static final int MAX _ OUTSTANDING _ REPLAY _ COUNT = Integer . getInteger ( " cassandra . commitlog _ max _ outstanding _ replay _ count " , 1024 ) ; <nl> private static final int LEGACY _ END _ OF _ SEGMENT _ MARKER = 0 ; <nl> <nl> private final Set < Keyspace > keyspacesRecovered ; <nl> - private final List < Future < ? > > futures ; <nl> + private final Queue < Future < Integer > > futures ; <nl> private final Map < UUID , AtomicInteger > invalidMutations ; <nl> private final AtomicInteger replayedCount ; <nl> private final Map < UUID , ReplayPosition > cfPositions ; <nl> @ @ - 79 , 14 + 83 , 74 @ @ public class CommitLogReplayer <nl> private final CRC32 checksum ; <nl> private byte [ ] buffer ; <nl> private byte [ ] uncompressedBuffer ; <nl> + private long pendingMutationBytes = 0 ; <nl> <nl> private final ReplayFilter replayFilter ; <nl> private final CommitLogArchiver archiver ; <nl> <nl> + / * <nl> + * Wrapper around initiating mutations read from the log to make it possible <nl> + * to spy on initiated mutations for test <nl> + * / <nl> + @ VisibleForTesting <nl> + public static class MutationInitiator <nl> + { <nl> + protected Future < Integer > initiateMutation ( final Mutation mutation , <nl> + final long segmentId , <nl> + final int serializedSize , <nl> + final long entryLocation , <nl> + final CommitLogReplayer clr ) <nl> + { <nl> + Runnable runnable = new WrappedRunnable ( ) <nl> + { <nl> + public void runMayThrow ( ) throws IOException <nl> + { <nl> + if ( Schema . instance . getKSMetaData ( mutation . getKeyspaceName ( ) ) = = null ) <nl> + return ; <nl> + if ( clr . pointInTimeExceeded ( mutation ) ) <nl> + return ; <nl> + <nl> + final Keyspace keyspace = Keyspace . open ( mutation . getKeyspaceName ( ) ) ; <nl> + <nl> + / / Rebuild the mutation , omitting column families that <nl> + / / a ) the user has requested that we ignore , <nl> + / / b ) have already been flushed , <nl> + / / or c ) are part of a cf that was dropped . <nl> + / / Keep in mind that the cf . name ( ) is suspect . do every thing based on the cfid instead . <nl> + Mutation newMutation = null ; <nl> + for ( PartitionUpdate update : clr . replayFilter . filter ( mutation ) ) <nl> + { <nl> + if ( Schema . instance . getCF ( update . metadata ( ) . cfId ) = = null ) <nl> + continue ; / / dropped <nl> + <nl> + ReplayPosition rp = clr . cfPositions . get ( update . metadata ( ) . cfId ) ; <nl> + <nl> + / / replay if current segment is newer than last flushed one or , <nl> + / / if it is the last known segment , if we are after the replay position <nl> + if ( segmentId > rp . segment | | ( segmentId = = rp . segment & & entryLocation > rp . position ) ) <nl> + { <nl> + if ( newMutation = = null ) <nl> + newMutation = new Mutation ( mutation . getKeyspaceName ( ) , mutation . key ( ) ) ; <nl> + newMutation . add ( update ) ; <nl> + clr . replayedCount . incrementAndGet ( ) ; <nl> + } <nl> + } <nl> + if ( newMutation ! = null ) <nl> + { <nl> + assert ! newMutation . isEmpty ( ) ; <nl> + Keyspace . open ( newMutation . getKeyspaceName ( ) ) . applyFromCommitLog ( newMutation ) ; <nl> + clr . keyspacesRecovered . add ( keyspace ) ; <nl> + } <nl> + } <nl> + } ; <nl> + return StageManager . getStage ( Stage . MUTATION ) . submit ( runnable , serializedSize ) ; <nl> + } <nl> + } <nl> + <nl> CommitLogReplayer ( CommitLog commitLog , ReplayPosition globalPosition , Map < UUID , ReplayPosition > cfPositions , ReplayFilter replayFilter ) <nl> { <nl> this . keyspacesRecovered = new NonBlockingHashSet < Keyspace > ( ) ; <nl> - this . futures = new ArrayList < Future < ? > > ( ) ; <nl> + this . futures = new ArrayDeque < Future < Integer > > ( ) ; <nl> this . buffer = new byte [ 4096 ] ; <nl> this . uncompressedBuffer = new byte [ 4096 ] ; <nl> this . invalidMutations = new HashMap < UUID , AtomicInteger > ( ) ; <nl> @ @ - 163 , 6 + 227 , 8 @ @ public class CommitLogReplayer <nl> / / flush replayed keyspaces <nl> futures . clear ( ) ; <nl> boolean flushingSystem = false ; <nl> + <nl> + List < Future < ? > > futures = new ArrayList < Future < ? > > ( ) ; <nl> for ( Keyspace keyspace : keyspacesRecovered ) <nl> { <nl> if ( keyspace . getName ( ) . equals ( SystemKeyspace . NAME ) ) <nl> @ @ - 176 , 6 + 242 , 7 @ @ public class CommitLogReplayer <nl> futures . add ( Keyspace . open ( SystemKeyspace . NAME ) . getColumnFamilyStore ( SystemKeyspace . BATCHES ) . forceFlush ( ) ) ; <nl> <nl> FBUtilities . waitOnFutures ( futures ) ; <nl> + <nl> return replayedCount . get ( ) ; <nl> } <nl> <nl> @ @ - 565 , 53 + 632 , 19 @ @ public class CommitLogReplayer <nl> if ( logger . isTraceEnabled ( ) ) <nl> logger . trace ( " replaying mutation for { } . { } : { } " , mutation . getKeyspaceName ( ) , mutation . key ( ) , " { " + StringUtils . join ( mutation . getPartitionUpdates ( ) . iterator ( ) , " , " ) + " } " ) ; <nl> <nl> - Runnable runnable = new WrappedRunnable ( ) <nl> - { <nl> - public void runMayThrow ( ) throws IOException <nl> - { <nl> - if ( Schema . instance . getKSMetaData ( mutation . getKeyspaceName ( ) ) = = null ) <nl> - return ; <nl> - if ( pointInTimeExceeded ( mutation ) ) <nl> - return ; <nl> - <nl> - final Keyspace keyspace = Keyspace . open ( mutation . getKeyspaceName ( ) ) ; <nl> - <nl> - / / Rebuild the mutation , omitting column families that <nl> - / / a ) the user has requested that we ignore , <nl> - / / b ) have already been flushed , <nl> - / / or c ) are part of a cf that was dropped . <nl> - / / Keep in mind that the cf . name ( ) is suspect . do every thing based on the cfid instead . <nl> - Mutation newMutation = null ; <nl> - for ( PartitionUpdate update : replayFilter . filter ( mutation ) ) <nl> - { <nl> - if ( Schema . instance . getCF ( update . metadata ( ) . cfId ) = = null ) <nl> - continue ; / / dropped <nl> - <nl> - ReplayPosition rp = cfPositions . get ( update . metadata ( ) . cfId ) ; <nl> - <nl> - / / replay if current segment is newer than last flushed one or , <nl> - / / if it is the last known segment , if we are after the replay position <nl> - if ( desc . id > rp . segment | | ( desc . id = = rp . segment & & entryLocation > rp . position ) ) <nl> - { <nl> - if ( newMutation = = null ) <nl> - newMutation = new Mutation ( mutation . getKeyspaceName ( ) , mutation . key ( ) ) ; <nl> - newMutation . add ( update ) ; <nl> - replayedCount . incrementAndGet ( ) ; <nl> - } <nl> - } <nl> - if ( newMutation ! = null ) <nl> - { <nl> - assert ! newMutation . isEmpty ( ) ; <nl> - Keyspace . open ( newMutation . getKeyspaceName ( ) ) . applyFromCommitLog ( newMutation ) ; <nl> - keyspacesRecovered . add ( keyspace ) ; <nl> - } <nl> - } <nl> - } ; <nl> - futures . add ( StageManager . getStage ( Stage . MUTATION ) . submit ( runnable ) ) ; <nl> - if ( futures . size ( ) > MAX _ OUTSTANDING _ REPLAY _ COUNT ) <nl> + pendingMutationBytes + = size ; <nl> + futures . offer ( mutationInitiator . initiateMutation ( mutation , <nl> + desc . id , <nl> + size , <nl> + entryLocation , <nl> + this ) ) ; <nl> + / / If there are finished mutations , or too many outstanding bytes / mutations <nl> + / / drain the futures in the queue <nl> + while ( futures . size ( ) > MAX _ OUTSTANDING _ REPLAY _ COUNT <nl> + | | pendingMutationBytes > MAX _ OUTSTANDING _ REPLAY _ BYTES <nl> + | | ( ! futures . isEmpty ( ) & & futures . peek ( ) . isDone ( ) ) ) <nl> { <nl> - FBUtilities . waitOnFutures ( futures ) ; <nl> - futures . clear ( ) ; <nl> + pendingMutationBytes - = FBUtilities . waitOnFuture ( futures . poll ( ) ) ; <nl> } <nl> } <nl> <nl> diff - - git a / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java b / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java <nl> index baf9466 . . 788757c 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java <nl> @ @ - 20 , 7 + 20 , 12 @ @ package org . apache . cassandra . db ; <nl> <nl> import java . io . IOException ; <nl> import java . util . Date ; <nl> + import java . util . concurrent . ExecutionException ; <nl> + import java . util . concurrent . Future ; <nl> + import java . util . concurrent . Semaphore ; <nl> import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . TimeoutException ; <nl> + import java . util . concurrent . atomic . AtomicReference ; <nl> <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 45 , 11 + 50 , 71 @ @ import org . apache . cassandra . db . commitlog . CommitLog ; <nl> import org . apache . cassandra . db . commitlog . CommitLogArchiver ; <nl> import org . apache . cassandra . schema . KeyspaceParams ; <nl> import org . apache . cassandra . utils . ByteBufferUtil ; <nl> + import org . apache . cassandra . db . commitlog . CommitLogReplayer ; <nl> <nl> @ RunWith ( OrderedJUnit4ClassRunner . class ) <nl> public class RecoveryManagerTest <nl> { <nl> private static Logger logger = LoggerFactory . getLogger ( RecoveryManagerTest . class ) ; <nl> + static final Semaphore blocker = new Semaphore ( 0 ) ; <nl> + static final Semaphore blocked = new Semaphore ( 0 ) ; <nl> + static CommitLogReplayer . MutationInitiator originalInitiator = null ; <nl> + static final CommitLogReplayer . MutationInitiator mockInitiator = new CommitLogReplayer . MutationInitiator ( ) <nl> + { <nl> + @ Override <nl> + protected Future < Integer > initiateMutation ( final Mutation mutation , <nl> + final long segmentId , <nl> + final int serializedSize , <nl> + final long entryLocation , <nl> + final CommitLogReplayer clr ) <nl> + { <nl> + final Future < Integer > toWrap = super . initiateMutation ( mutation , <nl> + segmentId , <nl> + serializedSize , <nl> + entryLocation , <nl> + clr ) ; <nl> + return new Future < Integer > ( ) <nl> + { <nl> + <nl> + @ Override <nl> + public boolean cancel ( boolean mayInterruptIfRunning ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public boolean isCancelled ( ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public boolean isDone ( ) <nl> + { <nl> + return blocker . availablePermits ( ) > 0 & & toWrap . isDone ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public Integer get ( ) throws InterruptedException , ExecutionException <nl> + { <nl> + System . out . println ( " Got blocker once " ) ; <nl> + blocked . release ( ) ; <nl> + blocker . acquire ( ) ; <nl> + return toWrap . get ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public Integer get ( long timeout , TimeUnit unit ) <nl> + throws InterruptedException , ExecutionException , TimeoutException <nl> + { <nl> + blocked . release ( ) ; <nl> + blocker . tryAcquire ( 1 , timeout , unit ) ; <nl> + return toWrap . get ( timeout , unit ) ; <nl> + } <nl> + <nl> + } ; <nl> + } <nl> + } ; <nl> <nl> private static final String KEYSPACE1 = " RecoveryManagerTest1 " ; <nl> private static final String CF _ STANDARD1 = " Standard1 " ; <nl> @ @ - 86 , 6 + 151 , 78 @ @ public class RecoveryManagerTest <nl> } <nl> <nl> @ Test <nl> + public void testRecoverBlocksOnBytesOutstanding ( ) throws Exception <nl> + { <nl> + long originalMaxOutstanding = CommitLogReplayer . MAX _ OUTSTANDING _ REPLAY _ BYTES ; <nl> + CommitLogReplayer . MAX _ OUTSTANDING _ REPLAY _ BYTES = 1 ; <nl> + CommitLogReplayer . MutationInitiator originalInitiator = CommitLogReplayer . mutationInitiator ; <nl> + CommitLogReplayer . mutationInitiator = mockInitiator ; <nl> + try <nl> + { <nl> + CommitLog . instance . resetUnsafe ( true ) ; <nl> + Keyspace keyspace1 = Keyspace . open ( KEYSPACE1 ) ; <nl> + Keyspace keyspace2 = Keyspace . open ( KEYSPACE2 ) ; <nl> + <nl> + UnfilteredRowIterator upd1 = Util . apply ( new RowUpdateBuilder ( keyspace1 . getColumnFamilyStore ( CF _ STANDARD1 ) . metadata , 1L , 0 , " keymulti " ) <nl> + . clustering ( " col1 " ) . add ( " val " , " 1 " ) <nl> + . build ( ) ) ; <nl> + <nl> + UnfilteredRowIterator upd2 = Util . apply ( new RowUpdateBuilder ( keyspace2 . getColumnFamilyStore ( CF _ STANDARD3 ) . metadata , 1L , 0 , " keymulti " ) <nl> + . clustering ( " col2 " ) . add ( " val " , " 1 " ) <nl> + . build ( ) ) ; <nl> + <nl> + keyspace1 . getColumnFamilyStore ( " Standard1 " ) . clearUnsafe ( ) ; <nl> + keyspace2 . getColumnFamilyStore ( " Standard3 " ) . clearUnsafe ( ) ; <nl> + <nl> + DecoratedKey dk = Util . dk ( " keymulti " ) ; <nl> + Assert . assertTrue ( Util . getAllUnfiltered ( Util . cmd ( keyspace1 . getColumnFamilyStore ( CF _ STANDARD1 ) , dk ) . build ( ) ) . isEmpty ( ) ) ; <nl> + Assert . assertTrue ( Util . getAllUnfiltered ( Util . cmd ( keyspace2 . getColumnFamilyStore ( CF _ STANDARD3 ) , dk ) . build ( ) ) . isEmpty ( ) ) ; <nl> + <nl> + final AtomicReference < Throwable > err = new AtomicReference < Throwable > ( ) ; <nl> + Thread t = new Thread ( ) { <nl> + @ Override <nl> + public void run ( ) <nl> + { <nl> + try <nl> + { <nl> + CommitLog . instance . resetUnsafe ( false ) ; / / disassociate segments from live CL <nl> + } <nl> + catch ( Throwable t ) <nl> + { <nl> + err . set ( t ) ; <nl> + } <nl> + } <nl> + } ; <nl> + t . start ( ) ; <nl> + Assert . assertTrue ( blocked . tryAcquire ( 1 , 20 , TimeUnit . SECONDS ) ) ; <nl> + Thread . sleep ( 100 ) ; <nl> + Assert . assertTrue ( t . isAlive ( ) ) ; <nl> + blocker . release ( Integer . MAX _ VALUE ) ; <nl> + t . join ( 20 * 1000 ) ; <nl> + <nl> + if ( err . get ( ) ! = null ) <nl> + throw new RuntimeException ( err . get ( ) ) ; <nl> + <nl> + if ( t . isAlive ( ) ) <nl> + { <nl> + Throwable toPrint = new Throwable ( ) ; <nl> + toPrint . setStackTrace ( Thread . getAllStackTraces ( ) . get ( t ) ) ; <nl> + toPrint . printStackTrace ( System . out ) ; <nl> + } <nl> + Assert . assertFalse ( t . isAlive ( ) ) ; <nl> + <nl> + Assert . assertTrue ( Util . equal ( upd1 , Util . getOnlyPartitionUnfiltered ( Util . cmd ( keyspace1 . getColumnFamilyStore ( CF _ STANDARD1 ) , dk ) . build ( ) ) . unfilteredIterator ( ) ) ) ; <nl> + Assert . assertTrue ( Util . equal ( upd2 , Util . getOnlyPartitionUnfiltered ( Util . cmd ( keyspace2 . getColumnFamilyStore ( CF _ STANDARD3 ) , dk ) . build ( ) ) . unfilteredIterator ( ) ) ) ; <nl> + } <nl> + finally <nl> + { <nl> + CommitLogReplayer . mutationInitiator = originalInitiator ; <nl> + CommitLogReplayer . MAX _ OUTSTANDING _ REPLAY _ BYTES = originalMaxOutstanding ; <nl> + } <nl> + } <nl> + <nl> + <nl> + @ Test <nl> public void testOne ( ) throws IOException <nl> { <nl> CommitLog . instance . resetUnsafe ( true ) ;
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 1607a66 . . 6c46183 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 2 
+ + * bound maximum in - flight commit log replay mutation bytes to 64 megabytes ( CASSANDRA - 8639 ) 
+ * Normalize all scripts ( CASSANDRA - 10679 ) 
+ * Make compression ratio much more accurate ( CASSANDRA - 10225 ) 
+ * Optimize building of Clustering object when only one is created ( CASSANDRA - 10409 ) 
+ diff - - git a / NEWS . txt b / NEWS . txt 
+ index 2a5970d . . 8830c99 100644 
+ - - - a / NEWS . txt 
+ + + + b / NEWS . txt 
+ @ @ - 18 , 7 + 18 , 8 @ @ using the provided ' sstableupgrade ' tool . 
+ 
+ New features 
+ - - - - - - - - - - - - 
+ - 
+ + - bound maximum in - flight commit log replay mutation bytes to 64 megabytes 
+ + tunable via cassandra . commitlog _ max _ outstanding _ replay _ bytes 
+ - Support for type casting has been added to the selection clause . 
+ 
+ Upgrading 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java 
+ index 2668bba . . 5010696 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogReplayer . java 
+ @ @ - 29 , 6 + 29 , 7 @ @ import java . util . concurrent . Future ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ import java . util . zip . CRC32 ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . base . Predicate ; 
+ import com . google . common . collect . HashMultimap ; 
+ import com . google . common . collect . Iterables ; 
+ @ @ - 54 , 7 + 55 , 6 @ @ import org . apache . cassandra . io . compress . ICompressor ; 
+ import org . apache . cassandra . io . util . ChannelProxy ; 
+ import org . apache . cassandra . io . util . DataInputBuffer ; 
+ import org . apache . cassandra . io . util . FileDataInput ; 
+ - import org . apache . cassandra . io . util . NIODataInputStream ; 
+ import org . apache . cassandra . io . util . RandomAccessReader ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . JVMStabilityInspector ; 
+ @ @ - 65 , 13 + 65 , 17 @ @ import static org . apache . cassandra . utils . FBUtilities . updateChecksumInt ; 
+ 
+ public class CommitLogReplayer 
+ { 
+ + @ VisibleForTesting 
+ + public static long MAX _ OUTSTANDING _ REPLAY _ BYTES = Long . getLong ( " cassandra . commitlog _ max _ outstanding _ replay _ bytes " , 1024 * 1024 * 64 ) ; 
+ + @ VisibleForTesting 
+ + public static MutationInitiator mutationInitiator = new MutationInitiator ( ) ; 
+ static final String IGNORE _ REPLAY _ ERRORS _ PROPERTY = " cassandra . commitlog . ignorereplayerrors " ; 
+ private static final Logger logger = LoggerFactory . getLogger ( CommitLogReplayer . class ) ; 
+ private static final int MAX _ OUTSTANDING _ REPLAY _ COUNT = Integer . getInteger ( " cassandra . commitlog _ max _ outstanding _ replay _ count " , 1024 ) ; 
+ private static final int LEGACY _ END _ OF _ SEGMENT _ MARKER = 0 ; 
+ 
+ private final Set < Keyspace > keyspacesRecovered ; 
+ - private final List < Future < ? > > futures ; 
+ + private final Queue < Future < Integer > > futures ; 
+ private final Map < UUID , AtomicInteger > invalidMutations ; 
+ private final AtomicInteger replayedCount ; 
+ private final Map < UUID , ReplayPosition > cfPositions ; 
+ @ @ - 79 , 14 + 83 , 74 @ @ public class CommitLogReplayer 
+ private final CRC32 checksum ; 
+ private byte [ ] buffer ; 
+ private byte [ ] uncompressedBuffer ; 
+ + private long pendingMutationBytes = 0 ; 
+ 
+ private final ReplayFilter replayFilter ; 
+ private final CommitLogArchiver archiver ; 
+ 
+ + / * 
+ + * Wrapper around initiating mutations read from the log to make it possible 
+ + * to spy on initiated mutations for test 
+ + * / 
+ + @ VisibleForTesting 
+ + public static class MutationInitiator 
+ + { 
+ + protected Future < Integer > initiateMutation ( final Mutation mutation , 
+ + final long segmentId , 
+ + final int serializedSize , 
+ + final long entryLocation , 
+ + final CommitLogReplayer clr ) 
+ + { 
+ + Runnable runnable = new WrappedRunnable ( ) 
+ + { 
+ + public void runMayThrow ( ) throws IOException 
+ + { 
+ + if ( Schema . instance . getKSMetaData ( mutation . getKeyspaceName ( ) ) = = null ) 
+ + return ; 
+ + if ( clr . pointInTimeExceeded ( mutation ) ) 
+ + return ; 
+ + 
+ + final Keyspace keyspace = Keyspace . open ( mutation . getKeyspaceName ( ) ) ; 
+ + 
+ + / / Rebuild the mutation , omitting column families that 
+ + / / a ) the user has requested that we ignore , 
+ + / / b ) have already been flushed , 
+ + / / or c ) are part of a cf that was dropped . 
+ + / / Keep in mind that the cf . name ( ) is suspect . do every thing based on the cfid instead . 
+ + Mutation newMutation = null ; 
+ + for ( PartitionUpdate update : clr . replayFilter . filter ( mutation ) ) 
+ + { 
+ + if ( Schema . instance . getCF ( update . metadata ( ) . cfId ) = = null ) 
+ + continue ; / / dropped 
+ + 
+ + ReplayPosition rp = clr . cfPositions . get ( update . metadata ( ) . cfId ) ; 
+ + 
+ + / / replay if current segment is newer than last flushed one or , 
+ + / / if it is the last known segment , if we are after the replay position 
+ + if ( segmentId > rp . segment | | ( segmentId = = rp . segment & & entryLocation > rp . position ) ) 
+ + { 
+ + if ( newMutation = = null ) 
+ + newMutation = new Mutation ( mutation . getKeyspaceName ( ) , mutation . key ( ) ) ; 
+ + newMutation . add ( update ) ; 
+ + clr . replayedCount . incrementAndGet ( ) ; 
+ + } 
+ + } 
+ + if ( newMutation ! = null ) 
+ + { 
+ + assert ! newMutation . isEmpty ( ) ; 
+ + Keyspace . open ( newMutation . getKeyspaceName ( ) ) . applyFromCommitLog ( newMutation ) ; 
+ + clr . keyspacesRecovered . add ( keyspace ) ; 
+ + } 
+ + } 
+ + } ; 
+ + return StageManager . getStage ( Stage . MUTATION ) . submit ( runnable , serializedSize ) ; 
+ + } 
+ + } 
+ + 
+ CommitLogReplayer ( CommitLog commitLog , ReplayPosition globalPosition , Map < UUID , ReplayPosition > cfPositions , ReplayFilter replayFilter ) 
+ { 
+ this . keyspacesRecovered = new NonBlockingHashSet < Keyspace > ( ) ; 
+ - this . futures = new ArrayList < Future < ? > > ( ) ; 
+ + this . futures = new ArrayDeque < Future < Integer > > ( ) ; 
+ this . buffer = new byte [ 4096 ] ; 
+ this . uncompressedBuffer = new byte [ 4096 ] ; 
+ this . invalidMutations = new HashMap < UUID , AtomicInteger > ( ) ; 
+ @ @ - 163 , 6 + 227 , 8 @ @ public class CommitLogReplayer 
+ / / flush replayed keyspaces 
+ futures . clear ( ) ; 
+ boolean flushingSystem = false ; 
+ + 
+ + List < Future < ? > > futures = new ArrayList < Future < ? > > ( ) ; 
+ for ( Keyspace keyspace : keyspacesRecovered ) 
+ { 
+ if ( keyspace . getName ( ) . equals ( SystemKeyspace . NAME ) ) 
+ @ @ - 176 , 6 + 242 , 7 @ @ public class CommitLogReplayer 
+ futures . add ( Keyspace . open ( SystemKeyspace . NAME ) . getColumnFamilyStore ( SystemKeyspace . BATCHES ) . forceFlush ( ) ) ; 
+ 
+ FBUtilities . waitOnFutures ( futures ) ; 
+ + 
+ return replayedCount . get ( ) ; 
+ } 
+ 
+ @ @ - 565 , 53 + 632 , 19 @ @ public class CommitLogReplayer 
+ if ( logger . isTraceEnabled ( ) ) 
+ logger . trace ( " replaying mutation for { } . { } : { } " , mutation . getKeyspaceName ( ) , mutation . key ( ) , " { " + StringUtils . join ( mutation . getPartitionUpdates ( ) . iterator ( ) , " , " ) + " } " ) ; 
+ 
+ - Runnable runnable = new WrappedRunnable ( ) 
+ - { 
+ - public void runMayThrow ( ) throws IOException 
+ - { 
+ - if ( Schema . instance . getKSMetaData ( mutation . getKeyspaceName ( ) ) = = null ) 
+ - return ; 
+ - if ( pointInTimeExceeded ( mutation ) ) 
+ - return ; 
+ - 
+ - final Keyspace keyspace = Keyspace . open ( mutation . getKeyspaceName ( ) ) ; 
+ - 
+ - / / Rebuild the mutation , omitting column families that 
+ - / / a ) the user has requested that we ignore , 
+ - / / b ) have already been flushed , 
+ - / / or c ) are part of a cf that was dropped . 
+ - / / Keep in mind that the cf . name ( ) is suspect . do every thing based on the cfid instead . 
+ - Mutation newMutation = null ; 
+ - for ( PartitionUpdate update : replayFilter . filter ( mutation ) ) 
+ - { 
+ - if ( Schema . instance . getCF ( update . metadata ( ) . cfId ) = = null ) 
+ - continue ; / / dropped 
+ - 
+ - ReplayPosition rp = cfPositions . get ( update . metadata ( ) . cfId ) ; 
+ - 
+ - / / replay if current segment is newer than last flushed one or , 
+ - / / if it is the last known segment , if we are after the replay position 
+ - if ( desc . id > rp . segment | | ( desc . id = = rp . segment & & entryLocation > rp . position ) ) 
+ - { 
+ - if ( newMutation = = null ) 
+ - newMutation = new Mutation ( mutation . getKeyspaceName ( ) , mutation . key ( ) ) ; 
+ - newMutation . add ( update ) ; 
+ - replayedCount . incrementAndGet ( ) ; 
+ - } 
+ - } 
+ - if ( newMutation ! = null ) 
+ - { 
+ - assert ! newMutation . isEmpty ( ) ; 
+ - Keyspace . open ( newMutation . getKeyspaceName ( ) ) . applyFromCommitLog ( newMutation ) ; 
+ - keyspacesRecovered . add ( keyspace ) ; 
+ - } 
+ - } 
+ - } ; 
+ - futures . add ( StageManager . getStage ( Stage . MUTATION ) . submit ( runnable ) ) ; 
+ - if ( futures . size ( ) > MAX _ OUTSTANDING _ REPLAY _ COUNT ) 
+ + pendingMutationBytes + = size ; 
+ + futures . offer ( mutationInitiator . initiateMutation ( mutation , 
+ + desc . id , 
+ + size , 
+ + entryLocation , 
+ + this ) ) ; 
+ + / / If there are finished mutations , or too many outstanding bytes / mutations 
+ + / / drain the futures in the queue 
+ + while ( futures . size ( ) > MAX _ OUTSTANDING _ REPLAY _ COUNT 
+ + | | pendingMutationBytes > MAX _ OUTSTANDING _ REPLAY _ BYTES 
+ + | | ( ! futures . isEmpty ( ) & & futures . peek ( ) . isDone ( ) ) ) 
+ { 
+ - FBUtilities . waitOnFutures ( futures ) ; 
+ - futures . clear ( ) ; 
+ + pendingMutationBytes - = FBUtilities . waitOnFuture ( futures . poll ( ) ) ; 
+ } 
+ } 
+ 
+ diff - - git a / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java b / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java 
+ index baf9466 . . 788757c 100644 
+ - - - a / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / RecoveryManagerTest . java 
+ @ @ - 20 , 7 + 20 , 12 @ @ package org . apache . cassandra . db ; 
+ 
+ import java . io . IOException ; 
+ import java . util . Date ; 
+ + import java . util . concurrent . ExecutionException ; 
+ + import java . util . concurrent . Future ; 
+ + import java . util . concurrent . Semaphore ; 
+ import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . TimeoutException ; 
+ + import java . util . concurrent . atomic . AtomicReference ; 
+ 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 45 , 11 + 50 , 71 @ @ import org . apache . cassandra . db . commitlog . CommitLog ; 
+ import org . apache . cassandra . db . commitlog . CommitLogArchiver ; 
+ import org . apache . cassandra . schema . KeyspaceParams ; 
+ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ + import org . apache . cassandra . db . commitlog . CommitLogReplayer ; 
+ 
+ @ RunWith ( OrderedJUnit4ClassRunner . class ) 
+ public class RecoveryManagerTest 
+ { 
+ private static Logger logger = LoggerFactory . getLogger ( RecoveryManagerTest . class ) ; 
+ + static final Semaphore blocker = new Semaphore ( 0 ) ; 
+ + static final Semaphore blocked = new Semaphore ( 0 ) ; 
+ + static CommitLogReplayer . MutationInitiator originalInitiator = null ; 
+ + static final CommitLogReplayer . MutationInitiator mockInitiator = new CommitLogReplayer . MutationInitiator ( ) 
+ + { 
+ + @ Override 
+ + protected Future < Integer > initiateMutation ( final Mutation mutation , 
+ + final long segmentId , 
+ + final int serializedSize , 
+ + final long entryLocation , 
+ + final CommitLogReplayer clr ) 
+ + { 
+ + final Future < Integer > toWrap = super . initiateMutation ( mutation , 
+ + segmentId , 
+ + serializedSize , 
+ + entryLocation , 
+ + clr ) ; 
+ + return new Future < Integer > ( ) 
+ + { 
+ + 
+ + @ Override 
+ + public boolean cancel ( boolean mayInterruptIfRunning ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public boolean isCancelled ( ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public boolean isDone ( ) 
+ + { 
+ + return blocker . availablePermits ( ) > 0 & & toWrap . isDone ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public Integer get ( ) throws InterruptedException , ExecutionException 
+ + { 
+ + System . out . println ( " Got blocker once " ) ; 
+ + blocked . release ( ) ; 
+ + blocker . acquire ( ) ; 
+ + return toWrap . get ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public Integer get ( long timeout , TimeUnit unit ) 
+ + throws InterruptedException , ExecutionException , TimeoutException 
+ + { 
+ + blocked . release ( ) ; 
+ + blocker . tryAcquire ( 1 , timeout , unit ) ; 
+ + return toWrap . get ( timeout , unit ) ; 
+ + } 
+ + 
+ + } ; 
+ + } 
+ + } ; 
+ 
+ private static final String KEYSPACE1 = " RecoveryManagerTest1 " ; 
+ private static final String CF _ STANDARD1 = " Standard1 " ; 
+ @ @ - 86 , 6 + 151 , 78 @ @ public class RecoveryManagerTest 
+ } 
+ 
+ @ Test 
+ + public void testRecoverBlocksOnBytesOutstanding ( ) throws Exception 
+ + { 
+ + long originalMaxOutstanding = CommitLogReplayer . MAX _ OUTSTANDING _ REPLAY _ BYTES ; 
+ + CommitLogReplayer . MAX _ OUTSTANDING _ REPLAY _ BYTES = 1 ; 
+ + CommitLogReplayer . MutationInitiator originalInitiator = CommitLogReplayer . mutationInitiator ; 
+ + CommitLogReplayer . mutationInitiator = mockInitiator ; 
+ + try 
+ + { 
+ + CommitLog . instance . resetUnsafe ( true ) ; 
+ + Keyspace keyspace1 = Keyspace . open ( KEYSPACE1 ) ; 
+ + Keyspace keyspace2 = Keyspace . open ( KEYSPACE2 ) ; 
+ + 
+ + UnfilteredRowIterator upd1 = Util . apply ( new RowUpdateBuilder ( keyspace1 . getColumnFamilyStore ( CF _ STANDARD1 ) . metadata , 1L , 0 , " keymulti " ) 
+ + . clustering ( " col1 " ) . add ( " val " , " 1 " ) 
+ + . build ( ) ) ; 
+ + 
+ + UnfilteredRowIterator upd2 = Util . apply ( new RowUpdateBuilder ( keyspace2 . getColumnFamilyStore ( CF _ STANDARD3 ) . metadata , 1L , 0 , " keymulti " ) 
+ + . clustering ( " col2 " ) . add ( " val " , " 1 " ) 
+ + . build ( ) ) ; 
+ + 
+ + keyspace1 . getColumnFamilyStore ( " Standard1 " ) . clearUnsafe ( ) ; 
+ + keyspace2 . getColumnFamilyStore ( " Standard3 " ) . clearUnsafe ( ) ; 
+ + 
+ + DecoratedKey dk = Util . dk ( " keymulti " ) ; 
+ + Assert . assertTrue ( Util . getAllUnfiltered ( Util . cmd ( keyspace1 . getColumnFamilyStore ( CF _ STANDARD1 ) , dk ) . build ( ) ) . isEmpty ( ) ) ; 
+ + Assert . assertTrue ( Util . getAllUnfiltered ( Util . cmd ( keyspace2 . getColumnFamilyStore ( CF _ STANDARD3 ) , dk ) . build ( ) ) . isEmpty ( ) ) ; 
+ + 
+ + final AtomicReference < Throwable > err = new AtomicReference < Throwable > ( ) ; 
+ + Thread t = new Thread ( ) { 
+ + @ Override 
+ + public void run ( ) 
+ + { 
+ + try 
+ + { 
+ + CommitLog . instance . resetUnsafe ( false ) ; / / disassociate segments from live CL 
+ + } 
+ + catch ( Throwable t ) 
+ + { 
+ + err . set ( t ) ; 
+ + } 
+ + } 
+ + } ; 
+ + t . start ( ) ; 
+ + Assert . assertTrue ( blocked . tryAcquire ( 1 , 20 , TimeUnit . SECONDS ) ) ; 
+ + Thread . sleep ( 100 ) ; 
+ + Assert . assertTrue ( t . isAlive ( ) ) ; 
+ + blocker . release ( Integer . MAX _ VALUE ) ; 
+ + t . join ( 20 * 1000 ) ; 
+ + 
+ + if ( err . get ( ) ! = null ) 
+ + throw new RuntimeException ( err . get ( ) ) ; 
+ + 
+ + if ( t . isAlive ( ) ) 
+ + { 
+ + Throwable toPrint = new Throwable ( ) ; 
+ + toPrint . setStackTrace ( Thread . getAllStackTraces ( ) . get ( t ) ) ; 
+ + toPrint . printStackTrace ( System . out ) ; 
+ + } 
+ + Assert . assertFalse ( t . isAlive ( ) ) ; 
+ + 
+ + Assert . assertTrue ( Util . equal ( upd1 , Util . getOnlyPartitionUnfiltered ( Util . cmd ( keyspace1 . getColumnFamilyStore ( CF _ STANDARD1 ) , dk ) . build ( ) ) . unfilteredIterator ( ) ) ) ; 
+ + Assert . assertTrue ( Util . equal ( upd2 , Util . getOnlyPartitionUnfiltered ( Util . cmd ( keyspace2 . getColumnFamilyStore ( CF _ STANDARD3 ) , dk ) . build ( ) ) . unfilteredIterator ( ) ) ) ; 
+ + } 
+ + finally 
+ + { 
+ + CommitLogReplayer . mutationInitiator = originalInitiator ; 
+ + CommitLogReplayer . MAX _ OUTSTANDING _ REPLAY _ BYTES = originalMaxOutstanding ; 
+ + } 
+ + } 
+ + 
+ + 
+ + @ Test 
+ public void testOne ( ) throws IOException 
+ { 
+ CommitLog . instance . resetUnsafe ( true ) ;
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

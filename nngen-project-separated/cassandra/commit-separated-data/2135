@@ -1,0 +1,739 @@
+BLEU SCORE: 0.03214954573057458
+
+TEST MSG: Add metrics to track usage of PreparedStatments
+GENERATED MSG: improve testing of StorageService init , and fix shutdown of messagingservice .
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 60fd4c9 . . 177ac76 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 1 <nl> + * Add metrics for tracking PreparedStatement use ( CASSANDRA - 7719 ) <nl> * ( cqlsh ) tab - completion for triggers ( CASSANDRA - 7824 ) <nl> * ( cqlsh ) : Support for query paging ( CASSANDRA - 7514 ) <nl> * ( cqlsh ) : Show progress of COPY operations ( CASSANDRA - 7789 ) <nl> diff - - git a / src / java / org / apache / cassandra / cql3 / QueryProcessor . java b / src / java / org / apache / cassandra / cql3 / QueryProcessor . java <nl> index f2bf305 . . 99972a2 100644 <nl> - - - a / src / java / org / apache / cassandra / cql3 / QueryProcessor . java <nl> + + + b / src / java / org / apache / cassandra / cql3 / QueryProcessor . java <nl> @ @ - 22 , 11 + 22 , 14 @ @ import java . util . * ; <nl> import java . util . concurrent . ConcurrentMap ; <nl> import java . util . concurrent . ConcurrentHashMap ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . primitives . Ints ; <nl> <nl> import com . googlecode . concurrentlinkedhashmap . ConcurrentLinkedHashMap ; <nl> import com . googlecode . concurrentlinkedhashmap . EntryWeigher ; <nl> + import com . googlecode . concurrentlinkedhashmap . EvictionListener ; <nl> import org . antlr . runtime . * ; <nl> + import org . apache . cassandra . metrics . CqlStatementMetrics ; <nl> import org . github . jamm . MemoryMeter ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 56 , 7 + 59 , 6 @ @ public class QueryProcessor implements QueryHandler <nl> private static final Logger logger = LoggerFactory . getLogger ( QueryProcessor . class ) ; <nl> private static final MemoryMeter meter = new MemoryMeter ( ) . withGuessing ( MemoryMeter . Guess . FALLBACK _ BEST ) ; <nl> private static final long MAX _ CACHE _ PREPARED _ MEMORY = Runtime . getRuntime ( ) . maxMemory ( ) / 256 ; <nl> - private static final int MAX _ CACHE _ PREPARED _ COUNT = 10000 ; <nl> <nl> private static EntryWeigher < MD5Digest , ParsedStatement . Prepared > cqlMemoryUsageWeigher = new EntryWeigher < MD5Digest , ParsedStatement . Prepared > ( ) <nl> { <nl> @ @ - 83 , 15 + 85 , 34 @ @ public class QueryProcessor implements QueryHandler <nl> / / bother with expiration on those . <nl> private static final ConcurrentMap < String , ParsedStatement . Prepared > internalStatements = new ConcurrentHashMap < > ( ) ; <nl> <nl> + @ VisibleForTesting <nl> + public static final CqlStatementMetrics metrics = new CqlStatementMetrics ( ) ; <nl> + <nl> static <nl> { <nl> preparedStatements = new ConcurrentLinkedHashMap . Builder < MD5Digest , ParsedStatement . Prepared > ( ) <nl> . maximumWeightedCapacity ( MAX _ CACHE _ PREPARED _ MEMORY ) <nl> . weigher ( cqlMemoryUsageWeigher ) <nl> - . build ( ) ; <nl> + . listener ( new EvictionListener < MD5Digest , ParsedStatement . Prepared > ( ) <nl> + { <nl> + @ Override <nl> + public void onEviction ( MD5Digest md5Digest , ParsedStatement . Prepared prepared ) <nl> + { <nl> + metrics . activePreparedStatements . dec ( ) ; <nl> + } <nl> + } ) . build ( ) ; <nl> + <nl> thriftPreparedStatements = new ConcurrentLinkedHashMap . Builder < Integer , CQLStatement > ( ) <nl> . maximumWeightedCapacity ( MAX _ CACHE _ PREPARED _ MEMORY ) <nl> . weigher ( thriftMemoryUsageWeigher ) <nl> + . listener ( new EvictionListener < Integer , CQLStatement > ( ) <nl> + { <nl> + @ Override <nl> + public void onEviction ( Integer integer , CQLStatement cqlStatement ) <nl> + { <nl> + metrics . activePreparedStatements . dec ( ) ; <nl> + } <nl> + } ) <nl> . build ( ) ; <nl> <nl> } <nl> @ @ - 174 , 7 + 195 , 7 @ @ public class QueryProcessor implements QueryHandler <nl> Cell . MAX _ NAME _ LENGTH ) ) ; <nl> } <nl> <nl> - public static ResultMessage processStatement ( CQLStatement statement , <nl> + private static ResultMessage processStatement ( CQLStatement statement , <nl> QueryState queryState , <nl> QueryOptions options ) <nl> throws RequestExecutionException , RequestValidationException <nl> @ @ - 203 , 6 + 224 , 9 @ @ public class QueryProcessor implements QueryHandler <nl> if ( prepared . getBoundTerms ( ) ! = options . getValues ( ) . size ( ) ) <nl> throw new InvalidRequestException ( " Invalid amount of bind variables " ) ; <nl> <nl> + if ( ! queryState . getClientState ( ) . isInternal ) <nl> + metrics . executedUnprepared . inc ( ) ; <nl> + <nl> return processStatement ( prepared , queryState , options ) ; <nl> } <nl> <nl> @ @ - 370 , 24 + 394 , 28 @ @ public class QueryProcessor implements QueryHandler <nl> throw new InvalidRequestException ( String . format ( " Prepared statement of size % d bytes is larger than allowed maximum of % d bytes . " , <nl> statementSize , <nl> MAX _ CACHE _ PREPARED _ MEMORY ) ) ; <nl> - <nl> - if ( forThrift ) <nl> + try <nl> { <nl> - int statementId = toHash . hashCode ( ) ; <nl> - thriftPreparedStatements . put ( statementId , prepared . statement ) ; <nl> - logger . trace ( String . format ( " Stored prepared statement # % d with % d bind markers " , <nl> - statementId , <nl> - prepared . statement . getBoundTerms ( ) ) ) ; <nl> - return ResultMessage . Prepared . forThrift ( statementId , prepared . boundNames ) ; <nl> - } <nl> - else <nl> + if ( forThrift ) <nl> + { <nl> + int statementId = toHash . hashCode ( ) ; <nl> + thriftPreparedStatements . put ( statementId , prepared . statement ) ; <nl> + logger . trace ( " Stored prepared statement # { } with { } bind markers " , <nl> + statementId , <nl> + prepared . statement . getBoundTerms ( ) ) ; <nl> + return ResultMessage . Prepared . forThrift ( statementId , prepared . boundNames ) ; <nl> + } else <nl> + { <nl> + MD5Digest statementId = MD5Digest . compute ( toHash ) ; <nl> + preparedStatements . put ( statementId , prepared ) ; <nl> + logger . trace ( " Stored prepared statement # { } with { } bind markers " , <nl> + statementId , <nl> + prepared . statement . getBoundTerms ( ) ) ; <nl> + return new ResultMessage . Prepared ( statementId , prepared ) ; <nl> + } <nl> + } finally <nl> { <nl> - MD5Digest statementId = MD5Digest . compute ( toHash ) ; <nl> - preparedStatements . put ( statementId , prepared ) ; <nl> - logger . trace ( String . format ( " Stored prepared statement % s with % d bind markers " , <nl> - statementId , <nl> - prepared . statement . getBoundTerms ( ) ) ) ; <nl> - return new ResultMessage . Prepared ( statementId , prepared ) ; <nl> + metrics . activePreparedStatements . inc ( ) ; <nl> } <nl> } <nl> <nl> @ @ - 410 , 6 + 438 , 7 @ @ public class QueryProcessor implements QueryHandler <nl> logger . trace ( " [ { } ] ' { } ' " , i + 1 , variables . get ( i ) ) ; <nl> } <nl> <nl> + metrics . executedPrepared . inc ( ) ; <nl> return processStatement ( statement , queryState , options ) ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / metrics / CqlStatementMetrics . java b / src / java / org / apache / cassandra / metrics / CqlStatementMetrics . java <nl> new file mode 100644 <nl> index 0000000 . . 02b4ad0 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / metrics / CqlStatementMetrics . java <nl> @ @ - 0 , 0 + 1 , 53 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . metrics ; <nl> + <nl> + import com . yammer . metrics . Metrics ; <nl> + import com . yammer . metrics . core . Counter ; <nl> + import com . yammer . metrics . core . Gauge ; <nl> + import com . yammer . metrics . util . RatioGauge ; <nl> + <nl> + <nl> + public class CqlStatementMetrics <nl> + { <nl> + private final MetricNameFactory factory = new DefaultNameFactory ( " CqlStatement " ) ; <nl> + public final Counter activePreparedStatements = Metrics . newCounter ( factory . createMetricName ( " ActivePreparedStatements " ) ) ; <nl> + public final Counter executedPrepared = Metrics . newCounter ( factory . createMetricName ( " ExecutedPrepared " ) ) ; <nl> + public final Counter executedUnprepared = Metrics . newCounter ( factory . createMetricName ( " ExecutedUnPrepared " ) ) ; <nl> + <nl> + public final Gauge < Double > preparedRatio = Metrics . newGauge ( factory . createMetricName ( " PreparedUnpreparedRatio " ) , new RatioGauge ( ) <nl> + { <nl> + protected double getNumerator ( ) <nl> + { <nl> + long num = executedPrepared . count ( ) ; <nl> + return num = = 0 ? 1 : num ; <nl> + } <nl> + <nl> + protected double getDenominator ( ) <nl> + { <nl> + long den = executedUnprepared . count ( ) ; <nl> + return den = = 0 ? 1 : den ; <nl> + } <nl> + } ) ; <nl> + <nl> + public void reset ( ) <nl> + { <nl> + executedPrepared . clear ( ) ; <nl> + executedUnprepared . clear ( ) ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / service / ClientState . java b / src / java / org / apache / cassandra / service / ClientState . java <nl> index c0396cb . . 725690e 100644 <nl> - - - a / src / java / org / apache / cassandra / service / ClientState . java <nl> + + + b / src / java / org / apache / cassandra / service / ClientState . java <nl> @ @ - 103 , 7 + 103 , 7 @ @ public class ClientState <nl> <nl> / / isInternal is used to mark ClientState as used by some internal component <nl> / / that should have an ability to modify system keyspace . <nl> - private final boolean isInternal ; <nl> + public final boolean isInternal ; <nl> <nl> / / The remote address of the client - null for internal clients . <nl> private final SocketAddress remoteAddress ; <nl> diff - - git a / test / unit / org / apache / cassandra / cql3 / CqlMetricsTest . java b / test / unit / org / apache / cassandra / cql3 / CqlMetricsTest . java <nl> new file mode 100644 <nl> index 0000000 . . dc9c6a4 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / cql3 / CqlMetricsTest . java <nl> @ @ - 0 , 0 + 1 , 110 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . cql3 ; <nl> + <nl> + import com . datastax . driver . core . Cluster ; <nl> + import com . datastax . driver . core . PreparedStatement ; <nl> + import com . datastax . driver . core . Session ; <nl> + import org . apache . cassandra . OrderedJUnit4ClassRunner ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . exceptions . ConfigurationException ; <nl> + import org . apache . cassandra . service . EmbeddedCassandraService ; <nl> + import org . junit . BeforeClass ; <nl> + import org . junit . Test ; <nl> + import org . junit . runner . RunWith ; <nl> + <nl> + import java . io . IOException ; <nl> + <nl> + <nl> + @ RunWith ( OrderedJUnit4ClassRunner . class ) <nl> + public class CqlMetricsTest <nl> + { <nl> + <nl> + private static EmbeddedCassandraService cassandra ; <nl> + <nl> + private static Cluster cluster ; <nl> + private static Session session ; <nl> + private static PreparedStatement metricsStatement ; <nl> + <nl> + @ BeforeClass ( ) <nl> + public static void setup ( ) throws ConfigurationException , IOException <nl> + { <nl> + cassandra = new EmbeddedCassandraService ( ) ; <nl> + cassandra . start ( ) ; <nl> + <nl> + cluster = Cluster . builder ( ) . addContactPoint ( " 127 . 0 . 0 . 1 " ) . withPort ( DatabaseDescriptor . getNativeTransportPort ( ) ) . build ( ) ; <nl> + session = cluster . connect ( ) ; <nl> + <nl> + session . execute ( " drop keyspace if exists junit ; " ) ; <nl> + session . execute ( " create keyspace junit WITH REPLICATION = { ' class ' : ' SimpleStrategy ' , ' replication _ factor ' : 1 } ; " ) ; <nl> + session . execute ( " CREATE TABLE junit . metricstest ( \ n " + <nl> + " id int PRIMARY KEY , \ n " + <nl> + " val text \ n " + <nl> + " ) ; " ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testActivePreparedStatements ( ) <nl> + { <nl> + assert QueryProcessor . metrics . activePreparedStatements . count ( ) = = 0 ; <nl> + <nl> + metricsStatement = session . prepare ( " insert into junit . metricstest ( id , val ) values ( ? , ? ) " ) ; <nl> + <nl> + assert QueryProcessor . metrics . activePreparedStatements . count ( ) = = 1 ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testExecutedPrepared ( ) <nl> + { <nl> + QueryProcessor . metrics . reset ( ) ; <nl> + <nl> + assert QueryProcessor . metrics . activePreparedStatements . count ( ) = = 1 ; <nl> + assert QueryProcessor . metrics . executedPrepared . count ( ) = = 0 ; <nl> + assert QueryProcessor . metrics . executedUnprepared . count ( ) = = 0 ; <nl> + assert QueryProcessor . metrics . preparedRatio . value ( ) = = 1 . 0 ; <nl> + <nl> + for ( int i = 0 ; i < 10 ; i + + ) <nl> + { <nl> + session . execute ( metricsStatement . bind ( i , " val " + i ) ) ; <nl> + } <nl> + <nl> + assert QueryProcessor . metrics . executedPrepared . count ( ) = = 10 ; <nl> + assert QueryProcessor . metrics . executedUnprepared . count ( ) = = 0 ; <nl> + assert QueryProcessor . metrics . preparedRatio . value ( ) = = 10d / 1d ; <nl> + <nl> + } <nl> + <nl> + @ Test <nl> + public void testExecutedUnPrepared ( ) <nl> + { <nl> + QueryProcessor . metrics . reset ( ) ; <nl> + <nl> + assert QueryProcessor . metrics . activePreparedStatements . count ( ) = = 1 ; <nl> + assert QueryProcessor . metrics . executedPrepared . count ( ) = = 0 ; <nl> + assert QueryProcessor . metrics . executedUnprepared . count ( ) = = 0 ; <nl> + <nl> + for ( int i = 0 ; i < 10 ; i + + ) <nl> + { <nl> + session . execute ( String . format ( " insert into junit . metricstest ( id , val ) values ( % d , ' % s ' ) " , i , " val " + 1 ) ) ; <nl> + } <nl> + <nl> + assert QueryProcessor . metrics . executedPrepared . count ( ) = = 0 ; <nl> + assert QueryProcessor . metrics . executedUnprepared . count ( ) = = 10 ; <nl> + assert QueryProcessor . metrics . preparedRatio . value ( ) = = 1d / 10d ; <nl> + } <nl> + }
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java <nl> index 1f235df . . 25e1072 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java <nl> @ @ - 19 , 6 + 19 , 7 @ @ <nl> package org . apache . cassandra . concurrent ; <nl> <nl> import java . lang . management . ManagementFactory ; <nl> + import java . util . List ; <nl> import java . util . concurrent . * ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . ObjectName ; <nl> @ @ - 34 , 6 + 35 , 7 @ @ import org . apache . log4j . Logger ; <nl> public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements DebuggableThreadPoolExecutorMBean <nl> { <nl> private static Logger logger _ = Logger . getLogger ( DebuggableThreadPoolExecutor . class ) ; <nl> + private final String mbeanName ; <nl> <nl> public DebuggableThreadPoolExecutor ( String threadPoolName ) <nl> { <nl> @ @ - 51 , 9 + 53 , 10 @ @ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements <nl> super . prestartAllCoreThreads ( ) ; <nl> <nl> MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; <nl> + mbeanName = " org . apache . cassandra . concurrent : type = " + threadFactory . id ; <nl> try <nl> { <nl> - mbs . registerMBean ( this , new ObjectName ( " org . apache . cassandra . concurrent : type = " + threadFactory . id ) ) ; <nl> + mbs . registerMBean ( this , new ObjectName ( mbeanName ) ) ; <nl> } <nl> catch ( Exception e ) <nl> { <nl> @ @ - 84 , 6 + 87 , 33 @ @ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements <nl> } <nl> } <nl> <nl> + private void unregisterMBean ( ) <nl> + { <nl> + try <nl> + { <nl> + ManagementFactory . getPlatformMBeanServer ( ) . unregisterMBean ( new ObjectName ( mbeanName ) ) ; <nl> + } <nl> + catch ( Exception ex ) <nl> + { <nl> + / / don ' t let it get in the way , but notify . <nl> + logger _ . error ( ex . getMessage ( ) , ex ) ; <nl> + } <nl> + } <nl> + <nl> + @ Override <nl> + public void shutdown ( ) <nl> + { <nl> + unregisterMBean ( ) ; <nl> + super . shutdown ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public List < Runnable > shutdownNow ( ) <nl> + { <nl> + unregisterMBean ( ) ; <nl> + return super . shutdownNow ( ) ; <nl> + } <nl> + <nl> / * * <nl> * Get the number of completed tasks <nl> * / <nl> diff - - git a / src / java / org / apache / cassandra / gms / Gossiper . java b / src / java / org / apache / cassandra / gms / Gossiper . java <nl> index 3b70d17 . . f5d8d35 100644 <nl> - - - a / src / java / org / apache / cassandra / gms / Gossiper . java <nl> + + + b / src / java / org / apache / cassandra / gms / Gossiper . java <nl> @ @ - 122 , 7 + 122 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC <nl> return gossiper _ ; <nl> } <nl> <nl> - private Timer gossipTimer _ = new Timer ( false ) ; <nl> + private Timer gossipTimer _ ; <nl> private InetAddress localEndPoint _ ; <nl> private long aVeryLongTime _ ; <nl> private Random random _ = new Random ( ) ; <nl> @ @ - 144 , 6 + 144 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC <nl> <nl> private Gossiper ( ) <nl> { <nl> + gossipTimer _ = new Timer ( false ) ; <nl> aVeryLongTime _ = 259200 * 1000 ; <nl> / * register with the Failure Detector for receiving Failure detector events * / <nl> FailureDetector . instance ( ) . registerFailureDetectionEventListener ( this ) ; <nl> @ @ - 834 , 6 + 835 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC <nl> public void stop ( ) <nl> { <nl> gossipTimer _ . cancel ( ) ; <nl> + gossipTimer _ = new Timer ( false ) ; / / makes the Gossiper reentrant . <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java <nl> index 8ff93f6 . . b1ad5ed 100644 <nl> - - - a / src / java / org / apache / cassandra / net / MessagingService . java <nl> + + + b / src / java / org / apache / cassandra / net / MessagingService . java <nl> @ @ - 69 , 6 + 69 , 9 @ @ public class MessagingService <nl> <nl> / * List of sockets we are listening on * / <nl> private static Map < InetAddress , SelectionKey > listenSockets _ = new HashMap < InetAddress , SelectionKey > ( ) ; <nl> + <nl> + / * List of UdpConnections we are listening on * / <nl> + private static Map < InetAddress , UdpConnection > udpConnections _ = new HashMap < InetAddress , UdpConnection > ( ) ; <nl> <nl> / * Lookup table for registering message handlers based on the verb . * / <nl> private static Map < String , IVerbHandler > verbHandlers _ ; <nl> @ @ - 214 , 7 + 217 , 8 @ @ public class MessagingService <nl> try <nl> { <nl> connection . init ( localEp ) ; <nl> - endPoints _ . add ( localEp ) ; <nl> + endPoints _ . add ( localEp ) ; <nl> + udpConnections _ . put ( localEp , connection ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> @ @ - 497 , 7 + 501 , 7 @ @ public class MessagingService <nl> logger _ . info ( " Shutting down . . . " ) ; <nl> synchronized ( MessagingService . class ) <nl> { <nl> - / * Stop listening on any socket * / <nl> + / * Stop listening on any TCP socket * / <nl> for ( SelectionKey skey : listenSockets _ . values ( ) ) <nl> { <nl> skey . cancel ( ) ; <nl> @ @ - 509 , 6 + 513 , 13 @ @ public class MessagingService <nl> } <nl> listenSockets _ . clear ( ) ; <nl> <nl> + / * Stop listening on any UDP ports . * / <nl> + for ( UdpConnection con : udpConnections _ . values ( ) ) <nl> + { <nl> + con . close ( ) ; <nl> + } <nl> + udpConnections _ . clear ( ) ; <nl> + <nl> / * Shutdown the threads in the EventQueue ' s * / <nl> messageDeserializationExecutor _ . shutdownNow ( ) ; <nl> messageDeserializerExecutor _ . shutdownNow ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / net / SelectorManager . java b / src / java / org / apache / cassandra / net / SelectorManager . java <nl> index 7623a05 . . 16511ee 100644 <nl> - - - a / src / java / org / apache / cassandra / net / SelectorManager . java <nl> + + + b / src / java / org / apache / cassandra / net / SelectorManager . java <nl> @ @ - 35 , 6 + 35 , 9 @ @ public class SelectorManager extends Thread <nl> / / workaround JDK select / register bug <nl> Object gate = new Object ( ) ; <nl> <nl> + / / flag to indicate that shutdown has been requested . <nl> + private boolean shutdownRequested = false ; <nl> + <nl> / / The static selector manager which is used by all applications <nl> private static SelectorManager manager ; <nl> <nl> @ @ - 82 , 7 + 85 , 13 @ @ public class SelectorManager extends Thread <nl> selector . wakeup ( ) ; <nl> return channel . register ( selector , ops , handler ) ; <nl> } <nl> - } <nl> + } <nl> + <nl> + / / requests the thread to shutdown . However , it brings no guarantees . Added for testing . <nl> + private void requestShutdown ( ) <nl> + { <nl> + shutdownRequested = true ; <nl> + } <nl> <nl> / * * <nl> * This method starts the socket manager listening for events . It is <nl> @ @ - 102 , 6 + 111 , 11 @ @ public class SelectorManager extends Thread <nl> { <nl> throw new RuntimeException ( e ) ; <nl> } <nl> + if ( shutdownRequested ) <nl> + { <nl> + shutdownRequested = false ; <nl> + break ; <nl> + } <nl> } <nl> } <nl> <nl> @ @ - 145 , 6 + 159 , 22 @ @ public class SelectorManager extends Thread <nl> } <nl> <nl> / * * <nl> + * Intended to reset the singleton as part of testing . <nl> + * / <nl> + static void reset ( ) <nl> + { <nl> + synchronized ( SelectorManager . class ) <nl> + { <nl> + if ( manager ! = null ) <nl> + manager . requestShutdown ( ) ; <nl> + manager = null ; <nl> + if ( udpManager ! = null ) <nl> + udpManager . requestShutdown ( ) ; <nl> + udpManager = null ; <nl> + } <nl> + } <nl> + <nl> + / * * <nl> * Returns the SelectorManager applications should use . <nl> * <nl> * @ return The SelectorManager which applications should use <nl> diff - - git a / test / unit / org / apache / cassandra / CleanupHelper . java b / test / unit / org / apache / cassandra / CleanupHelper . java <nl> index 969a2cd . . e3cde8d 100644 <nl> - - - a / test / unit / org / apache / cassandra / CleanupHelper . java <nl> + + + b / test / unit / org / apache / cassandra / CleanupHelper . java <nl> @ @ - 19 , 6 + 19 , 7 @ @ <nl> package org . apache . cassandra ; <nl> <nl> import java . io . File ; <nl> + import java . io . IOException ; <nl> <nl> import org . junit . BeforeClass ; <nl> <nl> @ @ - 30 , 6 + 31 , 13 @ @ public class CleanupHelper <nl> private static Logger logger = Logger . getLogger ( CleanupHelper . class ) ; <nl> <nl> @ BeforeClass <nl> + public static void cleanupAndLeaveDirs ( ) <nl> + { <nl> + mkdirs ( ) ; <nl> + cleanup ( ) ; <nl> + mkdirs ( ) ; <nl> + } <nl> + <nl> public static void cleanup ( ) <nl> { <nl> / / we clean the fs twice , once to start with ( so old data files don ' t get stored by anything static if this is the first run ) <nl> @ @ - 38 , 6 + 46 , 10 @ @ public class CleanupHelper <nl> DatabaseDescriptor . getLogFileLocation ( ) , <nl> } ; <nl> <nl> + / / try to delete the directories themselves too . don ' t panic if this fails . it probably means that the process <nl> + / / doesn ' t have permissions to do so , or it contains non - cassandra generated files that were intentionally <nl> + / / put there . <nl> + <nl> for ( String dirName : directoryNames ) <nl> { <nl> File dir = new File ( dirName ) ; <nl> @ @ - 47 , 11 + 59 , 15 @ @ public class CleanupHelper <nl> } <nl> for ( File f : dir . listFiles ( ) ) <nl> { <nl> - if ( ! f . delete ( ) ) { <nl> + if ( ! f . delete ( ) ) <nl> + { <nl> logger . error ( " could not delete " + f ) ; <nl> + } <nl> } <nl> + <nl> + if ( ! dir . delete ( ) ) <nl> + logger . warn ( " could not delete " + dir . getPath ( ) ) ; <nl> } <nl> - } <nl> <nl> / / cleanup data directory which are stored as data directory / table / data files <nl> for ( String dirName : DatabaseDescriptor . getAllDataFileLocations ( ) ) <nl> @ @ - 71 , 8 + 87 , 24 @ @ public class CleanupHelper <nl> } <nl> } <nl> } <nl> + if ( ! tableFile . delete ( ) ) <nl> + logger . warn ( " could not delete " + dir . getPath ( ) ) ; <nl> } <nl> + <nl> + if ( ! dir . delete ( ) ) <nl> + logger . warn ( " could not delete " + dir . getPath ( ) ) ; <nl> } <nl> + } <nl> <nl> + public static void mkdirs ( ) <nl> + { <nl> + try <nl> + { <nl> + DatabaseDescriptor . createAllDirectories ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / net / NetPackageAccessor . java b / test / unit / org / apache / cassandra / net / NetPackageAccessor . java <nl> new file mode 100644 <nl> index 0000000 . . 408bfba <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / net / NetPackageAccessor . java <nl> @ @ - 0 , 0 + 1 , 29 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . net ; <nl> + <nl> + / * * <nl> + For accesing package - level members created for the sole purpose of testing . <nl> + * / <nl> + public class NetPackageAccessor <nl> + { <nl> + public static void resetSelectorManager ( ) <nl> + { <nl> + SelectorManager . reset ( ) ; <nl> + } <nl> + } <nl> diff - - git a / test / unit / org / apache / cassandra / service / StorageServiceTest . java b / test / unit / org / apache / cassandra / service / StorageServiceTest . java <nl> new file mode 100644 <nl> index 0000000 . . 0ec9ffe <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / service / StorageServiceTest . java <nl> @ @ - 0 , 0 + 1 , 68 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + <nl> + package org . apache . cassandra . service ; <nl> + <nl> + import org . apache . cassandra . CleanupHelper ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . net . NetPackageAccessor ; <nl> + import org . junit . Test ; <nl> + import static org . junit . Assert . assertTrue ; <nl> + import static org . junit . Assert . assertFalse ; <nl> + <nl> + import java . io . File ; <nl> + import java . io . IOException ; <nl> + <nl> + public class StorageServiceTest <nl> + { <nl> + @ Test <nl> + public void testClientOnlyMode ( ) throws IOException <nl> + { <nl> + CleanupHelper . mkdirs ( ) ; <nl> + CleanupHelper . cleanup ( ) ; <nl> + StorageService . instance ( ) . initClient ( ) ; <nl> + <nl> + / / verify that no storage directories were created . <nl> + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) <nl> + { <nl> + assertFalse ( new File ( path ) . exists ( ) ) ; <nl> + } <nl> + StorageService . instance ( ) . stopClient ( ) ; <nl> + NetPackageAccessor . resetSelectorManager ( ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testRegularMode ( ) throws IOException , InterruptedException <nl> + { <nl> + CleanupHelper . mkdirs ( ) ; <nl> + CleanupHelper . cleanup ( ) ; <nl> + StorageService . instance ( ) . initServer ( ) ; <nl> + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) <nl> + { <nl> + / / verify that storage directories are there . <nl> + assertTrue ( new File ( path ) . exists ( ) ) ; <nl> + } <nl> + / / a proper test would be to call decommission here , but decommission ( ) mixes both shutdown and datatransfer <nl> + / / calls . This test is only interested in the shutdown - related items which a properly handled by just <nl> + / / stopping the client . <nl> + / / StorageService . instance ( ) . decommission ( ) ; <nl> + StorageService . instance ( ) . stopClient ( ) ; <nl> + NetPackageAccessor . resetSelectorManager ( ) ; <nl> + } <nl> + }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 60fd4c9 . . 177ac76 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 1 
+ + * Add metrics for tracking PreparedStatement use ( CASSANDRA - 7719 ) 
+ * ( cqlsh ) tab - completion for triggers ( CASSANDRA - 7824 ) 
+ * ( cqlsh ) : Support for query paging ( CASSANDRA - 7514 ) 
+ * ( cqlsh ) : Show progress of COPY operations ( CASSANDRA - 7789 ) 
+ diff - - git a / src / java / org / apache / cassandra / cql3 / QueryProcessor . java b / src / java / org / apache / cassandra / cql3 / QueryProcessor . java 
+ index f2bf305 . . 99972a2 100644 
+ - - - a / src / java / org / apache / cassandra / cql3 / QueryProcessor . java 
+ + + + b / src / java / org / apache / cassandra / cql3 / QueryProcessor . java 
+ @ @ - 22 , 11 + 22 , 14 @ @ import java . util . * ; 
+ import java . util . concurrent . ConcurrentMap ; 
+ import java . util . concurrent . ConcurrentHashMap ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . primitives . Ints ; 
+ 
+ import com . googlecode . concurrentlinkedhashmap . ConcurrentLinkedHashMap ; 
+ import com . googlecode . concurrentlinkedhashmap . EntryWeigher ; 
+ + import com . googlecode . concurrentlinkedhashmap . EvictionListener ; 
+ import org . antlr . runtime . * ; 
+ + import org . apache . cassandra . metrics . CqlStatementMetrics ; 
+ import org . github . jamm . MemoryMeter ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 56 , 7 + 59 , 6 @ @ public class QueryProcessor implements QueryHandler 
+ private static final Logger logger = LoggerFactory . getLogger ( QueryProcessor . class ) ; 
+ private static final MemoryMeter meter = new MemoryMeter ( ) . withGuessing ( MemoryMeter . Guess . FALLBACK _ BEST ) ; 
+ private static final long MAX _ CACHE _ PREPARED _ MEMORY = Runtime . getRuntime ( ) . maxMemory ( ) / 256 ; 
+ - private static final int MAX _ CACHE _ PREPARED _ COUNT = 10000 ; 
+ 
+ private static EntryWeigher < MD5Digest , ParsedStatement . Prepared > cqlMemoryUsageWeigher = new EntryWeigher < MD5Digest , ParsedStatement . Prepared > ( ) 
+ { 
+ @ @ - 83 , 15 + 85 , 34 @ @ public class QueryProcessor implements QueryHandler 
+ / / bother with expiration on those . 
+ private static final ConcurrentMap < String , ParsedStatement . Prepared > internalStatements = new ConcurrentHashMap < > ( ) ; 
+ 
+ + @ VisibleForTesting 
+ + public static final CqlStatementMetrics metrics = new CqlStatementMetrics ( ) ; 
+ + 
+ static 
+ { 
+ preparedStatements = new ConcurrentLinkedHashMap . Builder < MD5Digest , ParsedStatement . Prepared > ( ) 
+ . maximumWeightedCapacity ( MAX _ CACHE _ PREPARED _ MEMORY ) 
+ . weigher ( cqlMemoryUsageWeigher ) 
+ - . build ( ) ; 
+ + . listener ( new EvictionListener < MD5Digest , ParsedStatement . Prepared > ( ) 
+ + { 
+ + @ Override 
+ + public void onEviction ( MD5Digest md5Digest , ParsedStatement . Prepared prepared ) 
+ + { 
+ + metrics . activePreparedStatements . dec ( ) ; 
+ + } 
+ + } ) . build ( ) ; 
+ + 
+ thriftPreparedStatements = new ConcurrentLinkedHashMap . Builder < Integer , CQLStatement > ( ) 
+ . maximumWeightedCapacity ( MAX _ CACHE _ PREPARED _ MEMORY ) 
+ . weigher ( thriftMemoryUsageWeigher ) 
+ + . listener ( new EvictionListener < Integer , CQLStatement > ( ) 
+ + { 
+ + @ Override 
+ + public void onEviction ( Integer integer , CQLStatement cqlStatement ) 
+ + { 
+ + metrics . activePreparedStatements . dec ( ) ; 
+ + } 
+ + } ) 
+ . build ( ) ; 
+ 
+ } 
+ @ @ - 174 , 7 + 195 , 7 @ @ public class QueryProcessor implements QueryHandler 
+ Cell . MAX _ NAME _ LENGTH ) ) ; 
+ } 
+ 
+ - public static ResultMessage processStatement ( CQLStatement statement , 
+ + private static ResultMessage processStatement ( CQLStatement statement , 
+ QueryState queryState , 
+ QueryOptions options ) 
+ throws RequestExecutionException , RequestValidationException 
+ @ @ - 203 , 6 + 224 , 9 @ @ public class QueryProcessor implements QueryHandler 
+ if ( prepared . getBoundTerms ( ) ! = options . getValues ( ) . size ( ) ) 
+ throw new InvalidRequestException ( " Invalid amount of bind variables " ) ; 
+ 
+ + if ( ! queryState . getClientState ( ) . isInternal ) 
+ + metrics . executedUnprepared . inc ( ) ; 
+ + 
+ return processStatement ( prepared , queryState , options ) ; 
+ } 
+ 
+ @ @ - 370 , 24 + 394 , 28 @ @ public class QueryProcessor implements QueryHandler 
+ throw new InvalidRequestException ( String . format ( " Prepared statement of size % d bytes is larger than allowed maximum of % d bytes . " , 
+ statementSize , 
+ MAX _ CACHE _ PREPARED _ MEMORY ) ) ; 
+ - 
+ - if ( forThrift ) 
+ + try 
+ { 
+ - int statementId = toHash . hashCode ( ) ; 
+ - thriftPreparedStatements . put ( statementId , prepared . statement ) ; 
+ - logger . trace ( String . format ( " Stored prepared statement # % d with % d bind markers " , 
+ - statementId , 
+ - prepared . statement . getBoundTerms ( ) ) ) ; 
+ - return ResultMessage . Prepared . forThrift ( statementId , prepared . boundNames ) ; 
+ - } 
+ - else 
+ + if ( forThrift ) 
+ + { 
+ + int statementId = toHash . hashCode ( ) ; 
+ + thriftPreparedStatements . put ( statementId , prepared . statement ) ; 
+ + logger . trace ( " Stored prepared statement # { } with { } bind markers " , 
+ + statementId , 
+ + prepared . statement . getBoundTerms ( ) ) ; 
+ + return ResultMessage . Prepared . forThrift ( statementId , prepared . boundNames ) ; 
+ + } else 
+ + { 
+ + MD5Digest statementId = MD5Digest . compute ( toHash ) ; 
+ + preparedStatements . put ( statementId , prepared ) ; 
+ + logger . trace ( " Stored prepared statement # { } with { } bind markers " , 
+ + statementId , 
+ + prepared . statement . getBoundTerms ( ) ) ; 
+ + return new ResultMessage . Prepared ( statementId , prepared ) ; 
+ + } 
+ + } finally 
+ { 
+ - MD5Digest statementId = MD5Digest . compute ( toHash ) ; 
+ - preparedStatements . put ( statementId , prepared ) ; 
+ - logger . trace ( String . format ( " Stored prepared statement % s with % d bind markers " , 
+ - statementId , 
+ - prepared . statement . getBoundTerms ( ) ) ) ; 
+ - return new ResultMessage . Prepared ( statementId , prepared ) ; 
+ + metrics . activePreparedStatements . inc ( ) ; 
+ } 
+ } 
+ 
+ @ @ - 410 , 6 + 438 , 7 @ @ public class QueryProcessor implements QueryHandler 
+ logger . trace ( " [ { } ] ' { } ' " , i + 1 , variables . get ( i ) ) ; 
+ } 
+ 
+ + metrics . executedPrepared . inc ( ) ; 
+ return processStatement ( statement , queryState , options ) ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / metrics / CqlStatementMetrics . java b / src / java / org / apache / cassandra / metrics / CqlStatementMetrics . java 
+ new file mode 100644 
+ index 0000000 . . 02b4ad0 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / metrics / CqlStatementMetrics . java 
+ @ @ - 0 , 0 + 1 , 53 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . metrics ; 
+ + 
+ + import com . yammer . metrics . Metrics ; 
+ + import com . yammer . metrics . core . Counter ; 
+ + import com . yammer . metrics . core . Gauge ; 
+ + import com . yammer . metrics . util . RatioGauge ; 
+ + 
+ + 
+ + public class CqlStatementMetrics 
+ + { 
+ + private final MetricNameFactory factory = new DefaultNameFactory ( " CqlStatement " ) ; 
+ + public final Counter activePreparedStatements = Metrics . newCounter ( factory . createMetricName ( " ActivePreparedStatements " ) ) ; 
+ + public final Counter executedPrepared = Metrics . newCounter ( factory . createMetricName ( " ExecutedPrepared " ) ) ; 
+ + public final Counter executedUnprepared = Metrics . newCounter ( factory . createMetricName ( " ExecutedUnPrepared " ) ) ; 
+ + 
+ + public final Gauge < Double > preparedRatio = Metrics . newGauge ( factory . createMetricName ( " PreparedUnpreparedRatio " ) , new RatioGauge ( ) 
+ + { 
+ + protected double getNumerator ( ) 
+ + { 
+ + long num = executedPrepared . count ( ) ; 
+ + return num = = 0 ? 1 : num ; 
+ + } 
+ + 
+ + protected double getDenominator ( ) 
+ + { 
+ + long den = executedUnprepared . count ( ) ; 
+ + return den = = 0 ? 1 : den ; 
+ + } 
+ + } ) ; 
+ + 
+ + public void reset ( ) 
+ + { 
+ + executedPrepared . clear ( ) ; 
+ + executedUnprepared . clear ( ) ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / service / ClientState . java b / src / java / org / apache / cassandra / service / ClientState . java 
+ index c0396cb . . 725690e 100644 
+ - - - a / src / java / org / apache / cassandra / service / ClientState . java 
+ + + + b / src / java / org / apache / cassandra / service / ClientState . java 
+ @ @ - 103 , 7 + 103 , 7 @ @ public class ClientState 
+ 
+ / / isInternal is used to mark ClientState as used by some internal component 
+ / / that should have an ability to modify system keyspace . 
+ - private final boolean isInternal ; 
+ + public final boolean isInternal ; 
+ 
+ / / The remote address of the client - null for internal clients . 
+ private final SocketAddress remoteAddress ; 
+ diff - - git a / test / unit / org / apache / cassandra / cql3 / CqlMetricsTest . java b / test / unit / org / apache / cassandra / cql3 / CqlMetricsTest . java 
+ new file mode 100644 
+ index 0000000 . . dc9c6a4 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / cql3 / CqlMetricsTest . java 
+ @ @ - 0 , 0 + 1 , 110 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . cql3 ; 
+ + 
+ + import com . datastax . driver . core . Cluster ; 
+ + import com . datastax . driver . core . PreparedStatement ; 
+ + import com . datastax . driver . core . Session ; 
+ + import org . apache . cassandra . OrderedJUnit4ClassRunner ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . exceptions . ConfigurationException ; 
+ + import org . apache . cassandra . service . EmbeddedCassandraService ; 
+ + import org . junit . BeforeClass ; 
+ + import org . junit . Test ; 
+ + import org . junit . runner . RunWith ; 
+ + 
+ + import java . io . IOException ; 
+ + 
+ + 
+ + @ RunWith ( OrderedJUnit4ClassRunner . class ) 
+ + public class CqlMetricsTest 
+ + { 
+ + 
+ + private static EmbeddedCassandraService cassandra ; 
+ + 
+ + private static Cluster cluster ; 
+ + private static Session session ; 
+ + private static PreparedStatement metricsStatement ; 
+ + 
+ + @ BeforeClass ( ) 
+ + public static void setup ( ) throws ConfigurationException , IOException 
+ + { 
+ + cassandra = new EmbeddedCassandraService ( ) ; 
+ + cassandra . start ( ) ; 
+ + 
+ + cluster = Cluster . builder ( ) . addContactPoint ( " 127 . 0 . 0 . 1 " ) . withPort ( DatabaseDescriptor . getNativeTransportPort ( ) ) . build ( ) ; 
+ + session = cluster . connect ( ) ; 
+ + 
+ + session . execute ( " drop keyspace if exists junit ; " ) ; 
+ + session . execute ( " create keyspace junit WITH REPLICATION = { ' class ' : ' SimpleStrategy ' , ' replication _ factor ' : 1 } ; " ) ; 
+ + session . execute ( " CREATE TABLE junit . metricstest ( \ n " + 
+ + " id int PRIMARY KEY , \ n " + 
+ + " val text \ n " + 
+ + " ) ; " ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testActivePreparedStatements ( ) 
+ + { 
+ + assert QueryProcessor . metrics . activePreparedStatements . count ( ) = = 0 ; 
+ + 
+ + metricsStatement = session . prepare ( " insert into junit . metricstest ( id , val ) values ( ? , ? ) " ) ; 
+ + 
+ + assert QueryProcessor . metrics . activePreparedStatements . count ( ) = = 1 ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testExecutedPrepared ( ) 
+ + { 
+ + QueryProcessor . metrics . reset ( ) ; 
+ + 
+ + assert QueryProcessor . metrics . activePreparedStatements . count ( ) = = 1 ; 
+ + assert QueryProcessor . metrics . executedPrepared . count ( ) = = 0 ; 
+ + assert QueryProcessor . metrics . executedUnprepared . count ( ) = = 0 ; 
+ + assert QueryProcessor . metrics . preparedRatio . value ( ) = = 1 . 0 ; 
+ + 
+ + for ( int i = 0 ; i < 10 ; i + + ) 
+ + { 
+ + session . execute ( metricsStatement . bind ( i , " val " + i ) ) ; 
+ + } 
+ + 
+ + assert QueryProcessor . metrics . executedPrepared . count ( ) = = 10 ; 
+ + assert QueryProcessor . metrics . executedUnprepared . count ( ) = = 0 ; 
+ + assert QueryProcessor . metrics . preparedRatio . value ( ) = = 10d / 1d ; 
+ + 
+ + } 
+ + 
+ + @ Test 
+ + public void testExecutedUnPrepared ( ) 
+ + { 
+ + QueryProcessor . metrics . reset ( ) ; 
+ + 
+ + assert QueryProcessor . metrics . activePreparedStatements . count ( ) = = 1 ; 
+ + assert QueryProcessor . metrics . executedPrepared . count ( ) = = 0 ; 
+ + assert QueryProcessor . metrics . executedUnprepared . count ( ) = = 0 ; 
+ + 
+ + for ( int i = 0 ; i < 10 ; i + + ) 
+ + { 
+ + session . execute ( String . format ( " insert into junit . metricstest ( id , val ) values ( % d , ' % s ' ) " , i , " val " + 1 ) ) ; 
+ + } 
+ + 
+ + assert QueryProcessor . metrics . executedPrepared . count ( ) = = 0 ; 
+ + assert QueryProcessor . metrics . executedUnprepared . count ( ) = = 10 ; 
+ + assert QueryProcessor . metrics . preparedRatio . value ( ) = = 1d / 10d ; 
+ + } 
+ + }
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java 
+ index 1f235df . . 25e1072 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / DebuggableThreadPoolExecutor . java 
+ @ @ - 19 , 6 + 19 , 7 @ @ 
+ package org . apache . cassandra . concurrent ; 
+ 
+ import java . lang . management . ManagementFactory ; 
+ + import java . util . List ; 
+ import java . util . concurrent . * ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . ObjectName ; 
+ @ @ - 34 , 6 + 35 , 7 @ @ import org . apache . log4j . Logger ; 
+ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements DebuggableThreadPoolExecutorMBean 
+ { 
+ private static Logger logger _ = Logger . getLogger ( DebuggableThreadPoolExecutor . class ) ; 
+ + private final String mbeanName ; 
+ 
+ public DebuggableThreadPoolExecutor ( String threadPoolName ) 
+ { 
+ @ @ - 51 , 9 + 53 , 10 @ @ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements 
+ super . prestartAllCoreThreads ( ) ; 
+ 
+ MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; 
+ + mbeanName = " org . apache . cassandra . concurrent : type = " + threadFactory . id ; 
+ try 
+ { 
+ - mbs . registerMBean ( this , new ObjectName ( " org . apache . cassandra . concurrent : type = " + threadFactory . id ) ) ; 
+ + mbs . registerMBean ( this , new ObjectName ( mbeanName ) ) ; 
+ } 
+ catch ( Exception e ) 
+ { 
+ @ @ - 84 , 6 + 87 , 33 @ @ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor implements 
+ } 
+ } 
+ 
+ + private void unregisterMBean ( ) 
+ + { 
+ + try 
+ + { 
+ + ManagementFactory . getPlatformMBeanServer ( ) . unregisterMBean ( new ObjectName ( mbeanName ) ) ; 
+ + } 
+ + catch ( Exception ex ) 
+ + { 
+ + / / don ' t let it get in the way , but notify . 
+ + logger _ . error ( ex . getMessage ( ) , ex ) ; 
+ + } 
+ + } 
+ + 
+ + @ Override 
+ + public void shutdown ( ) 
+ + { 
+ + unregisterMBean ( ) ; 
+ + super . shutdown ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public List < Runnable > shutdownNow ( ) 
+ + { 
+ + unregisterMBean ( ) ; 
+ + return super . shutdownNow ( ) ; 
+ + } 
+ + 
+ / * * 
+ * Get the number of completed tasks 
+ * / 
+ diff - - git a / src / java / org / apache / cassandra / gms / Gossiper . java b / src / java / org / apache / cassandra / gms / Gossiper . java 
+ index 3b70d17 . . f5d8d35 100644 
+ - - - a / src / java / org / apache / cassandra / gms / Gossiper . java 
+ + + + b / src / java / org / apache / cassandra / gms / Gossiper . java 
+ @ @ - 122 , 7 + 122 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC 
+ return gossiper _ ; 
+ } 
+ 
+ - private Timer gossipTimer _ = new Timer ( false ) ; 
+ + private Timer gossipTimer _ ; 
+ private InetAddress localEndPoint _ ; 
+ private long aVeryLongTime _ ; 
+ private Random random _ = new Random ( ) ; 
+ @ @ - 144 , 6 + 144 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC 
+ 
+ private Gossiper ( ) 
+ { 
+ + gossipTimer _ = new Timer ( false ) ; 
+ aVeryLongTime _ = 259200 * 1000 ; 
+ / * register with the Failure Detector for receiving Failure detector events * / 
+ FailureDetector . instance ( ) . registerFailureDetectionEventListener ( this ) ; 
+ @ @ - 834 , 6 + 835 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC 
+ public void stop ( ) 
+ { 
+ gossipTimer _ . cancel ( ) ; 
+ + gossipTimer _ = new Timer ( false ) ; / / makes the Gossiper reentrant . 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java 
+ index 8ff93f6 . . b1ad5ed 100644 
+ - - - a / src / java / org / apache / cassandra / net / MessagingService . java 
+ + + + b / src / java / org / apache / cassandra / net / MessagingService . java 
+ @ @ - 69 , 6 + 69 , 9 @ @ public class MessagingService 
+ 
+ / * List of sockets we are listening on * / 
+ private static Map < InetAddress , SelectionKey > listenSockets _ = new HashMap < InetAddress , SelectionKey > ( ) ; 
+ + 
+ + / * List of UdpConnections we are listening on * / 
+ + private static Map < InetAddress , UdpConnection > udpConnections _ = new HashMap < InetAddress , UdpConnection > ( ) ; 
+ 
+ / * Lookup table for registering message handlers based on the verb . * / 
+ private static Map < String , IVerbHandler > verbHandlers _ ; 
+ @ @ - 214 , 7 + 217 , 8 @ @ public class MessagingService 
+ try 
+ { 
+ connection . init ( localEp ) ; 
+ - endPoints _ . add ( localEp ) ; 
+ + endPoints _ . add ( localEp ) ; 
+ + udpConnections _ . put ( localEp , connection ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ @ @ - 497 , 7 + 501 , 7 @ @ public class MessagingService 
+ logger _ . info ( " Shutting down . . . " ) ; 
+ synchronized ( MessagingService . class ) 
+ { 
+ - / * Stop listening on any socket * / 
+ + / * Stop listening on any TCP socket * / 
+ for ( SelectionKey skey : listenSockets _ . values ( ) ) 
+ { 
+ skey . cancel ( ) ; 
+ @ @ - 509 , 6 + 513 , 13 @ @ public class MessagingService 
+ } 
+ listenSockets _ . clear ( ) ; 
+ 
+ + / * Stop listening on any UDP ports . * / 
+ + for ( UdpConnection con : udpConnections _ . values ( ) ) 
+ + { 
+ + con . close ( ) ; 
+ + } 
+ + udpConnections _ . clear ( ) ; 
+ + 
+ / * Shutdown the threads in the EventQueue ' s * / 
+ messageDeserializationExecutor _ . shutdownNow ( ) ; 
+ messageDeserializerExecutor _ . shutdownNow ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / net / SelectorManager . java b / src / java / org / apache / cassandra / net / SelectorManager . java 
+ index 7623a05 . . 16511ee 100644 
+ - - - a / src / java / org / apache / cassandra / net / SelectorManager . java 
+ + + + b / src / java / org / apache / cassandra / net / SelectorManager . java 
+ @ @ - 35 , 6 + 35 , 9 @ @ public class SelectorManager extends Thread 
+ / / workaround JDK select / register bug 
+ Object gate = new Object ( ) ; 
+ 
+ + / / flag to indicate that shutdown has been requested . 
+ + private boolean shutdownRequested = false ; 
+ + 
+ / / The static selector manager which is used by all applications 
+ private static SelectorManager manager ; 
+ 
+ @ @ - 82 , 7 + 85 , 13 @ @ public class SelectorManager extends Thread 
+ selector . wakeup ( ) ; 
+ return channel . register ( selector , ops , handler ) ; 
+ } 
+ - } 
+ + } 
+ + 
+ + / / requests the thread to shutdown . However , it brings no guarantees . Added for testing . 
+ + private void requestShutdown ( ) 
+ + { 
+ + shutdownRequested = true ; 
+ + } 
+ 
+ / * * 
+ * This method starts the socket manager listening for events . It is 
+ @ @ - 102 , 6 + 111 , 11 @ @ public class SelectorManager extends Thread 
+ { 
+ throw new RuntimeException ( e ) ; 
+ } 
+ + if ( shutdownRequested ) 
+ + { 
+ + shutdownRequested = false ; 
+ + break ; 
+ + } 
+ } 
+ } 
+ 
+ @ @ - 145 , 6 + 159 , 22 @ @ public class SelectorManager extends Thread 
+ } 
+ 
+ / * * 
+ + * Intended to reset the singleton as part of testing . 
+ + * / 
+ + static void reset ( ) 
+ + { 
+ + synchronized ( SelectorManager . class ) 
+ + { 
+ + if ( manager ! = null ) 
+ + manager . requestShutdown ( ) ; 
+ + manager = null ; 
+ + if ( udpManager ! = null ) 
+ + udpManager . requestShutdown ( ) ; 
+ + udpManager = null ; 
+ + } 
+ + } 
+ + 
+ + / * * 
+ * Returns the SelectorManager applications should use . 
+ * 
+ * @ return The SelectorManager which applications should use 
+ diff - - git a / test / unit / org / apache / cassandra / CleanupHelper . java b / test / unit / org / apache / cassandra / CleanupHelper . java 
+ index 969a2cd . . e3cde8d 100644 
+ - - - a / test / unit / org / apache / cassandra / CleanupHelper . java 
+ + + + b / test / unit / org / apache / cassandra / CleanupHelper . java 
+ @ @ - 19 , 6 + 19 , 7 @ @ 
+ package org . apache . cassandra ; 
+ 
+ import java . io . File ; 
+ + import java . io . IOException ; 
+ 
+ import org . junit . BeforeClass ; 
+ 
+ @ @ - 30 , 6 + 31 , 13 @ @ public class CleanupHelper 
+ private static Logger logger = Logger . getLogger ( CleanupHelper . class ) ; 
+ 
+ @ BeforeClass 
+ + public static void cleanupAndLeaveDirs ( ) 
+ + { 
+ + mkdirs ( ) ; 
+ + cleanup ( ) ; 
+ + mkdirs ( ) ; 
+ + } 
+ + 
+ public static void cleanup ( ) 
+ { 
+ / / we clean the fs twice , once to start with ( so old data files don ' t get stored by anything static if this is the first run ) 
+ @ @ - 38 , 6 + 46 , 10 @ @ public class CleanupHelper 
+ DatabaseDescriptor . getLogFileLocation ( ) , 
+ } ; 
+ 
+ + / / try to delete the directories themselves too . don ' t panic if this fails . it probably means that the process 
+ + / / doesn ' t have permissions to do so , or it contains non - cassandra generated files that were intentionally 
+ + / / put there . 
+ + 
+ for ( String dirName : directoryNames ) 
+ { 
+ File dir = new File ( dirName ) ; 
+ @ @ - 47 , 11 + 59 , 15 @ @ public class CleanupHelper 
+ } 
+ for ( File f : dir . listFiles ( ) ) 
+ { 
+ - if ( ! f . delete ( ) ) { 
+ + if ( ! f . delete ( ) ) 
+ + { 
+ logger . error ( " could not delete " + f ) ; 
+ + } 
+ } 
+ + 
+ + if ( ! dir . delete ( ) ) 
+ + logger . warn ( " could not delete " + dir . getPath ( ) ) ; 
+ } 
+ - } 
+ 
+ / / cleanup data directory which are stored as data directory / table / data files 
+ for ( String dirName : DatabaseDescriptor . getAllDataFileLocations ( ) ) 
+ @ @ - 71 , 8 + 87 , 24 @ @ public class CleanupHelper 
+ } 
+ } 
+ } 
+ + if ( ! tableFile . delete ( ) ) 
+ + logger . warn ( " could not delete " + dir . getPath ( ) ) ; 
+ } 
+ + 
+ + if ( ! dir . delete ( ) ) 
+ + logger . warn ( " could not delete " + dir . getPath ( ) ) ; 
+ } 
+ + } 
+ 
+ + public static void mkdirs ( ) 
+ + { 
+ + try 
+ + { 
+ + DatabaseDescriptor . createAllDirectories ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / net / NetPackageAccessor . java b / test / unit / org / apache / cassandra / net / NetPackageAccessor . java 
+ new file mode 100644 
+ index 0000000 . . 408bfba 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / net / NetPackageAccessor . java 
+ @ @ - 0 , 0 + 1 , 29 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . net ; 
+ + 
+ + / * * 
+ + For accesing package - level members created for the sole purpose of testing . 
+ + * / 
+ + public class NetPackageAccessor 
+ + { 
+ + public static void resetSelectorManager ( ) 
+ + { 
+ + SelectorManager . reset ( ) ; 
+ + } 
+ + } 
+ diff - - git a / test / unit / org / apache / cassandra / service / StorageServiceTest . java b / test / unit / org / apache / cassandra / service / StorageServiceTest . java 
+ new file mode 100644 
+ index 0000000 . . 0ec9ffe 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / service / StorageServiceTest . java 
+ @ @ - 0 , 0 + 1 , 68 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + 
+ + package org . apache . cassandra . service ; 
+ + 
+ + import org . apache . cassandra . CleanupHelper ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . net . NetPackageAccessor ; 
+ + import org . junit . Test ; 
+ + import static org . junit . Assert . assertTrue ; 
+ + import static org . junit . Assert . assertFalse ; 
+ + 
+ + import java . io . File ; 
+ + import java . io . IOException ; 
+ + 
+ + public class StorageServiceTest 
+ + { 
+ + @ Test 
+ + public void testClientOnlyMode ( ) throws IOException 
+ + { 
+ + CleanupHelper . mkdirs ( ) ; 
+ + CleanupHelper . cleanup ( ) ; 
+ + StorageService . instance ( ) . initClient ( ) ; 
+ + 
+ + / / verify that no storage directories were created . 
+ + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) 
+ + { 
+ + assertFalse ( new File ( path ) . exists ( ) ) ; 
+ + } 
+ + StorageService . instance ( ) . stopClient ( ) ; 
+ + NetPackageAccessor . resetSelectorManager ( ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testRegularMode ( ) throws IOException , InterruptedException 
+ + { 
+ + CleanupHelper . mkdirs ( ) ; 
+ + CleanupHelper . cleanup ( ) ; 
+ + StorageService . instance ( ) . initServer ( ) ; 
+ + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) 
+ + { 
+ + / / verify that storage directories are there . 
+ + assertTrue ( new File ( path ) . exists ( ) ) ; 
+ + } 
+ + / / a proper test would be to call decommission here , but decommission ( ) mixes both shutdown and datatransfer 
+ + / / calls . This test is only interested in the shutdown - related items which a properly handled by just 
+ + / / stopping the client . 
+ + / / StorageService . instance ( ) . decommission ( ) ; 
+ + StorageService . instance ( ) . stopClient ( ) ; 
+ + NetPackageAccessor . resetSelectorManager ( ) ; 
+ + } 
+ + }

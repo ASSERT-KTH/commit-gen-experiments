@@ -1,0 +1,536 @@
+BLEU SCORE: 0.03089055318156698
+
+TEST MSG: Rework tombstone purgeability checks to not use sentinel timestamp to indicate unconditional purgeability
+GENERATED MSG: maxPurgeableTimestamp needs to check memtables too
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 3482052 . . 54dc4b5 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 2 . 9 <nl> + * Fix purgeability of tombstones with max timestamp ( CASSANDRA - 12792 ) <nl> * Fail repair if participant dies during sync or anticompaction ( CASSANDRA - 12901 ) <nl> * cqlsh COPY : unprotected pk values before converting them if not using prepared statements ( CASSANDRA - 12863 ) <nl> * Fix Util . spinAssertEquals ( CASSANDRA - 12283 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionController . java b / src / java / org / apache / cassandra / db / compaction / CompactionController . java <nl> index 699bc55 . . e895573 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionController . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionController . java <nl> @ @ - 19 , 6 + 19 , 9 @ @ package org . apache . cassandra . db . compaction ; <nl> <nl> import java . util . * ; <nl> <nl> + import com . google . common . base . Predicate ; <nl> + import com . google . common . base . Predicates ; <nl> + <nl> import org . apache . cassandra . io . sstable . format . SSTableReader ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 186 , 36 + 189 , 59 @ @ public class CompactionController implements AutoCloseable <nl> } <nl> <nl> / * * <nl> - * @ return the largest timestamp before which it ' s okay to drop tombstones for the given partition ; <nl> - * i . e . , after the maxPurgeableTimestamp there may exist newer data that still needs to be suppressed <nl> - * in other sstables . This returns the minimum timestamp for any SSTable that contains this partition and is not <nl> - * participating in this compaction , or memtable that contains this partition , <nl> - * or LONG . MAX _ VALUE if no SSTable or memtable exist . <nl> + * @ param key <nl> + * @ return a predicate for whether tombstones marked for deletion at the given time for the given partition are <nl> + * purgeable ; we calculate this by checking whether the deletion time is less than the min timestamp of all SSTables <nl> + * containing his partition and not participating in the compaction . This means there isn ' t any data in those <nl> + * sstables that might still need to be suppressed by a tombstone at this timestamp . <nl> * / <nl> - public long maxPurgeableTimestamp ( DecoratedKey key ) <nl> + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) <nl> { <nl> if ( NEVER _ PURGE _ TOMBSTONES ) <nl> - return Long . MIN _ VALUE ; <nl> + return Predicates . alwaysFalse ( ) ; <nl> <nl> - long min = Long . MAX _ VALUE ; <nl> overlapIterator . update ( key ) ; <nl> - for ( SSTableReader sstable : overlapIterator . overlaps ( ) ) <nl> + Set < SSTableReader > filteredSSTables = overlapIterator . overlaps ( ) ; <nl> + Iterable < Memtable > memtables = cfs . getTracker ( ) . getView ( ) . getAllMemtables ( ) ; <nl> + long minTimestampSeen = Long . MAX _ VALUE ; <nl> + boolean hasTimestamp = false ; <nl> + <nl> + for ( SSTableReader sstable : filteredSSTables ) <nl> { <nl> / / if we don ' t have bloom filter ( bf _ fp _ chance = 1 . 0 or filter file is missing ) , <nl> / / we check index file instead . <nl> - if ( sstable . getBloomFilter ( ) instanceof AlwaysPresentFilter & & sstable . getPosition ( key , SSTableReader . Operator . EQ , false ) ! = null ) <nl> - min = Math . min ( min , sstable . getMinTimestamp ( ) ) ; <nl> - else if ( sstable . getBloomFilter ( ) . isPresent ( key ) ) <nl> - min = Math . min ( min , sstable . getMinTimestamp ( ) ) ; <nl> + if ( sstable . getBloomFilter ( ) instanceof AlwaysPresentFilter & & sstable . getPosition ( key , SSTableReader . Operator . EQ , false ) ! = null <nl> + | | sstable . getBloomFilter ( ) . isPresent ( key ) ) <nl> + { <nl> + minTimestampSeen = Math . min ( minTimestampSeen , sstable . getMinTimestamp ( ) ) ; <nl> + hasTimestamp = true ; <nl> + } <nl> + <nl> } <nl> <nl> - for ( Memtable memtable : cfs . getTracker ( ) . getView ( ) . getAllMemtables ( ) ) <nl> + for ( Memtable memtable : memtables ) <nl> { <nl> ColumnFamily cf = memtable . getColumnFamily ( key ) ; <nl> if ( cf ! = null ) <nl> - min = Math . min ( min , memtable . getMinTimestamp ( ) ) ; <nl> + { <nl> + minTimestampSeen = Math . min ( minTimestampSeen , memtable . getMinTimestamp ( ) ) ; <nl> + hasTimestamp = true ; <nl> + } <nl> + } <nl> + <nl> + if ( ! hasTimestamp ) <nl> + return Predicates . alwaysTrue ( ) ; <nl> + else <nl> + { <nl> + final long finalTimestamp = minTimestampSeen ; <nl> + return new Predicate < Long > ( ) <nl> + { <nl> + public boolean apply ( Long time ) <nl> + { <nl> + return time < finalTimestamp ; <nl> + } <nl> + } ; <nl> } <nl> - return min ; <nl> } <nl> <nl> public void close ( ) <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> index 626bd27 . . 8a3c11e 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> @ @ - 28 , 6 + 28 , 8 @ @ import javax . management . openmbean . OpenDataException ; <nl> import javax . management . openmbean . TabularData ; <nl> <nl> import com . google . common . annotations . VisibleForTesting ; <nl> + import com . google . common . base . Predicate ; <nl> + import com . google . common . base . Predicates ; <nl> import com . google . common . collect . * ; <nl> import com . google . common . util . concurrent . * ; <nl> import org . slf4j . Logger ; <nl> @ @ - 1419 , 7 + 1421 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> } <nl> <nl> @ Override <nl> - public long maxPurgeableTimestamp ( DecoratedKey key ) <nl> + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) <nl> { <nl> / * <nl> * The main reason we always purge is that including gcable tombstone would mean that the <nl> @ @ - 1432 , 7 + 1434 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> * a tombstone that could shadow a column in another sstable , but this is doubly not a concern <nl> * since validation compaction is read - only . <nl> * / <nl> - return Long . MAX _ VALUE ; <nl> + return Predicates . alwaysTrue ( ) ; <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / LazilyCompactedRow . java b / src / java / org / apache / cassandra / db / compaction / LazilyCompactedRow . java <nl> index 74865b2 . . eaceead 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / LazilyCompactedRow . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / LazilyCompactedRow . java <nl> @ @ - 24 , 6 + 24 , 7 @ @ import java . util . Collections ; <nl> import java . util . Iterator ; <nl> import java . util . List ; <nl> <nl> + import com . google . common . base . Predicate ; <nl> import com . google . common . base . Predicates ; <nl> import com . google . common . collect . Iterators ; <nl> <nl> @ @ - 52 , 8 + 53 , 7 @ @ public class LazilyCompactedRow extends AbstractCompactedRow <nl> { <nl> protected final List < ? extends OnDiskAtomIterator > rows ; <nl> protected final CompactionController controller ; <nl> - protected boolean hasCalculatedMaxPurgeableTimestamp = false ; <nl> - protected long maxPurgeableTimestamp ; <nl> + protected Predicate < Long > purgeEvaluator ; <nl> protected final ColumnFamily emptyColumnFamily ; <nl> protected ColumnStats columnStats ; <nl> protected boolean closed ; <nl> @ @ - 82 , 25 + 82 , 21 @ @ public class LazilyCompactedRow extends AbstractCompactedRow <nl> <nl> emptyColumnFamily = ArrayBackedSortedColumns . factory . create ( controller . cfs . metadata ) ; <nl> emptyColumnFamily . delete ( maxRowTombstone ) ; <nl> - if ( ! maxRowTombstone . isLive ( ) & & maxRowTombstone . markedForDeleteAt < getMaxPurgeableTimestamp ( ) ) <nl> + if ( ! maxRowTombstone . isLive ( ) & & getPurgeEvaluator ( ) . apply ( maxRowTombstone . markedForDeleteAt ) ) <nl> emptyColumnFamily . purgeTombstones ( controller . gcBefore ) ; <nl> <nl> reducer = new Reducer ( ) ; <nl> merger = Iterators . filter ( MergeIterator . get ( rows , emptyColumnFamily . getComparator ( ) . onDiskAtomComparator ( ) , reducer ) , Predicates . notNull ( ) ) ; <nl> } <nl> <nl> - / * * <nl> - * tombstones with a localDeletionTime before this can be purged . This is the minimum timestamp for any sstable <nl> - * containing ` key ` outside of the set of sstables involved in this compaction . <nl> - * / <nl> - private long getMaxPurgeableTimestamp ( ) <nl> + private Predicate < Long > getPurgeEvaluator ( ) <nl> { <nl> - if ( ! hasCalculatedMaxPurgeableTimestamp ) <nl> + if ( purgeEvaluator = = null ) <nl> { <nl> - hasCalculatedMaxPurgeableTimestamp = true ; <nl> - maxPurgeableTimestamp = controller . maxPurgeableTimestamp ( key ) ; <nl> + purgeEvaluator = controller . getPurgeEvaluator ( key ) ; <nl> } <nl> - return maxPurgeableTimestamp ; <nl> + <nl> + return purgeEvaluator ; <nl> } <nl> <nl> private static void removeDeleted ( ColumnFamily cf , boolean shouldPurge , DecoratedKey key , CompactionController controller ) <nl> @ @ - 291 , 7 + 287 , 7 @ @ public class LazilyCompactedRow extends AbstractCompactedRow <nl> RangeTombstone t = tombstone ; <nl> tombstone = null ; <nl> <nl> - if ( t . data . isGcAble ( controller . gcBefore ) & & t . timestamp ( ) < getMaxPurgeableTimestamp ( ) | | <nl> + if ( t . data . isGcAble ( controller . gcBefore ) & & getPurgeEvaluator ( ) . apply ( t . timestamp ( ) ) | | <nl> maxRowTombstone . markedForDeleteAt > = t . timestamp ( ) ) <nl> { <nl> indexBuilder . tombstoneTracker ( ) . update ( t , true ) ; <nl> @ @ - 314 , 7 + 310 , 7 @ @ public class LazilyCompactedRow extends AbstractCompactedRow <nl> container . delete ( maxRowTombstone ) ; <nl> Iterator < Cell > iter = container . iterator ( ) ; <nl> Cell c = iter . next ( ) ; <nl> - boolean shouldPurge = c . getLocalDeletionTime ( ) < Integer . MAX _ VALUE & & c . timestamp ( ) < getMaxPurgeableTimestamp ( ) ; <nl> + boolean shouldPurge = c . getLocalDeletionTime ( ) < Integer . MAX _ VALUE & & getPurgeEvaluator ( ) . apply ( c . timestamp ( ) ) ; <nl> removeDeleted ( container , shouldPurge , key , controller ) ; <nl> iter = container . iterator ( ) ; <nl> if ( ! iter . hasNext ( ) ) <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / SSTableSplitter . java b / src / java / org / apache / cassandra / db / compaction / SSTableSplitter . java <nl> index e9a4f05 . . 6b302d2 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / SSTableSplitter . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / SSTableSplitter . java <nl> @ @ - 19 , 6 + 19 , 9 @ @ package org . apache . cassandra . db . compaction ; <nl> <nl> import java . util . * ; <nl> <nl> + import com . google . common . base . Predicate ; <nl> + import com . google . common . base . Predicates ; <nl> + <nl> import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . db . compaction . writers . CompactionAwareWriter ; <nl> import org . apache . cassandra . db . compaction . writers . MaxSSTableSizeWriter ; <nl> @ @ - 94 , 9 + 97 , 9 @ @ public class SSTableSplitter { <nl> } <nl> <nl> @ Override <nl> - public long maxPurgeableTimestamp ( DecoratedKey key ) <nl> + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) <nl> { <nl> - return Long . MIN _ VALUE ; <nl> + return Predicates . alwaysFalse ( ) ; <nl> } <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / Scrubber . java b / src / java / org / apache / cassandra / db / compaction / Scrubber . java <nl> index 99ee62e . . aaed234 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / Scrubber . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / Scrubber . java <nl> @ @ - 22 , 6 + 22 , 8 @ @ import java . io . * ; <nl> import java . util . * ; <nl> <nl> import com . google . common . annotations . VisibleForTesting ; <nl> + import com . google . common . base . Predicate ; <nl> + import com . google . common . base . Predicates ; <nl> import com . google . common . base . Throwables ; <nl> import com . google . common . collect . AbstractIterator ; <nl> <nl> @ @ - 495 , 9 + 497 , 9 @ @ public class Scrubber implements Closeable <nl> } <nl> <nl> @ Override <nl> - public long maxPurgeableTimestamp ( DecoratedKey key ) <nl> + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) <nl> { <nl> - return Long . MIN _ VALUE ; <nl> + return Predicates . alwaysFalse ( ) ; <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / Upgrader . java b / src / java / org / apache / cassandra / db / compaction / Upgrader . java <nl> index ca975b8 . . d6ef60e 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / Upgrader . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / Upgrader . java <nl> @ @ - 20 , 6 + 20 , 8 @ @ package org . apache . cassandra . db . compaction ; <nl> import java . io . File ; <nl> import java . util . * ; <nl> <nl> + import com . google . common . base . Predicate ; <nl> + import com . google . common . base . Predicates ; <nl> import com . google . common . base . Throwables ; <nl> <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> @ @ - 118 , 9 + 120 , 9 @ @ public class Upgrader <nl> } <nl> <nl> @ Override <nl> - public long maxPurgeableTimestamp ( DecoratedKey key ) <nl> + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) <nl> { <nl> - return Long . MIN _ VALUE ; <nl> + return Predicates . alwaysFalse ( ) ; <nl> } <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / Verifier . java b / src / java / org / apache / cassandra / db / compaction / Verifier . java <nl> index 0177819 . . 42302fe 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / Verifier . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / Verifier . java <nl> @ @ - 17 , 6 + 17 , 8 @ @ <nl> * / <nl> package org . apache . cassandra . db . compaction ; <nl> <nl> + import com . google . common . base . Predicate ; <nl> + import com . google . common . base . Predicates ; <nl> import com . google . common . base . Throwables ; <nl> import com . google . common . collect . Sets ; <nl> import org . apache . cassandra . db . * ; <nl> @ @ - 276 , 9 + 278 , 9 @ @ public class Verifier implements Closeable <nl> } <nl> <nl> @ Override <nl> - public long maxPurgeableTimestamp ( DecoratedKey key ) <nl> + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) <nl> { <nl> - return Long . MIN _ VALUE ; <nl> + return Predicates . alwaysFalse ( ) ; <nl> } <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / db / compaction / CompactionControllerTest . java b / test / unit / org / apache / cassandra / db / compaction / CompactionControllerTest . java <nl> index 750a38e . . 3184159 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / compaction / CompactionControllerTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / compaction / CompactionControllerTest . java <nl> @ @ - 21 , 6 + 21 , 7 @ @ package org . apache . cassandra . db . compaction ; <nl> import java . nio . ByteBuffer ; <nl> import java . util . Set ; <nl> <nl> + import com . google . common . base . Predicate ; <nl> import com . google . common . collect . Sets ; <nl> import org . junit . BeforeClass ; <nl> import org . junit . Test ; <nl> @ @ - 41 , 6 + 42 , 8 @ @ import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> import static org . apache . cassandra . Util . cellname ; <nl> import static org . junit . Assert . assertEquals ; <nl> + import static org . junit . Assert . assertFalse ; <nl> + import static org . junit . Assert . assertTrue ; <nl> import static org . junit . Assert . assertNotNull ; <nl> <nl> public class CompactionControllerTest extends SchemaLoader <nl> @ @ - 80 , 10 + 83 , 10 @ @ public class CompactionControllerTest extends SchemaLoader <nl> / / check max purgeable timestamp without any sstables <nl> try ( CompactionController controller = new CompactionController ( cfs , null , 0 ) ) <nl> { <nl> - assertEquals ( timestamp1 , controller . maxPurgeableTimestamp ( key ) ) ; / / memtable only <nl> + assertPurgeBoundary ( controller . getPurgeEvaluator ( key ) , timestamp1 ) ; / / memtable only <nl> <nl> cfs . forceBlockingFlush ( ) ; <nl> - assertEquals ( Long . MAX _ VALUE , controller . maxPurgeableTimestamp ( key ) ) ; / / no memtables and no sstables <nl> + assertTrue ( controller . getPurgeEvaluator ( key ) . apply ( Long . MAX _ VALUE ) ) ; / / no memtables and no sstables <nl> } <nl> <nl> Set < SSTableReader > compacting = Sets . newHashSet ( cfs . getSSTables ( ) ) ; / / first sstable is compacting <nl> @ @ - 95 , 11 + 98 , 11 @ @ public class CompactionControllerTest extends SchemaLoader <nl> / / check max purgeable timestamp when compacting the first sstable with and without a memtable <nl> try ( CompactionController controller = new CompactionController ( cfs , compacting , 0 ) ) <nl> { <nl> - assertEquals ( timestamp2 , controller . maxPurgeableTimestamp ( key ) ) ; / / second sstable only <nl> + assertPurgeBoundary ( controller . getPurgeEvaluator ( key ) , timestamp2 ) ; <nl> <nl> applyMutation ( CF1 , rowKey , timestamp3 ) ; <nl> <nl> - assertEquals ( timestamp3 , controller . maxPurgeableTimestamp ( key ) ) ; / / second sstable and second memtable <nl> + assertPurgeBoundary ( controller . getPurgeEvaluator ( key ) , timestamp3 ) ; / / second sstable and second memtable <nl> } <nl> <nl> / / check max purgeable timestamp again without any sstables but with different insertion orders on the memtable <nl> @ @ - 112 , 7 + 115 , 7 @ @ public class CompactionControllerTest extends SchemaLoader <nl> applyMutation ( CF1 , rowKey , timestamp2 ) ; <nl> applyMutation ( CF1 , rowKey , timestamp3 ) ; <nl> <nl> - assertEquals ( timestamp3 , controller . maxPurgeableTimestamp ( key ) ) ; / / memtable only <nl> + assertPurgeBoundary ( controller . getPurgeEvaluator ( key ) , timestamp3 ) ; / / memtable only <nl> } <nl> <nl> cfs . forceBlockingFlush ( ) ; <nl> @ @ - 124 , 7 + 127 , 7 @ @ public class CompactionControllerTest extends SchemaLoader <nl> applyMutation ( CF1 , rowKey , timestamp2 ) ; <nl> applyMutation ( CF1 , rowKey , timestamp1 ) ; <nl> <nl> - assertEquals ( timestamp3 , controller . maxPurgeableTimestamp ( key ) ) ; / / memtable only <nl> + assertPurgeBoundary ( controller . getPurgeEvaluator ( key ) , timestamp3 ) ; <nl> } <nl> } <nl> <nl> @ @ - 186 , 6 + 189 , 9 @ @ public class CompactionControllerTest extends SchemaLoader <nl> rm . applyUnsafe ( ) ; <nl> } <nl> <nl> - <nl> - <nl> + private void assertPurgeBoundary ( Predicate < Long > evaluator , long boundary ) <nl> + { <nl> + assertFalse ( evaluator . apply ( boundary ) ) ; <nl> + assertTrue ( evaluator . apply ( boundary - 1 ) ) ; <nl> + } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / db / compaction / CompactionsPurgeTest . java b / test / unit / org / apache / cassandra / db / compaction / CompactionsPurgeTest . java <nl> index e5baab6 . . 4a1f2ca 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / compaction / CompactionsPurgeTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / compaction / CompactionsPurgeTest . java <nl> @ @ - 134 , 6 + 134 , 137 @ @ public class CompactionsPurgeTest <nl> } <nl> <nl> @ Test <nl> + public void testMajorCompactionPurgeTombstonesWithMaxTimestamp ( ) <nl> + { <nl> + CompactionManager . instance . disableAutoCompaction ( ) ; <nl> + <nl> + Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; <nl> + String cfName = " Standard1 " ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfName ) ; <nl> + <nl> + DecoratedKey key = Util . dk ( " key1 " ) ; <nl> + Mutation rm ; <nl> + <nl> + / / inserts <nl> + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; <nl> + for ( int i = 0 ; i < 10 ; i + + ) <nl> + { <nl> + rm . add ( cfName , cellname ( String . valueOf ( i ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 0 ) ; <nl> + } <nl> + rm . apply ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + / / deletes <nl> + for ( int i = 0 ; i < 10 ; i + + ) <nl> + { <nl> + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; <nl> + rm . delete ( cfName , cellname ( String . valueOf ( i ) ) , Long . MAX _ VALUE ) ; <nl> + rm . apply ( ) ; <nl> + } <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + / / major compact - tombstones should be purged <nl> + FBUtilities . waitOnFutures ( CompactionManager . instance . submitMaximal ( cfs , Integer . MAX _ VALUE , false ) ) ; <nl> + <nl> + / / resurrect one column <nl> + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; <nl> + rm . add ( cfName , cellname ( String . valueOf ( 5 ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 2 ) ; <nl> + rm . apply ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + cfs . invalidateCachedRow ( key ) ; <nl> + ColumnFamily cf = cfs . getColumnFamily ( QueryFilter . getIdentityFilter ( key , cfName , System . currentTimeMillis ( ) ) ) ; <nl> + assertColumns ( cf , " 5 " ) ; <nl> + assert cf . getColumn ( cellname ( String . valueOf ( 5 ) ) ) ! = null ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testMajorCompactionPurgeTopLevelTombstoneWithMaxTimestamp ( ) <nl> + { <nl> + CompactionManager . instance . disableAutoCompaction ( ) ; <nl> + <nl> + Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; <nl> + String cfName = " Standard1 " ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfName ) ; <nl> + <nl> + DecoratedKey key = Util . dk ( " key1 " ) ; <nl> + Mutation rm ; <nl> + <nl> + / / inserts <nl> + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; <nl> + for ( int i = 0 ; i < 10 ; i + + ) <nl> + { <nl> + rm . add ( cfName , cellname ( String . valueOf ( i ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 0 ) ; <nl> + } <nl> + rm . apply ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + / / delete <nl> + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; <nl> + rm . delete ( cfName , Long . MAX _ VALUE ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + / / major compact - tombstone should be purged <nl> + FBUtilities . waitOnFutures ( CompactionManager . instance . submitMaximal ( cfs , Integer . MAX _ VALUE , false ) ) ; <nl> + <nl> + / / resurrect one column <nl> + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; <nl> + rm . add ( cfName , cellname ( String . valueOf ( 5 ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 2 ) ; <nl> + rm . apply ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + cfs . invalidateCachedRow ( key ) ; <nl> + ColumnFamily cf = cfs . getColumnFamily ( QueryFilter . getIdentityFilter ( key , cfName , System . currentTimeMillis ( ) ) ) ; <nl> + assertColumns ( cf , " 5 " ) ; <nl> + assert cf . getColumn ( cellname ( String . valueOf ( 5 ) ) ) ! = null ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testMajorCompactionPurgeRangeTombstoneWithMaxTimestamp ( ) <nl> + { <nl> + CompactionManager . instance . disableAutoCompaction ( ) ; <nl> + <nl> + Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; <nl> + String cfName = " Standard1 " ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfName ) ; <nl> + <nl> + DecoratedKey key = Util . dk ( " key1 " ) ; <nl> + Mutation rm ; <nl> + <nl> + / / inserts <nl> + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; <nl> + for ( int i = 0 ; i < 10 ; i + + ) <nl> + { <nl> + rm . add ( cfName , cellname ( String . valueOf ( i ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 0 ) ; <nl> + } <nl> + rm . apply ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + / / delete <nl> + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; <nl> + rm . deleteRange ( cfName , cellname ( String . valueOf ( 0 ) ) , cellname ( String . valueOf ( 9 ) ) , Long . MAX _ VALUE ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + / / major compact - tombstone should be purged <nl> + FBUtilities . waitOnFutures ( CompactionManager . instance . submitMaximal ( cfs , Integer . MAX _ VALUE , false ) ) ; <nl> + <nl> + / / resurrect one column <nl> + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; <nl> + rm . add ( cfName , cellname ( String . valueOf ( 5 ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 2 ) ; <nl> + rm . apply ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + cfs . invalidateCachedRow ( key ) ; <nl> + ColumnFamily cf = cfs . getColumnFamily ( QueryFilter . getIdentityFilter ( key , cfName , System . currentTimeMillis ( ) ) ) ; <nl> + assertColumns ( cf , " 5 " ) ; <nl> + assert cf . getColumn ( cellname ( String . valueOf ( 5 ) ) ) ! = null ; <nl> + } <nl> + <nl> + @ Test <nl> public void testMinorCompactionPurge ( ) <nl> { <nl> CompactionManager . instance . disableAutoCompaction ( ) ;
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 3482052 . . 54dc4b5 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 2 . 9 
+ + * Fix purgeability of tombstones with max timestamp ( CASSANDRA - 12792 ) 
+ * Fail repair if participant dies during sync or anticompaction ( CASSANDRA - 12901 ) 
+ * cqlsh COPY : unprotected pk values before converting them if not using prepared statements ( CASSANDRA - 12863 ) 
+ * Fix Util . spinAssertEquals ( CASSANDRA - 12283 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionController . java b / src / java / org / apache / cassandra / db / compaction / CompactionController . java 
+ index 699bc55 . . e895573 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionController . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionController . java 
+ @ @ - 19 , 6 + 19 , 9 @ @ package org . apache . cassandra . db . compaction ; 
+ 
+ import java . util . * ; 
+ 
+ + import com . google . common . base . Predicate ; 
+ + import com . google . common . base . Predicates ; 
+ + 
+ import org . apache . cassandra . io . sstable . format . SSTableReader ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 186 , 36 + 189 , 59 @ @ public class CompactionController implements AutoCloseable 
+ } 
+ 
+ / * * 
+ - * @ return the largest timestamp before which it ' s okay to drop tombstones for the given partition ; 
+ - * i . e . , after the maxPurgeableTimestamp there may exist newer data that still needs to be suppressed 
+ - * in other sstables . This returns the minimum timestamp for any SSTable that contains this partition and is not 
+ - * participating in this compaction , or memtable that contains this partition , 
+ - * or LONG . MAX _ VALUE if no SSTable or memtable exist . 
+ + * @ param key 
+ + * @ return a predicate for whether tombstones marked for deletion at the given time for the given partition are 
+ + * purgeable ; we calculate this by checking whether the deletion time is less than the min timestamp of all SSTables 
+ + * containing his partition and not participating in the compaction . This means there isn ' t any data in those 
+ + * sstables that might still need to be suppressed by a tombstone at this timestamp . 
+ * / 
+ - public long maxPurgeableTimestamp ( DecoratedKey key ) 
+ + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) 
+ { 
+ if ( NEVER _ PURGE _ TOMBSTONES ) 
+ - return Long . MIN _ VALUE ; 
+ + return Predicates . alwaysFalse ( ) ; 
+ 
+ - long min = Long . MAX _ VALUE ; 
+ overlapIterator . update ( key ) ; 
+ - for ( SSTableReader sstable : overlapIterator . overlaps ( ) ) 
+ + Set < SSTableReader > filteredSSTables = overlapIterator . overlaps ( ) ; 
+ + Iterable < Memtable > memtables = cfs . getTracker ( ) . getView ( ) . getAllMemtables ( ) ; 
+ + long minTimestampSeen = Long . MAX _ VALUE ; 
+ + boolean hasTimestamp = false ; 
+ + 
+ + for ( SSTableReader sstable : filteredSSTables ) 
+ { 
+ / / if we don ' t have bloom filter ( bf _ fp _ chance = 1 . 0 or filter file is missing ) , 
+ / / we check index file instead . 
+ - if ( sstable . getBloomFilter ( ) instanceof AlwaysPresentFilter & & sstable . getPosition ( key , SSTableReader . Operator . EQ , false ) ! = null ) 
+ - min = Math . min ( min , sstable . getMinTimestamp ( ) ) ; 
+ - else if ( sstable . getBloomFilter ( ) . isPresent ( key ) ) 
+ - min = Math . min ( min , sstable . getMinTimestamp ( ) ) ; 
+ + if ( sstable . getBloomFilter ( ) instanceof AlwaysPresentFilter & & sstable . getPosition ( key , SSTableReader . Operator . EQ , false ) ! = null 
+ + | | sstable . getBloomFilter ( ) . isPresent ( key ) ) 
+ + { 
+ + minTimestampSeen = Math . min ( minTimestampSeen , sstable . getMinTimestamp ( ) ) ; 
+ + hasTimestamp = true ; 
+ + } 
+ + 
+ } 
+ 
+ - for ( Memtable memtable : cfs . getTracker ( ) . getView ( ) . getAllMemtables ( ) ) 
+ + for ( Memtable memtable : memtables ) 
+ { 
+ ColumnFamily cf = memtable . getColumnFamily ( key ) ; 
+ if ( cf ! = null ) 
+ - min = Math . min ( min , memtable . getMinTimestamp ( ) ) ; 
+ + { 
+ + minTimestampSeen = Math . min ( minTimestampSeen , memtable . getMinTimestamp ( ) ) ; 
+ + hasTimestamp = true ; 
+ + } 
+ + } 
+ + 
+ + if ( ! hasTimestamp ) 
+ + return Predicates . alwaysTrue ( ) ; 
+ + else 
+ + { 
+ + final long finalTimestamp = minTimestampSeen ; 
+ + return new Predicate < Long > ( ) 
+ + { 
+ + public boolean apply ( Long time ) 
+ + { 
+ + return time < finalTimestamp ; 
+ + } 
+ + } ; 
+ } 
+ - return min ; 
+ } 
+ 
+ public void close ( ) 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ index 626bd27 . . 8a3c11e 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ @ @ - 28 , 6 + 28 , 8 @ @ import javax . management . openmbean . OpenDataException ; 
+ import javax . management . openmbean . TabularData ; 
+ 
+ import com . google . common . annotations . VisibleForTesting ; 
+ + import com . google . common . base . Predicate ; 
+ + import com . google . common . base . Predicates ; 
+ import com . google . common . collect . * ; 
+ import com . google . common . util . concurrent . * ; 
+ import org . slf4j . Logger ; 
+ @ @ - 1419 , 7 + 1421 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ } 
+ 
+ @ Override 
+ - public long maxPurgeableTimestamp ( DecoratedKey key ) 
+ + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) 
+ { 
+ / * 
+ * The main reason we always purge is that including gcable tombstone would mean that the 
+ @ @ - 1432 , 7 + 1434 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ * a tombstone that could shadow a column in another sstable , but this is doubly not a concern 
+ * since validation compaction is read - only . 
+ * / 
+ - return Long . MAX _ VALUE ; 
+ + return Predicates . alwaysTrue ( ) ; 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / LazilyCompactedRow . java b / src / java / org / apache / cassandra / db / compaction / LazilyCompactedRow . java 
+ index 74865b2 . . eaceead 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / LazilyCompactedRow . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / LazilyCompactedRow . java 
+ @ @ - 24 , 6 + 24 , 7 @ @ import java . util . Collections ; 
+ import java . util . Iterator ; 
+ import java . util . List ; 
+ 
+ + import com . google . common . base . Predicate ; 
+ import com . google . common . base . Predicates ; 
+ import com . google . common . collect . Iterators ; 
+ 
+ @ @ - 52 , 8 + 53 , 7 @ @ public class LazilyCompactedRow extends AbstractCompactedRow 
+ { 
+ protected final List < ? extends OnDiskAtomIterator > rows ; 
+ protected final CompactionController controller ; 
+ - protected boolean hasCalculatedMaxPurgeableTimestamp = false ; 
+ - protected long maxPurgeableTimestamp ; 
+ + protected Predicate < Long > purgeEvaluator ; 
+ protected final ColumnFamily emptyColumnFamily ; 
+ protected ColumnStats columnStats ; 
+ protected boolean closed ; 
+ @ @ - 82 , 25 + 82 , 21 @ @ public class LazilyCompactedRow extends AbstractCompactedRow 
+ 
+ emptyColumnFamily = ArrayBackedSortedColumns . factory . create ( controller . cfs . metadata ) ; 
+ emptyColumnFamily . delete ( maxRowTombstone ) ; 
+ - if ( ! maxRowTombstone . isLive ( ) & & maxRowTombstone . markedForDeleteAt < getMaxPurgeableTimestamp ( ) ) 
+ + if ( ! maxRowTombstone . isLive ( ) & & getPurgeEvaluator ( ) . apply ( maxRowTombstone . markedForDeleteAt ) ) 
+ emptyColumnFamily . purgeTombstones ( controller . gcBefore ) ; 
+ 
+ reducer = new Reducer ( ) ; 
+ merger = Iterators . filter ( MergeIterator . get ( rows , emptyColumnFamily . getComparator ( ) . onDiskAtomComparator ( ) , reducer ) , Predicates . notNull ( ) ) ; 
+ } 
+ 
+ - / * * 
+ - * tombstones with a localDeletionTime before this can be purged . This is the minimum timestamp for any sstable 
+ - * containing ` key ` outside of the set of sstables involved in this compaction . 
+ - * / 
+ - private long getMaxPurgeableTimestamp ( ) 
+ + private Predicate < Long > getPurgeEvaluator ( ) 
+ { 
+ - if ( ! hasCalculatedMaxPurgeableTimestamp ) 
+ + if ( purgeEvaluator = = null ) 
+ { 
+ - hasCalculatedMaxPurgeableTimestamp = true ; 
+ - maxPurgeableTimestamp = controller . maxPurgeableTimestamp ( key ) ; 
+ + purgeEvaluator = controller . getPurgeEvaluator ( key ) ; 
+ } 
+ - return maxPurgeableTimestamp ; 
+ + 
+ + return purgeEvaluator ; 
+ } 
+ 
+ private static void removeDeleted ( ColumnFamily cf , boolean shouldPurge , DecoratedKey key , CompactionController controller ) 
+ @ @ - 291 , 7 + 287 , 7 @ @ public class LazilyCompactedRow extends AbstractCompactedRow 
+ RangeTombstone t = tombstone ; 
+ tombstone = null ; 
+ 
+ - if ( t . data . isGcAble ( controller . gcBefore ) & & t . timestamp ( ) < getMaxPurgeableTimestamp ( ) | | 
+ + if ( t . data . isGcAble ( controller . gcBefore ) & & getPurgeEvaluator ( ) . apply ( t . timestamp ( ) ) | | 
+ maxRowTombstone . markedForDeleteAt > = t . timestamp ( ) ) 
+ { 
+ indexBuilder . tombstoneTracker ( ) . update ( t , true ) ; 
+ @ @ - 314 , 7 + 310 , 7 @ @ public class LazilyCompactedRow extends AbstractCompactedRow 
+ container . delete ( maxRowTombstone ) ; 
+ Iterator < Cell > iter = container . iterator ( ) ; 
+ Cell c = iter . next ( ) ; 
+ - boolean shouldPurge = c . getLocalDeletionTime ( ) < Integer . MAX _ VALUE & & c . timestamp ( ) < getMaxPurgeableTimestamp ( ) ; 
+ + boolean shouldPurge = c . getLocalDeletionTime ( ) < Integer . MAX _ VALUE & & getPurgeEvaluator ( ) . apply ( c . timestamp ( ) ) ; 
+ removeDeleted ( container , shouldPurge , key , controller ) ; 
+ iter = container . iterator ( ) ; 
+ if ( ! iter . hasNext ( ) ) 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / SSTableSplitter . java b / src / java / org / apache / cassandra / db / compaction / SSTableSplitter . java 
+ index e9a4f05 . . 6b302d2 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / SSTableSplitter . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / SSTableSplitter . java 
+ @ @ - 19 , 6 + 19 , 9 @ @ package org . apache . cassandra . db . compaction ; 
+ 
+ import java . util . * ; 
+ 
+ + import com . google . common . base . Predicate ; 
+ + import com . google . common . base . Predicates ; 
+ + 
+ import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . db . compaction . writers . CompactionAwareWriter ; 
+ import org . apache . cassandra . db . compaction . writers . MaxSSTableSizeWriter ; 
+ @ @ - 94 , 9 + 97 , 9 @ @ public class SSTableSplitter { 
+ } 
+ 
+ @ Override 
+ - public long maxPurgeableTimestamp ( DecoratedKey key ) 
+ + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) 
+ { 
+ - return Long . MIN _ VALUE ; 
+ + return Predicates . alwaysFalse ( ) ; 
+ } 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / Scrubber . java b / src / java / org / apache / cassandra / db / compaction / Scrubber . java 
+ index 99ee62e . . aaed234 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / Scrubber . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / Scrubber . java 
+ @ @ - 22 , 6 + 22 , 8 @ @ import java . io . * ; 
+ import java . util . * ; 
+ 
+ import com . google . common . annotations . VisibleForTesting ; 
+ + import com . google . common . base . Predicate ; 
+ + import com . google . common . base . Predicates ; 
+ import com . google . common . base . Throwables ; 
+ import com . google . common . collect . AbstractIterator ; 
+ 
+ @ @ - 495 , 9 + 497 , 9 @ @ public class Scrubber implements Closeable 
+ } 
+ 
+ @ Override 
+ - public long maxPurgeableTimestamp ( DecoratedKey key ) 
+ + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) 
+ { 
+ - return Long . MIN _ VALUE ; 
+ + return Predicates . alwaysFalse ( ) ; 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / Upgrader . java b / src / java / org / apache / cassandra / db / compaction / Upgrader . java 
+ index ca975b8 . . d6ef60e 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / Upgrader . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / Upgrader . java 
+ @ @ - 20 , 6 + 20 , 8 @ @ package org . apache . cassandra . db . compaction ; 
+ import java . io . File ; 
+ import java . util . * ; 
+ 
+ + import com . google . common . base . Predicate ; 
+ + import com . google . common . base . Predicates ; 
+ import com . google . common . base . Throwables ; 
+ 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ @ @ - 118 , 9 + 120 , 9 @ @ public class Upgrader 
+ } 
+ 
+ @ Override 
+ - public long maxPurgeableTimestamp ( DecoratedKey key ) 
+ + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) 
+ { 
+ - return Long . MIN _ VALUE ; 
+ + return Predicates . alwaysFalse ( ) ; 
+ } 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / Verifier . java b / src / java / org / apache / cassandra / db / compaction / Verifier . java 
+ index 0177819 . . 42302fe 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / Verifier . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / Verifier . java 
+ @ @ - 17 , 6 + 17 , 8 @ @ 
+ * / 
+ package org . apache . cassandra . db . compaction ; 
+ 
+ + import com . google . common . base . Predicate ; 
+ + import com . google . common . base . Predicates ; 
+ import com . google . common . base . Throwables ; 
+ import com . google . common . collect . Sets ; 
+ import org . apache . cassandra . db . * ; 
+ @ @ - 276 , 9 + 278 , 9 @ @ public class Verifier implements Closeable 
+ } 
+ 
+ @ Override 
+ - public long maxPurgeableTimestamp ( DecoratedKey key ) 
+ + public Predicate < Long > getPurgeEvaluator ( DecoratedKey key ) 
+ { 
+ - return Long . MIN _ VALUE ; 
+ + return Predicates . alwaysFalse ( ) ; 
+ } 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / db / compaction / CompactionControllerTest . java b / test / unit / org / apache / cassandra / db / compaction / CompactionControllerTest . java 
+ index 750a38e . . 3184159 100644 
+ - - - a / test / unit / org / apache / cassandra / db / compaction / CompactionControllerTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / compaction / CompactionControllerTest . java 
+ @ @ - 21 , 6 + 21 , 7 @ @ package org . apache . cassandra . db . compaction ; 
+ import java . nio . ByteBuffer ; 
+ import java . util . Set ; 
+ 
+ + import com . google . common . base . Predicate ; 
+ import com . google . common . collect . Sets ; 
+ import org . junit . BeforeClass ; 
+ import org . junit . Test ; 
+ @ @ - 41 , 6 + 42 , 8 @ @ import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ import static org . apache . cassandra . Util . cellname ; 
+ import static org . junit . Assert . assertEquals ; 
+ + import static org . junit . Assert . assertFalse ; 
+ + import static org . junit . Assert . assertTrue ; 
+ import static org . junit . Assert . assertNotNull ; 
+ 
+ public class CompactionControllerTest extends SchemaLoader 
+ @ @ - 80 , 10 + 83 , 10 @ @ public class CompactionControllerTest extends SchemaLoader 
+ / / check max purgeable timestamp without any sstables 
+ try ( CompactionController controller = new CompactionController ( cfs , null , 0 ) ) 
+ { 
+ - assertEquals ( timestamp1 , controller . maxPurgeableTimestamp ( key ) ) ; / / memtable only 
+ + assertPurgeBoundary ( controller . getPurgeEvaluator ( key ) , timestamp1 ) ; / / memtable only 
+ 
+ cfs . forceBlockingFlush ( ) ; 
+ - assertEquals ( Long . MAX _ VALUE , controller . maxPurgeableTimestamp ( key ) ) ; / / no memtables and no sstables 
+ + assertTrue ( controller . getPurgeEvaluator ( key ) . apply ( Long . MAX _ VALUE ) ) ; / / no memtables and no sstables 
+ } 
+ 
+ Set < SSTableReader > compacting = Sets . newHashSet ( cfs . getSSTables ( ) ) ; / / first sstable is compacting 
+ @ @ - 95 , 11 + 98 , 11 @ @ public class CompactionControllerTest extends SchemaLoader 
+ / / check max purgeable timestamp when compacting the first sstable with and without a memtable 
+ try ( CompactionController controller = new CompactionController ( cfs , compacting , 0 ) ) 
+ { 
+ - assertEquals ( timestamp2 , controller . maxPurgeableTimestamp ( key ) ) ; / / second sstable only 
+ + assertPurgeBoundary ( controller . getPurgeEvaluator ( key ) , timestamp2 ) ; 
+ 
+ applyMutation ( CF1 , rowKey , timestamp3 ) ; 
+ 
+ - assertEquals ( timestamp3 , controller . maxPurgeableTimestamp ( key ) ) ; / / second sstable and second memtable 
+ + assertPurgeBoundary ( controller . getPurgeEvaluator ( key ) , timestamp3 ) ; / / second sstable and second memtable 
+ } 
+ 
+ / / check max purgeable timestamp again without any sstables but with different insertion orders on the memtable 
+ @ @ - 112 , 7 + 115 , 7 @ @ public class CompactionControllerTest extends SchemaLoader 
+ applyMutation ( CF1 , rowKey , timestamp2 ) ; 
+ applyMutation ( CF1 , rowKey , timestamp3 ) ; 
+ 
+ - assertEquals ( timestamp3 , controller . maxPurgeableTimestamp ( key ) ) ; / / memtable only 
+ + assertPurgeBoundary ( controller . getPurgeEvaluator ( key ) , timestamp3 ) ; / / memtable only 
+ } 
+ 
+ cfs . forceBlockingFlush ( ) ; 
+ @ @ - 124 , 7 + 127 , 7 @ @ public class CompactionControllerTest extends SchemaLoader 
+ applyMutation ( CF1 , rowKey , timestamp2 ) ; 
+ applyMutation ( CF1 , rowKey , timestamp1 ) ; 
+ 
+ - assertEquals ( timestamp3 , controller . maxPurgeableTimestamp ( key ) ) ; / / memtable only 
+ + assertPurgeBoundary ( controller . getPurgeEvaluator ( key ) , timestamp3 ) ; 
+ } 
+ } 
+ 
+ @ @ - 186 , 6 + 189 , 9 @ @ public class CompactionControllerTest extends SchemaLoader 
+ rm . applyUnsafe ( ) ; 
+ } 
+ 
+ - 
+ - 
+ + private void assertPurgeBoundary ( Predicate < Long > evaluator , long boundary ) 
+ + { 
+ + assertFalse ( evaluator . apply ( boundary ) ) ; 
+ + assertTrue ( evaluator . apply ( boundary - 1 ) ) ; 
+ + } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / db / compaction / CompactionsPurgeTest . java b / test / unit / org / apache / cassandra / db / compaction / CompactionsPurgeTest . java 
+ index e5baab6 . . 4a1f2ca 100644 
+ - - - a / test / unit / org / apache / cassandra / db / compaction / CompactionsPurgeTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / compaction / CompactionsPurgeTest . java 
+ @ @ - 134 , 6 + 134 , 137 @ @ public class CompactionsPurgeTest 
+ } 
+ 
+ @ Test 
+ + public void testMajorCompactionPurgeTombstonesWithMaxTimestamp ( ) 
+ + { 
+ + CompactionManager . instance . disableAutoCompaction ( ) ; 
+ + 
+ + Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; 
+ + String cfName = " Standard1 " ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfName ) ; 
+ + 
+ + DecoratedKey key = Util . dk ( " key1 " ) ; 
+ + Mutation rm ; 
+ + 
+ + / / inserts 
+ + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; 
+ + for ( int i = 0 ; i < 10 ; i + + ) 
+ + { 
+ + rm . add ( cfName , cellname ( String . valueOf ( i ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 0 ) ; 
+ + } 
+ + rm . apply ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + / / deletes 
+ + for ( int i = 0 ; i < 10 ; i + + ) 
+ + { 
+ + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; 
+ + rm . delete ( cfName , cellname ( String . valueOf ( i ) ) , Long . MAX _ VALUE ) ; 
+ + rm . apply ( ) ; 
+ + } 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + / / major compact - tombstones should be purged 
+ + FBUtilities . waitOnFutures ( CompactionManager . instance . submitMaximal ( cfs , Integer . MAX _ VALUE , false ) ) ; 
+ + 
+ + / / resurrect one column 
+ + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; 
+ + rm . add ( cfName , cellname ( String . valueOf ( 5 ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 2 ) ; 
+ + rm . apply ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + cfs . invalidateCachedRow ( key ) ; 
+ + ColumnFamily cf = cfs . getColumnFamily ( QueryFilter . getIdentityFilter ( key , cfName , System . currentTimeMillis ( ) ) ) ; 
+ + assertColumns ( cf , " 5 " ) ; 
+ + assert cf . getColumn ( cellname ( String . valueOf ( 5 ) ) ) ! = null ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testMajorCompactionPurgeTopLevelTombstoneWithMaxTimestamp ( ) 
+ + { 
+ + CompactionManager . instance . disableAutoCompaction ( ) ; 
+ + 
+ + Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; 
+ + String cfName = " Standard1 " ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfName ) ; 
+ + 
+ + DecoratedKey key = Util . dk ( " key1 " ) ; 
+ + Mutation rm ; 
+ + 
+ + / / inserts 
+ + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; 
+ + for ( int i = 0 ; i < 10 ; i + + ) 
+ + { 
+ + rm . add ( cfName , cellname ( String . valueOf ( i ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 0 ) ; 
+ + } 
+ + rm . apply ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + / / delete 
+ + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; 
+ + rm . delete ( cfName , Long . MAX _ VALUE ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + / / major compact - tombstone should be purged 
+ + FBUtilities . waitOnFutures ( CompactionManager . instance . submitMaximal ( cfs , Integer . MAX _ VALUE , false ) ) ; 
+ + 
+ + / / resurrect one column 
+ + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; 
+ + rm . add ( cfName , cellname ( String . valueOf ( 5 ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 2 ) ; 
+ + rm . apply ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + cfs . invalidateCachedRow ( key ) ; 
+ + ColumnFamily cf = cfs . getColumnFamily ( QueryFilter . getIdentityFilter ( key , cfName , System . currentTimeMillis ( ) ) ) ; 
+ + assertColumns ( cf , " 5 " ) ; 
+ + assert cf . getColumn ( cellname ( String . valueOf ( 5 ) ) ) ! = null ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testMajorCompactionPurgeRangeTombstoneWithMaxTimestamp ( ) 
+ + { 
+ + CompactionManager . instance . disableAutoCompaction ( ) ; 
+ + 
+ + Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; 
+ + String cfName = " Standard1 " ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfName ) ; 
+ + 
+ + DecoratedKey key = Util . dk ( " key1 " ) ; 
+ + Mutation rm ; 
+ + 
+ + / / inserts 
+ + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; 
+ + for ( int i = 0 ; i < 10 ; i + + ) 
+ + { 
+ + rm . add ( cfName , cellname ( String . valueOf ( i ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 0 ) ; 
+ + } 
+ + rm . apply ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + / / delete 
+ + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; 
+ + rm . deleteRange ( cfName , cellname ( String . valueOf ( 0 ) ) , cellname ( String . valueOf ( 9 ) ) , Long . MAX _ VALUE ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + / / major compact - tombstone should be purged 
+ + FBUtilities . waitOnFutures ( CompactionManager . instance . submitMaximal ( cfs , Integer . MAX _ VALUE , false ) ) ; 
+ + 
+ + / / resurrect one column 
+ + rm = new Mutation ( KEYSPACE1 , key . getKey ( ) ) ; 
+ + rm . add ( cfName , cellname ( String . valueOf ( 5 ) ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , 2 ) ; 
+ + rm . apply ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + cfs . invalidateCachedRow ( key ) ; 
+ + ColumnFamily cf = cfs . getColumnFamily ( QueryFilter . getIdentityFilter ( key , cfName , System . currentTimeMillis ( ) ) ) ; 
+ + assertColumns ( cf , " 5 " ) ; 
+ + assert cf . getColumn ( cellname ( String . valueOf ( 5 ) ) ) ! = null ; 
+ + } 
+ + 
+ + @ Test 
+ public void testMinorCompactionPurge ( ) 
+ { 
+ CompactionManager . instance . disableAutoCompaction ( ) ;
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

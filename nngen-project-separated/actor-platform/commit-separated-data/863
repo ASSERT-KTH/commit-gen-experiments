@@ -1,0 +1,714 @@
+BLEU SCORE: 0.2090067144241744
+
+TEST MSG: feat ( server : activation ) : internal activation
+GENERATED MSG: fix ( server : auth ) : improve activation logic
+
+TEST DIFF (one line): diff - - git a / actor - server / actor - activation / src / main / resources / reference . conf b / actor - server / actor - activation / src / main / resources / reference . conf < nl > index 77920b6 . . d67251d 100644 < nl > - - - a / actor - server / actor - activation / src / main / resources / reference . conf < nl > + + + b / actor - server / actor - activation / src / main / resources / reference . conf < nl > @ @ - 1 , 6 + 1 , 7 @ @ < nl > services { < nl > activation { < nl > providers { < nl > + internal : im . actor . server . activation . internal . InternalCodeProvider < nl > sms : im . actor . server . activation . gate . ActorGateSmsProvider < nl > smtp : im . actor . server . activation . smtp . SMTPProvider < nl > call : im . actor . server . activation . telesign . TelesignProvider < nl > @ @ - 12 , 6 + 13 , 11 @ @ services { < nl > email { < nl > template : $ { actor . home } / templates / activation - email - template . html < nl > } < nl > + internal { < nl > + sender - user - id : 10 < nl > + online - time - window : 10m < nl > + message - template : " Your Actor activation code : $ $ CODE $ $ " < nl > + } < nl > } < nl > < nl > actor - activation { < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala < nl > index 846a72d . . 45b0e6b 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala < nl > @ @ - 16 , 53 + 16 , 72 @ @ final class ActivationContext ( implicit system : ActorSystem ) { < nl > private val db = DbExtension ( system ) . db < nl > private val providers = getProviders ( ) < nl > < nl > - require ( providers exists { case ( k , _ ) ⇒ k ! = InApp } , " Should be at least one external activation provider " ) < nl > + require ( providers exists { case ( k , _ ) ⇒ k ! = Internal } , " Should be at least one external activation provider " ) < nl > < nl > + private val optInternalProvider = providers . get ( Internal ) < nl > private val optSmsProvider = providers . get ( Sms ) < nl > private val optCallProvider = providers . get ( Call ) < nl > private val optSmtpProvider = providers . get ( Smtp ) < nl > < nl > - def send ( txHash : String , code : Code ) : Future [ CodeFailure Xor Unit ] = code match { < nl > - case s : SmsCode ⇒ trySend ( optSmsProvider , txHash , s ) < nl > - case e : EmailCode ⇒ trySend ( optSmtpProvider , txHash , e ) < nl > - case c : CallCode ⇒ trySend ( optCallProvider , txHash , c ) < nl > - } < nl > + / * * < nl > + * We don ' t care about result of sending internal code . < nl > + * But we do care about sending code via external provider . < nl > + * / < nl > + def send ( txHash : String , code : Code ) : Future [ CodeFailure Xor Unit ] = < nl > + for { < nl > + _ ← trySend ( optInternalProvider , txHash , code , logFailure = false ) < nl > + result ← code match { < nl > + case s : SmsCode ⇒ trySend ( optSmsProvider , txHash , s ) < nl > + case e : EmailCode ⇒ trySend ( optSmtpProvider , txHash , e ) < nl > + case c : CallCode ⇒ trySend ( optCallProvider , txHash , c ) < nl > + } < nl > + } yield result < nl > < nl > + / * * < nl > + * If internal code validates - we are fine . < nl > + * Otherwise - validate code sent via external provider . < nl > + * / < nl > def validate ( tx : AuthTransactionBase with ExpirableCode , code : String ) : Future [ ValidationResponse ] = < nl > for { < nl > - resp ← tx match { < nl > - case _ : AuthEmailTransaction ⇒ tryValidate ( optSmtpProvider , tx . transactionHash , code ) < nl > - case _ : AuthPhoneTransaction ⇒ tryValidate ( optSmsProvider , tx . transactionHash , code ) < nl > + internalResp ← tryValidate ( optInternalProvider , tx . transactionHash , code , logFailure = false ) < nl > + result ← if ( internalResp = = Validated ) { < nl > + Future . successful ( internalResp ) < nl > + } else { < nl > + for { < nl > + resp ← tx match { < nl > + case _ : AuthEmailTransaction ⇒ tryValidate ( optSmtpProvider , tx . transactionHash , code ) < nl > + case _ : AuthPhoneTransaction ⇒ tryValidate ( optSmsProvider , tx . transactionHash , code ) < nl > + } < nl > + } yield resp < nl > } < nl > - } yield resp < nl > + } yield result < nl > < nl > + / * * < nl > + * It is required to cleanup both internal and external provider . < nl > + * / < nl > def cleanup ( tx : AuthTransactionBase with ExpirableCode ) : Future [ Unit ] = < nl > for { < nl > - resp ← tx match { < nl > - case _ : AuthEmailTransaction ⇒ tryCleanup ( optSmtpProvider , tx . transactionHash ) < nl > - case _ : AuthPhoneTransaction ⇒ tryCleanup ( optSmsProvider , tx . transactionHash ) < nl > - } < nl > + _ ← tryCleanup ( optInternalProvider , tx . transactionHash ) < nl > + _ ← for { < nl > + resp ← tx match { < nl > + case _ : AuthEmailTransaction ⇒ tryCleanup ( optSmtpProvider , tx . transactionHash ) < nl > + case _ : AuthPhoneTransaction ⇒ tryCleanup ( optSmsProvider , tx . transactionHash ) < nl > + } < nl > + } yield ( ) < nl > } yield ( ) < nl > < nl > - private def trySend ( optProvider : Option [ ActivationProvider ] , txHash : String , code : Code ) : Future [ CodeFailure Xor Unit ] = < nl > - optProvider map { provider ⇒ < nl > - for ( result ← provider . send ( txHash , code ) ) yield result < nl > - } getOrElse { < nl > - system . log . error ( s " No provider found to handle code of type { } " , code . getClass ) < nl > + private def trySend ( optProvider : Option [ ActivationProvider ] , txHash : String , code : Code , logFailure : Boolean = true ) : Future [ CodeFailure Xor Unit ] = < nl > + optProvider map ( _ . send ( txHash , code ) ) getOrElse { < nl > + if ( logFailure ) { system . log . error ( s " No provider found to handle code of type { } " , code . getClass ) } < nl > Future . successful ( Xor . left ( SendFailure ( s " No provider found to handle code of type $ { code . getClass } " ) ) ) < nl > } < nl > < nl > - private def tryValidate ( optProvider : Option [ ActivationProvider ] , txHash : String , code : String ) : Future [ ValidationResponse ] = < nl > + private def tryValidate ( optProvider : Option [ ActivationProvider ] , txHash : String , code : String , logFailure : Boolean = true ) : Future [ ValidationResponse ] = < nl > optProvider map ( _ . validate ( txHash , code ) ) getOrElse { < nl > - system . log . error ( s " No provider found to handle code " ) < nl > + if ( logFailure ) { system . log . error ( s " No provider found to validate code " ) } < nl > Future . successful ( InternalError ) < nl > } < nl > < nl > private def tryCleanup ( optProvider : Option [ ActivationProvider ] , txHash : String ) : Future [ Unit ] = < nl > - optProvider map { provider ⇒ < nl > - for ( _ ← provider . cleanup ( txHash ) ) yield ( ) < nl > - } getOrElse { < nl > - system . log . error ( s " No provider found to handle code " ) < nl > - Future . successful ( ( ) ) < nl > - } < nl > + optProvider map ( _ . cleanup ( txHash ) ) getOrElse Future . successful ( ( ) ) < nl > } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / ActivationProviders . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / ActivationProviders . scala < nl > index 7029d69 . . 4b72a61 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / ActivationProviders . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / ActivationProviders . scala < nl > @ @ - 10 , 7 + 10 , 7 @ @ object ActivationProviders { < nl > val Sms = " sms " < nl > val Smtp = " smtp " < nl > val Call = " call " < nl > - val InApp = " in - app " < nl > + val Internal = " internal " < nl > < nl > / * * < nl > * Instantiates activation providers based on configuration . < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / CommonAuthCodes . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / CommonAuthCodes . scala < nl > index 9961601 . . ae3cede 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / CommonAuthCodes . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / CommonAuthCodes . scala < nl > @ @ - 42 , 7 + 42 , 7 @ @ trait CommonAuthCodes { < nl > case Xor . Right ( _ ) ⇒ db . run ( AuthCodeRepo . createOrUpdate ( txHash , code ) ) < nl > } < nl > < nl > - private def isExpired ( code : AuthCode , expiration : Long ) : Boolean = < nl > + protected def isExpired ( code : AuthCode , expiration : Long ) : Boolean = < nl > code . createdAt . plus ( expiration , MILLIS ) . isBefore ( LocalDateTime . now ( ZoneOffset . UTC ) ) < nl > < nl > } < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / ActorGateSmsProvider . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / ActorGateSmsProvider . scala < nl > index 015129a . . 8f177d6 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / ActorGateSmsProvider . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / ActorGateSmsProvider . scala < nl > @ @ - 17 , 7 + 17 , 7 @ @ import spray . httpx . unmarshalling . _ < nl > import scala . concurrent . Future < nl > import scala . reflect . ClassTag < nl > < nl > - class ActorGateSmsProvider ( implicit system : ActorSystem ) < nl > + private [ activation ] final class ActorGateSmsProvider ( implicit system : ActorSystem ) < nl > extends ActivationProvider < nl > with JsonFormatters < nl > with PlayJsonSupport { < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalActivationConfig . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalActivationConfig . scala < nl > new file mode 100644 < nl > index 0000000 . . 9ad726e < nl > - - - / dev / null < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalActivationConfig . scala < nl > @ @ - 0 , 0 + 1 , 26 @ @ < nl > + package im . actor . server . activation . internal < nl > + < nl > + import com . github . kxbmap . configs . _ < nl > + import com . typesafe . config . Config < nl > + import im . actor . config . ActorConfig < nl > + < nl > + import scala . concurrent . duration . Duration < nl > + import scala . util . Try < nl > + < nl > + case class InternalActivationConfig ( onlineWindow : Duration , senderUserId : Int , messageTemplate : String ) < nl > + < nl > + object InternalActivationConfig { < nl > + def load ( config : Config ) : Try [ InternalActivationConfig ] = < nl > + for { < nl > + onlineWindow ← config . get [ Try [ Duration ] ] ( " online - time - window " ) < nl > + senderUserId ← config . get [ Try [ Int ] ] ( " sender - user - id " ) < nl > + messageTemplate ← config . get [ Try [ String ] ] ( " message - template " ) < nl > + } yield InternalActivationConfig ( onlineWindow , senderUserId , messageTemplate ) < nl > + < nl > + def load : Try [ InternalActivationConfig ] = { < nl > + for { < nl > + config ← Try ( ActorConfig . load ( ) . getConfig ( " services . activation . internal " ) ) < nl > + internalConfig ← load ( config ) < nl > + } yield internalConfig < nl > + } < nl > + } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeProvider . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeProvider . scala < nl > new file mode 100644 < nl > index 0000000 . . de93c26 < nl > - - - / dev / null < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeProvider . scala < nl > @ @ - 0 , 0 + 1 , 98 @ @ < nl > + package im . actor . server . activation . internal < nl > + < nl > + import akka . actor . ActorSystem < nl > + import cats . data . { Xor , XorT } < nl > + import im . actor . api . rpc . messaging . ApiTextMessage < nl > + import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType } < nl > + import im . actor . concurrent . FutureResultCats < nl > + import im . actor . server . acl . ACLUtils < nl > + import im . actor . server . activation . common . _ < nl > + import im . actor . server . db . DbExtension < nl > + import im . actor . server . dialog . DialogExtension < nl > + import im . actor . server . model . { AuthEmailTransaction , AuthPhoneTransaction } < nl > + import im . actor . server . db . ActorPostgresDriver . api . _ < nl > + import im . actor . server . persist . auth . AuthTransactionRepo < nl > + import im . actor . server . persist . presences . UserPresenceRepo < nl > + import im . actor . server . persist . { AuthCodeRepo , UserEmailRepo , UserPhoneRepo } < nl > + < nl > + import scala . concurrent . Future < nl > + < nl > + private [ activation ] final class InternalCodeProvider ( system : ActorSystem ) < nl > + extends ActivationProvider < nl > + with CommonAuthCodes < nl > + with FutureResultCats [ String ] { < nl > + < nl > + private val config = InternalActivationConfig . load . getOrElse ( throw new RuntimeException ( " Failed to load InternalActivationConfig " ) ) < nl > + private val onlineTimeWindow = config . onlineWindow . toMillis < nl > + < nl > + protected val activationConfig : ActivationConfig = ActivationConfig . load . getOrElse ( throw new RuntimeException ( " Failed to load activation config " ) ) < nl > + protected val db = DbExtension ( system ) . db < nl > + protected implicit val ec = system . dispatcher < nl > + < nl > + override def send ( txHash : String , code : Code ) : Future [ Xor [ CodeFailure , Unit ] ] = { < nl > + val response = ( for { < nl > + userId ← findUserId ( txHash ) < nl > + presence ← fromFutureOption ( " No presence found for user " ) ( db . run ( UserPresenceRepo . find ( userId ) ) ) < nl > + lastSeen ← fromOption ( " No last seen date for user presence " ) ( presence . lastSeenAt ) < nl > + _ ← fromFuture ( < nl > + if ( wasOnlineRecently ( lastSeen . getMillis ) ) < nl > + sendCode ( userId , code . code ) < nl > + else Future . successful ( ( ) ) < nl > + ) < nl > + } yield ( ) ) . fold ( < nl > + failure ⇒ { < nl > + system . log . warning ( " Failed to send message via internal code provider : { } " , failure ) < nl > + Xor . right [ CodeFailure , Unit ] ( ( ) ) < nl > + } , < nl > + success ⇒ Xor . right [ CodeFailure , Unit ] ( ( ) ) < nl > + ) recover { case e : RuntimeException ⇒ Xor . left ( SendFailure ( e . toString ) ) } < nl > + for { < nl > + resp ← response < nl > + _ ← createAuthCodeIfNeeded ( resp , txHash , code . code ) < nl > + } yield resp < nl > + } < nl > + < nl > + / / we just validate code here , don ' t expire it < nl > + override def validate ( txHash : String , code : String ) : Future [ ValidationResponse ] = { < nl > + val action = for { < nl > + optCode ← AuthCodeRepo . findByTransactionHash ( txHash ) < nl > + result = optCode map { < nl > + case s if isExpired ( s , activationConfig . expiration . toMillis ) ⇒ ExpiredCode < nl > + case s if s . code ! = code ⇒ < nl > + if ( s . attempts + 1 > = activationConfig . attempts ) ExpiredCode else InvalidCode < nl > + case _ ⇒ Validated < nl > + } getOrElse InvalidHash < nl > + } yield result < nl > + db . run ( action ) < nl > + } < nl > + < nl > + private def sendCode ( userId : Int , code : String ) : Future [ Unit ] = { < nl > + val messageText = config . messageTemplate . replace ( " $ $ CODE $ $ " , code ) < nl > + val userPeer = ApiPeer ( ApiPeerType . Private , userId ) < nl > + val message = ApiTextMessage ( messageText , Vector . empty , None ) < nl > + DialogExtension ( system ) . sendMessage ( < nl > + peer = userPeer , < nl > + senderUserId = config . senderUserId , < nl > + senderAuthSid = 0 , < nl > + senderAuthId = None , < nl > + randomId = ACLUtils . randomLong ( ) , < nl > + message = message , < nl > + accessHash = None , < nl > + isFat = false < nl > + ) map { _ ⇒ system . log . debug ( " Successfully sent activation code to user : { } " , userId ) } < nl > + } < nl > + < nl > + private def wasOnlineRecently ( lastSeenMillis : Long ) : Boolean = < nl > + ( lastSeenMillis + onlineTimeWindow ) > System . currentTimeMillis < nl > + < nl > + private def findUserId ( txHash : String ) : XorT [ Future , String , Int ] = < nl > + for { < nl > + tx ← fromFutureOption ( " No auth transaction found " ) ( db . run ( AuthTransactionRepo . findChildren ( txHash ) ) ) < nl > + userId ← fromFutureOption ( " User does not exist ( possibly it is new user ) " ) ( db . run ( tx match { < nl > + case phone : AuthPhoneTransaction ⇒ UserPhoneRepo . findByPhoneNumber ( phone . phoneNumber ) . headOption map ( _ . map ( _ . userId ) ) < nl > + case email : AuthEmailTransaction ⇒ UserEmailRepo . find ( email . email ) map ( _ . map ( _ . userId ) ) < nl > + case _ ⇒ DBIO . successful ( None ) < nl > + } ) ) < nl > + } yield userId < nl > + < nl > + } < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / telesign / TelesignProvider . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / telesign / TelesignProvider . scala < nl > index 81c5948 . . 56ec8af 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / telesign / TelesignProvider . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / telesign / TelesignProvider . scala < nl > @ @ - 14 , 9 + 14 , 8 @ @ import im . actor . util . misc . PhoneNumberUtils . isTestPhone < nl > import scala . concurrent . Future < nl > import scala . concurrent . duration . _ < nl > < nl > - private [ activation ] final class TelesignProvider ( _ system : ActorSystem ) extends ActivationProvider with CommonAuthCodes { < nl > + private [ activation ] final class TelesignProvider ( implicit system : ActorSystem ) extends ActivationProvider with CommonAuthCodes { < nl > < nl > - private implicit val system = _ system < nl > protected val activationConfig = ActivationConfig . load . getOrElse ( throw new RuntimeException ( " Failed to load activation config " ) ) < nl > protected val db = DbExtension ( system ) . db < nl > protected implicit val ec = system . dispatcher < nl > diff - - git a / actor - server / actor - runtime / src / main / resources / reference . conf b / actor - server / actor - runtime / src / main / resources / reference . conf < nl > index b697100 . . 49347ce 100644 < nl > - - - a / actor - server / actor - runtime / src / main / resources / reference . conf < nl > + + + b / actor - server / actor - runtime / src / main / resources / reference . conf < nl > @ @ - 11 , 7 + 11 , 6 @ @ akka { < nl > } < nl > loggers : [ " akka . event . slf4j . Slf4jLogger " ] < nl > loglevel : " DEBUG " < nl > - log - config - on - start : true < nl > } < nl > < nl > jdbc - journal { < nl > diff - - git a / actor - server / project / Build . scala b / actor - server / project / Build . scala < nl > index b4435e9 . . fbd1a79 100644 < nl > - - - a / actor - server / project / Build . scala < nl > + + + b / actor - server / project / Build . scala < nl > @ @ - 123 , 7 + 123 , 7 @ @ object Build extends sbt . Build with Versioning with Releasing { < nl > scalacOptions in Compile : = ( scalacOptions in Compile ) . value . filterNot ( _ = = " - Ywarn - unused - import " ) < nl > ) < nl > ) < nl > - . dependsOn ( actorEmail , actorSms , actorPersist ) < nl > + . dependsOn ( actorCore , actorEmail , actorSms , actorPersist ) < nl > < nl > lazy val actorBots = Project ( < nl > id = " actor - bots " , < nl > diff - - git a / actor - server / src / universal / conf / server . conf . example b / actor - server / src / universal / conf / server . conf . example < nl > index 93ef553 . . d50b580 100644 < nl > - - - a / actor - server / src / universal / conf / server . conf . example < nl > + + + b / actor - server / src / universal / conf / server . conf . example < nl > @ @ - 107 , 6 + 107 , 7 @ @ services { < nl > activation { < nl > # Define code providers . look im . actor . server . activation for full provider list < nl > # providers { < nl > + # internal : im . actor . server . activation . internal . InternalCodeProvider < nl > # sms : im . actor . server . activation . gate . ActorGateSmsProvider < nl > # smtp : im . actor . server . activation . smtp . SMTPProvider < nl > # call : im . actor . server . activation . telesign . TelesignProvider < nl > @ @ - 121 , 6 + 122 , 12 @ @ services { < nl > # email { < nl > # template : $ { actor . home } / templates / activation - email - template . html < nl > # } < nl > + # Setting for internal activation ( aka via actor bot ) < nl > + # internal { < nl > + # sender - user - id : 10 < nl > + # online - time - window : 10m < nl > + # message - template : " Your Actor activation code : $ $ CODE $ $ " < nl > + # } < nl > } < nl > < nl > # Actor SMS gate
+NEAREST DIFF (one line): diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala < nl > index 23f1360 . . cd30bde 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala < nl > @ @ - 4 , 7 + 4 , 31 @ @ object Activation { < nl > sealed trait Code { < nl > def code : String < nl > } < nl > - final case class SmsCode ( phone : Long , code : String ) extends Code < nl > - final case class CallCode ( phone : Long , code : String , language : String ) extends Code < nl > - final case class EmailCode ( email : String , code : String ) extends Code < nl > + sealed trait PhoneCode extends Code { < nl > + def phone : Long < nl > + } < nl > + final case class SmsCode ( phone : Long , code : String ) extends PhoneCode { < nl > + override def equals ( that : Any ) : Boolean = < nl > + that match { < nl > + case that : SmsCode ⇒ this . phone = = that . phone < nl > + case _ ⇒ false < nl > + } < nl > + override def hashCode ( ) : Int = phone . hashCode ( ) < nl > + } < nl > + final case class CallCode ( phone : Long , code : String , language : String ) extends PhoneCode { < nl > + override def equals ( that : Any ) : Boolean = < nl > + that match { < nl > + case that : CallCode ⇒ this . phone = = that . phone < nl > + case _ ⇒ false < nl > + } < nl > + override def hashCode ( ) : Int = phone . hashCode ( ) < nl > + } < nl > + final case class EmailCode ( email : String , code : String ) extends Code { < nl > + override def equals ( that : Any ) : Boolean = < nl > + that match { < nl > + case that : EmailCode ⇒ this . email = = that . email < nl > + case _ ⇒ false < nl > + } < nl > + override def hashCode ( ) : Int = email . hashCode ( ) < nl > + } < nl > } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala < nl > index abd0e61 . . 1c6616c 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala < nl > @ @ - 1 , 15 + 1 , 17 @ @ < nl > package im . actor . server . activation . gate < nl > < nl > + import akka . http . scaladsl . marshalling . Marshal < nl > + import de . heikoseeberger . akkahttpplayjson . PlayJsonSupport < nl > + < nl > import scala . concurrent . { ExecutionContext , Future } < nl > import scalaz . { - \ / , \ / , \ / - } < nl > < nl > import akka . actor . ActorSystem < nl > import akka . http . scaladsl . Http < nl > import akka . http . scaladsl . model . HttpMethods . { GET , POST } < nl > - import akka . http . scaladsl . model . { HttpRequest , Uri } < nl > + import akka . http . scaladsl . model . { RequestEntity , HttpRequest , Uri } < nl > import akka . http . scaladsl . unmarshalling . Unmarshal < nl > import akka . stream . Materializer < nl > - import play . api . libs . json . Json < nl > import slick . dbio . DBIO < nl > < nl > import im . actor . server . activation . Activation . Code < nl > @ @ - 22 , 21 + 24 , 18 @ @ class GateCodeActivation ( config : GateConfig ) ( < nl > system : ActorSystem , < nl > val materializer : Materializer , < nl > ec : ExecutionContext < nl > - ) extends CodeActivation with JsonImplicits { < nl > + ) extends CodeActivation with JsonImplicits with PlayJsonSupport { < nl > < nl > private [ this ] val http = Http ( ) < nl > < nl > override def send ( optTransactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = { < nl > - val request = HttpRequest ( < nl > - method = POST , < nl > - uri = s " $ { config . uri } / v1 / codes / send " , < nl > - entity = Json . toJson ( code ) . toString < nl > - ) < nl > - < nl > - system . log . debug ( " Requesting code send with { } " , request ) < nl > - < nl > val codeResponse : Future [ CodeResponse ] = for { < nl > - resp ← http . singleRequest ( request . withHeaders ( ` X - Auth - Token ` ( config . authToken ) ) ) < nl > + entity ← Marshal ( code ) . to [ RequestEntity ] < nl > + request = HttpRequest ( method = POST , uri = s " $ { config . uri } / v1 / codes / send " ) < nl > + . withEntity ( entity ) < nl > + . withHeaders ( ` X - Auth - Token ` ( config . authToken ) ) < nl > + _ = system . log . debug ( " Requesting code send with { } " , request ) < nl > + resp ← http . singleRequest ( request ) < nl > codeResp ← Unmarshal ( resp ) . to [ CodeResponse ] < nl > } yield codeResp < nl > < nl > @ @ - 45 , 7 + 44 , 7 @ @ class GateCodeActivation ( config : GateConfig ) ( < nl > result ← codeResponse match { < nl > case CodeHash ( hash ) ⇒ < nl > optTransactionHash . map { transactionHash ⇒ < nl > - for ( _ ← persist . auth . GateAuthCode . create ( transactionHash , hash ) ) yield \ / - ( ( ) ) < nl > + for ( _ ← persist . auth . GateAuthCode . createOrUpdate ( transactionHash , hash ) ) yield \ / - ( ( ) ) < nl > } getOrElse DBIO . successful ( \ / - ( ( ) ) ) < nl > case CodeError ( message ) ⇒ < nl > DBIO . successful ( - \ / ( message ) ) < nl > diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala < nl > index 83c60fe . . 13ec452 100644 < nl > - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala < nl > + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala < nl > @ @ - 4 , 10 + 4 , 11 @ @ import java . time . temporal . ChronoUnit . _ < nl > import java . time . { LocalDateTime , ZoneOffset } < nl > < nl > import akka . actor . _ < nl > + import akka . pattern . ask < nl > import akka . stream . Materializer < nl > + import akka . util . Timeout < nl > import im . actor . server . activation . Activation . { CallCode , Code , EmailCode , SmsCode } < nl > import im . actor . server . activation . _ < nl > - import im . actor . server . activation . internal . InternalCodeActivation . Send < nl > import im . actor . server . email . { EmailSender , Message } < nl > import im . actor . server . models . AuthCode < nl > import im . actor . server . persist < nl > @ @ - 16 , 7 + 17 , 7 @ @ import slick . driver . PostgresDriver . api . _ < nl > < nl > import scala . concurrent . duration . _ < nl > import scala . concurrent . { ExecutionContext , Future } < nl > - import scalaz . { \ / , \ / - } < nl > + import scalaz . { - \ / , \ / , \ / - } < nl > < nl > object InternalCodeActivation { < nl > < nl > @ @ - 24 , 6 + 25 , 8 @ @ object InternalCodeActivation { < nl > < nl > private [ activation ] final case class Send ( code : Code ) < nl > < nl > + private [ activation ] case class SendAck ( result : String \ / Unit ) < nl > + < nl > private [ activation ] final case class ForgetSentCode ( code : Code ) extends Message < nl > < nl > def newContext ( config : ActivationConfig , smsEngine : AuthSmsEngine , callEngine : AuthCallEngine , emailSender : EmailSender ) ( < nl > @ @ - 42 , 16 + 45 , 15 @ @ object InternalCodeActivation { < nl > < nl > private [ activation ] class InternalCodeActivation ( activationActor : ActorRef , config : ActivationConfig ) ( implicit db : Database , ec : ExecutionContext ) extends CodeActivation { < nl > < nl > + import InternalCodeActivation . _ < nl > import im . actor . server . activation . Activation . _ < nl > < nl > - def send ( transactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = transactionHash match { < nl > - case Some ( hash ) ⇒ < nl > - for { < nl > - _ ← persist . AuthCode . createOrUpdate ( hash , code . code ) < nl > - result ← DBIO . from ( send ( code ) ) < nl > - } yield result < nl > - case None ⇒ DBIO . successful ( \ / - ( send ( code ) ) ) < nl > - } < nl > + implicit val timeout : Timeout = Timeout ( 20 . seconds ) < nl > + < nl > + def send ( transactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = ( transactionHash match { < nl > + case Some ( hash ) ⇒ for ( _ ← persist . AuthCode . createOrUpdate ( hash , code . code ) ) yield ( ) < nl > + case None ⇒ DBIO . successful ( ( ) ) < nl > + } ) flatMap ( _ ⇒ DBIO . from ( sendCode ( code ) ) ) < nl > < nl > def validate ( transactionHash : String , code : String ) : DBIO [ ValidationResponse ] = < nl > for { < nl > @ @ - 74 , 14 + 76 , 11 @ @ private [ activation ] class InternalCodeActivation ( activationActor : ActorRef , conf < nl > private def isExpired ( code : AuthCode ) : Boolean = < nl > code . createdAt . plus ( config . expiration . toMillis , MILLIS ) . isBefore ( LocalDateTime . now ( ZoneOffset . UTC ) ) < nl > < nl > - private def send ( code : Code ) : Future [ String \ / Unit ] = { < nl > + private def sendCode ( code : Code ) : Future [ String \ / Unit ] = < nl > code match { < nl > - case SmsCode ( phone , _ ) ⇒ if ( ! isTestPhone ( phone ) ) activationActor ! Send ( code ) < nl > - case CallCode ( phone , _ , _ ) ⇒ if ( ! isTestPhone ( phone ) ) activationActor ! Send ( code ) < nl > - case _ : EmailCode ⇒ activationActor ! Send ( code ) < nl > + case p : PhoneCode if isTestPhone ( p . phone ) ⇒ Future . successful ( \ / - ( ( ) ) ) < nl > + case _ ⇒ ( activationActor ? Send ( code ) ) . mapTo [ SendAck ] . map ( _ . result ) < nl > } < nl > - Future . successful ( \ / - ( ( ) ) ) < nl > - } < nl > < nl > private def isTestPhone ( number : Long ) : Boolean = number . toString . startsWith ( " 7555 " ) < nl > } < nl > @ @ - 105 , 25 + 104 , 29 @ @ class Activation ( repeatLimit : Duration , smsEngine : AuthSmsEngine , callEngine : Au < nl > system . scheduler . scheduleOnce ( repeatLimit . toMillis . millis , self , ForgetSentCode ( code ) ) < nl > < nl > override def receive : Receive = { < nl > - case Send ( code ) ⇒ sendCode ( code ) < nl > + case Send ( code ) ⇒ < nl > + val replyTo = sender ( ) < nl > + sendCode ( code ) foreach { resp ⇒ replyTo ! SendAck ( resp ) } < nl > case ForgetSentCode ( code ) ⇒ forgetSentCode ( code ) < nl > } < nl > < nl > - private def sendCode ( code : Code ) : Unit = { < nl > + private def sendCode ( code : Code ) : Future [ String \ / Unit ] = { < nl > if ( codeWasNotSent ( code ) ) { < nl > log . debug ( s " Sending $ code " ) < nl > < nl > rememberSentCode ( code ) < nl > < nl > - code match { < nl > + ( code match { < nl > case SmsCode ( phone , c ) ⇒ smsEngine . sendCode ( phone , c ) < nl > case CallCode ( phone , c , language ) ⇒ callEngine . sendCode ( phone , c , language ) < nl > case EmailCode ( email , c ) ⇒ emailSender . send ( Message ( email , " Actor activation code " , s " $ c is your Actor code " ) ) < nl > - } < nl > - < nl > - forgetSentCodeAfterDelay ( code ) < nl > + } ) map { _ ⇒ < nl > + forgetSentCodeAfterDelay ( code ) < nl > + \ / - ( ( ) ) < nl > + } recover { case e ⇒ - \ / ( " Unable to send code " ) } < nl > } else { < nl > log . debug ( s " Ignoring send $ code " ) < nl > + Future . successful ( - \ / ( " Attempt to get code later " ) ) < nl > } < nl > } < nl > < nl > diff - - git a / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala b / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala < nl > index b2029b7 . . 06d7e8b 100644 < nl > - - - a / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala < nl > + + + b / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala < nl > @ @ - 28 , 7 + 28 , 7 @ @ abstract class RemoteBot ( token : String , endpoint : String ) extends BotBase with A < nl > def onReceive ( message : Object ) : Unit = { } < nl > < nl > def receive = internalReceive orElse { < nl > - case message = > < nl > + case message ⇒ < nl > onReceive ( message . asInstanceOf [ Object ] ) < nl > } < nl > < nl > @ @ - 37 , 9 + 37 , 9 @ @ abstract class RemoteBot ( token : String , endpoint : String ) extends BotBase with A < nl > val prefix = " Actor will restart . " < nl > < nl > message match { < nl > - case Some ( msg ) = > < nl > + case Some ( msg ) ⇒ < nl > log . error ( reason , prefix + " Last message received : { } " , msg ) < nl > - case None = > < nl > + case None ⇒ < nl > log . error ( reason , prefix ) < nl > } < nl > < nl > diff - - git a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala < nl > index b468bd0 . . 1a38ff7 100644 < nl > - - - a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala < nl > + + + b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala < nl > @ @ - 16 , 8 + 16 , 8 @ @ object GateAuthCode { < nl > < nl > val active = codes . filter ( _ . isDeleted = = = false ) < nl > < nl > - def create ( transactionHash : String , codeHash : String ) = < nl > - codes + = models . auth . GateAuthCode ( transactionHash , codeHash ) < nl > + def createOrUpdate ( transactionHash : String , codeHash : String ) = < nl > + codes . insertOrUpdate ( models . auth . GateAuthCode ( transactionHash , codeHash ) ) < nl > < nl > def find ( transactionHash : String ) = < nl > active . filter ( _ . transactionHash = = = transactionHash ) . result . headOption < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala < nl > index f00e668 . . 73da5be 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala < nl > @ @ - 20 , 4 + 20 , 6 @ @ object AuthErrors { < nl > val OAuthUserIdDoesNotMatch = RpcError ( 400 , " WRONG _ OAUTH2 _ USER _ ID " , " Email does not match one provided on the first step . " , false , None ) < nl > val ActivationServiceError = RpcError ( 500 , " ACTIVATION _ SERVICE _ ERROR " , " Error occured in activation service . Try again later . " , true , None ) < nl > val InvalidAuthCodeHash = RpcError ( 400 , " CODE _ HASH _ INVALID " , " " , false , None ) < nl > + < nl > + def activationFailure ( message : String ) = RpcError ( 500 , " ACTIVATION _ ERROR " , message , false , None ) < nl > } < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala < nl > index f3dca4d . . 8f8a585 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala < nl > @ @ - 150 , 20 + 150 , 16 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) < nl > normalizedPhone ← fromOption ( AuthErrors . PhoneNumberInvalid ) ( normalizeLong ( phoneNumber ) . headOption ) < nl > optAuthTransaction ← fromDBIO ( persist . auth . AuthPhoneTransaction . findByPhoneAndDeviceHash ( normalizedPhone , deviceHash ) ) < nl > transactionHash ← optAuthTransaction match { < nl > - case Some ( transaction ) ⇒ < nl > - val hash = transaction . transactionHash < nl > - for { < nl > - _ ← fromDBIO ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( hash ) ) ) < nl > - } yield hash < nl > + case Some ( transaction ) ⇒ point ( transaction . transactionHash ) < nl > case None ⇒ < nl > val accessSalt = ACLUtils . nextAccessSalt ( ) < nl > val transactionHash = ACLUtils . authTransactionHash ( accessSalt ) < nl > val phoneAuthTransaction = models . AuthPhoneTransaction ( normalizedPhone , transactionHash , appId , apiKey , deviceHash , deviceTitle , accessSalt ) < nl > for { < nl > _ ← fromDBIO ( persist . auth . AuthPhoneTransaction . create ( phoneAuthTransaction ) ) < nl > - _ ← fromDBIO ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( transactionHash ) ) ) < nl > } yield transactionHash < nl > } < nl > + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( transactionHash ) ) ) < nl > isRegistered ← fromDBIO ( persist . UserPhone . exists ( normalizedPhone ) ) < nl > } yield ResponseStartPhoneAuth ( transactionHash , isRegistered ) < nl > db . run ( action . run ) < nl > @ @ - 173 , 7 + 169 , 8 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) < nl > val action = for { < nl > tx ← fromDBIOOption ( AuthErrors . PhoneCodeExpired ) ( persist . auth . AuthPhoneTransaction . find ( transactionHash ) ) < nl > code ← fromDBIO ( persist . AuthCode . findByTransactionHash ( tx . transactionHash ) map ( _ map ( _ . code ) getOrElse ( genSmsCode ( tx . phoneNumber ) ) ) ) < nl > - _ ← fromDBIO ( sendCallCode ( tx . phoneNumber , genSmsCode ( tx . phoneNumber ) , Some ( transactionHash ) , PhoneNumberUtils . normalizeWithCountry ( tx . phoneNumber ) . headOption . map ( _ . _ 2 ) . getOrElse ( " en " ) ) ) < nl > + lang = PhoneNumberUtils . normalizeWithCountry ( tx . phoneNumber ) . headOption . map ( _ . _ 2 ) . getOrElse ( " en " ) < nl > + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendCallCode ( tx . phoneNumber , genSmsCode ( tx . phoneNumber ) , Some ( transactionHash ) , lang ) ) < nl > } yield ResponseVoid < nl > < nl > db . run ( action . run ) < nl > @ @ - 228 , 7 + 225 , 7 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) < nl > activationType match { < nl > case CODE ⇒ < nl > for { < nl > - _ ← fromDBIO ( sendEmailCode ( email , genCode ( ) , hash ) ) < nl > + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendEmailCode ( email , genCode ( ) , hash ) ) < nl > } yield hash < nl > case OAUTH2 ⇒ < nl > point ( hash ) < nl > @ @ - 241 , 7 + 238 , 7 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) < nl > case CODE ⇒ < nl > for { < nl > _ ← fromDBIO ( persist . auth . AuthEmailTransaction . create ( emailAuthTransaction ) ) < nl > - _ ← fromDBIO ( sendEmailCode ( email , genCode ( ) , transactionHash ) ) < nl > + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendEmailCode ( email , genCode ( ) , transactionHash ) ) < nl > } yield transactionHash < nl > case OAUTH2 ⇒ < nl > for { < nl > diff - - git a / actor - server / project / Dependencies . scala b / actor - server / project / Dependencies . scala < nl > index 51af876 . . cf75189 100644 < nl > - - - a / actor - server / project / Dependencies . scala < nl > + + + b / actor - server / project / Dependencies . scala < nl > @ @ - 101 , 7 + 101 , 7 @ @ object Dependencies { < nl > akkaSlf4j , akkaActor , akkaStream < nl > ) < nl > < nl > - val activation = shared + + Seq ( akkaActor , akkaHttp , playJson ) < nl > + val activation = shared + + Seq ( akkaActor , akkaHttp , akkaHttpPlayJson , playJson ) < nl > < nl > val bot = shared + + Seq ( upickle )
+
+TEST DIFF:
+diff - - git a / actor - server / actor - activation / src / main / resources / reference . conf b / actor - server / actor - activation / src / main / resources / reference . conf 
+ index 77920b6 . . d67251d 100644 
+ - - - a / actor - server / actor - activation / src / main / resources / reference . conf 
+ + + + b / actor - server / actor - activation / src / main / resources / reference . conf 
+ @ @ - 1 , 6 + 1 , 7 @ @ 
+ services { 
+ activation { 
+ providers { 
+ + internal : im . actor . server . activation . internal . InternalCodeProvider 
+ sms : im . actor . server . activation . gate . ActorGateSmsProvider 
+ smtp : im . actor . server . activation . smtp . SMTPProvider 
+ call : im . actor . server . activation . telesign . TelesignProvider 
+ @ @ - 12 , 6 + 13 , 11 @ @ services { 
+ email { 
+ template : $ { actor . home } / templates / activation - email - template . html 
+ } 
+ + internal { 
+ + sender - user - id : 10 
+ + online - time - window : 10m 
+ + message - template : " Your Actor activation code : $ $ CODE $ $ " 
+ + } 
+ } 
+ 
+ actor - activation { 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala 
+ index 846a72d . . 45b0e6b 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / ActivationContext . scala 
+ @ @ - 16 , 53 + 16 , 72 @ @ final class ActivationContext ( implicit system : ActorSystem ) { 
+ private val db = DbExtension ( system ) . db 
+ private val providers = getProviders ( ) 
+ 
+ - require ( providers exists { case ( k , _ ) ⇒ k ! = InApp } , " Should be at least one external activation provider " ) 
+ + require ( providers exists { case ( k , _ ) ⇒ k ! = Internal } , " Should be at least one external activation provider " ) 
+ 
+ + private val optInternalProvider = providers . get ( Internal ) 
+ private val optSmsProvider = providers . get ( Sms ) 
+ private val optCallProvider = providers . get ( Call ) 
+ private val optSmtpProvider = providers . get ( Smtp ) 
+ 
+ - def send ( txHash : String , code : Code ) : Future [ CodeFailure Xor Unit ] = code match { 
+ - case s : SmsCode ⇒ trySend ( optSmsProvider , txHash , s ) 
+ - case e : EmailCode ⇒ trySend ( optSmtpProvider , txHash , e ) 
+ - case c : CallCode ⇒ trySend ( optCallProvider , txHash , c ) 
+ - } 
+ + / * * 
+ + * We don ' t care about result of sending internal code . 
+ + * But we do care about sending code via external provider . 
+ + * / 
+ + def send ( txHash : String , code : Code ) : Future [ CodeFailure Xor Unit ] = 
+ + for { 
+ + _ ← trySend ( optInternalProvider , txHash , code , logFailure = false ) 
+ + result ← code match { 
+ + case s : SmsCode ⇒ trySend ( optSmsProvider , txHash , s ) 
+ + case e : EmailCode ⇒ trySend ( optSmtpProvider , txHash , e ) 
+ + case c : CallCode ⇒ trySend ( optCallProvider , txHash , c ) 
+ + } 
+ + } yield result 
+ 
+ + / * * 
+ + * If internal code validates - we are fine . 
+ + * Otherwise - validate code sent via external provider . 
+ + * / 
+ def validate ( tx : AuthTransactionBase with ExpirableCode , code : String ) : Future [ ValidationResponse ] = 
+ for { 
+ - resp ← tx match { 
+ - case _ : AuthEmailTransaction ⇒ tryValidate ( optSmtpProvider , tx . transactionHash , code ) 
+ - case _ : AuthPhoneTransaction ⇒ tryValidate ( optSmsProvider , tx . transactionHash , code ) 
+ + internalResp ← tryValidate ( optInternalProvider , tx . transactionHash , code , logFailure = false ) 
+ + result ← if ( internalResp = = Validated ) { 
+ + Future . successful ( internalResp ) 
+ + } else { 
+ + for { 
+ + resp ← tx match { 
+ + case _ : AuthEmailTransaction ⇒ tryValidate ( optSmtpProvider , tx . transactionHash , code ) 
+ + case _ : AuthPhoneTransaction ⇒ tryValidate ( optSmsProvider , tx . transactionHash , code ) 
+ + } 
+ + } yield resp 
+ } 
+ - } yield resp 
+ + } yield result 
+ 
+ + / * * 
+ + * It is required to cleanup both internal and external provider . 
+ + * / 
+ def cleanup ( tx : AuthTransactionBase with ExpirableCode ) : Future [ Unit ] = 
+ for { 
+ - resp ← tx match { 
+ - case _ : AuthEmailTransaction ⇒ tryCleanup ( optSmtpProvider , tx . transactionHash ) 
+ - case _ : AuthPhoneTransaction ⇒ tryCleanup ( optSmsProvider , tx . transactionHash ) 
+ - } 
+ + _ ← tryCleanup ( optInternalProvider , tx . transactionHash ) 
+ + _ ← for { 
+ + resp ← tx match { 
+ + case _ : AuthEmailTransaction ⇒ tryCleanup ( optSmtpProvider , tx . transactionHash ) 
+ + case _ : AuthPhoneTransaction ⇒ tryCleanup ( optSmsProvider , tx . transactionHash ) 
+ + } 
+ + } yield ( ) 
+ } yield ( ) 
+ 
+ - private def trySend ( optProvider : Option [ ActivationProvider ] , txHash : String , code : Code ) : Future [ CodeFailure Xor Unit ] = 
+ - optProvider map { provider ⇒ 
+ - for ( result ← provider . send ( txHash , code ) ) yield result 
+ - } getOrElse { 
+ - system . log . error ( s " No provider found to handle code of type { } " , code . getClass ) 
+ + private def trySend ( optProvider : Option [ ActivationProvider ] , txHash : String , code : Code , logFailure : Boolean = true ) : Future [ CodeFailure Xor Unit ] = 
+ + optProvider map ( _ . send ( txHash , code ) ) getOrElse { 
+ + if ( logFailure ) { system . log . error ( s " No provider found to handle code of type { } " , code . getClass ) } 
+ Future . successful ( Xor . left ( SendFailure ( s " No provider found to handle code of type $ { code . getClass } " ) ) ) 
+ } 
+ 
+ - private def tryValidate ( optProvider : Option [ ActivationProvider ] , txHash : String , code : String ) : Future [ ValidationResponse ] = 
+ + private def tryValidate ( optProvider : Option [ ActivationProvider ] , txHash : String , code : String , logFailure : Boolean = true ) : Future [ ValidationResponse ] = 
+ optProvider map ( _ . validate ( txHash , code ) ) getOrElse { 
+ - system . log . error ( s " No provider found to handle code " ) 
+ + if ( logFailure ) { system . log . error ( s " No provider found to validate code " ) } 
+ Future . successful ( InternalError ) 
+ } 
+ 
+ private def tryCleanup ( optProvider : Option [ ActivationProvider ] , txHash : String ) : Future [ Unit ] = 
+ - optProvider map { provider ⇒ 
+ - for ( _ ← provider . cleanup ( txHash ) ) yield ( ) 
+ - } getOrElse { 
+ - system . log . error ( s " No provider found to handle code " ) 
+ - Future . successful ( ( ) ) 
+ - } 
+ + optProvider map ( _ . cleanup ( txHash ) ) getOrElse Future . successful ( ( ) ) 
+ } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / ActivationProviders . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / ActivationProviders . scala 
+ index 7029d69 . . 4b72a61 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / ActivationProviders . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / ActivationProviders . scala 
+ @ @ - 10 , 7 + 10 , 7 @ @ object ActivationProviders { 
+ val Sms = " sms " 
+ val Smtp = " smtp " 
+ val Call = " call " 
+ - val InApp = " in - app " 
+ + val Internal = " internal " 
+ 
+ / * * 
+ * Instantiates activation providers based on configuration . 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / CommonAuthCodes . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / CommonAuthCodes . scala 
+ index 9961601 . . ae3cede 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / CommonAuthCodes . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / common / CommonAuthCodes . scala 
+ @ @ - 42 , 7 + 42 , 7 @ @ trait CommonAuthCodes { 
+ case Xor . Right ( _ ) ⇒ db . run ( AuthCodeRepo . createOrUpdate ( txHash , code ) ) 
+ } 
+ 
+ - private def isExpired ( code : AuthCode , expiration : Long ) : Boolean = 
+ + protected def isExpired ( code : AuthCode , expiration : Long ) : Boolean = 
+ code . createdAt . plus ( expiration , MILLIS ) . isBefore ( LocalDateTime . now ( ZoneOffset . UTC ) ) 
+ 
+ } 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / ActorGateSmsProvider . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / ActorGateSmsProvider . scala 
+ index 015129a . . 8f177d6 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / ActorGateSmsProvider . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / ActorGateSmsProvider . scala 
+ @ @ - 17 , 7 + 17 , 7 @ @ import spray . httpx . unmarshalling . _ 
+ import scala . concurrent . Future 
+ import scala . reflect . ClassTag 
+ 
+ - class ActorGateSmsProvider ( implicit system : ActorSystem ) 
+ + private [ activation ] final class ActorGateSmsProvider ( implicit system : ActorSystem ) 
+ extends ActivationProvider 
+ with JsonFormatters 
+ with PlayJsonSupport { 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalActivationConfig . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalActivationConfig . scala 
+ new file mode 100644 
+ index 0000000 . . 9ad726e 
+ - - - / dev / null 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalActivationConfig . scala 
+ @ @ - 0 , 0 + 1 , 26 @ @ 
+ + package im . actor . server . activation . internal 
+ + 
+ + import com . github . kxbmap . configs . _ 
+ + import com . typesafe . config . Config 
+ + import im . actor . config . ActorConfig 
+ + 
+ + import scala . concurrent . duration . Duration 
+ + import scala . util . Try 
+ + 
+ + case class InternalActivationConfig ( onlineWindow : Duration , senderUserId : Int , messageTemplate : String ) 
+ + 
+ + object InternalActivationConfig { 
+ + def load ( config : Config ) : Try [ InternalActivationConfig ] = 
+ + for { 
+ + onlineWindow ← config . get [ Try [ Duration ] ] ( " online - time - window " ) 
+ + senderUserId ← config . get [ Try [ Int ] ] ( " sender - user - id " ) 
+ + messageTemplate ← config . get [ Try [ String ] ] ( " message - template " ) 
+ + } yield InternalActivationConfig ( onlineWindow , senderUserId , messageTemplate ) 
+ + 
+ + def load : Try [ InternalActivationConfig ] = { 
+ + for { 
+ + config ← Try ( ActorConfig . load ( ) . getConfig ( " services . activation . internal " ) ) 
+ + internalConfig ← load ( config ) 
+ + } yield internalConfig 
+ + } 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeProvider . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeProvider . scala 
+ new file mode 100644 
+ index 0000000 . . de93c26 
+ - - - / dev / null 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeProvider . scala 
+ @ @ - 0 , 0 + 1 , 98 @ @ 
+ + package im . actor . server . activation . internal 
+ + 
+ + import akka . actor . ActorSystem 
+ + import cats . data . { Xor , XorT } 
+ + import im . actor . api . rpc . messaging . ApiTextMessage 
+ + import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType } 
+ + import im . actor . concurrent . FutureResultCats 
+ + import im . actor . server . acl . ACLUtils 
+ + import im . actor . server . activation . common . _ 
+ + import im . actor . server . db . DbExtension 
+ + import im . actor . server . dialog . DialogExtension 
+ + import im . actor . server . model . { AuthEmailTransaction , AuthPhoneTransaction } 
+ + import im . actor . server . db . ActorPostgresDriver . api . _ 
+ + import im . actor . server . persist . auth . AuthTransactionRepo 
+ + import im . actor . server . persist . presences . UserPresenceRepo 
+ + import im . actor . server . persist . { AuthCodeRepo , UserEmailRepo , UserPhoneRepo } 
+ + 
+ + import scala . concurrent . Future 
+ + 
+ + private [ activation ] final class InternalCodeProvider ( system : ActorSystem ) 
+ + extends ActivationProvider 
+ + with CommonAuthCodes 
+ + with FutureResultCats [ String ] { 
+ + 
+ + private val config = InternalActivationConfig . load . getOrElse ( throw new RuntimeException ( " Failed to load InternalActivationConfig " ) ) 
+ + private val onlineTimeWindow = config . onlineWindow . toMillis 
+ + 
+ + protected val activationConfig : ActivationConfig = ActivationConfig . load . getOrElse ( throw new RuntimeException ( " Failed to load activation config " ) ) 
+ + protected val db = DbExtension ( system ) . db 
+ + protected implicit val ec = system . dispatcher 
+ + 
+ + override def send ( txHash : String , code : Code ) : Future [ Xor [ CodeFailure , Unit ] ] = { 
+ + val response = ( for { 
+ + userId ← findUserId ( txHash ) 
+ + presence ← fromFutureOption ( " No presence found for user " ) ( db . run ( UserPresenceRepo . find ( userId ) ) ) 
+ + lastSeen ← fromOption ( " No last seen date for user presence " ) ( presence . lastSeenAt ) 
+ + _ ← fromFuture ( 
+ + if ( wasOnlineRecently ( lastSeen . getMillis ) ) 
+ + sendCode ( userId , code . code ) 
+ + else Future . successful ( ( ) ) 
+ + ) 
+ + } yield ( ) ) . fold ( 
+ + failure ⇒ { 
+ + system . log . warning ( " Failed to send message via internal code provider : { } " , failure ) 
+ + Xor . right [ CodeFailure , Unit ] ( ( ) ) 
+ + } , 
+ + success ⇒ Xor . right [ CodeFailure , Unit ] ( ( ) ) 
+ + ) recover { case e : RuntimeException ⇒ Xor . left ( SendFailure ( e . toString ) ) } 
+ + for { 
+ + resp ← response 
+ + _ ← createAuthCodeIfNeeded ( resp , txHash , code . code ) 
+ + } yield resp 
+ + } 
+ + 
+ + / / we just validate code here , don ' t expire it 
+ + override def validate ( txHash : String , code : String ) : Future [ ValidationResponse ] = { 
+ + val action = for { 
+ + optCode ← AuthCodeRepo . findByTransactionHash ( txHash ) 
+ + result = optCode map { 
+ + case s if isExpired ( s , activationConfig . expiration . toMillis ) ⇒ ExpiredCode 
+ + case s if s . code ! = code ⇒ 
+ + if ( s . attempts + 1 > = activationConfig . attempts ) ExpiredCode else InvalidCode 
+ + case _ ⇒ Validated 
+ + } getOrElse InvalidHash 
+ + } yield result 
+ + db . run ( action ) 
+ + } 
+ + 
+ + private def sendCode ( userId : Int , code : String ) : Future [ Unit ] = { 
+ + val messageText = config . messageTemplate . replace ( " $ $ CODE $ $ " , code ) 
+ + val userPeer = ApiPeer ( ApiPeerType . Private , userId ) 
+ + val message = ApiTextMessage ( messageText , Vector . empty , None ) 
+ + DialogExtension ( system ) . sendMessage ( 
+ + peer = userPeer , 
+ + senderUserId = config . senderUserId , 
+ + senderAuthSid = 0 , 
+ + senderAuthId = None , 
+ + randomId = ACLUtils . randomLong ( ) , 
+ + message = message , 
+ + accessHash = None , 
+ + isFat = false 
+ + ) map { _ ⇒ system . log . debug ( " Successfully sent activation code to user : { } " , userId ) } 
+ + } 
+ + 
+ + private def wasOnlineRecently ( lastSeenMillis : Long ) : Boolean = 
+ + ( lastSeenMillis + onlineTimeWindow ) > System . currentTimeMillis 
+ + 
+ + private def findUserId ( txHash : String ) : XorT [ Future , String , Int ] = 
+ + for { 
+ + tx ← fromFutureOption ( " No auth transaction found " ) ( db . run ( AuthTransactionRepo . findChildren ( txHash ) ) ) 
+ + userId ← fromFutureOption ( " User does not exist ( possibly it is new user ) " ) ( db . run ( tx match { 
+ + case phone : AuthPhoneTransaction ⇒ UserPhoneRepo . findByPhoneNumber ( phone . phoneNumber ) . headOption map ( _ . map ( _ . userId ) ) 
+ + case email : AuthEmailTransaction ⇒ UserEmailRepo . find ( email . email ) map ( _ . map ( _ . userId ) ) 
+ + case _ ⇒ DBIO . successful ( None ) 
+ + } ) ) 
+ + } yield userId 
+ + 
+ + } 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / telesign / TelesignProvider . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / telesign / TelesignProvider . scala 
+ index 81c5948 . . 56ec8af 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / telesign / TelesignProvider . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / telesign / TelesignProvider . scala 
+ @ @ - 14 , 9 + 14 , 8 @ @ import im . actor . util . misc . PhoneNumberUtils . isTestPhone 
+ import scala . concurrent . Future 
+ import scala . concurrent . duration . _ 
+ 
+ - private [ activation ] final class TelesignProvider ( _ system : ActorSystem ) extends ActivationProvider with CommonAuthCodes { 
+ + private [ activation ] final class TelesignProvider ( implicit system : ActorSystem ) extends ActivationProvider with CommonAuthCodes { 
+ 
+ - private implicit val system = _ system 
+ protected val activationConfig = ActivationConfig . load . getOrElse ( throw new RuntimeException ( " Failed to load activation config " ) ) 
+ protected val db = DbExtension ( system ) . db 
+ protected implicit val ec = system . dispatcher 
+ diff - - git a / actor - server / actor - runtime / src / main / resources / reference . conf b / actor - server / actor - runtime / src / main / resources / reference . conf 
+ index b697100 . . 49347ce 100644 
+ - - - a / actor - server / actor - runtime / src / main / resources / reference . conf 
+ + + + b / actor - server / actor - runtime / src / main / resources / reference . conf 
+ @ @ - 11 , 7 + 11 , 6 @ @ akka { 
+ } 
+ loggers : [ " akka . event . slf4j . Slf4jLogger " ] 
+ loglevel : " DEBUG " 
+ - log - config - on - start : true 
+ } 
+ 
+ jdbc - journal { 
+ diff - - git a / actor - server / project / Build . scala b / actor - server / project / Build . scala 
+ index b4435e9 . . fbd1a79 100644 
+ - - - a / actor - server / project / Build . scala 
+ + + + b / actor - server / project / Build . scala 
+ @ @ - 123 , 7 + 123 , 7 @ @ object Build extends sbt . Build with Versioning with Releasing { 
+ scalacOptions in Compile : = ( scalacOptions in Compile ) . value . filterNot ( _ = = " - Ywarn - unused - import " ) 
+ ) 
+ ) 
+ - . dependsOn ( actorEmail , actorSms , actorPersist ) 
+ + . dependsOn ( actorCore , actorEmail , actorSms , actorPersist ) 
+ 
+ lazy val actorBots = Project ( 
+ id = " actor - bots " , 
+ diff - - git a / actor - server / src / universal / conf / server . conf . example b / actor - server / src / universal / conf / server . conf . example 
+ index 93ef553 . . d50b580 100644 
+ - - - a / actor - server / src / universal / conf / server . conf . example 
+ + + + b / actor - server / src / universal / conf / server . conf . example 
+ @ @ - 107 , 6 + 107 , 7 @ @ services { 
+ activation { 
+ # Define code providers . look im . actor . server . activation for full provider list 
+ # providers { 
+ + # internal : im . actor . server . activation . internal . InternalCodeProvider 
+ # sms : im . actor . server . activation . gate . ActorGateSmsProvider 
+ # smtp : im . actor . server . activation . smtp . SMTPProvider 
+ # call : im . actor . server . activation . telesign . TelesignProvider 
+ @ @ - 121 , 6 + 122 , 12 @ @ services { 
+ # email { 
+ # template : $ { actor . home } / templates / activation - email - template . html 
+ # } 
+ + # Setting for internal activation ( aka via actor bot ) 
+ + # internal { 
+ + # sender - user - id : 10 
+ + # online - time - window : 10m 
+ + # message - template : " Your Actor activation code : $ $ CODE $ $ " 
+ + # } 
+ } 
+ 
+ # Actor SMS gate
+
+NEAREST DIFF:
+diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala 
+ index 23f1360 . . cd30bde 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / Activation . scala 
+ @ @ - 4 , 7 + 4 , 31 @ @ object Activation { 
+ sealed trait Code { 
+ def code : String 
+ } 
+ - final case class SmsCode ( phone : Long , code : String ) extends Code 
+ - final case class CallCode ( phone : Long , code : String , language : String ) extends Code 
+ - final case class EmailCode ( email : String , code : String ) extends Code 
+ + sealed trait PhoneCode extends Code { 
+ + def phone : Long 
+ + } 
+ + final case class SmsCode ( phone : Long , code : String ) extends PhoneCode { 
+ + override def equals ( that : Any ) : Boolean = 
+ + that match { 
+ + case that : SmsCode ⇒ this . phone = = that . phone 
+ + case _ ⇒ false 
+ + } 
+ + override def hashCode ( ) : Int = phone . hashCode ( ) 
+ + } 
+ + final case class CallCode ( phone : Long , code : String , language : String ) extends PhoneCode { 
+ + override def equals ( that : Any ) : Boolean = 
+ + that match { 
+ + case that : CallCode ⇒ this . phone = = that . phone 
+ + case _ ⇒ false 
+ + } 
+ + override def hashCode ( ) : Int = phone . hashCode ( ) 
+ + } 
+ + final case class EmailCode ( email : String , code : String ) extends Code { 
+ + override def equals ( that : Any ) : Boolean = 
+ + that match { 
+ + case that : EmailCode ⇒ this . email = = that . email 
+ + case _ ⇒ false 
+ + } 
+ + override def hashCode ( ) : Int = email . hashCode ( ) 
+ + } 
+ } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala 
+ index abd0e61 . . 1c6616c 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / gate / GateCodeActivation . scala 
+ @ @ - 1 , 15 + 1 , 17 @ @ 
+ package im . actor . server . activation . gate 
+ 
+ + import akka . http . scaladsl . marshalling . Marshal 
+ + import de . heikoseeberger . akkahttpplayjson . PlayJsonSupport 
+ + 
+ import scala . concurrent . { ExecutionContext , Future } 
+ import scalaz . { - \ / , \ / , \ / - } 
+ 
+ import akka . actor . ActorSystem 
+ import akka . http . scaladsl . Http 
+ import akka . http . scaladsl . model . HttpMethods . { GET , POST } 
+ - import akka . http . scaladsl . model . { HttpRequest , Uri } 
+ + import akka . http . scaladsl . model . { RequestEntity , HttpRequest , Uri } 
+ import akka . http . scaladsl . unmarshalling . Unmarshal 
+ import akka . stream . Materializer 
+ - import play . api . libs . json . Json 
+ import slick . dbio . DBIO 
+ 
+ import im . actor . server . activation . Activation . Code 
+ @ @ - 22 , 21 + 24 , 18 @ @ class GateCodeActivation ( config : GateConfig ) ( 
+ system : ActorSystem , 
+ val materializer : Materializer , 
+ ec : ExecutionContext 
+ - ) extends CodeActivation with JsonImplicits { 
+ + ) extends CodeActivation with JsonImplicits with PlayJsonSupport { 
+ 
+ private [ this ] val http = Http ( ) 
+ 
+ override def send ( optTransactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = { 
+ - val request = HttpRequest ( 
+ - method = POST , 
+ - uri = s " $ { config . uri } / v1 / codes / send " , 
+ - entity = Json . toJson ( code ) . toString 
+ - ) 
+ - 
+ - system . log . debug ( " Requesting code send with { } " , request ) 
+ - 
+ val codeResponse : Future [ CodeResponse ] = for { 
+ - resp ← http . singleRequest ( request . withHeaders ( ` X - Auth - Token ` ( config . authToken ) ) ) 
+ + entity ← Marshal ( code ) . to [ RequestEntity ] 
+ + request = HttpRequest ( method = POST , uri = s " $ { config . uri } / v1 / codes / send " ) 
+ + . withEntity ( entity ) 
+ + . withHeaders ( ` X - Auth - Token ` ( config . authToken ) ) 
+ + _ = system . log . debug ( " Requesting code send with { } " , request ) 
+ + resp ← http . singleRequest ( request ) 
+ codeResp ← Unmarshal ( resp ) . to [ CodeResponse ] 
+ } yield codeResp 
+ 
+ @ @ - 45 , 7 + 44 , 7 @ @ class GateCodeActivation ( config : GateConfig ) ( 
+ result ← codeResponse match { 
+ case CodeHash ( hash ) ⇒ 
+ optTransactionHash . map { transactionHash ⇒ 
+ - for ( _ ← persist . auth . GateAuthCode . create ( transactionHash , hash ) ) yield \ / - ( ( ) ) 
+ + for ( _ ← persist . auth . GateAuthCode . createOrUpdate ( transactionHash , hash ) ) yield \ / - ( ( ) ) 
+ } getOrElse DBIO . successful ( \ / - ( ( ) ) ) 
+ case CodeError ( message ) ⇒ 
+ DBIO . successful ( - \ / ( message ) ) 
+ diff - - git a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala 
+ index 83c60fe . . 13ec452 100644 
+ - - - a / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala 
+ + + + b / actor - server / actor - activation / src / main / scala / im / actor / server / activation / internal / InternalCodeActivation . scala 
+ @ @ - 4 , 10 + 4 , 11 @ @ import java . time . temporal . ChronoUnit . _ 
+ import java . time . { LocalDateTime , ZoneOffset } 
+ 
+ import akka . actor . _ 
+ + import akka . pattern . ask 
+ import akka . stream . Materializer 
+ + import akka . util . Timeout 
+ import im . actor . server . activation . Activation . { CallCode , Code , EmailCode , SmsCode } 
+ import im . actor . server . activation . _ 
+ - import im . actor . server . activation . internal . InternalCodeActivation . Send 
+ import im . actor . server . email . { EmailSender , Message } 
+ import im . actor . server . models . AuthCode 
+ import im . actor . server . persist 
+ @ @ - 16 , 7 + 17 , 7 @ @ import slick . driver . PostgresDriver . api . _ 
+ 
+ import scala . concurrent . duration . _ 
+ import scala . concurrent . { ExecutionContext , Future } 
+ - import scalaz . { \ / , \ / - } 
+ + import scalaz . { - \ / , \ / , \ / - } 
+ 
+ object InternalCodeActivation { 
+ 
+ @ @ - 24 , 6 + 25 , 8 @ @ object InternalCodeActivation { 
+ 
+ private [ activation ] final case class Send ( code : Code ) 
+ 
+ + private [ activation ] case class SendAck ( result : String \ / Unit ) 
+ + 
+ private [ activation ] final case class ForgetSentCode ( code : Code ) extends Message 
+ 
+ def newContext ( config : ActivationConfig , smsEngine : AuthSmsEngine , callEngine : AuthCallEngine , emailSender : EmailSender ) ( 
+ @ @ - 42 , 16 + 45 , 15 @ @ object InternalCodeActivation { 
+ 
+ private [ activation ] class InternalCodeActivation ( activationActor : ActorRef , config : ActivationConfig ) ( implicit db : Database , ec : ExecutionContext ) extends CodeActivation { 
+ 
+ + import InternalCodeActivation . _ 
+ import im . actor . server . activation . Activation . _ 
+ 
+ - def send ( transactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = transactionHash match { 
+ - case Some ( hash ) ⇒ 
+ - for { 
+ - _ ← persist . AuthCode . createOrUpdate ( hash , code . code ) 
+ - result ← DBIO . from ( send ( code ) ) 
+ - } yield result 
+ - case None ⇒ DBIO . successful ( \ / - ( send ( code ) ) ) 
+ - } 
+ + implicit val timeout : Timeout = Timeout ( 20 . seconds ) 
+ + 
+ + def send ( transactionHash : Option [ String ] , code : Code ) : DBIO [ String \ / Unit ] = ( transactionHash match { 
+ + case Some ( hash ) ⇒ for ( _ ← persist . AuthCode . createOrUpdate ( hash , code . code ) ) yield ( ) 
+ + case None ⇒ DBIO . successful ( ( ) ) 
+ + } ) flatMap ( _ ⇒ DBIO . from ( sendCode ( code ) ) ) 
+ 
+ def validate ( transactionHash : String , code : String ) : DBIO [ ValidationResponse ] = 
+ for { 
+ @ @ - 74 , 14 + 76 , 11 @ @ private [ activation ] class InternalCodeActivation ( activationActor : ActorRef , conf 
+ private def isExpired ( code : AuthCode ) : Boolean = 
+ code . createdAt . plus ( config . expiration . toMillis , MILLIS ) . isBefore ( LocalDateTime . now ( ZoneOffset . UTC ) ) 
+ 
+ - private def send ( code : Code ) : Future [ String \ / Unit ] = { 
+ + private def sendCode ( code : Code ) : Future [ String \ / Unit ] = 
+ code match { 
+ - case SmsCode ( phone , _ ) ⇒ if ( ! isTestPhone ( phone ) ) activationActor ! Send ( code ) 
+ - case CallCode ( phone , _ , _ ) ⇒ if ( ! isTestPhone ( phone ) ) activationActor ! Send ( code ) 
+ - case _ : EmailCode ⇒ activationActor ! Send ( code ) 
+ + case p : PhoneCode if isTestPhone ( p . phone ) ⇒ Future . successful ( \ / - ( ( ) ) ) 
+ + case _ ⇒ ( activationActor ? Send ( code ) ) . mapTo [ SendAck ] . map ( _ . result ) 
+ } 
+ - Future . successful ( \ / - ( ( ) ) ) 
+ - } 
+ 
+ private def isTestPhone ( number : Long ) : Boolean = number . toString . startsWith ( " 7555 " ) 
+ } 
+ @ @ - 105 , 25 + 104 , 29 @ @ class Activation ( repeatLimit : Duration , smsEngine : AuthSmsEngine , callEngine : Au 
+ system . scheduler . scheduleOnce ( repeatLimit . toMillis . millis , self , ForgetSentCode ( code ) ) 
+ 
+ override def receive : Receive = { 
+ - case Send ( code ) ⇒ sendCode ( code ) 
+ + case Send ( code ) ⇒ 
+ + val replyTo = sender ( ) 
+ + sendCode ( code ) foreach { resp ⇒ replyTo ! SendAck ( resp ) } 
+ case ForgetSentCode ( code ) ⇒ forgetSentCode ( code ) 
+ } 
+ 
+ - private def sendCode ( code : Code ) : Unit = { 
+ + private def sendCode ( code : Code ) : Future [ String \ / Unit ] = { 
+ if ( codeWasNotSent ( code ) ) { 
+ log . debug ( s " Sending $ code " ) 
+ 
+ rememberSentCode ( code ) 
+ 
+ - code match { 
+ + ( code match { 
+ case SmsCode ( phone , c ) ⇒ smsEngine . sendCode ( phone , c ) 
+ case CallCode ( phone , c , language ) ⇒ callEngine . sendCode ( phone , c , language ) 
+ case EmailCode ( email , c ) ⇒ emailSender . send ( Message ( email , " Actor activation code " , s " $ c is your Actor code " ) ) 
+ - } 
+ - 
+ - forgetSentCodeAfterDelay ( code ) 
+ + } ) map { _ ⇒ 
+ + forgetSentCodeAfterDelay ( code ) 
+ + \ / - ( ( ) ) 
+ + } recover { case e ⇒ - \ / ( " Unable to send code " ) } 
+ } else { 
+ log . debug ( s " Ignoring send $ code " ) 
+ + Future . successful ( - \ / ( " Attempt to get code later " ) ) 
+ } 
+ } 
+ 
+ diff - - git a / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala b / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala 
+ index b2029b7 . . 06d7e8b 100644 
+ - - - a / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala 
+ + + + b / actor - server / actor - botkit / src / main / scala / im / actor / botkit / RemoteBot . scala 
+ @ @ - 28 , 7 + 28 , 7 @ @ abstract class RemoteBot ( token : String , endpoint : String ) extends BotBase with A 
+ def onReceive ( message : Object ) : Unit = { } 
+ 
+ def receive = internalReceive orElse { 
+ - case message = > 
+ + case message ⇒ 
+ onReceive ( message . asInstanceOf [ Object ] ) 
+ } 
+ 
+ @ @ - 37 , 9 + 37 , 9 @ @ abstract class RemoteBot ( token : String , endpoint : String ) extends BotBase with A 
+ val prefix = " Actor will restart . " 
+ 
+ message match { 
+ - case Some ( msg ) = > 
+ + case Some ( msg ) ⇒ 
+ log . error ( reason , prefix + " Last message received : { } " , msg ) 
+ - case None = > 
+ + case None ⇒ 
+ log . error ( reason , prefix ) 
+ } 
+ 
+ diff - - git a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala 
+ index b468bd0 . . 1a38ff7 100644 
+ - - - a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala 
+ + + + b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / auth / GateAuthCode . scala 
+ @ @ - 16 , 8 + 16 , 8 @ @ object GateAuthCode { 
+ 
+ val active = codes . filter ( _ . isDeleted = = = false ) 
+ 
+ - def create ( transactionHash : String , codeHash : String ) = 
+ - codes + = models . auth . GateAuthCode ( transactionHash , codeHash ) 
+ + def createOrUpdate ( transactionHash : String , codeHash : String ) = 
+ + codes . insertOrUpdate ( models . auth . GateAuthCode ( transactionHash , codeHash ) ) 
+ 
+ def find ( transactionHash : String ) = 
+ active . filter ( _ . transactionHash = = = transactionHash ) . result . headOption 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala 
+ index f00e668 . . 73da5be 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthErrors . scala 
+ @ @ - 20 , 4 + 20 , 6 @ @ object AuthErrors { 
+ val OAuthUserIdDoesNotMatch = RpcError ( 400 , " WRONG _ OAUTH2 _ USER _ ID " , " Email does not match one provided on the first step . " , false , None ) 
+ val ActivationServiceError = RpcError ( 500 , " ACTIVATION _ SERVICE _ ERROR " , " Error occured in activation service . Try again later . " , true , None ) 
+ val InvalidAuthCodeHash = RpcError ( 400 , " CODE _ HASH _ INVALID " , " " , false , None ) 
+ + 
+ + def activationFailure ( message : String ) = RpcError ( 500 , " ACTIVATION _ ERROR " , message , false , None ) 
+ } 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala 
+ index f3dca4d . . 8f8a585 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / auth / AuthServiceImpl . scala 
+ @ @ - 150 , 20 + 150 , 16 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) 
+ normalizedPhone ← fromOption ( AuthErrors . PhoneNumberInvalid ) ( normalizeLong ( phoneNumber ) . headOption ) 
+ optAuthTransaction ← fromDBIO ( persist . auth . AuthPhoneTransaction . findByPhoneAndDeviceHash ( normalizedPhone , deviceHash ) ) 
+ transactionHash ← optAuthTransaction match { 
+ - case Some ( transaction ) ⇒ 
+ - val hash = transaction . transactionHash 
+ - for { 
+ - _ ← fromDBIO ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( hash ) ) ) 
+ - } yield hash 
+ + case Some ( transaction ) ⇒ point ( transaction . transactionHash ) 
+ case None ⇒ 
+ val accessSalt = ACLUtils . nextAccessSalt ( ) 
+ val transactionHash = ACLUtils . authTransactionHash ( accessSalt ) 
+ val phoneAuthTransaction = models . AuthPhoneTransaction ( normalizedPhone , transactionHash , appId , apiKey , deviceHash , deviceTitle , accessSalt ) 
+ for { 
+ _ ← fromDBIO ( persist . auth . AuthPhoneTransaction . create ( phoneAuthTransaction ) ) 
+ - _ ← fromDBIO ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( transactionHash ) ) ) 
+ } yield transactionHash 
+ } 
+ + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendSmsCode ( normalizedPhone , genSmsCode ( normalizedPhone ) , Some ( transactionHash ) ) ) 
+ isRegistered ← fromDBIO ( persist . UserPhone . exists ( normalizedPhone ) ) 
+ } yield ResponseStartPhoneAuth ( transactionHash , isRegistered ) 
+ db . run ( action . run ) 
+ @ @ - 173 , 7 + 169 , 8 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) 
+ val action = for { 
+ tx ← fromDBIOOption ( AuthErrors . PhoneCodeExpired ) ( persist . auth . AuthPhoneTransaction . find ( transactionHash ) ) 
+ code ← fromDBIO ( persist . AuthCode . findByTransactionHash ( tx . transactionHash ) map ( _ map ( _ . code ) getOrElse ( genSmsCode ( tx . phoneNumber ) ) ) ) 
+ - _ ← fromDBIO ( sendCallCode ( tx . phoneNumber , genSmsCode ( tx . phoneNumber ) , Some ( transactionHash ) , PhoneNumberUtils . normalizeWithCountry ( tx . phoneNumber ) . headOption . map ( _ . _ 2 ) . getOrElse ( " en " ) ) ) 
+ + lang = PhoneNumberUtils . normalizeWithCountry ( tx . phoneNumber ) . headOption . map ( _ . _ 2 ) . getOrElse ( " en " ) 
+ + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendCallCode ( tx . phoneNumber , genSmsCode ( tx . phoneNumber ) , Some ( transactionHash ) , lang ) ) 
+ } yield ResponseVoid 
+ 
+ db . run ( action . run ) 
+ @ @ - 228 , 7 + 225 , 7 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) 
+ activationType match { 
+ case CODE ⇒ 
+ for { 
+ - _ ← fromDBIO ( sendEmailCode ( email , genCode ( ) , hash ) ) 
+ + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendEmailCode ( email , genCode ( ) , hash ) ) 
+ } yield hash 
+ case OAUTH2 ⇒ 
+ point ( hash ) 
+ @ @ - 241 , 7 + 238 , 7 @ @ class AuthServiceImpl ( val activationContext : CodeActivation , mediator : ActorRef ) 
+ case CODE ⇒ 
+ for { 
+ _ ← fromDBIO ( persist . auth . AuthEmailTransaction . create ( emailAuthTransaction ) ) 
+ - _ ← fromDBIO ( sendEmailCode ( email , genCode ( ) , transactionHash ) ) 
+ + _ ← fromDBIOEither [ Unit , String ] ( err ⇒ AuthErrors . activationFailure ( err ) ) ( sendEmailCode ( email , genCode ( ) , transactionHash ) ) 
+ } yield transactionHash 
+ case OAUTH2 ⇒ 
+ for { 
+ diff - - git a / actor - server / project / Dependencies . scala b / actor - server / project / Dependencies . scala 
+ index 51af876 . . cf75189 100644 
+ - - - a / actor - server / project / Dependencies . scala 
+ + + + b / actor - server / project / Dependencies . scala 
+ @ @ - 101 , 7 + 101 , 7 @ @ object Dependencies { 
+ akkaSlf4j , akkaActor , akkaStream 
+ ) 
+ 
+ - val activation = shared + + Seq ( akkaActor , akkaHttp , playJson ) 
+ + val activation = shared + + Seq ( akkaActor , akkaHttp , akkaHttpPlayJson , playJson ) 
+ 
+ val bot = shared + + Seq ( upickle )

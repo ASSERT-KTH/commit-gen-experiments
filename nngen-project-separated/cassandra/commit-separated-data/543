@@ -1,0 +1,416 @@
+BLEU SCORE: 0.04767707020457096
+
+TEST MSG: Reduce granuality of OpOrder . Group during index build
+GENERATED MSG: Reject index queries while the index is building
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 5bc30be . . a65a147 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 10 , 6 + 10 , 7 @ @ <nl> * Prevent reloading of logback . xml from UDF sandbox ( CASSANDRA - 12535 ) <nl> * Reenable HeapPool ( CASSANDRA - 12900 ) <nl> Merged from 2 . 2 : <nl> + * Reduce granuality of OpOrder . Group during index build ( CASSANDRA - 12796 ) <nl> * Test bind parameters and unset parameters in InsertUpdateIfConditionTest ( CASSANDRA - 12980 ) <nl> * Do not specify local address on outgoing connection when listen _ on _ broadcast _ address is set ( CASSANDRA - 12673 ) <nl> * Use saved tokens when setting local tokens on StorageService . joinRing ( CASSANDRA - 12935 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / Keyspace . java b / src / java / org / apache / cassandra / db / Keyspace . java <nl> index 75aab8f . . ec5102b 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Keyspace . java <nl> + + + b / src / java / org / apache / cassandra / db / Keyspace . java <nl> @ @ - 35 , 7 + 35 , 6 @ @ import org . apache . cassandra . db . commitlog . ReplayPosition ; <nl> import org . apache . cassandra . db . compaction . CompactionManager ; <nl> import org . apache . cassandra . db . lifecycle . SSTableSet ; <nl> import org . apache . cassandra . db . partitions . PartitionUpdate ; <nl> - import org . apache . cassandra . db . rows . UnfilteredRowIterator ; <nl> import org . apache . cassandra . db . view . ViewManager ; <nl> import org . apache . cassandra . exceptions . WriteTimeoutException ; <nl> import org . apache . cassandra . index . Index ; <nl> @ @ - 569 , 28 + 568 , 6 @ @ public class Keyspace <nl> return replicationStrategy ; <nl> } <nl> <nl> - / * * <nl> - * @ param key row to index <nl> - * @ param cfs ColumnFamily to index partition in <nl> - * @ param indexes the indexes to submit the row to <nl> - * / <nl> - public static void indexPartition ( DecoratedKey key , ColumnFamilyStore cfs , Set < Index > indexes ) <nl> - { <nl> - if ( logger . isTraceEnabled ( ) ) <nl> - logger . trace ( " Indexing partition { } " , cfs . metadata . getKeyValidator ( ) . getString ( key . getKey ( ) ) ) ; <nl> - <nl> - SinglePartitionReadCommand cmd = SinglePartitionReadCommand . fullPartitionRead ( cfs . metadata , <nl> - FBUtilities . nowInSeconds ( ) , <nl> - key ) ; <nl> - <nl> - try ( OpOrder . Group writeGroup = cfs . keyspace . writeOrder . start ( ) ; <nl> - OpOrder . Group readGroup = cfs . readOrdering . start ( ) ; <nl> - UnfilteredRowIterator partition = cmd . queryMemtableAndDisk ( cfs , readGroup ) ) <nl> - { <nl> - cfs . indexManager . indexPartition ( partition , writeGroup , indexes , cmd . nowInSec ( ) ) ; <nl> - } <nl> - } <nl> - <nl> public List < Future < ? > > flush ( ) <nl> { <nl> List < Future < ? > > futures = new ArrayList < > ( columnFamilyStores . size ( ) ) ; <nl> diff - - git a / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java b / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java <nl> index e66f0a3 . . c627b2d 100644 <nl> - - - a / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java <nl> + + + b / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java <nl> @ @ - 17 , 13 + 17 , 11 @ @ <nl> * / <nl> package org . apache . cassandra . index ; <nl> <nl> - import java . io . IOException ; <nl> import java . util . Set ; <nl> import java . util . UUID ; <nl> <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . db . DecoratedKey ; <nl> - import org . apache . cassandra . db . Keyspace ; <nl> import org . apache . cassandra . db . compaction . CompactionInfo ; <nl> import org . apache . cassandra . db . compaction . CompactionInterruptedException ; <nl> import org . apache . cassandra . db . compaction . OperationType ; <nl> @ @ - 61 , 12 + 59 , 13 @ @ public class SecondaryIndexBuilder extends CompactionInfo . Holder <nl> { <nl> try <nl> { <nl> + int pageSize = cfs . indexManager . calculateIndexingPageSize ( ) ; <nl> while ( iter . hasNext ( ) ) <nl> { <nl> if ( isStopRequested ( ) ) <nl> throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; <nl> DecoratedKey key = iter . next ( ) ; <nl> - Keyspace . indexPartition ( key , cfs , indexers ) ; <nl> + cfs . indexManager . indexPartition ( key , indexers , pageSize ) ; <nl> } <nl> } <nl> finally <nl> diff - - git a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java <nl> index 6dfdeee . . 003b624 100644 <nl> - - - a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java <nl> + + + b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java <nl> @ @ - 47 , 6 + 47 , 7 @ @ import org . apache . cassandra . db . compaction . CompactionManager ; <nl> import org . apache . cassandra . db . filter . RowFilter ; <nl> import org . apache . cassandra . db . lifecycle . SSTableSet ; <nl> import org . apache . cassandra . db . lifecycle . View ; <nl> + import org . apache . cassandra . db . partitions . PartitionIterators ; <nl> import org . apache . cassandra . db . partitions . PartitionUpdate ; <nl> import org . apache . cassandra . db . rows . * ; <nl> import org . apache . cassandra . exceptions . InvalidRequestException ; <nl> @ @ - 56 , 7 + 57 , 9 @ @ import org . apache . cassandra . io . sstable . ReducingKeyIterator ; <nl> import org . apache . cassandra . io . sstable . format . SSTableReader ; <nl> import org . apache . cassandra . schema . IndexMetadata ; <nl> import org . apache . cassandra . schema . Indexes ; <nl> + import org . apache . cassandra . service . pager . SinglePartitionPager ; <nl> import org . apache . cassandra . tracing . Tracing ; <nl> + import org . apache . cassandra . transport . Server ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . concurrent . OpOrder ; <nl> import org . apache . cassandra . utils . concurrent . Refs ; <nl> @ @ - 98 , 6 + 101 , 9 @ @ public class SecondaryIndexManager implements IndexRegistry <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( SecondaryIndexManager . class ) ; <nl> <nl> + / / default page size ( in rows ) when rebuilding the index for a whole partition <nl> + public static final int DEFAULT _ PAGE _ SIZE = 10000 ; <nl> + <nl> private Map < String , Index > indexes = Maps . newConcurrentMap ( ) ; <nl> <nl> / * * <nl> @ @ - 517 , 39 + 523 , 97 @ @ public class SecondaryIndexManager implements IndexRegistry <nl> / * * <nl> * When building an index against existing data in sstables , add the given partition to the index <nl> * / <nl> - public void indexPartition ( UnfilteredRowIterator partition , OpOrder . Group opGroup , Set < Index > indexes , int nowInSec ) <nl> + public void indexPartition ( DecoratedKey key , Set < Index > indexes , int pageSize ) <nl> { <nl> + if ( logger . isTraceEnabled ( ) ) <nl> + logger . trace ( " Indexing partition { } " , baseCfs . metadata . getKeyValidator ( ) . getString ( key . getKey ( ) ) ) ; <nl> + <nl> if ( ! indexes . isEmpty ( ) ) <nl> { <nl> - DecoratedKey key = partition . partitionKey ( ) ; <nl> - Set < Index . Indexer > indexers = indexes . stream ( ) <nl> - . map ( index - > index . indexerFor ( key , <nl> - partition . columns ( ) , <nl> - nowInSec , <nl> - opGroup , <nl> - IndexTransaction . Type . UPDATE ) ) <nl> - . filter ( Objects : : nonNull ) <nl> - . collect ( Collectors . toSet ( ) ) ; <nl> - <nl> - indexers . forEach ( Index . Indexer : : begin ) ; <nl> - <nl> - try ( RowIterator filtered = UnfilteredRowIterators . filter ( partition , nowInSec ) ) <nl> + SinglePartitionReadCommand cmd = SinglePartitionReadCommand . fullPartitionRead ( baseCfs . metadata , <nl> + FBUtilities . nowInSeconds ( ) , <nl> + key ) ; <nl> + int nowInSec = cmd . nowInSec ( ) ; <nl> + boolean readStatic = false ; <nl> + <nl> + SinglePartitionPager pager = new SinglePartitionPager ( cmd , null , Server . CURRENT _ VERSION ) ; <nl> + while ( ! pager . isExhausted ( ) ) <nl> { <nl> - if ( ! filtered . staticRow ( ) . isEmpty ( ) ) <nl> - indexers . forEach ( indexer - > indexer . insertRow ( filtered . staticRow ( ) ) ) ; <nl> - <nl> - while ( filtered . hasNext ( ) ) <nl> + try ( ReadOrderGroup readGroup = cmd . startOrderGroup ( ) ; <nl> + OpOrder . Group writeGroup = Keyspace . writeOrder . start ( ) ; <nl> + RowIterator partition = <nl> + PartitionIterators . getOnlyElement ( pager . fetchPageInternal ( pageSize , readGroup ) , <nl> + cmd ) ) <nl> { <nl> - Row row = filtered . next ( ) ; <nl> - indexers . forEach ( indexer - > indexer . insertRow ( row ) ) ; <nl> + Set < Index . Indexer > indexers = indexes . stream ( ) <nl> + . map ( index - > index . indexerFor ( key , <nl> + partition . columns ( ) , <nl> + nowInSec , <nl> + writeGroup , <nl> + IndexTransaction . Type . UPDATE ) ) <nl> + . filter ( Objects : : nonNull ) <nl> + . collect ( Collectors . toSet ( ) ) ; <nl> + <nl> + indexers . forEach ( Index . Indexer : : begin ) ; <nl> + <nl> + / / only process the static row once per partition <nl> + if ( ! readStatic & & ! partition . staticRow ( ) . isEmpty ( ) ) <nl> + { <nl> + indexers . forEach ( indexer - > indexer . insertRow ( partition . staticRow ( ) ) ) ; <nl> + readStatic = true ; <nl> + } <nl> + <nl> + while ( partition . hasNext ( ) ) <nl> + { <nl> + Row row = partition . next ( ) ; <nl> + indexers . forEach ( indexer - > indexer . insertRow ( row ) ) ; <nl> + } <nl> + <nl> + indexers . forEach ( Index . Indexer : : finish ) ; <nl> } <nl> } <nl> - <nl> - indexers . forEach ( Index . Indexer : : finish ) ; <nl> } <nl> } <nl> <nl> / * * <nl> + * Return the page size used when indexing an entire partition <nl> + * / <nl> + public int calculateIndexingPageSize ( ) <nl> + { <nl> + if ( Boolean . getBoolean ( " cassandra . force _ default _ indexing _ page _ size " ) ) <nl> + return DEFAULT _ PAGE _ SIZE ; <nl> + <nl> + double targetPageSizeInBytes = 32 * 1024 * 1024 ; <nl> + double meanPartitionSize = baseCfs . getMeanPartitionSize ( ) ; <nl> + if ( meanPartitionSize < = 0 ) <nl> + return DEFAULT _ PAGE _ SIZE ; <nl> + <nl> + int meanCellsPerPartition = baseCfs . getMeanColumns ( ) ; <nl> + if ( meanCellsPerPartition < = 0 ) <nl> + return DEFAULT _ PAGE _ SIZE ; <nl> + <nl> + int columnsPerRow = baseCfs . metadata . partitionColumns ( ) . regulars . size ( ) ; <nl> + if ( meanCellsPerPartition < = 0 ) <nl> + return DEFAULT _ PAGE _ SIZE ; <nl> + <nl> + int meanRowsPerPartition = meanCellsPerPartition / columnsPerRow ; <nl> + double meanRowSize = meanPartitionSize / meanRowsPerPartition ; <nl> + <nl> + int pageSize = ( int ) Math . max ( 1 , Math . min ( DEFAULT _ PAGE _ SIZE , targetPageSizeInBytes / meanRowSize ) ) ; <nl> + <nl> + logger . trace ( " Calculated page size { } for indexing { } . { } ( { } / { } / { } / { } ) " , <nl> + pageSize , <nl> + baseCfs . metadata . ksName , <nl> + baseCfs . metadata . cfName , <nl> + meanPartitionSize , <nl> + meanCellsPerPartition , <nl> + meanRowsPerPartition , <nl> + meanRowSize ) ; <nl> + <nl> + return pageSize ; <nl> + } <nl> + <nl> + / * * <nl> * Delete all data from all indexes for this partition . <nl> * For when cleanup rips a partition out entirely . <nl> * <nl> diff - - git a / test / unit / org / apache / cassandra / index / CustomIndexTest . java b / test / unit / org / apache / cassandra / index / CustomIndexTest . java <nl> index 6930d13 . . 33e7182 100644 <nl> - - - a / test / unit / org / apache / cassandra / index / CustomIndexTest . java <nl> + + + b / test / unit / org / apache / cassandra / index / CustomIndexTest . java <nl> @ @ - 39 , 22 + 39 , 25 @ @ import org . apache . cassandra . cql3 . restrictions . IndexRestrictions ; <nl> import org . apache . cassandra . cql3 . restrictions . StatementRestrictions ; <nl> import org . apache . cassandra . cql3 . statements . IndexTarget ; <nl> import org . apache . cassandra . cql3 . statements . ModificationStatement ; <nl> - import org . apache . cassandra . db . ColumnFamilyStore ; <nl> - import org . apache . cassandra . db . ReadCommand ; <nl> - import org . apache . cassandra . db . ReadOrderGroup ; <nl> + import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . db . marshal . AbstractType ; <nl> import org . apache . cassandra . db . marshal . Int32Type ; <nl> import org . apache . cassandra . db . marshal . UTF8Type ; <nl> import org . apache . cassandra . db . partitions . UnfilteredPartitionIterator ; <nl> + import org . apache . cassandra . db . rows . Row ; <nl> import org . apache . cassandra . exceptions . InvalidRequestException ; <nl> + import org . apache . cassandra . index . transactions . IndexTransaction ; <nl> import org . apache . cassandra . schema . IndexMetadata ; <nl> import org . apache . cassandra . schema . Indexes ; <nl> import org . apache . cassandra . transport . Server ; <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . apache . cassandra . utils . concurrent . OpOrder ; <nl> <nl> import static org . apache . cassandra . Util . throwAssert ; <nl> import static org . apache . cassandra . cql3 . statements . IndexTarget . CUSTOM _ INDEX _ OPTION _ NAME ; <nl> import static org . junit . Assert . assertEquals ; <nl> + import static org . junit . Assert . assertFalse ; <nl> import static org . junit . Assert . assertNotNull ; <nl> import static org . junit . Assert . assertTrue ; <nl> import static org . junit . Assert . fail ; <nl> @ @ - 647 , 6 + 650 , 42 @ @ public class CustomIndexTest extends CQLTester <nl> assertEquals ( 1 , getCurrentColumnFamilyStore ( ) . getDirectories ( ) . getDirectoryForNewSSTables ( ) . listFiles ( ) . length ) ; <nl> } <nl> <nl> + @ Test <nl> + public void indexBuildingPagesLargePartitions ( ) throws Throwable <nl> + { <nl> + createTable ( " CREATE TABLE % s ( k int , c int , v int , PRIMARY KEY ( k , c ) ) " ) ; <nl> + ColumnFamilyStore cfs = getCurrentColumnFamilyStore ( ) ; <nl> + SecondaryIndexManager indexManager = cfs . indexManager ; <nl> + int totalRows = SimulateConcurrentFlushingIndex . ROWS _ IN _ PARTITION ; <nl> + / / Insert a single wide partition to be indexed <nl> + for ( int i = 0 ; i < totalRows ; i + + ) <nl> + execute ( " INSERT INTO % s ( k , c , v ) VALUES ( 0 , ? , ? ) " , i , i ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + / / Create the index , which won ' t automatically start building <nl> + String indexName = " build _ single _ partition _ idx " ; <nl> + createIndex ( String . format ( " CREATE CUSTOM INDEX % s ON % % s ( v ) USING ' % s ' " , <nl> + indexName , SimulateConcurrentFlushingIndex . class . getName ( ) ) ) ; <nl> + SimulateConcurrentFlushingIndex index = ( SimulateConcurrentFlushingIndex ) indexManager . getIndexByName ( indexName ) ; <nl> + <nl> + / / Index the partition with an Indexer which artificially simulates additional concurrent <nl> + / / flush activity by periodically issuing barriers on the read & write op groupings <nl> + DecoratedKey targetKey = getCurrentColumnFamilyStore ( ) . decorateKey ( ByteBufferUtil . bytes ( 0 ) ) ; <nl> + indexManager . indexPartition ( targetKey , Collections . singleton ( index ) , totalRows / 10 ) ; <nl> + <nl> + / / When indexing is done check that : <nl> + / / * The base table ' s read ordering at finish was > the one at the start ( i . e . that <nl> + / / we didn ' t hold a single read OpOrder . Group for the whole operation . <nl> + / / * That multiple write OpOrder . Groups were used to perform the writes to the index <nl> + / / * That all operations are complete , that none of the relevant OpOrder . Groups are <nl> + / / marked as blocking progress and that all the barriers ' ops are considered done . <nl> + assertTrue ( index . readOrderingAtFinish . compareTo ( index . readOrderingAtStart ) > 0 ) ; <nl> + assertTrue ( index . writeGroups . size ( ) > 1 ) ; <nl> + assertFalse ( index . readOrderingAtFinish . isBlocking ( ) ) ; <nl> + index . writeGroups . forEach ( group - > assertFalse ( group . isBlocking ( ) ) ) ; <nl> + index . barriers . forEach ( OpOrder . Barrier : : allPriorOpsAreFinished ) ; <nl> + } <nl> + <nl> / / Used for index creation above <nl> public static class BrokenCustom2I extends StubIndex <nl> { <nl> @ @ - 868 , 4 + 907 , 89 @ @ public class CustomIndexTest extends CQLTester <nl> return new HashMap < > ( ) ; <nl> } <nl> } <nl> + <nl> + public static final class SimulateConcurrentFlushingIndex extends StubIndex <nl> + { <nl> + ColumnFamilyStore baseCfs ; <nl> + AtomicInteger indexedRowCount = new AtomicInteger ( 0 ) ; <nl> + <nl> + OpOrder . Group readOrderingAtStart = null ; <nl> + OpOrder . Group readOrderingAtFinish = null ; <nl> + Set < OpOrder . Group > writeGroups = new HashSet < > ( ) ; <nl> + List < OpOrder . Barrier > barriers = new ArrayList < > ( ) ; <nl> + <nl> + static final int ROWS _ IN _ PARTITION = 1000 ; <nl> + <nl> + public SimulateConcurrentFlushingIndex ( ColumnFamilyStore baseCfs , IndexMetadata metadata ) <nl> + { <nl> + super ( baseCfs , metadata ) ; <nl> + this . baseCfs = baseCfs ; <nl> + } <nl> + <nl> + / / When indexing an entire partition 2 potential problems can be caused by <nl> + / / whilst holding a single read & a single write OpOrder . Group . <nl> + / / * By holding a write group too long , flushes are blocked <nl> + / / * Holding a read group for too long prevents the memory from flushed memtables <nl> + / / from being reclaimed . <nl> + / / See CASSANDRA - 12796 for details . <nl> + / / To test that the index builder pages through a large partition , using <nl> + / / finer grained OpOrder . Groups we write a " large " partition to disk , then <nl> + / / kick off an index build on it , using this indexer . <nl> + / / To simulate concurrent flush activity , we periodically issue barriers on <nl> + / / the current read and write groups . <nl> + / / When we ' re done indexing the partition , the test checks the states of the <nl> + / / various OpOrder . Groups , which it can obtain from this index . <nl> + <nl> + public Indexer indexerFor ( final DecoratedKey key , <nl> + PartitionColumns columns , <nl> + int nowInSec , <nl> + OpOrder . Group opGroup , <nl> + IndexTransaction . Type transactionType ) <nl> + { <nl> + if ( readOrderingAtStart = = null ) <nl> + readOrderingAtStart = baseCfs . readOrdering . getCurrent ( ) ; <nl> + <nl> + writeGroups . add ( opGroup ) ; <nl> + <nl> + return new Indexer ( ) <nl> + { <nl> + public void begin ( ) <nl> + { <nl> + / / to simulate other activity on base table during indexing , issue <nl> + / / barriers on the read and write orderings . This is analogous to <nl> + / / what happens when other flushes are being processed during the <nl> + / / indexing of a partition <nl> + OpOrder . Barrier readBarrier = baseCfs . readOrdering . newBarrier ( ) ; <nl> + readBarrier . issue ( ) ; <nl> + barriers . add ( readBarrier ) ; <nl> + OpOrder . Barrier writeBarrier = Keyspace . writeOrder . newBarrier ( ) ; <nl> + writeBarrier . issue ( ) ; <nl> + barriers . add ( writeBarrier ) ; <nl> + } <nl> + <nl> + public void insertRow ( Row row ) <nl> + { <nl> + indexedRowCount . incrementAndGet ( ) ; <nl> + } <nl> + <nl> + public void finish ( ) <nl> + { <nl> + / / we ' ve indexed all rows in the target partition , <nl> + / / grab the read OpOrder . Group for the base CFS so <nl> + / / we can compare it with the starting group <nl> + if ( indexedRowCount . get ( ) < ROWS _ IN _ PARTITION ) <nl> + readOrderingAtFinish = baseCfs . readOrdering . getCurrent ( ) ; <nl> + } <nl> + <nl> + public void partitionDelete ( DeletionTime deletionTime ) { } <nl> + <nl> + public void rangeTombstone ( RangeTombstone tombstone ) { } <nl> + <nl> + public void updateRow ( Row oldRowData , Row newRowData ) { } <nl> + <nl> + public void removeRow ( Row row ) { } <nl> + <nl> + } ; <nl> + } <nl> + } <nl> }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 5bc30be . . a65a147 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 10 , 6 + 10 , 7 @ @ 
+ * Prevent reloading of logback . xml from UDF sandbox ( CASSANDRA - 12535 ) 
+ * Reenable HeapPool ( CASSANDRA - 12900 ) 
+ Merged from 2 . 2 : 
+ + * Reduce granuality of OpOrder . Group during index build ( CASSANDRA - 12796 ) 
+ * Test bind parameters and unset parameters in InsertUpdateIfConditionTest ( CASSANDRA - 12980 ) 
+ * Do not specify local address on outgoing connection when listen _ on _ broadcast _ address is set ( CASSANDRA - 12673 ) 
+ * Use saved tokens when setting local tokens on StorageService . joinRing ( CASSANDRA - 12935 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / Keyspace . java b / src / java / org / apache / cassandra / db / Keyspace . java 
+ index 75aab8f . . ec5102b 100644 
+ - - - a / src / java / org / apache / cassandra / db / Keyspace . java 
+ + + + b / src / java / org / apache / cassandra / db / Keyspace . java 
+ @ @ - 35 , 7 + 35 , 6 @ @ import org . apache . cassandra . db . commitlog . ReplayPosition ; 
+ import org . apache . cassandra . db . compaction . CompactionManager ; 
+ import org . apache . cassandra . db . lifecycle . SSTableSet ; 
+ import org . apache . cassandra . db . partitions . PartitionUpdate ; 
+ - import org . apache . cassandra . db . rows . UnfilteredRowIterator ; 
+ import org . apache . cassandra . db . view . ViewManager ; 
+ import org . apache . cassandra . exceptions . WriteTimeoutException ; 
+ import org . apache . cassandra . index . Index ; 
+ @ @ - 569 , 28 + 568 , 6 @ @ public class Keyspace 
+ return replicationStrategy ; 
+ } 
+ 
+ - / * * 
+ - * @ param key row to index 
+ - * @ param cfs ColumnFamily to index partition in 
+ - * @ param indexes the indexes to submit the row to 
+ - * / 
+ - public static void indexPartition ( DecoratedKey key , ColumnFamilyStore cfs , Set < Index > indexes ) 
+ - { 
+ - if ( logger . isTraceEnabled ( ) ) 
+ - logger . trace ( " Indexing partition { } " , cfs . metadata . getKeyValidator ( ) . getString ( key . getKey ( ) ) ) ; 
+ - 
+ - SinglePartitionReadCommand cmd = SinglePartitionReadCommand . fullPartitionRead ( cfs . metadata , 
+ - FBUtilities . nowInSeconds ( ) , 
+ - key ) ; 
+ - 
+ - try ( OpOrder . Group writeGroup = cfs . keyspace . writeOrder . start ( ) ; 
+ - OpOrder . Group readGroup = cfs . readOrdering . start ( ) ; 
+ - UnfilteredRowIterator partition = cmd . queryMemtableAndDisk ( cfs , readGroup ) ) 
+ - { 
+ - cfs . indexManager . indexPartition ( partition , writeGroup , indexes , cmd . nowInSec ( ) ) ; 
+ - } 
+ - } 
+ - 
+ public List < Future < ? > > flush ( ) 
+ { 
+ List < Future < ? > > futures = new ArrayList < > ( columnFamilyStores . size ( ) ) ; 
+ diff - - git a / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java b / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java 
+ index e66f0a3 . . c627b2d 100644 
+ - - - a / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java 
+ + + + b / src / java / org / apache / cassandra / index / SecondaryIndexBuilder . java 
+ @ @ - 17 , 13 + 17 , 11 @ @ 
+ * / 
+ package org . apache . cassandra . index ; 
+ 
+ - import java . io . IOException ; 
+ import java . util . Set ; 
+ import java . util . UUID ; 
+ 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . db . DecoratedKey ; 
+ - import org . apache . cassandra . db . Keyspace ; 
+ import org . apache . cassandra . db . compaction . CompactionInfo ; 
+ import org . apache . cassandra . db . compaction . CompactionInterruptedException ; 
+ import org . apache . cassandra . db . compaction . OperationType ; 
+ @ @ - 61 , 12 + 59 , 13 @ @ public class SecondaryIndexBuilder extends CompactionInfo . Holder 
+ { 
+ try 
+ { 
+ + int pageSize = cfs . indexManager . calculateIndexingPageSize ( ) ; 
+ while ( iter . hasNext ( ) ) 
+ { 
+ if ( isStopRequested ( ) ) 
+ throw new CompactionInterruptedException ( getCompactionInfo ( ) ) ; 
+ DecoratedKey key = iter . next ( ) ; 
+ - Keyspace . indexPartition ( key , cfs , indexers ) ; 
+ + cfs . indexManager . indexPartition ( key , indexers , pageSize ) ; 
+ } 
+ } 
+ finally 
+ diff - - git a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java 
+ index 6dfdeee . . 003b624 100644 
+ - - - a / src / java / org / apache / cassandra / index / SecondaryIndexManager . java 
+ + + + b / src / java / org / apache / cassandra / index / SecondaryIndexManager . java 
+ @ @ - 47 , 6 + 47 , 7 @ @ import org . apache . cassandra . db . compaction . CompactionManager ; 
+ import org . apache . cassandra . db . filter . RowFilter ; 
+ import org . apache . cassandra . db . lifecycle . SSTableSet ; 
+ import org . apache . cassandra . db . lifecycle . View ; 
+ + import org . apache . cassandra . db . partitions . PartitionIterators ; 
+ import org . apache . cassandra . db . partitions . PartitionUpdate ; 
+ import org . apache . cassandra . db . rows . * ; 
+ import org . apache . cassandra . exceptions . InvalidRequestException ; 
+ @ @ - 56 , 7 + 57 , 9 @ @ import org . apache . cassandra . io . sstable . ReducingKeyIterator ; 
+ import org . apache . cassandra . io . sstable . format . SSTableReader ; 
+ import org . apache . cassandra . schema . IndexMetadata ; 
+ import org . apache . cassandra . schema . Indexes ; 
+ + import org . apache . cassandra . service . pager . SinglePartitionPager ; 
+ import org . apache . cassandra . tracing . Tracing ; 
+ + import org . apache . cassandra . transport . Server ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . concurrent . OpOrder ; 
+ import org . apache . cassandra . utils . concurrent . Refs ; 
+ @ @ - 98 , 6 + 101 , 9 @ @ public class SecondaryIndexManager implements IndexRegistry 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( SecondaryIndexManager . class ) ; 
+ 
+ + / / default page size ( in rows ) when rebuilding the index for a whole partition 
+ + public static final int DEFAULT _ PAGE _ SIZE = 10000 ; 
+ + 
+ private Map < String , Index > indexes = Maps . newConcurrentMap ( ) ; 
+ 
+ / * * 
+ @ @ - 517 , 39 + 523 , 97 @ @ public class SecondaryIndexManager implements IndexRegistry 
+ / * * 
+ * When building an index against existing data in sstables , add the given partition to the index 
+ * / 
+ - public void indexPartition ( UnfilteredRowIterator partition , OpOrder . Group opGroup , Set < Index > indexes , int nowInSec ) 
+ + public void indexPartition ( DecoratedKey key , Set < Index > indexes , int pageSize ) 
+ { 
+ + if ( logger . isTraceEnabled ( ) ) 
+ + logger . trace ( " Indexing partition { } " , baseCfs . metadata . getKeyValidator ( ) . getString ( key . getKey ( ) ) ) ; 
+ + 
+ if ( ! indexes . isEmpty ( ) ) 
+ { 
+ - DecoratedKey key = partition . partitionKey ( ) ; 
+ - Set < Index . Indexer > indexers = indexes . stream ( ) 
+ - . map ( index - > index . indexerFor ( key , 
+ - partition . columns ( ) , 
+ - nowInSec , 
+ - opGroup , 
+ - IndexTransaction . Type . UPDATE ) ) 
+ - . filter ( Objects : : nonNull ) 
+ - . collect ( Collectors . toSet ( ) ) ; 
+ - 
+ - indexers . forEach ( Index . Indexer : : begin ) ; 
+ - 
+ - try ( RowIterator filtered = UnfilteredRowIterators . filter ( partition , nowInSec ) ) 
+ + SinglePartitionReadCommand cmd = SinglePartitionReadCommand . fullPartitionRead ( baseCfs . metadata , 
+ + FBUtilities . nowInSeconds ( ) , 
+ + key ) ; 
+ + int nowInSec = cmd . nowInSec ( ) ; 
+ + boolean readStatic = false ; 
+ + 
+ + SinglePartitionPager pager = new SinglePartitionPager ( cmd , null , Server . CURRENT _ VERSION ) ; 
+ + while ( ! pager . isExhausted ( ) ) 
+ { 
+ - if ( ! filtered . staticRow ( ) . isEmpty ( ) ) 
+ - indexers . forEach ( indexer - > indexer . insertRow ( filtered . staticRow ( ) ) ) ; 
+ - 
+ - while ( filtered . hasNext ( ) ) 
+ + try ( ReadOrderGroup readGroup = cmd . startOrderGroup ( ) ; 
+ + OpOrder . Group writeGroup = Keyspace . writeOrder . start ( ) ; 
+ + RowIterator partition = 
+ + PartitionIterators . getOnlyElement ( pager . fetchPageInternal ( pageSize , readGroup ) , 
+ + cmd ) ) 
+ { 
+ - Row row = filtered . next ( ) ; 
+ - indexers . forEach ( indexer - > indexer . insertRow ( row ) ) ; 
+ + Set < Index . Indexer > indexers = indexes . stream ( ) 
+ + . map ( index - > index . indexerFor ( key , 
+ + partition . columns ( ) , 
+ + nowInSec , 
+ + writeGroup , 
+ + IndexTransaction . Type . UPDATE ) ) 
+ + . filter ( Objects : : nonNull ) 
+ + . collect ( Collectors . toSet ( ) ) ; 
+ + 
+ + indexers . forEach ( Index . Indexer : : begin ) ; 
+ + 
+ + / / only process the static row once per partition 
+ + if ( ! readStatic & & ! partition . staticRow ( ) . isEmpty ( ) ) 
+ + { 
+ + indexers . forEach ( indexer - > indexer . insertRow ( partition . staticRow ( ) ) ) ; 
+ + readStatic = true ; 
+ + } 
+ + 
+ + while ( partition . hasNext ( ) ) 
+ + { 
+ + Row row = partition . next ( ) ; 
+ + indexers . forEach ( indexer - > indexer . insertRow ( row ) ) ; 
+ + } 
+ + 
+ + indexers . forEach ( Index . Indexer : : finish ) ; 
+ } 
+ } 
+ - 
+ - indexers . forEach ( Index . Indexer : : finish ) ; 
+ } 
+ } 
+ 
+ / * * 
+ + * Return the page size used when indexing an entire partition 
+ + * / 
+ + public int calculateIndexingPageSize ( ) 
+ + { 
+ + if ( Boolean . getBoolean ( " cassandra . force _ default _ indexing _ page _ size " ) ) 
+ + return DEFAULT _ PAGE _ SIZE ; 
+ + 
+ + double targetPageSizeInBytes = 32 * 1024 * 1024 ; 
+ + double meanPartitionSize = baseCfs . getMeanPartitionSize ( ) ; 
+ + if ( meanPartitionSize < = 0 ) 
+ + return DEFAULT _ PAGE _ SIZE ; 
+ + 
+ + int meanCellsPerPartition = baseCfs . getMeanColumns ( ) ; 
+ + if ( meanCellsPerPartition < = 0 ) 
+ + return DEFAULT _ PAGE _ SIZE ; 
+ + 
+ + int columnsPerRow = baseCfs . metadata . partitionColumns ( ) . regulars . size ( ) ; 
+ + if ( meanCellsPerPartition < = 0 ) 
+ + return DEFAULT _ PAGE _ SIZE ; 
+ + 
+ + int meanRowsPerPartition = meanCellsPerPartition / columnsPerRow ; 
+ + double meanRowSize = meanPartitionSize / meanRowsPerPartition ; 
+ + 
+ + int pageSize = ( int ) Math . max ( 1 , Math . min ( DEFAULT _ PAGE _ SIZE , targetPageSizeInBytes / meanRowSize ) ) ; 
+ + 
+ + logger . trace ( " Calculated page size { } for indexing { } . { } ( { } / { } / { } / { } ) " , 
+ + pageSize , 
+ + baseCfs . metadata . ksName , 
+ + baseCfs . metadata . cfName , 
+ + meanPartitionSize , 
+ + meanCellsPerPartition , 
+ + meanRowsPerPartition , 
+ + meanRowSize ) ; 
+ + 
+ + return pageSize ; 
+ + } 
+ + 
+ + / * * 
+ * Delete all data from all indexes for this partition . 
+ * For when cleanup rips a partition out entirely . 
+ * 
+ diff - - git a / test / unit / org / apache / cassandra / index / CustomIndexTest . java b / test / unit / org / apache / cassandra / index / CustomIndexTest . java 
+ index 6930d13 . . 33e7182 100644 
+ - - - a / test / unit / org / apache / cassandra / index / CustomIndexTest . java 
+ + + + b / test / unit / org / apache / cassandra / index / CustomIndexTest . java 
+ @ @ - 39 , 22 + 39 , 25 @ @ import org . apache . cassandra . cql3 . restrictions . IndexRestrictions ; 
+ import org . apache . cassandra . cql3 . restrictions . StatementRestrictions ; 
+ import org . apache . cassandra . cql3 . statements . IndexTarget ; 
+ import org . apache . cassandra . cql3 . statements . ModificationStatement ; 
+ - import org . apache . cassandra . db . ColumnFamilyStore ; 
+ - import org . apache . cassandra . db . ReadCommand ; 
+ - import org . apache . cassandra . db . ReadOrderGroup ; 
+ + import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . db . marshal . AbstractType ; 
+ import org . apache . cassandra . db . marshal . Int32Type ; 
+ import org . apache . cassandra . db . marshal . UTF8Type ; 
+ import org . apache . cassandra . db . partitions . UnfilteredPartitionIterator ; 
+ + import org . apache . cassandra . db . rows . Row ; 
+ import org . apache . cassandra . exceptions . InvalidRequestException ; 
+ + import org . apache . cassandra . index . transactions . IndexTransaction ; 
+ import org . apache . cassandra . schema . IndexMetadata ; 
+ import org . apache . cassandra . schema . Indexes ; 
+ import org . apache . cassandra . transport . Server ; 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . apache . cassandra . utils . concurrent . OpOrder ; 
+ 
+ import static org . apache . cassandra . Util . throwAssert ; 
+ import static org . apache . cassandra . cql3 . statements . IndexTarget . CUSTOM _ INDEX _ OPTION _ NAME ; 
+ import static org . junit . Assert . assertEquals ; 
+ + import static org . junit . Assert . assertFalse ; 
+ import static org . junit . Assert . assertNotNull ; 
+ import static org . junit . Assert . assertTrue ; 
+ import static org . junit . Assert . fail ; 
+ @ @ - 647 , 6 + 650 , 42 @ @ public class CustomIndexTest extends CQLTester 
+ assertEquals ( 1 , getCurrentColumnFamilyStore ( ) . getDirectories ( ) . getDirectoryForNewSSTables ( ) . listFiles ( ) . length ) ; 
+ } 
+ 
+ + @ Test 
+ + public void indexBuildingPagesLargePartitions ( ) throws Throwable 
+ + { 
+ + createTable ( " CREATE TABLE % s ( k int , c int , v int , PRIMARY KEY ( k , c ) ) " ) ; 
+ + ColumnFamilyStore cfs = getCurrentColumnFamilyStore ( ) ; 
+ + SecondaryIndexManager indexManager = cfs . indexManager ; 
+ + int totalRows = SimulateConcurrentFlushingIndex . ROWS _ IN _ PARTITION ; 
+ + / / Insert a single wide partition to be indexed 
+ + for ( int i = 0 ; i < totalRows ; i + + ) 
+ + execute ( " INSERT INTO % s ( k , c , v ) VALUES ( 0 , ? , ? ) " , i , i ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + / / Create the index , which won ' t automatically start building 
+ + String indexName = " build _ single _ partition _ idx " ; 
+ + createIndex ( String . format ( " CREATE CUSTOM INDEX % s ON % % s ( v ) USING ' % s ' " , 
+ + indexName , SimulateConcurrentFlushingIndex . class . getName ( ) ) ) ; 
+ + SimulateConcurrentFlushingIndex index = ( SimulateConcurrentFlushingIndex ) indexManager . getIndexByName ( indexName ) ; 
+ + 
+ + / / Index the partition with an Indexer which artificially simulates additional concurrent 
+ + / / flush activity by periodically issuing barriers on the read & write op groupings 
+ + DecoratedKey targetKey = getCurrentColumnFamilyStore ( ) . decorateKey ( ByteBufferUtil . bytes ( 0 ) ) ; 
+ + indexManager . indexPartition ( targetKey , Collections . singleton ( index ) , totalRows / 10 ) ; 
+ + 
+ + / / When indexing is done check that : 
+ + / / * The base table ' s read ordering at finish was > the one at the start ( i . e . that 
+ + / / we didn ' t hold a single read OpOrder . Group for the whole operation . 
+ + / / * That multiple write OpOrder . Groups were used to perform the writes to the index 
+ + / / * That all operations are complete , that none of the relevant OpOrder . Groups are 
+ + / / marked as blocking progress and that all the barriers ' ops are considered done . 
+ + assertTrue ( index . readOrderingAtFinish . compareTo ( index . readOrderingAtStart ) > 0 ) ; 
+ + assertTrue ( index . writeGroups . size ( ) > 1 ) ; 
+ + assertFalse ( index . readOrderingAtFinish . isBlocking ( ) ) ; 
+ + index . writeGroups . forEach ( group - > assertFalse ( group . isBlocking ( ) ) ) ; 
+ + index . barriers . forEach ( OpOrder . Barrier : : allPriorOpsAreFinished ) ; 
+ + } 
+ + 
+ / / Used for index creation above 
+ public static class BrokenCustom2I extends StubIndex 
+ { 
+ @ @ - 868 , 4 + 907 , 89 @ @ public class CustomIndexTest extends CQLTester 
+ return new HashMap < > ( ) ; 
+ } 
+ } 
+ + 
+ + public static final class SimulateConcurrentFlushingIndex extends StubIndex 
+ + { 
+ + ColumnFamilyStore baseCfs ; 
+ + AtomicInteger indexedRowCount = new AtomicInteger ( 0 ) ; 
+ + 
+ + OpOrder . Group readOrderingAtStart = null ; 
+ + OpOrder . Group readOrderingAtFinish = null ; 
+ + Set < OpOrder . Group > writeGroups = new HashSet < > ( ) ; 
+ + List < OpOrder . Barrier > barriers = new ArrayList < > ( ) ; 
+ + 
+ + static final int ROWS _ IN _ PARTITION = 1000 ; 
+ + 
+ + public SimulateConcurrentFlushingIndex ( ColumnFamilyStore baseCfs , IndexMetadata metadata ) 
+ + { 
+ + super ( baseCfs , metadata ) ; 
+ + this . baseCfs = baseCfs ; 
+ + } 
+ + 
+ + / / When indexing an entire partition 2 potential problems can be caused by 
+ + / / whilst holding a single read & a single write OpOrder . Group . 
+ + / / * By holding a write group too long , flushes are blocked 
+ + / / * Holding a read group for too long prevents the memory from flushed memtables 
+ + / / from being reclaimed . 
+ + / / See CASSANDRA - 12796 for details . 
+ + / / To test that the index builder pages through a large partition , using 
+ + / / finer grained OpOrder . Groups we write a " large " partition to disk , then 
+ + / / kick off an index build on it , using this indexer . 
+ + / / To simulate concurrent flush activity , we periodically issue barriers on 
+ + / / the current read and write groups . 
+ + / / When we ' re done indexing the partition , the test checks the states of the 
+ + / / various OpOrder . Groups , which it can obtain from this index . 
+ + 
+ + public Indexer indexerFor ( final DecoratedKey key , 
+ + PartitionColumns columns , 
+ + int nowInSec , 
+ + OpOrder . Group opGroup , 
+ + IndexTransaction . Type transactionType ) 
+ + { 
+ + if ( readOrderingAtStart = = null ) 
+ + readOrderingAtStart = baseCfs . readOrdering . getCurrent ( ) ; 
+ + 
+ + writeGroups . add ( opGroup ) ; 
+ + 
+ + return new Indexer ( ) 
+ + { 
+ + public void begin ( ) 
+ + { 
+ + / / to simulate other activity on base table during indexing , issue 
+ + / / barriers on the read and write orderings . This is analogous to 
+ + / / what happens when other flushes are being processed during the 
+ + / / indexing of a partition 
+ + OpOrder . Barrier readBarrier = baseCfs . readOrdering . newBarrier ( ) ; 
+ + readBarrier . issue ( ) ; 
+ + barriers . add ( readBarrier ) ; 
+ + OpOrder . Barrier writeBarrier = Keyspace . writeOrder . newBarrier ( ) ; 
+ + writeBarrier . issue ( ) ; 
+ + barriers . add ( writeBarrier ) ; 
+ + } 
+ + 
+ + public void insertRow ( Row row ) 
+ + { 
+ + indexedRowCount . incrementAndGet ( ) ; 
+ + } 
+ + 
+ + public void finish ( ) 
+ + { 
+ + / / we ' ve indexed all rows in the target partition , 
+ + / / grab the read OpOrder . Group for the base CFS so 
+ + / / we can compare it with the starting group 
+ + if ( indexedRowCount . get ( ) < ROWS _ IN _ PARTITION ) 
+ + readOrderingAtFinish = baseCfs . readOrdering . getCurrent ( ) ; 
+ + } 
+ + 
+ + public void partitionDelete ( DeletionTime deletionTime ) { } 
+ + 
+ + public void rangeTombstone ( RangeTombstone tombstone ) { } 
+ + 
+ + public void updateRow ( Row oldRowData , Row newRowData ) { } 
+ + 
+ + public void removeRow ( Row row ) { } 
+ + 
+ + } ; 
+ + } 
+ + } 
+ }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

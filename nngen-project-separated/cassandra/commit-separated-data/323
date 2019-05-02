@@ -1,0 +1,245 @@
+BLEU SCORE: 0.010738456044579523
+
+TEST MSG: Use an ExecutorService for repair commands instead of new Thread ( . . ) . start ( )
+GENERATED MSG: Allow disabling SlabAllocator
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 7c9d79a . . a6428d3 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 4 . 0 <nl> + * Use an ExecutorService for repair commands instead of new Thread ( . . ) . start ( ) ( CASSANDRA - 13594 ) <nl> * Fix race / ref leak in anticompaction ( CASSANDRA - 13688 ) <nl> * Expose tasks queue length via JMX ( CASSANDRA - 12758 ) <nl> * Fix race / ref leak in PendingRepairManager ( CASSANDRA - 13751 ) <nl> diff - - git a / src / java / org / apache / cassandra / concurrent / JMXEnabledThreadPoolExecutor . java b / src / java / org / apache / cassandra / concurrent / JMXEnabledThreadPoolExecutor . java <nl> index a7a54f2 . . 2dafb4f 100644 <nl> - - - a / src / java / org / apache / cassandra / concurrent / JMXEnabledThreadPoolExecutor . java <nl> + + + b / src / java / org / apache / cassandra / concurrent / JMXEnabledThreadPoolExecutor . java <nl> @ @ - 21 , 6 + 21 , 7 @ @ import java . lang . management . ManagementFactory ; <nl> import java . util . List ; <nl> import java . util . concurrent . BlockingQueue ; <nl> import java . util . concurrent . LinkedBlockingQueue ; <nl> + import java . util . concurrent . RejectedExecutionHandler ; <nl> import java . util . concurrent . TimeUnit ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . ObjectName ; <nl> @ @ - 93 , 6 + 94 , 19 @ @ public class JMXEnabledThreadPoolExecutor extends DebuggableThreadPoolExecutor i <nl> } <nl> } <nl> <nl> + public JMXEnabledThreadPoolExecutor ( int corePoolSize , <nl> + int maxPoolSize , <nl> + long keepAliveTime , <nl> + TimeUnit unit , <nl> + BlockingQueue < Runnable > workQueue , <nl> + NamedThreadFactory threadFactory , <nl> + String jmxPath , <nl> + RejectedExecutionHandler rejectedExecutionHandler ) <nl> + { <nl> + this ( corePoolSize , maxPoolSize , keepAliveTime , unit , workQueue , threadFactory , jmxPath ) ; <nl> + setRejectedExecutionHandler ( rejectedExecutionHandler ) ; <nl> + } <nl> + <nl> public JMXEnabledThreadPoolExecutor ( Stage stage ) <nl> { <nl> this ( stage . getJmxName ( ) , stage . getJmxType ( ) ) ; <nl> diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java <nl> index 22f3551 . . 5a45282 100644 <nl> - - - a / src / java / org / apache / cassandra / config / Config . java <nl> + + + b / src / java / org / apache / cassandra / config / Config . java <nl> @ @ - 348 , 6 + 348 , 9 @ @ public class Config <nl> public volatile boolean back _ pressure _ enabled = false ; <nl> public volatile ParameterizedClass back _ pressure _ strategy ; <nl> <nl> + public RepairCommandPoolFullStrategy repair _ command _ pool _ full _ strategy = RepairCommandPoolFullStrategy . queue ; <nl> + public int repair _ command _ pool _ size = concurrent _ validations ; <nl> + <nl> / * * <nl> * @ deprecated migrate to { @ link DatabaseDescriptor # isClientInitialized ( ) } <nl> * / <nl> @ @ - 425 , 6 + 428 , 12 @ @ public class Config <nl> spinning <nl> } <nl> <nl> + public enum RepairCommandPoolFullStrategy <nl> + { <nl> + queue , <nl> + reject <nl> + } <nl> + <nl> private static final List < String > SENSITIVE _ KEYS = new ArrayList < String > ( ) { { <nl> add ( " client _ encryption _ options " ) ; <nl> add ( " server _ encryption _ options " ) ; <nl> diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> index 89c9432 . . fb50826 100644 <nl> - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> @ @ - 2328 , 4 + 2328 , 14 @ @ public class DatabaseDescriptor <nl> { <nl> conf . ideal _ consistency _ level = cl ; <nl> } <nl> + <nl> + public static int getRepairCommandPoolSize ( ) <nl> + { <nl> + return conf . repair _ command _ pool _ size ; <nl> + } <nl> + <nl> + public static Config . RepairCommandPoolFullStrategy getRepairCommandPoolFullStrategy ( ) <nl> + { <nl> + return conf . repair _ command _ pool _ full _ strategy ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / ActiveRepairService . java b / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> index d50dc3f . . 2e02f0c 100644 <nl> - - - a / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> + + + b / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> @ @ - 42 , 7 + 42 , 10 @ @ import com . google . common . util . concurrent . MoreExecutors ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> + import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutor ; <nl> + import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> import org . apache . cassandra . concurrent . ScheduledExecutors ; <nl> + import org . apache . cassandra . config . Config ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . dht . Bounds ; <nl> @ @ - 77 , 6 + 80 , 8 @ @ import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . Pair ; <nl> import org . apache . cassandra . utils . UUIDGen ; <nl> <nl> + import static org . apache . cassandra . config . Config . RepairCommandPoolFullStrategy . queue ; <nl> + <nl> / * * <nl> * ActiveRepairService is the starting point for manual " active " repairs . <nl> * <nl> @ @ - 125 , 6 + 130 , 25 @ @ public class ActiveRepairService implements IEndpointStateChangeSubscriber , IFai <nl> <nl> private final ConcurrentMap < UUID , ParentRepairSession > parentRepairSessions = new ConcurrentHashMap < > ( ) ; <nl> <nl> + public final static ExecutorService repairCommandExecutor ; <nl> + static <nl> + { <nl> + Config . RepairCommandPoolFullStrategy strategy = DatabaseDescriptor . getRepairCommandPoolFullStrategy ( ) ; <nl> + BlockingQueue < Runnable > queue ; <nl> + if ( strategy = = Config . RepairCommandPoolFullStrategy . reject ) <nl> + queue = new SynchronousQueue < > ( ) ; <nl> + else <nl> + queue = new LinkedBlockingQueue < > ( ) ; <nl> + <nl> + repairCommandExecutor = new JMXEnabledThreadPoolExecutor ( 1 , <nl> + DatabaseDescriptor . getRepairCommandPoolSize ( ) , <nl> + 1 , TimeUnit . HOURS , <nl> + queue , <nl> + new NamedThreadFactory ( " Repair - Task " ) , <nl> + " internal " , <nl> + new ThreadPoolExecutor . AbortPolicy ( ) ) ; <nl> + } <nl> + <nl> private final IFailureDetector failureDetector ; <nl> private final Gossiper gossiper ; <nl> private final Cache < Integer , Pair < ParentRepairStatus , List < String > > > repairStatusByCmd ; <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index 9070e89 . . 5f691b4 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 56 , 6 + 56 , 7 @ @ import org . apache . cassandra . auth . AuthSchemaChangeListener ; <nl> import org . apache . cassandra . batchlog . BatchRemoveVerbHandler ; <nl> import org . apache . cassandra . batchlog . BatchStoreVerbHandler ; <nl> import org . apache . cassandra . batchlog . BatchlogManager ; <nl> + import org . apache . cassandra . concurrent . ExecutorLocals ; <nl> import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> import org . apache . cassandra . concurrent . ScheduledExecutors ; <nl> import org . apache . cassandra . concurrent . Stage ; <nl> @ @ - 95 , 6 + 96 , 7 @ @ import org . apache . cassandra . service . paxos . PrepareVerbHandler ; <nl> import org . apache . cassandra . service . paxos . ProposeVerbHandler ; <nl> import org . apache . cassandra . streaming . * ; <nl> import org . apache . cassandra . tracing . TraceKeyspace ; <nl> + import org . apache . cassandra . tracing . Tracing ; <nl> import org . apache . cassandra . transport . ProtocolVersion ; <nl> import org . apache . cassandra . utils . * ; <nl> import org . apache . cassandra . utils . progress . ProgressEvent ; <nl> @ @ - 120 , 8 + 122 , 6 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> <nl> private final JMXProgressSupport progressSupport = new JMXProgressSupport ( this ) ; <nl> <nl> - private static final AtomicInteger threadCounter = new AtomicInteger ( 1 ) ; <nl> - <nl> private static int getRingDelay ( ) <nl> { <nl> String newdelay = System . getProperty ( " cassandra . ring _ delay _ ms " ) ; <nl> @ @ - 3304 , 7 + 3304 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> return 0 ; <nl> <nl> int cmd = nextRepairCommand . incrementAndGet ( ) ; <nl> - NamedThreadFactory . createThread ( createRepairTask ( cmd , keyspace , option ) , " Repair - Task - " + threadCounter . incrementAndGet ( ) ) . start ( ) ; <nl> + ActiveRepairService . repairCommandExecutor . execute ( createRepairTask ( cmd , keyspace , option ) ) ; <nl> return cmd ; <nl> } <nl> <nl> @ @ - 3360 , 6 + 3360 , 21 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> <nl> RepairRunnable task = new RepairRunnable ( this , cmd , options , keyspace ) ; <nl> task . addProgressListener ( progressSupport ) ; <nl> + if ( options . isTraced ( ) ) <nl> + { <nl> + Runnable r = ( ) - > <nl> + { <nl> + try <nl> + { <nl> + task . run ( ) ; <nl> + } <nl> + finally <nl> + { <nl> + ExecutorLocals . set ( null ) ; <nl> + } <nl> + } ; <nl> + return new FutureTask < > ( r , null ) ; <nl> + } <nl> return new FutureTask < > ( task , null ) ; <nl> } <nl>
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 13b4214 . . 45e6497 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 5 + 1 , 6 @ @ <nl> 1 . 2 . 10 <nl> * Allow disabling SlabAllocator ( CASSANDRA - 5935 ) <nl> + * Make user - defined compaction JMX blocking ( CASSANDRA - 4952 ) <nl> <nl> <nl> 1 . 2 . 9 <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> index c9e1b79 . . 44b973f 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> @ @ - 56 , 10 + 56 , 7 @ @ import org . apache . cassandra . metrics . CompactionMetrics ; <nl> import org . apache . cassandra . service . AntiEntropyService ; <nl> import org . apache . cassandra . service . CacheService ; <nl> import org . apache . cassandra . service . StorageService ; <nl> - import org . apache . cassandra . utils . CloseableIterator ; <nl> - import org . apache . cassandra . utils . CounterId ; <nl> - import org . apache . cassandra . utils . Pair ; <nl> - import org . apache . cassandra . utils . WrappedRunnable ; <nl> + import org . apache . cassandra . utils . * ; <nl> <nl> / * * <nl> * A singleton which manages a private executor of ongoing compactions . A readwrite lock <nl> @ @ - 405 , 7 + 402 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> } <nl> <nl> ColumnFamilyStore cfs = Table . open ( ksname ) . getColumnFamilyStore ( cfname ) ; <nl> - submitUserDefined ( cfs , descriptors , getDefaultGcBefore ( cfs ) ) ; <nl> + FBUtilities . waitOnFuture ( submitUserDefined ( cfs , descriptors , getDefaultGcBefore ( cfs ) ) ) ; <nl> } <nl> <nl> public Future < ? > submitUserDefined ( final ColumnFamilyStore cfs , final Collection < Descriptor > dataFiles , final int gcBefore )
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 7c9d79a . . a6428d3 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 4 . 0 
+ + * Use an ExecutorService for repair commands instead of new Thread ( . . ) . start ( ) ( CASSANDRA - 13594 ) 
+ * Fix race / ref leak in anticompaction ( CASSANDRA - 13688 ) 
+ * Expose tasks queue length via JMX ( CASSANDRA - 12758 ) 
+ * Fix race / ref leak in PendingRepairManager ( CASSANDRA - 13751 ) 
+ diff - - git a / src / java / org / apache / cassandra / concurrent / JMXEnabledThreadPoolExecutor . java b / src / java / org / apache / cassandra / concurrent / JMXEnabledThreadPoolExecutor . java 
+ index a7a54f2 . . 2dafb4f 100644 
+ - - - a / src / java / org / apache / cassandra / concurrent / JMXEnabledThreadPoolExecutor . java 
+ + + + b / src / java / org / apache / cassandra / concurrent / JMXEnabledThreadPoolExecutor . java 
+ @ @ - 21 , 6 + 21 , 7 @ @ import java . lang . management . ManagementFactory ; 
+ import java . util . List ; 
+ import java . util . concurrent . BlockingQueue ; 
+ import java . util . concurrent . LinkedBlockingQueue ; 
+ + import java . util . concurrent . RejectedExecutionHandler ; 
+ import java . util . concurrent . TimeUnit ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . ObjectName ; 
+ @ @ - 93 , 6 + 94 , 19 @ @ public class JMXEnabledThreadPoolExecutor extends DebuggableThreadPoolExecutor i 
+ } 
+ } 
+ 
+ + public JMXEnabledThreadPoolExecutor ( int corePoolSize , 
+ + int maxPoolSize , 
+ + long keepAliveTime , 
+ + TimeUnit unit , 
+ + BlockingQueue < Runnable > workQueue , 
+ + NamedThreadFactory threadFactory , 
+ + String jmxPath , 
+ + RejectedExecutionHandler rejectedExecutionHandler ) 
+ + { 
+ + this ( corePoolSize , maxPoolSize , keepAliveTime , unit , workQueue , threadFactory , jmxPath ) ; 
+ + setRejectedExecutionHandler ( rejectedExecutionHandler ) ; 
+ + } 
+ + 
+ public JMXEnabledThreadPoolExecutor ( Stage stage ) 
+ { 
+ this ( stage . getJmxName ( ) , stage . getJmxType ( ) ) ; 
+ diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java 
+ index 22f3551 . . 5a45282 100644 
+ - - - a / src / java / org / apache / cassandra / config / Config . java 
+ + + + b / src / java / org / apache / cassandra / config / Config . java 
+ @ @ - 348 , 6 + 348 , 9 @ @ public class Config 
+ public volatile boolean back _ pressure _ enabled = false ; 
+ public volatile ParameterizedClass back _ pressure _ strategy ; 
+ 
+ + public RepairCommandPoolFullStrategy repair _ command _ pool _ full _ strategy = RepairCommandPoolFullStrategy . queue ; 
+ + public int repair _ command _ pool _ size = concurrent _ validations ; 
+ + 
+ / * * 
+ * @ deprecated migrate to { @ link DatabaseDescriptor # isClientInitialized ( ) } 
+ * / 
+ @ @ - 425 , 6 + 428 , 12 @ @ public class Config 
+ spinning 
+ } 
+ 
+ + public enum RepairCommandPoolFullStrategy 
+ + { 
+ + queue , 
+ + reject 
+ + } 
+ + 
+ private static final List < String > SENSITIVE _ KEYS = new ArrayList < String > ( ) { { 
+ add ( " client _ encryption _ options " ) ; 
+ add ( " server _ encryption _ options " ) ; 
+ diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ index 89c9432 . . fb50826 100644 
+ - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ @ @ - 2328 , 4 + 2328 , 14 @ @ public class DatabaseDescriptor 
+ { 
+ conf . ideal _ consistency _ level = cl ; 
+ } 
+ + 
+ + public static int getRepairCommandPoolSize ( ) 
+ + { 
+ + return conf . repair _ command _ pool _ size ; 
+ + } 
+ + 
+ + public static Config . RepairCommandPoolFullStrategy getRepairCommandPoolFullStrategy ( ) 
+ + { 
+ + return conf . repair _ command _ pool _ full _ strategy ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / ActiveRepairService . java b / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ index d50dc3f . . 2e02f0c 100644 
+ - - - a / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ + + + b / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ @ @ - 42 , 7 + 42 , 10 @ @ import com . google . common . util . concurrent . MoreExecutors ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ + import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutor ; 
+ + import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ import org . apache . cassandra . concurrent . ScheduledExecutors ; 
+ + import org . apache . cassandra . config . Config ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . dht . Bounds ; 
+ @ @ - 77 , 6 + 80 , 8 @ @ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . Pair ; 
+ import org . apache . cassandra . utils . UUIDGen ; 
+ 
+ + import static org . apache . cassandra . config . Config . RepairCommandPoolFullStrategy . queue ; 
+ + 
+ / * * 
+ * ActiveRepairService is the starting point for manual " active " repairs . 
+ * 
+ @ @ - 125 , 6 + 130 , 25 @ @ public class ActiveRepairService implements IEndpointStateChangeSubscriber , IFai 
+ 
+ private final ConcurrentMap < UUID , ParentRepairSession > parentRepairSessions = new ConcurrentHashMap < > ( ) ; 
+ 
+ + public final static ExecutorService repairCommandExecutor ; 
+ + static 
+ + { 
+ + Config . RepairCommandPoolFullStrategy strategy = DatabaseDescriptor . getRepairCommandPoolFullStrategy ( ) ; 
+ + BlockingQueue < Runnable > queue ; 
+ + if ( strategy = = Config . RepairCommandPoolFullStrategy . reject ) 
+ + queue = new SynchronousQueue < > ( ) ; 
+ + else 
+ + queue = new LinkedBlockingQueue < > ( ) ; 
+ + 
+ + repairCommandExecutor = new JMXEnabledThreadPoolExecutor ( 1 , 
+ + DatabaseDescriptor . getRepairCommandPoolSize ( ) , 
+ + 1 , TimeUnit . HOURS , 
+ + queue , 
+ + new NamedThreadFactory ( " Repair - Task " ) , 
+ + " internal " , 
+ + new ThreadPoolExecutor . AbortPolicy ( ) ) ; 
+ + } 
+ + 
+ private final IFailureDetector failureDetector ; 
+ private final Gossiper gossiper ; 
+ private final Cache < Integer , Pair < ParentRepairStatus , List < String > > > repairStatusByCmd ; 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index 9070e89 . . 5f691b4 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 56 , 6 + 56 , 7 @ @ import org . apache . cassandra . auth . AuthSchemaChangeListener ; 
+ import org . apache . cassandra . batchlog . BatchRemoveVerbHandler ; 
+ import org . apache . cassandra . batchlog . BatchStoreVerbHandler ; 
+ import org . apache . cassandra . batchlog . BatchlogManager ; 
+ + import org . apache . cassandra . concurrent . ExecutorLocals ; 
+ import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ import org . apache . cassandra . concurrent . ScheduledExecutors ; 
+ import org . apache . cassandra . concurrent . Stage ; 
+ @ @ - 95 , 6 + 96 , 7 @ @ import org . apache . cassandra . service . paxos . PrepareVerbHandler ; 
+ import org . apache . cassandra . service . paxos . ProposeVerbHandler ; 
+ import org . apache . cassandra . streaming . * ; 
+ import org . apache . cassandra . tracing . TraceKeyspace ; 
+ + import org . apache . cassandra . tracing . Tracing ; 
+ import org . apache . cassandra . transport . ProtocolVersion ; 
+ import org . apache . cassandra . utils . * ; 
+ import org . apache . cassandra . utils . progress . ProgressEvent ; 
+ @ @ - 120 , 8 + 122 , 6 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ 
+ private final JMXProgressSupport progressSupport = new JMXProgressSupport ( this ) ; 
+ 
+ - private static final AtomicInteger threadCounter = new AtomicInteger ( 1 ) ; 
+ - 
+ private static int getRingDelay ( ) 
+ { 
+ String newdelay = System . getProperty ( " cassandra . ring _ delay _ ms " ) ; 
+ @ @ - 3304 , 7 + 3304 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ return 0 ; 
+ 
+ int cmd = nextRepairCommand . incrementAndGet ( ) ; 
+ - NamedThreadFactory . createThread ( createRepairTask ( cmd , keyspace , option ) , " Repair - Task - " + threadCounter . incrementAndGet ( ) ) . start ( ) ; 
+ + ActiveRepairService . repairCommandExecutor . execute ( createRepairTask ( cmd , keyspace , option ) ) ; 
+ return cmd ; 
+ } 
+ 
+ @ @ - 3360 , 6 + 3360 , 21 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ 
+ RepairRunnable task = new RepairRunnable ( this , cmd , options , keyspace ) ; 
+ task . addProgressListener ( progressSupport ) ; 
+ + if ( options . isTraced ( ) ) 
+ + { 
+ + Runnable r = ( ) - > 
+ + { 
+ + try 
+ + { 
+ + task . run ( ) ; 
+ + } 
+ + finally 
+ + { 
+ + ExecutorLocals . set ( null ) ; 
+ + } 
+ + } ; 
+ + return new FutureTask < > ( r , null ) ; 
+ + } 
+ return new FutureTask < > ( task , null ) ; 
+ } 
+
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 13b4214 . . 45e6497 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 5 + 1 , 6 @ @ 
+ 1 . 2 . 10 
+ * Allow disabling SlabAllocator ( CASSANDRA - 5935 ) 
+ + * Make user - defined compaction JMX blocking ( CASSANDRA - 4952 ) 
+ 
+ 
+ 1 . 2 . 9 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ index c9e1b79 . . 44b973f 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ @ @ - 56 , 10 + 56 , 7 @ @ import org . apache . cassandra . metrics . CompactionMetrics ; 
+ import org . apache . cassandra . service . AntiEntropyService ; 
+ import org . apache . cassandra . service . CacheService ; 
+ import org . apache . cassandra . service . StorageService ; 
+ - import org . apache . cassandra . utils . CloseableIterator ; 
+ - import org . apache . cassandra . utils . CounterId ; 
+ - import org . apache . cassandra . utils . Pair ; 
+ - import org . apache . cassandra . utils . WrappedRunnable ; 
+ + import org . apache . cassandra . utils . * ; 
+ 
+ / * * 
+ * A singleton which manages a private executor of ongoing compactions . A readwrite lock 
+ @ @ - 405 , 7 + 402 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ } 
+ 
+ ColumnFamilyStore cfs = Table . open ( ksname ) . getColumnFamilyStore ( cfname ) ; 
+ - submitUserDefined ( cfs , descriptors , getDefaultGcBefore ( cfs ) ) ; 
+ + FBUtilities . waitOnFuture ( submitUserDefined ( cfs , descriptors , getDefaultGcBefore ( cfs ) ) ) ; 
+ } 
+ 
+ public Future < ? > submitUserDefined ( final ColumnFamilyStore cfs , final Collection < Descriptor > dataFiles , final int gcBefore )

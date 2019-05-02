@@ -1,0 +1,532 @@
+BLEU SCORE: 0.023028766869631404
+
+TEST MSG: Ensure SSTableReader . last corresponds exactly with the file end
+GENERATED MSG: pool [ Compressed ] RandomAccessReader objects on the partitioned read path ; creating them is expensive
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index cbb4334 . . bbbf9a6 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 4 <nl> + * Ensure SSTableReader . last corresponds exactly with the file end ( CASSANDRA - 8750 ) <nl> * Make SSTableWriter . openEarly more robust and obvious ( CASSANDRA - 8747 ) <nl> * Enforce SSTableReader . first / last ( CASSANDRA - 8744 ) <nl> * Cleanup SegmentedFile API ( CASSANDRA - 8749 ) <nl> diff - - git a / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java b / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java <nl> index 49dcd3d . . e29ad33 100644 <nl> - - - a / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java <nl> + + + b / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java <nl> @ @ - 67 , 7 + 67 , 7 @ @ public class CompressedRandomAccessReader extends RandomAccessReader <nl> <nl> protected CompressedRandomAccessReader ( String dataFilePath , CompressionMetadata metadata , PoolingSegmentedFile owner ) throws FileNotFoundException <nl> { <nl> - super ( new File ( dataFilePath ) , metadata . chunkLength ( ) , owner ) ; <nl> + super ( new File ( dataFilePath ) , metadata . chunkLength ( ) , metadata . compressedFileLength , owner ) ; <nl> this . metadata = metadata ; <nl> checksum = metadata . hasPostCompressionAdlerChecksums ? new Adler32 ( ) : new CRC32 ( ) ; <nl> compressed = ByteBuffer . wrap ( new byte [ metadata . compressor ( ) . initialCompressedBufferLength ( metadata . chunkLength ( ) ) ] ) ; <nl> diff - - git a / src / java / org / apache / cassandra / io / compress / CompressedSequentialWriter . java b / src / java / org / apache / cassandra / io / compress / CompressedSequentialWriter . java <nl> index 87eb2fb . . ea0d785 100644 <nl> - - - a / src / java / org / apache / cassandra / io / compress / CompressedSequentialWriter . java <nl> + + + b / src / java / org / apache / cassandra / io / compress / CompressedSequentialWriter . java <nl> @ @ - 33 , 6 + 33 , 10 @ @ import org . apache . cassandra . io . util . DataIntegrityMetadata ; <nl> import org . apache . cassandra . io . util . FileMark ; <nl> import org . apache . cassandra . io . util . SequentialWriter ; <nl> <nl> + import static org . apache . cassandra . io . compress . CompressionMetadata . Writer . OpenType . FINAL ; <nl> + import static org . apache . cassandra . io . compress . CompressionMetadata . Writer . OpenType . SHARED ; <nl> + import static org . apache . cassandra . io . compress . CompressionMetadata . Writer . OpenType . SHARED _ FINAL ; <nl> + <nl> public class CompressedSequentialWriter extends SequentialWriter <nl> { <nl> private final DataIntegrityMetadata . ChecksumWriter crcMetadata ; <nl> @ @ - 142 , 10 + 146 , 11 @ @ public class CompressedSequentialWriter extends SequentialWriter <nl> runPostFlush . run ( ) ; <nl> } <nl> <nl> - public CompressionMetadata open ( SSTableWriter . FinishType finishType ) <nl> + public CompressionMetadata open ( long overrideLength , boolean isFinal ) <nl> { <nl> - assert finishType ! = SSTableWriter . FinishType . NORMAL | | current = = originalSize ; <nl> - return metadataWriter . open ( originalSize , chunkOffset , finishType ) ; <nl> + if ( overrideLength < = 0 ) <nl> + return metadataWriter . open ( originalSize , chunkOffset , isFinal ? FINAL : SHARED _ FINAL ) ; <nl> + return metadataWriter . open ( overrideLength , chunkOffset , SHARED ) ; <nl> } <nl> <nl> @ Override <nl> diff - - git a / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java b / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java <nl> index aaf1656 . . ad087c7 100644 <nl> - - - a / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java <nl> + + + b / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java <nl> @ @ - 322 , 18 + 322 , 56 @ @ public class CompressionMetadata <nl> } <nl> } <nl> <nl> - public CompressionMetadata open ( long dataLength , long compressedLength , SSTableWriter . FinishType finishType ) <nl> + static enum OpenType <nl> { <nl> - RefCountedMemory offsets ; <nl> - if ( finishType . isFinal ) <nl> - { <nl> - / / we now know how many offsets we have and can resize the offsets properly <nl> - offsets = this . offsets . copy ( count * 8L ) ; <nl> - this . offsets . unreference ( ) ; <nl> - } <nl> - else <nl> + / / i . e . FinishType = = EARLY ; we will use the RefCountedMemory in possibly multiple instances <nl> + SHARED , <nl> + / / i . e . FinishType = = EARLY , but the sstable has been completely written , so we can <nl> + / / finalise the contents and size of the memory , but must retain a reference to it <nl> + SHARED _ FINAL , <nl> + / / i . e . FinishType = = NORMAL or FINISH _ EARLY , i . e . we have actually finished writing the table <nl> + / / and will never need to open the metadata again , so we can release any references to it here <nl> + FINAL <nl> + } <nl> + <nl> + public CompressionMetadata open ( long dataLength , long compressedLength , OpenType type ) <nl> + { <nl> + RefCountedMemory offsets = this . offsets ; <nl> + int count = this . count ; <nl> + switch ( type ) <nl> { <nl> - offsets = this . offsets ; <nl> + case FINAL : case SHARED _ FINAL : <nl> + / / maybe resize the data <nl> + if ( this . offsets . size ( ) ! = count * 8L ) <nl> + { <nl> + offsets = this . offsets . copy ( count * 8L ) ; <nl> + / / release our reference to the original shared data ; <nl> + / / we don ' t do this if not resizing since we must pass out existing <nl> + / / reference onto our caller <nl> + this . offsets . unreference ( ) ; <nl> + } <nl> + / / null out our reference to the original shared data to catch accidental reuse <nl> + this . offsets = null ; <nl> + if ( type = = OpenType . SHARED _ FINAL ) <nl> + { <nl> + / / we will use the data again , so stash our resized data back , and take an extra reference to it <nl> + this . offsets = offsets ; <nl> + this . offsets . reference ( ) ; <nl> + } <nl> + break ; <nl> + <nl> + case SHARED : <nl> + <nl> + / / we should only be opened on a compression data boundary ; truncate our size to this boundary <nl> + assert dataLength % parameters . chunkLength ( ) = = 0 ; <nl> + count = ( int ) ( dataLength / parameters . chunkLength ( ) ) ; <nl> + / / grab our actual compressed length from the next offset from our the position we ' re opened to <nl> + if ( count < this . count ) <nl> + compressedLength = offsets . getLong ( count * 8 ) ; <nl> + break ; <nl> + <nl> + default : <nl> + throw new AssertionError ( ) ; <nl> } <nl> return new CompressionMetadata ( filePath , parameters , offsets , count * 8L , dataLength , compressedLength , Descriptor . Version . CURRENT . hasPostCompressionAdlerChecksums ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> index 5abd1b7 . . 202bc4d 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> @ @ - 1314 , 11 + 1314 , 7 @ @ public class SSTableReader extends SSTable implements RefCounted < SSTableReader > <nl> <nl> long left = getPosition ( leftBound , Operator . GT ) . position ; <nl> long right = ( rightBound . compareTo ( last ) > 0 ) <nl> - ? ( openReason = = OpenReason . EARLY <nl> - / / if opened early , we overlap with the old sstables by one key , so we know that the last <nl> - / / ( and further ) key ( s ) will be streamed from these if necessary <nl> - ? getPosition ( last , Operator . GT , false , true ) . position <nl> - : uncompressedLength ( ) ) <nl> + ? uncompressedLength ( ) <nl> : getPosition ( rightBound , Operator . GT ) . position ; <nl> <nl> if ( left = = right ) <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> index 2c1cf0e . . b67685d 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> @ @ - 398 , 8 + 398 , 8 @ @ public class SSTableWriter extends SSTable <nl> assert boundary . indexLength > 0 & & boundary . dataLength > 0 ; <nl> Descriptor link = makeTmpLinks ( ) ; <nl> / / open the reader early , giving it a FINAL descriptor type so that it is indistinguishable for other consumers <nl> - SegmentedFile ifile = iwriter . builder . complete ( link . filenameFor ( Component . PRIMARY _ INDEX ) , FinishType . EARLY ) ; <nl> - SegmentedFile dfile = dbuilder . complete ( link . filenameFor ( Component . DATA ) , FinishType . EARLY ) ; <nl> + SegmentedFile ifile = iwriter . builder . complete ( link . filenameFor ( Component . PRIMARY _ INDEX ) , boundary . indexLength ) ; <nl> + SegmentedFile dfile = dbuilder . complete ( link . filenameFor ( Component . DATA ) , boundary . dataLength ) ; <nl> SSTableReader sstable = SSTableReader . internalOpen ( descriptor . asType ( Descriptor . Type . FINAL ) , <nl> components , metadata , <nl> partitioner , ifile , <nl> @ @ - 451 , 8 + 451 , 8 @ @ public class SSTableWriter extends SSTable <nl> desc = makeTmpLinks ( ) ; <nl> <nl> / / finalize in - memory state for the reader <nl> - SegmentedFile ifile = iwriter . builder . complete ( desc . filenameFor ( Component . PRIMARY _ INDEX ) , finishType ) ; <nl> - SegmentedFile dfile = dbuilder . complete ( desc . filenameFor ( Component . DATA ) , finishType ) ; <nl> + SegmentedFile ifile = iwriter . builder . complete ( desc . filenameFor ( Component . PRIMARY _ INDEX ) , finishType . isFinal ) ; <nl> + SegmentedFile dfile = dbuilder . complete ( desc . filenameFor ( Component . DATA ) , finishType . isFinal ) ; <nl> SSTableReader sstable = SSTableReader . internalOpen ( desc . asType ( Descriptor . Type . FINAL ) , <nl> components , <nl> this . metadata , <nl> diff - - git a / src / java / org / apache / cassandra / io / util / BufferedPoolingSegmentedFile . java b / src / java / org / apache / cassandra / io / util / BufferedPoolingSegmentedFile . java <nl> index e4c363a . . f04a1fb 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / BufferedPoolingSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / BufferedPoolingSegmentedFile . java <nl> @ @ - 45 , 9 + 45 , 10 @ @ public class BufferedPoolingSegmentedFile extends PoolingSegmentedFile <nl> / / only one segment in a standard - io file <nl> } <nl> <nl> - public SegmentedFile complete ( String path , SSTableWriter . FinishType finishType ) <nl> + public SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) <nl> { <nl> - long length = new File ( path ) . length ( ) ; <nl> + assert ! isFinal | | overrideLength < = 0 ; <nl> + long length = overrideLength > 0 ? overrideLength : new File ( path ) . length ( ) ; <nl> return new BufferedPoolingSegmentedFile ( path , length ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java <nl> index c29bbf3 . . 1a1d208 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java <nl> @ @ - 53 , 9 + 53 , 10 @ @ public class BufferedSegmentedFile extends SegmentedFile <nl> / / only one segment in a standard - io file <nl> } <nl> <nl> - public SegmentedFile complete ( String path , SSTableWriter . FinishType finishType ) <nl> + public SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) <nl> { <nl> - long length = new File ( path ) . length ( ) ; <nl> + assert ! isFinal | | overrideLength < = 0 ; <nl> + long length = overrideLength > 0 ? overrideLength : new File ( path ) . length ( ) ; <nl> return new BufferedSegmentedFile ( path , length ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / CompressedPoolingSegmentedFile . java b / src / java / org / apache / cassandra / io / util / CompressedPoolingSegmentedFile . java <nl> index c514b80 . . 40a54dc 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / CompressedPoolingSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / CompressedPoolingSegmentedFile . java <nl> @ @ - 23 , 7 + 23 , 6 @ @ import org . apache . cassandra . io . compress . CompressedRandomAccessReader ; <nl> import org . apache . cassandra . io . compress . CompressedSequentialWriter ; <nl> import org . apache . cassandra . io . compress . CompressedThrottledReader ; <nl> import org . apache . cassandra . io . compress . CompressionMetadata ; <nl> - import org . apache . cassandra . io . sstable . SSTableWriter ; <nl> <nl> public class CompressedPoolingSegmentedFile extends PoolingSegmentedFile implements ICompressedFile <nl> { <nl> @ @ - 68 , 9 + 67 , 9 @ @ public class CompressedPoolingSegmentedFile extends PoolingSegmentedFile impleme <nl> / / only one segment in a standard - io file <nl> } <nl> <nl> - public SegmentedFile complete ( String path , SSTableWriter . FinishType finishType ) <nl> + public SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) <nl> { <nl> - return new CompressedPoolingSegmentedFile ( path , metadata ( path , finishType ) ) ; <nl> + return new CompressedPoolingSegmentedFile ( path , metadata ( path , overrideLength , isFinal ) ) ; <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java <nl> index 6b5c2e1 . . 9721bc3 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java <nl> @ @ - 73 , 17 + 73 , 18 @ @ public class CompressedSegmentedFile extends SegmentedFile implements ICompresse <nl> / / only one segment in a standard - io file <nl> } <nl> <nl> - protected CompressionMetadata metadata ( String path , SSTableWriter . FinishType finishType ) <nl> + protected CompressionMetadata metadata ( String path , long overrideLength , boolean isFinal ) <nl> { <nl> if ( writer = = null ) <nl> return CompressionMetadata . create ( path ) ; <nl> <nl> - return writer . open ( finishType ) ; <nl> + return writer . open ( overrideLength , isFinal ) ; <nl> } <nl> <nl> - public SegmentedFile complete ( String path , SSTableWriter . FinishType finishType ) <nl> + public SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) <nl> { <nl> - return new CompressedSegmentedFile ( path , metadata ( path , finishType ) ) ; <nl> + assert ! isFinal | | overrideLength < = 0 ; <nl> + return new CompressedSegmentedFile ( path , metadata ( path , overrideLength , isFinal ) ) ; <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> index 8067c68 . . 1b23343 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> @ @ - 183 , 31 + 183 , 38 @ @ public class MmappedSegmentedFile extends SegmentedFile <nl> } <nl> } <nl> <nl> - public SegmentedFile complete ( String path , SSTableWriter . FinishType finishType ) <nl> + public SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) <nl> { <nl> - long length = new File ( path ) . length ( ) ; <nl> + assert ! isFinal | | overrideLength < = 0 ; <nl> + long length = overrideLength > 0 ? overrideLength : new File ( path ) . length ( ) ; <nl> / / create the segments <nl> - return new MmappedSegmentedFile ( path , length , createSegments ( path ) ) ; <nl> + return new MmappedSegmentedFile ( path , length , createSegments ( path , length ) ) ; <nl> } <nl> <nl> - private Segment [ ] createSegments ( String path ) <nl> + private Segment [ ] createSegments ( String path , long length ) <nl> { <nl> RandomAccessFile raf ; <nl> - long length ; <nl> try <nl> { <nl> raf = new RandomAccessFile ( path , " r " ) ; <nl> - length = raf . length ( ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> throw new RuntimeException ( e ) ; <nl> } <nl> <nl> + / / if we ' re early finishing a range that doesn ' t span multiple segments , but the finished file now does , <nl> + / / we remove these from the end ( we loop incase somehow this spans multiple segments , but that would <nl> + / / be a loco dataset <nl> + while ( length < boundaries . get ( boundaries . size ( ) - 1 ) ) <nl> + boundaries . remove ( boundaries . size ( ) - 1 ) ; <nl> + <nl> / / add a sentinel value = = length <nl> List < Long > boundaries = new ArrayList < > ( this . boundaries ) ; <nl> if ( length ! = boundaries . get ( boundaries . size ( ) - 1 ) ) <nl> boundaries . add ( length ) ; <nl> + <nl> + <nl> int segcount = boundaries . size ( ) - 1 ; <nl> Segment [ ] segments = new Segment [ segcount ] ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / io / util / PoolingSegmentedFile . java b / src / java / org / apache / cassandra / io / util / PoolingSegmentedFile . java <nl> index d3c90c7 . . 4ab98af 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / PoolingSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / PoolingSegmentedFile . java <nl> @ @ - 67 , 7 + 67 , 7 @ @ public abstract class PoolingSegmentedFile extends SegmentedFile <nl> <nl> protected RandomAccessReader createPooledReader ( ) <nl> { <nl> - return RandomAccessReader . open ( new File ( path ) , this ) ; <nl> + return RandomAccessReader . open ( new File ( path ) , length , this ) ; <nl> } <nl> <nl> public void recycle ( RandomAccessReader reader ) <nl> diff - - git a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java <nl> index 81e45b5 . . df68ca3 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java <nl> + + + b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java <nl> @ @ - 55 , 6 + 55 , 10 @ @ public class RandomAccessReader extends RandomAccessFile implements FileDataInpu <nl> <nl> protected RandomAccessReader ( File file , int bufferSize , PoolingSegmentedFile owner ) throws FileNotFoundException <nl> { <nl> + this ( file , bufferSize , - 1 , owner ) ; <nl> + } <nl> + protected RandomAccessReader ( File file , int bufferSize , long overrideLength , PoolingSegmentedFile owner ) throws FileNotFoundException <nl> + { <nl> super ( file , " r " ) ; <nl> <nl> this . owner = owner ; <nl> @ @ - 69 , 33 + 73 , 49 @ @ public class RandomAccessReader extends RandomAccessFile implements FileDataInpu <nl> buffer = new byte [ bufferSize ] ; <nl> <nl> / / we can cache file length in read - only mode <nl> - try <nl> - { <nl> - fileLength = channel . size ( ) ; <nl> - } <nl> - catch ( IOException e ) <nl> + long fileLength = overrideLength ; <nl> + if ( fileLength < = 0 ) <nl> { <nl> - throw new FSReadError ( e , filePath ) ; <nl> + try <nl> + { <nl> + fileLength = channel . size ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new FSReadError ( e , filePath ) ; <nl> + } <nl> } <nl> + <nl> + this . fileLength = fileLength ; <nl> validBufferBytes = - 1 ; / / that will trigger reBuffer ( ) on demand by read / seek operations <nl> } <nl> <nl> - public static RandomAccessReader open ( File file , PoolingSegmentedFile owner ) <nl> + public static RandomAccessReader open ( File file , long overrideSize , PoolingSegmentedFile owner ) <nl> { <nl> - return open ( file , DEFAULT _ BUFFER _ SIZE , owner ) ; <nl> + return open ( file , DEFAULT _ BUFFER _ SIZE , overrideSize , owner ) ; <nl> } <nl> <nl> public static RandomAccessReader open ( File file ) <nl> { <nl> - return open ( file , DEFAULT _ BUFFER _ SIZE , null ) ; <nl> + return open ( file , - 1L ) ; <nl> + } <nl> + <nl> + public static RandomAccessReader open ( File file , long overrideSize ) <nl> + { <nl> + return open ( file , DEFAULT _ BUFFER _ SIZE , overrideSize , null ) ; <nl> } <nl> <nl> @ VisibleForTesting <nl> static RandomAccessReader open ( File file , int bufferSize , PoolingSegmentedFile owner ) <nl> { <nl> + return open ( file , bufferSize , - 1L , owner ) ; <nl> + } <nl> + <nl> + private static RandomAccessReader open ( File file , int bufferSize , long overrideSize , PoolingSegmentedFile owner ) <nl> + { <nl> try <nl> { <nl> - return new RandomAccessReader ( file , bufferSize , owner ) ; <nl> + return new RandomAccessReader ( file , bufferSize , overrideSize , owner ) ; <nl> } <nl> catch ( FileNotFoundException e ) <nl> { <nl> @ @ - 118 , 22 + 138 , 27 @ @ public class RandomAccessReader extends RandomAccessFile implements FileDataInpu <nl> <nl> try <nl> { <nl> - if ( bufferOffset > = channel . size ( ) ) <nl> - return ; <nl> + int read = buffer . length ; <nl> + if ( bufferOffset + read > fileLength ) <nl> + { <nl> + if ( bufferOffset > = fileLength ) <nl> + return ; <nl> + read = ( int ) ( fileLength - bufferOffset ) ; <nl> + } <nl> <nl> channel . position ( bufferOffset ) ; / / setting channel position <nl> <nl> - int read = 0 ; <nl> - <nl> - while ( read < buffer . length ) <nl> + int offset = 0 ; <nl> + while ( read > 0 ) <nl> { <nl> - int n = super . read ( buffer , read , buffer . length - read ) ; <nl> + int n = super . read ( buffer , offset , read ) ; <nl> if ( n < 0 ) <nl> - break ; <nl> - read + = n ; <nl> + throw new IllegalStateException ( ) ; <nl> + read - = n ; <nl> + offset + = n ; <nl> } <nl> <nl> - validBufferBytes = read ; <nl> + validBufferBytes = offset ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / io / util / SegmentedFile . java b / src / java / org / apache / cassandra / io / util / SegmentedFile . java <nl> index 510ed81 . . 146494d 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / SegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / SegmentedFile . java <nl> @ @ - 31 , 7 + 31 , 6 @ @ import org . apache . cassandra . config . Config ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . io . FSReadError ; <nl> import org . apache . cassandra . io . compress . CompressedSequentialWriter ; <nl> - import org . apache . cassandra . io . sstable . SSTableWriter ; <nl> import org . apache . cassandra . utils . Pair ; <nl> import org . apache . cassandra . utils . concurrent . RefCounted ; <nl> import org . apache . cassandra . utils . concurrent . SharedCloseableImpl ; <nl> @ @ - 96 , 13 + 95 , 13 @ @ public abstract class SegmentedFile extends SharedCloseableImpl <nl> <nl> public RandomAccessReader createReader ( ) <nl> { <nl> - return RandomAccessReader . open ( new File ( path ) ) ; <nl> + return RandomAccessReader . open ( new File ( path ) , length ) ; <nl> } <nl> <nl> public RandomAccessReader createThrottledReader ( RateLimiter limiter ) <nl> { <nl> assert limiter ! = null ; <nl> - return ThrottledReader . open ( new File ( path ) , limiter ) ; <nl> + return ThrottledReader . open ( new File ( path ) , length , limiter ) ; <nl> } <nl> <nl> public FileDataInput getSegment ( long position ) <nl> @ @ - 156 , 11 + 155 , 21 @ @ public abstract class SegmentedFile extends SharedCloseableImpl <nl> * Called after all potential boundaries have been added to apply this Builder to a concrete file on disk . <nl> * @ param path The file on disk . <nl> * / <nl> - public abstract SegmentedFile complete ( String path , SSTableWriter . FinishType openType ) ; <nl> + protected abstract SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) ; <nl> <nl> public SegmentedFile complete ( String path ) <nl> { <nl> - return complete ( path , SSTableWriter . FinishType . NORMAL ) ; <nl> + return complete ( path , - 1 , true ) ; <nl> + } <nl> + <nl> + public SegmentedFile complete ( String path , boolean isFinal ) <nl> + { <nl> + return complete ( path , - 1 , isFinal ) ; <nl> + } <nl> + <nl> + public SegmentedFile complete ( String path , long overrideLength ) <nl> + { <nl> + return complete ( path , overrideLength , false ) ; <nl> } <nl> <nl> public void serializeBounds ( DataOutput out ) throws IOException <nl> diff - - git a / src / java / org / apache / cassandra / io / util / ThrottledReader . java b / src / java / org / apache / cassandra / io / util / ThrottledReader . java <nl> index b12a8a8 . . c4845c5 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / ThrottledReader . java <nl> + + + b / src / java / org / apache / cassandra / io / util / ThrottledReader . java <nl> @ @ - 30 , 9 + 30 , 9 @ @ public class ThrottledReader extends RandomAccessReader <nl> { <nl> private final RateLimiter limiter ; <nl> <nl> - protected ThrottledReader ( File file , RateLimiter limiter ) throws FileNotFoundException <nl> + protected ThrottledReader ( File file , long overrideLength , RateLimiter limiter ) throws FileNotFoundException <nl> { <nl> - super ( file , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , null ) ; <nl> + super ( file , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , overrideLength , null ) ; <nl> this . limiter = limiter ; <nl> } <nl> <nl> @ @ - 42 , 11 + 42 , 11 @ @ public class ThrottledReader extends RandomAccessReader <nl> super . reBuffer ( ) ; <nl> } <nl> <nl> - public static ThrottledReader open ( File file , RateLimiter limiter ) <nl> + public static ThrottledReader open ( File file , long overrideLength , RateLimiter limiter ) <nl> { <nl> try <nl> { <nl> - return new ThrottledReader ( file , limiter ) ; <nl> + return new ThrottledReader ( file , overrideLength , limiter ) ; <nl> } <nl> catch ( FileNotFoundException e ) <nl> {
+NEAREST DIFF (one line): diff - - git a / src / resources / org / apache / cassandra / cli / CliHelp . yaml b / src / resources / org / apache / cassandra / cli / CliHelp . yaml <nl> index 12c7bf7 . . 360c7704 100644 <nl> - - - a / src / resources / org / apache / cassandra / cli / CliHelp . yaml <nl> + + + b / src / resources / org / apache / cassandra / cli / CliHelp . yaml <nl> @ @ - 130 , 7 + 130 , 7 @ @ commands : <nl> describe ; - Describes current authenticated keyspace <nl> describe < keyspace > ; - Describe this keyspace <nl> describe < column _ family > ; - Describe the colum family in the current authenticated keyspace <nl> - - name : <nl> + - name : NODE _ DESCRIBE _ CLUSTER <nl> help : | <nl> describe cluster ; <nl>
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index cbb4334 . . bbbf9a6 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 4 
+ + * Ensure SSTableReader . last corresponds exactly with the file end ( CASSANDRA - 8750 ) 
+ * Make SSTableWriter . openEarly more robust and obvious ( CASSANDRA - 8747 ) 
+ * Enforce SSTableReader . first / last ( CASSANDRA - 8744 ) 
+ * Cleanup SegmentedFile API ( CASSANDRA - 8749 ) 
+ diff - - git a / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java b / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java 
+ index 49dcd3d . . e29ad33 100644 
+ - - - a / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java 
+ + + + b / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java 
+ @ @ - 67 , 7 + 67 , 7 @ @ public class CompressedRandomAccessReader extends RandomAccessReader 
+ 
+ protected CompressedRandomAccessReader ( String dataFilePath , CompressionMetadata metadata , PoolingSegmentedFile owner ) throws FileNotFoundException 
+ { 
+ - super ( new File ( dataFilePath ) , metadata . chunkLength ( ) , owner ) ; 
+ + super ( new File ( dataFilePath ) , metadata . chunkLength ( ) , metadata . compressedFileLength , owner ) ; 
+ this . metadata = metadata ; 
+ checksum = metadata . hasPostCompressionAdlerChecksums ? new Adler32 ( ) : new CRC32 ( ) ; 
+ compressed = ByteBuffer . wrap ( new byte [ metadata . compressor ( ) . initialCompressedBufferLength ( metadata . chunkLength ( ) ) ] ) ; 
+ diff - - git a / src / java / org / apache / cassandra / io / compress / CompressedSequentialWriter . java b / src / java / org / apache / cassandra / io / compress / CompressedSequentialWriter . java 
+ index 87eb2fb . . ea0d785 100644 
+ - - - a / src / java / org / apache / cassandra / io / compress / CompressedSequentialWriter . java 
+ + + + b / src / java / org / apache / cassandra / io / compress / CompressedSequentialWriter . java 
+ @ @ - 33 , 6 + 33 , 10 @ @ import org . apache . cassandra . io . util . DataIntegrityMetadata ; 
+ import org . apache . cassandra . io . util . FileMark ; 
+ import org . apache . cassandra . io . util . SequentialWriter ; 
+ 
+ + import static org . apache . cassandra . io . compress . CompressionMetadata . Writer . OpenType . FINAL ; 
+ + import static org . apache . cassandra . io . compress . CompressionMetadata . Writer . OpenType . SHARED ; 
+ + import static org . apache . cassandra . io . compress . CompressionMetadata . Writer . OpenType . SHARED _ FINAL ; 
+ + 
+ public class CompressedSequentialWriter extends SequentialWriter 
+ { 
+ private final DataIntegrityMetadata . ChecksumWriter crcMetadata ; 
+ @ @ - 142 , 10 + 146 , 11 @ @ public class CompressedSequentialWriter extends SequentialWriter 
+ runPostFlush . run ( ) ; 
+ } 
+ 
+ - public CompressionMetadata open ( SSTableWriter . FinishType finishType ) 
+ + public CompressionMetadata open ( long overrideLength , boolean isFinal ) 
+ { 
+ - assert finishType ! = SSTableWriter . FinishType . NORMAL | | current = = originalSize ; 
+ - return metadataWriter . open ( originalSize , chunkOffset , finishType ) ; 
+ + if ( overrideLength < = 0 ) 
+ + return metadataWriter . open ( originalSize , chunkOffset , isFinal ? FINAL : SHARED _ FINAL ) ; 
+ + return metadataWriter . open ( overrideLength , chunkOffset , SHARED ) ; 
+ } 
+ 
+ @ Override 
+ diff - - git a / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java b / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java 
+ index aaf1656 . . ad087c7 100644 
+ - - - a / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java 
+ + + + b / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java 
+ @ @ - 322 , 18 + 322 , 56 @ @ public class CompressionMetadata 
+ } 
+ } 
+ 
+ - public CompressionMetadata open ( long dataLength , long compressedLength , SSTableWriter . FinishType finishType ) 
+ + static enum OpenType 
+ { 
+ - RefCountedMemory offsets ; 
+ - if ( finishType . isFinal ) 
+ - { 
+ - / / we now know how many offsets we have and can resize the offsets properly 
+ - offsets = this . offsets . copy ( count * 8L ) ; 
+ - this . offsets . unreference ( ) ; 
+ - } 
+ - else 
+ + / / i . e . FinishType = = EARLY ; we will use the RefCountedMemory in possibly multiple instances 
+ + SHARED , 
+ + / / i . e . FinishType = = EARLY , but the sstable has been completely written , so we can 
+ + / / finalise the contents and size of the memory , but must retain a reference to it 
+ + SHARED _ FINAL , 
+ + / / i . e . FinishType = = NORMAL or FINISH _ EARLY , i . e . we have actually finished writing the table 
+ + / / and will never need to open the metadata again , so we can release any references to it here 
+ + FINAL 
+ + } 
+ + 
+ + public CompressionMetadata open ( long dataLength , long compressedLength , OpenType type ) 
+ + { 
+ + RefCountedMemory offsets = this . offsets ; 
+ + int count = this . count ; 
+ + switch ( type ) 
+ { 
+ - offsets = this . offsets ; 
+ + case FINAL : case SHARED _ FINAL : 
+ + / / maybe resize the data 
+ + if ( this . offsets . size ( ) ! = count * 8L ) 
+ + { 
+ + offsets = this . offsets . copy ( count * 8L ) ; 
+ + / / release our reference to the original shared data ; 
+ + / / we don ' t do this if not resizing since we must pass out existing 
+ + / / reference onto our caller 
+ + this . offsets . unreference ( ) ; 
+ + } 
+ + / / null out our reference to the original shared data to catch accidental reuse 
+ + this . offsets = null ; 
+ + if ( type = = OpenType . SHARED _ FINAL ) 
+ + { 
+ + / / we will use the data again , so stash our resized data back , and take an extra reference to it 
+ + this . offsets = offsets ; 
+ + this . offsets . reference ( ) ; 
+ + } 
+ + break ; 
+ + 
+ + case SHARED : 
+ + 
+ + / / we should only be opened on a compression data boundary ; truncate our size to this boundary 
+ + assert dataLength % parameters . chunkLength ( ) = = 0 ; 
+ + count = ( int ) ( dataLength / parameters . chunkLength ( ) ) ; 
+ + / / grab our actual compressed length from the next offset from our the position we ' re opened to 
+ + if ( count < this . count ) 
+ + compressedLength = offsets . getLong ( count * 8 ) ; 
+ + break ; 
+ + 
+ + default : 
+ + throw new AssertionError ( ) ; 
+ } 
+ return new CompressionMetadata ( filePath , parameters , offsets , count * 8L , dataLength , compressedLength , Descriptor . Version . CURRENT . hasPostCompressionAdlerChecksums ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ index 5abd1b7 . . 202bc4d 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ @ @ - 1314 , 11 + 1314 , 7 @ @ public class SSTableReader extends SSTable implements RefCounted < SSTableReader > 
+ 
+ long left = getPosition ( leftBound , Operator . GT ) . position ; 
+ long right = ( rightBound . compareTo ( last ) > 0 ) 
+ - ? ( openReason = = OpenReason . EARLY 
+ - / / if opened early , we overlap with the old sstables by one key , so we know that the last 
+ - / / ( and further ) key ( s ) will be streamed from these if necessary 
+ - ? getPosition ( last , Operator . GT , false , true ) . position 
+ - : uncompressedLength ( ) ) 
+ + ? uncompressedLength ( ) 
+ : getPosition ( rightBound , Operator . GT ) . position ; 
+ 
+ if ( left = = right ) 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ index 2c1cf0e . . b67685d 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ @ @ - 398 , 8 + 398 , 8 @ @ public class SSTableWriter extends SSTable 
+ assert boundary . indexLength > 0 & & boundary . dataLength > 0 ; 
+ Descriptor link = makeTmpLinks ( ) ; 
+ / / open the reader early , giving it a FINAL descriptor type so that it is indistinguishable for other consumers 
+ - SegmentedFile ifile = iwriter . builder . complete ( link . filenameFor ( Component . PRIMARY _ INDEX ) , FinishType . EARLY ) ; 
+ - SegmentedFile dfile = dbuilder . complete ( link . filenameFor ( Component . DATA ) , FinishType . EARLY ) ; 
+ + SegmentedFile ifile = iwriter . builder . complete ( link . filenameFor ( Component . PRIMARY _ INDEX ) , boundary . indexLength ) ; 
+ + SegmentedFile dfile = dbuilder . complete ( link . filenameFor ( Component . DATA ) , boundary . dataLength ) ; 
+ SSTableReader sstable = SSTableReader . internalOpen ( descriptor . asType ( Descriptor . Type . FINAL ) , 
+ components , metadata , 
+ partitioner , ifile , 
+ @ @ - 451 , 8 + 451 , 8 @ @ public class SSTableWriter extends SSTable 
+ desc = makeTmpLinks ( ) ; 
+ 
+ / / finalize in - memory state for the reader 
+ - SegmentedFile ifile = iwriter . builder . complete ( desc . filenameFor ( Component . PRIMARY _ INDEX ) , finishType ) ; 
+ - SegmentedFile dfile = dbuilder . complete ( desc . filenameFor ( Component . DATA ) , finishType ) ; 
+ + SegmentedFile ifile = iwriter . builder . complete ( desc . filenameFor ( Component . PRIMARY _ INDEX ) , finishType . isFinal ) ; 
+ + SegmentedFile dfile = dbuilder . complete ( desc . filenameFor ( Component . DATA ) , finishType . isFinal ) ; 
+ SSTableReader sstable = SSTableReader . internalOpen ( desc . asType ( Descriptor . Type . FINAL ) , 
+ components , 
+ this . metadata , 
+ diff - - git a / src / java / org / apache / cassandra / io / util / BufferedPoolingSegmentedFile . java b / src / java / org / apache / cassandra / io / util / BufferedPoolingSegmentedFile . java 
+ index e4c363a . . f04a1fb 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / BufferedPoolingSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / BufferedPoolingSegmentedFile . java 
+ @ @ - 45 , 9 + 45 , 10 @ @ public class BufferedPoolingSegmentedFile extends PoolingSegmentedFile 
+ / / only one segment in a standard - io file 
+ } 
+ 
+ - public SegmentedFile complete ( String path , SSTableWriter . FinishType finishType ) 
+ + public SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) 
+ { 
+ - long length = new File ( path ) . length ( ) ; 
+ + assert ! isFinal | | overrideLength < = 0 ; 
+ + long length = overrideLength > 0 ? overrideLength : new File ( path ) . length ( ) ; 
+ return new BufferedPoolingSegmentedFile ( path , length ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java 
+ index c29bbf3 . . 1a1d208 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java 
+ @ @ - 53 , 9 + 53 , 10 @ @ public class BufferedSegmentedFile extends SegmentedFile 
+ / / only one segment in a standard - io file 
+ } 
+ 
+ - public SegmentedFile complete ( String path , SSTableWriter . FinishType finishType ) 
+ + public SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) 
+ { 
+ - long length = new File ( path ) . length ( ) ; 
+ + assert ! isFinal | | overrideLength < = 0 ; 
+ + long length = overrideLength > 0 ? overrideLength : new File ( path ) . length ( ) ; 
+ return new BufferedSegmentedFile ( path , length ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / CompressedPoolingSegmentedFile . java b / src / java / org / apache / cassandra / io / util / CompressedPoolingSegmentedFile . java 
+ index c514b80 . . 40a54dc 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / CompressedPoolingSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / CompressedPoolingSegmentedFile . java 
+ @ @ - 23 , 7 + 23 , 6 @ @ import org . apache . cassandra . io . compress . CompressedRandomAccessReader ; 
+ import org . apache . cassandra . io . compress . CompressedSequentialWriter ; 
+ import org . apache . cassandra . io . compress . CompressedThrottledReader ; 
+ import org . apache . cassandra . io . compress . CompressionMetadata ; 
+ - import org . apache . cassandra . io . sstable . SSTableWriter ; 
+ 
+ public class CompressedPoolingSegmentedFile extends PoolingSegmentedFile implements ICompressedFile 
+ { 
+ @ @ - 68 , 9 + 67 , 9 @ @ public class CompressedPoolingSegmentedFile extends PoolingSegmentedFile impleme 
+ / / only one segment in a standard - io file 
+ } 
+ 
+ - public SegmentedFile complete ( String path , SSTableWriter . FinishType finishType ) 
+ + public SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) 
+ { 
+ - return new CompressedPoolingSegmentedFile ( path , metadata ( path , finishType ) ) ; 
+ + return new CompressedPoolingSegmentedFile ( path , metadata ( path , overrideLength , isFinal ) ) ; 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java 
+ index 6b5c2e1 . . 9721bc3 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java 
+ @ @ - 73 , 17 + 73 , 18 @ @ public class CompressedSegmentedFile extends SegmentedFile implements ICompresse 
+ / / only one segment in a standard - io file 
+ } 
+ 
+ - protected CompressionMetadata metadata ( String path , SSTableWriter . FinishType finishType ) 
+ + protected CompressionMetadata metadata ( String path , long overrideLength , boolean isFinal ) 
+ { 
+ if ( writer = = null ) 
+ return CompressionMetadata . create ( path ) ; 
+ 
+ - return writer . open ( finishType ) ; 
+ + return writer . open ( overrideLength , isFinal ) ; 
+ } 
+ 
+ - public SegmentedFile complete ( String path , SSTableWriter . FinishType finishType ) 
+ + public SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) 
+ { 
+ - return new CompressedSegmentedFile ( path , metadata ( path , finishType ) ) ; 
+ + assert ! isFinal | | overrideLength < = 0 ; 
+ + return new CompressedSegmentedFile ( path , metadata ( path , overrideLength , isFinal ) ) ; 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ index 8067c68 . . 1b23343 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ @ @ - 183 , 31 + 183 , 38 @ @ public class MmappedSegmentedFile extends SegmentedFile 
+ } 
+ } 
+ 
+ - public SegmentedFile complete ( String path , SSTableWriter . FinishType finishType ) 
+ + public SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) 
+ { 
+ - long length = new File ( path ) . length ( ) ; 
+ + assert ! isFinal | | overrideLength < = 0 ; 
+ + long length = overrideLength > 0 ? overrideLength : new File ( path ) . length ( ) ; 
+ / / create the segments 
+ - return new MmappedSegmentedFile ( path , length , createSegments ( path ) ) ; 
+ + return new MmappedSegmentedFile ( path , length , createSegments ( path , length ) ) ; 
+ } 
+ 
+ - private Segment [ ] createSegments ( String path ) 
+ + private Segment [ ] createSegments ( String path , long length ) 
+ { 
+ RandomAccessFile raf ; 
+ - long length ; 
+ try 
+ { 
+ raf = new RandomAccessFile ( path , " r " ) ; 
+ - length = raf . length ( ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ throw new RuntimeException ( e ) ; 
+ } 
+ 
+ + / / if we ' re early finishing a range that doesn ' t span multiple segments , but the finished file now does , 
+ + / / we remove these from the end ( we loop incase somehow this spans multiple segments , but that would 
+ + / / be a loco dataset 
+ + while ( length < boundaries . get ( boundaries . size ( ) - 1 ) ) 
+ + boundaries . remove ( boundaries . size ( ) - 1 ) ; 
+ + 
+ / / add a sentinel value = = length 
+ List < Long > boundaries = new ArrayList < > ( this . boundaries ) ; 
+ if ( length ! = boundaries . get ( boundaries . size ( ) - 1 ) ) 
+ boundaries . add ( length ) ; 
+ + 
+ + 
+ int segcount = boundaries . size ( ) - 1 ; 
+ Segment [ ] segments = new Segment [ segcount ] ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / io / util / PoolingSegmentedFile . java b / src / java / org / apache / cassandra / io / util / PoolingSegmentedFile . java 
+ index d3c90c7 . . 4ab98af 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / PoolingSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / PoolingSegmentedFile . java 
+ @ @ - 67 , 7 + 67 , 7 @ @ public abstract class PoolingSegmentedFile extends SegmentedFile 
+ 
+ protected RandomAccessReader createPooledReader ( ) 
+ { 
+ - return RandomAccessReader . open ( new File ( path ) , this ) ; 
+ + return RandomAccessReader . open ( new File ( path ) , length , this ) ; 
+ } 
+ 
+ public void recycle ( RandomAccessReader reader ) 
+ diff - - git a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java 
+ index 81e45b5 . . df68ca3 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java 
+ + + + b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java 
+ @ @ - 55 , 6 + 55 , 10 @ @ public class RandomAccessReader extends RandomAccessFile implements FileDataInpu 
+ 
+ protected RandomAccessReader ( File file , int bufferSize , PoolingSegmentedFile owner ) throws FileNotFoundException 
+ { 
+ + this ( file , bufferSize , - 1 , owner ) ; 
+ + } 
+ + protected RandomAccessReader ( File file , int bufferSize , long overrideLength , PoolingSegmentedFile owner ) throws FileNotFoundException 
+ + { 
+ super ( file , " r " ) ; 
+ 
+ this . owner = owner ; 
+ @ @ - 69 , 33 + 73 , 49 @ @ public class RandomAccessReader extends RandomAccessFile implements FileDataInpu 
+ buffer = new byte [ bufferSize ] ; 
+ 
+ / / we can cache file length in read - only mode 
+ - try 
+ - { 
+ - fileLength = channel . size ( ) ; 
+ - } 
+ - catch ( IOException e ) 
+ + long fileLength = overrideLength ; 
+ + if ( fileLength < = 0 ) 
+ { 
+ - throw new FSReadError ( e , filePath ) ; 
+ + try 
+ + { 
+ + fileLength = channel . size ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new FSReadError ( e , filePath ) ; 
+ + } 
+ } 
+ + 
+ + this . fileLength = fileLength ; 
+ validBufferBytes = - 1 ; / / that will trigger reBuffer ( ) on demand by read / seek operations 
+ } 
+ 
+ - public static RandomAccessReader open ( File file , PoolingSegmentedFile owner ) 
+ + public static RandomAccessReader open ( File file , long overrideSize , PoolingSegmentedFile owner ) 
+ { 
+ - return open ( file , DEFAULT _ BUFFER _ SIZE , owner ) ; 
+ + return open ( file , DEFAULT _ BUFFER _ SIZE , overrideSize , owner ) ; 
+ } 
+ 
+ public static RandomAccessReader open ( File file ) 
+ { 
+ - return open ( file , DEFAULT _ BUFFER _ SIZE , null ) ; 
+ + return open ( file , - 1L ) ; 
+ + } 
+ + 
+ + public static RandomAccessReader open ( File file , long overrideSize ) 
+ + { 
+ + return open ( file , DEFAULT _ BUFFER _ SIZE , overrideSize , null ) ; 
+ } 
+ 
+ @ VisibleForTesting 
+ static RandomAccessReader open ( File file , int bufferSize , PoolingSegmentedFile owner ) 
+ { 
+ + return open ( file , bufferSize , - 1L , owner ) ; 
+ + } 
+ + 
+ + private static RandomAccessReader open ( File file , int bufferSize , long overrideSize , PoolingSegmentedFile owner ) 
+ + { 
+ try 
+ { 
+ - return new RandomAccessReader ( file , bufferSize , owner ) ; 
+ + return new RandomAccessReader ( file , bufferSize , overrideSize , owner ) ; 
+ } 
+ catch ( FileNotFoundException e ) 
+ { 
+ @ @ - 118 , 22 + 138 , 27 @ @ public class RandomAccessReader extends RandomAccessFile implements FileDataInpu 
+ 
+ try 
+ { 
+ - if ( bufferOffset > = channel . size ( ) ) 
+ - return ; 
+ + int read = buffer . length ; 
+ + if ( bufferOffset + read > fileLength ) 
+ + { 
+ + if ( bufferOffset > = fileLength ) 
+ + return ; 
+ + read = ( int ) ( fileLength - bufferOffset ) ; 
+ + } 
+ 
+ channel . position ( bufferOffset ) ; / / setting channel position 
+ 
+ - int read = 0 ; 
+ - 
+ - while ( read < buffer . length ) 
+ + int offset = 0 ; 
+ + while ( read > 0 ) 
+ { 
+ - int n = super . read ( buffer , read , buffer . length - read ) ; 
+ + int n = super . read ( buffer , offset , read ) ; 
+ if ( n < 0 ) 
+ - break ; 
+ - read + = n ; 
+ + throw new IllegalStateException ( ) ; 
+ + read - = n ; 
+ + offset + = n ; 
+ } 
+ 
+ - validBufferBytes = read ; 
+ + validBufferBytes = offset ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / io / util / SegmentedFile . java b / src / java / org / apache / cassandra / io / util / SegmentedFile . java 
+ index 510ed81 . . 146494d 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / SegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / SegmentedFile . java 
+ @ @ - 31 , 7 + 31 , 6 @ @ import org . apache . cassandra . config . Config ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . io . FSReadError ; 
+ import org . apache . cassandra . io . compress . CompressedSequentialWriter ; 
+ - import org . apache . cassandra . io . sstable . SSTableWriter ; 
+ import org . apache . cassandra . utils . Pair ; 
+ import org . apache . cassandra . utils . concurrent . RefCounted ; 
+ import org . apache . cassandra . utils . concurrent . SharedCloseableImpl ; 
+ @ @ - 96 , 13 + 95 , 13 @ @ public abstract class SegmentedFile extends SharedCloseableImpl 
+ 
+ public RandomAccessReader createReader ( ) 
+ { 
+ - return RandomAccessReader . open ( new File ( path ) ) ; 
+ + return RandomAccessReader . open ( new File ( path ) , length ) ; 
+ } 
+ 
+ public RandomAccessReader createThrottledReader ( RateLimiter limiter ) 
+ { 
+ assert limiter ! = null ; 
+ - return ThrottledReader . open ( new File ( path ) , limiter ) ; 
+ + return ThrottledReader . open ( new File ( path ) , length , limiter ) ; 
+ } 
+ 
+ public FileDataInput getSegment ( long position ) 
+ @ @ - 156 , 11 + 155 , 21 @ @ public abstract class SegmentedFile extends SharedCloseableImpl 
+ * Called after all potential boundaries have been added to apply this Builder to a concrete file on disk . 
+ * @ param path The file on disk . 
+ * / 
+ - public abstract SegmentedFile complete ( String path , SSTableWriter . FinishType openType ) ; 
+ + protected abstract SegmentedFile complete ( String path , long overrideLength , boolean isFinal ) ; 
+ 
+ public SegmentedFile complete ( String path ) 
+ { 
+ - return complete ( path , SSTableWriter . FinishType . NORMAL ) ; 
+ + return complete ( path , - 1 , true ) ; 
+ + } 
+ + 
+ + public SegmentedFile complete ( String path , boolean isFinal ) 
+ + { 
+ + return complete ( path , - 1 , isFinal ) ; 
+ + } 
+ + 
+ + public SegmentedFile complete ( String path , long overrideLength ) 
+ + { 
+ + return complete ( path , overrideLength , false ) ; 
+ } 
+ 
+ public void serializeBounds ( DataOutput out ) throws IOException 
+ diff - - git a / src / java / org / apache / cassandra / io / util / ThrottledReader . java b / src / java / org / apache / cassandra / io / util / ThrottledReader . java 
+ index b12a8a8 . . c4845c5 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / ThrottledReader . java 
+ + + + b / src / java / org / apache / cassandra / io / util / ThrottledReader . java 
+ @ @ - 30 , 9 + 30 , 9 @ @ public class ThrottledReader extends RandomAccessReader 
+ { 
+ private final RateLimiter limiter ; 
+ 
+ - protected ThrottledReader ( File file , RateLimiter limiter ) throws FileNotFoundException 
+ + protected ThrottledReader ( File file , long overrideLength , RateLimiter limiter ) throws FileNotFoundException 
+ { 
+ - super ( file , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , null ) ; 
+ + super ( file , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , overrideLength , null ) ; 
+ this . limiter = limiter ; 
+ } 
+ 
+ @ @ - 42 , 11 + 42 , 11 @ @ public class ThrottledReader extends RandomAccessReader 
+ super . reBuffer ( ) ; 
+ } 
+ 
+ - public static ThrottledReader open ( File file , RateLimiter limiter ) 
+ + public static ThrottledReader open ( File file , long overrideLength , RateLimiter limiter ) 
+ { 
+ try 
+ { 
+ - return new ThrottledReader ( file , limiter ) ; 
+ + return new ThrottledReader ( file , overrideLength , limiter ) ; 
+ } 
+ catch ( FileNotFoundException e ) 
+ {
+
+NEAREST DIFF:
+diff - - git a / src / resources / org / apache / cassandra / cli / CliHelp . yaml b / src / resources / org / apache / cassandra / cli / CliHelp . yaml 
+ index 12c7bf7 . . 360c7704 100644 
+ - - - a / src / resources / org / apache / cassandra / cli / CliHelp . yaml 
+ + + + b / src / resources / org / apache / cassandra / cli / CliHelp . yaml 
+ @ @ - 130 , 7 + 130 , 7 @ @ commands : 
+ describe ; - Describes current authenticated keyspace 
+ describe < keyspace > ; - Describe this keyspace 
+ describe < column _ family > ; - Describe the colum family in the current authenticated keyspace 
+ - - name : 
+ + - name : NODE _ DESCRIBE _ CLUSTER 
+ help : | 
+ describe cluster ; 
+

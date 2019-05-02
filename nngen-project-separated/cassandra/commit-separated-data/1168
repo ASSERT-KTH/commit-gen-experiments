@@ -1,0 +1,160 @@
+BLEU SCORE: 0.015821934551541402
+
+TEST MSG: Use constant nowInSec for SinglePartitionReadCommands in QueryPager test
+GENERATED MSG: test to more reliably reproduce CME during range . fix by locking out compact during range query .
+
+TEST DIFF (one line): diff - - git a / test / unit / org / apache / cassandra / service / QueryPagerTest . java b / test / unit / org / apache / cassandra / service / QueryPagerTest . java <nl> index 15bc060 . . bfc66e0 100644 <nl> - - - a / test / unit / org / apache / cassandra / service / QueryPagerTest . java <nl> + + + b / test / unit / org / apache / cassandra / service / QueryPagerTest . java <nl> @ @ - 53 , 6 + 53 , 7 @ @ public class QueryPagerTest <nl> public static final String CF _ STANDARD = " Standard1 " ; <nl> public static final String KEYSPACE _ CQL = " cql _ keyspace " ; <nl> public static final String CF _ CQL = " table2 " ; <nl> + public static final int nowInSec = FBUtilities . nowInSeconds ( ) ; <nl> <nl> @ BeforeClass <nl> public static void defineSchema ( ) throws ConfigurationException <nl> @ @ - 159 , 7 + 160 , 7 @ @ public class QueryPagerTest <nl> Slice slice = Slice . make ( cmp . make ( start ) , cmp . make ( end ) ) ; <nl> ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter ( Slices . with ( cmp , slice ) , reversed ) ; <nl> <nl> - return SinglePartitionReadCommand . create ( cfs ( ) . metadata , FBUtilities . nowInSeconds ( ) , ColumnFilter . all ( metadata ) , RowFilter . NONE , DataLimits . NONE , Util . dk ( key ) , filter ) ; <nl> + return SinglePartitionReadCommand . create ( cfs ( ) . metadata , nowInSec , ColumnFilter . all ( metadata ) , RowFilter . NONE , DataLimits . NONE , Util . dk ( key ) , filter ) ; <nl> } <nl> <nl> private static ReadCommand rangeNamesQuery ( String keyStart , String keyEnd , int count , String . . . names ) <nl> @ @ - 425 , 7 + 426 , 7 @ @ public class QueryPagerTest <nl> for ( int i = 0 ; i < 5 ; i + + ) <nl> executeInternal ( String . format ( " INSERT INTO % s . % s ( k , c , v ) VALUES ( ' k % d ' , ' c % d ' , null ) " , keyspace , table , 0 , i ) ) ; <nl> <nl> - ReadCommand command = SinglePartitionReadCommand . create ( cfs . metadata , FBUtilities . nowInSeconds ( ) , Util . dk ( " k0 " ) , Slice . ALL ) ; <nl> + ReadCommand command = SinglePartitionReadCommand . create ( cfs . metadata , nowInSec , Util . dk ( " k0 " ) , Slice . ALL ) ; <nl> <nl> QueryPager pager = command . getPager ( null , Server . CURRENT _ VERSION ) ; <nl>
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 986c803 . . 044ea3d 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1526 , 11 + 1526 , 17 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> return memtable _ . get ( ) ; <nl> } <nl> <nl> + / * * not threadsafe . caller must have lock _ acquired . * / <nl> public Set < String > getSSTableFilenames ( ) <nl> { <nl> return Collections . unmodifiableSet ( ssTables _ ) ; <nl> } <nl> <nl> + public ReentrantReadWriteLock . ReadLock getReadLock ( ) <nl> + { <nl> + return lock _ . readLock ( ) ; <nl> + } <nl> + <nl> public int getReadCount ( ) <nl> { <nl> return readStats _ . size ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / Table . java b / src / java / org / apache / cassandra / db / Table . java <nl> index b470fd2 . . 82a456d 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Table . java <nl> + + + b / src / java / org / apache / cassandra / db / Table . java <nl> @ @ - 395 , 7 + 395 , 7 @ @ public class Table <nl> / * The AnalyticsSource instance which keeps track of statistics reported to Ganglia . * / <nl> private DBAnalyticsSource dbAnalyticsSource _ ; <nl> / / cache application CFs since Range queries ask for them a _ lot _ <nl> - private Set < String > applicationColumnFamilies _ ; <nl> + private SortedSet < String > applicationColumnFamilies _ ; <nl> <nl> public static Table open ( String table ) <nl> { <nl> @ @ - 849 , 11 + 849 , 11 @ @ public class Table <nl> dbAnalyticsSource _ . updateWriteStatistics ( timeTaken ) ; <nl> } <nl> <nl> - public Set < String > getApplicationColumnFamilies ( ) <nl> + public SortedSet < String > getApplicationColumnFamilies ( ) <nl> { <nl> if ( applicationColumnFamilies _ = = null ) <nl> { <nl> - applicationColumnFamilies _ = new HashSet < String > ( ) ; <nl> + applicationColumnFamilies _ = new TreeSet < String > ( ) ; <nl> for ( String cfName : getColumnFamilies ( ) ) <nl> { <nl> if ( DatabaseDescriptor . isApplicationColumnFamily ( cfName ) ) <nl> @ @ - 873 , 6 + 873 , 26 @ @ public class Table <nl> * / <nl> public List < String > getKeyRange ( final String startWith , final String stopAt , int maxResults ) throws IOException , ExecutionException , InterruptedException <nl> { <nl> + / / TODO we need a better way to keep compactions from stomping on reads than One Big Lock per CF . <nl> + for ( String cfName : getApplicationColumnFamilies ( ) ) <nl> + { <nl> + getColumnFamilyStore ( cfName ) . getReadLock ( ) . lock ( ) ; <nl> + } <nl> + try <nl> + { <nl> + return getKeyRangeUnsafe ( startWith , stopAt , maxResults ) ; <nl> + } <nl> + finally <nl> + { <nl> + for ( String cfName : getApplicationColumnFamilies ( ) ) <nl> + { <nl> + getColumnFamilyStore ( cfName ) . getReadLock ( ) . unlock ( ) ; <nl> + } <nl> + } <nl> + } <nl> + <nl> + private List < String > getKeyRangeUnsafe ( final String startWith , final String stopAt , int maxResults ) throws IOException , ExecutionException , InterruptedException <nl> + { <nl> / / ( OPP key decoration is a no - op so using the " decorated " comparator against raw keys is fine ) <nl> final Comparator < String > comparator = StorageService . getPartitioner ( ) . getDecoratedKeyComparator ( ) ; <nl> <nl> diff - - git a / test / unit / org / apache / cassandra / db / OneCompactionTest . java b / test / unit / org / apache / cassandra / db / OneCompactionTest . java <nl> index 297b8a5 . . 418386b 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / OneCompactionTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / OneCompactionTest . java <nl> @ @ - 11 , 17 + 11 , 16 @ @ import static junit . framework . Assert . assertEquals ; <nl> <nl> public class OneCompactionTest <nl> { <nl> - @ Test <nl> - public void testOneCompaction ( ) throws IOException , ExecutionException , InterruptedException <nl> + private void testCompaction ( String columnFamilyName , int insertsPerTable ) throws IOException , ExecutionException , InterruptedException <nl> { <nl> Table table = Table . open ( " Table1 " ) ; <nl> - ColumnFamilyStore store = table . getColumnFamilyStore ( " Standard1 " ) ; <nl> + ColumnFamilyStore store = table . getColumnFamilyStore ( columnFamilyName ) ; <nl> <nl> Set < String > inserted = new HashSet < String > ( ) ; <nl> - for ( int j = 0 ; j < 2 ; j + + ) { <nl> + for ( int j = 0 ; j < insertsPerTable ; j + + ) { <nl> String key = " 0 " ; <nl> RowMutation rm = new RowMutation ( " Table1 " , key ) ; <nl> - rm . add ( " Standard1 : 0 " , new byte [ 0 ] , j ) ; <nl> + rm . add ( columnFamilyName + " : 0 " , new byte [ 0 ] , j ) ; <nl> rm . apply ( ) ; <nl> inserted . add ( key ) ; <nl> store . forceBlockingFlush ( ) ; <nl> @ @ - 30 , 4 + 29 , 16 @ @ public class OneCompactionTest <nl> store . doCompaction ( 2 ) ; <nl> assertEquals ( table . getKeyRange ( " " , " " , 10000 ) . size ( ) , inserted . size ( ) ) ; <nl> } <nl> + <nl> + @ Test <nl> + public void testCompaction1 ( ) throws IOException , ExecutionException , InterruptedException <nl> + { <nl> + testCompaction ( " Standard1 " , 1 ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testCompaction2 ( ) throws IOException , ExecutionException , InterruptedException <nl> + { <nl> + testCompaction ( " Standard2 " , 500 ) ; <nl> + } <nl> }
+
+TEST DIFF:
+diff - - git a / test / unit / org / apache / cassandra / service / QueryPagerTest . java b / test / unit / org / apache / cassandra / service / QueryPagerTest . java 
+ index 15bc060 . . bfc66e0 100644 
+ - - - a / test / unit / org / apache / cassandra / service / QueryPagerTest . java 
+ + + + b / test / unit / org / apache / cassandra / service / QueryPagerTest . java 
+ @ @ - 53 , 6 + 53 , 7 @ @ public class QueryPagerTest 
+ public static final String CF _ STANDARD = " Standard1 " ; 
+ public static final String KEYSPACE _ CQL = " cql _ keyspace " ; 
+ public static final String CF _ CQL = " table2 " ; 
+ + public static final int nowInSec = FBUtilities . nowInSeconds ( ) ; 
+ 
+ @ BeforeClass 
+ public static void defineSchema ( ) throws ConfigurationException 
+ @ @ - 159 , 7 + 160 , 7 @ @ public class QueryPagerTest 
+ Slice slice = Slice . make ( cmp . make ( start ) , cmp . make ( end ) ) ; 
+ ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter ( Slices . with ( cmp , slice ) , reversed ) ; 
+ 
+ - return SinglePartitionReadCommand . create ( cfs ( ) . metadata , FBUtilities . nowInSeconds ( ) , ColumnFilter . all ( metadata ) , RowFilter . NONE , DataLimits . NONE , Util . dk ( key ) , filter ) ; 
+ + return SinglePartitionReadCommand . create ( cfs ( ) . metadata , nowInSec , ColumnFilter . all ( metadata ) , RowFilter . NONE , DataLimits . NONE , Util . dk ( key ) , filter ) ; 
+ } 
+ 
+ private static ReadCommand rangeNamesQuery ( String keyStart , String keyEnd , int count , String . . . names ) 
+ @ @ - 425 , 7 + 426 , 7 @ @ public class QueryPagerTest 
+ for ( int i = 0 ; i < 5 ; i + + ) 
+ executeInternal ( String . format ( " INSERT INTO % s . % s ( k , c , v ) VALUES ( ' k % d ' , ' c % d ' , null ) " , keyspace , table , 0 , i ) ) ; 
+ 
+ - ReadCommand command = SinglePartitionReadCommand . create ( cfs . metadata , FBUtilities . nowInSeconds ( ) , Util . dk ( " k0 " ) , Slice . ALL ) ; 
+ + ReadCommand command = SinglePartitionReadCommand . create ( cfs . metadata , nowInSec , Util . dk ( " k0 " ) , Slice . ALL ) ; 
+ 
+ QueryPager pager = command . getPager ( null , Server . CURRENT _ VERSION ) ; 
+
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 986c803 . . 044ea3d 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1526 , 11 + 1526 , 17 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ return memtable _ . get ( ) ; 
+ } 
+ 
+ + / * * not threadsafe . caller must have lock _ acquired . * / 
+ public Set < String > getSSTableFilenames ( ) 
+ { 
+ return Collections . unmodifiableSet ( ssTables _ ) ; 
+ } 
+ 
+ + public ReentrantReadWriteLock . ReadLock getReadLock ( ) 
+ + { 
+ + return lock _ . readLock ( ) ; 
+ + } 
+ + 
+ public int getReadCount ( ) 
+ { 
+ return readStats _ . size ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / Table . java b / src / java / org / apache / cassandra / db / Table . java 
+ index b470fd2 . . 82a456d 100644 
+ - - - a / src / java / org / apache / cassandra / db / Table . java 
+ + + + b / src / java / org / apache / cassandra / db / Table . java 
+ @ @ - 395 , 7 + 395 , 7 @ @ public class Table 
+ / * The AnalyticsSource instance which keeps track of statistics reported to Ganglia . * / 
+ private DBAnalyticsSource dbAnalyticsSource _ ; 
+ / / cache application CFs since Range queries ask for them a _ lot _ 
+ - private Set < String > applicationColumnFamilies _ ; 
+ + private SortedSet < String > applicationColumnFamilies _ ; 
+ 
+ public static Table open ( String table ) 
+ { 
+ @ @ - 849 , 11 + 849 , 11 @ @ public class Table 
+ dbAnalyticsSource _ . updateWriteStatistics ( timeTaken ) ; 
+ } 
+ 
+ - public Set < String > getApplicationColumnFamilies ( ) 
+ + public SortedSet < String > getApplicationColumnFamilies ( ) 
+ { 
+ if ( applicationColumnFamilies _ = = null ) 
+ { 
+ - applicationColumnFamilies _ = new HashSet < String > ( ) ; 
+ + applicationColumnFamilies _ = new TreeSet < String > ( ) ; 
+ for ( String cfName : getColumnFamilies ( ) ) 
+ { 
+ if ( DatabaseDescriptor . isApplicationColumnFamily ( cfName ) ) 
+ @ @ - 873 , 6 + 873 , 26 @ @ public class Table 
+ * / 
+ public List < String > getKeyRange ( final String startWith , final String stopAt , int maxResults ) throws IOException , ExecutionException , InterruptedException 
+ { 
+ + / / TODO we need a better way to keep compactions from stomping on reads than One Big Lock per CF . 
+ + for ( String cfName : getApplicationColumnFamilies ( ) ) 
+ + { 
+ + getColumnFamilyStore ( cfName ) . getReadLock ( ) . lock ( ) ; 
+ + } 
+ + try 
+ + { 
+ + return getKeyRangeUnsafe ( startWith , stopAt , maxResults ) ; 
+ + } 
+ + finally 
+ + { 
+ + for ( String cfName : getApplicationColumnFamilies ( ) ) 
+ + { 
+ + getColumnFamilyStore ( cfName ) . getReadLock ( ) . unlock ( ) ; 
+ + } 
+ + } 
+ + } 
+ + 
+ + private List < String > getKeyRangeUnsafe ( final String startWith , final String stopAt , int maxResults ) throws IOException , ExecutionException , InterruptedException 
+ + { 
+ / / ( OPP key decoration is a no - op so using the " decorated " comparator against raw keys is fine ) 
+ final Comparator < String > comparator = StorageService . getPartitioner ( ) . getDecoratedKeyComparator ( ) ; 
+ 
+ diff - - git a / test / unit / org / apache / cassandra / db / OneCompactionTest . java b / test / unit / org / apache / cassandra / db / OneCompactionTest . java 
+ index 297b8a5 . . 418386b 100644 
+ - - - a / test / unit / org / apache / cassandra / db / OneCompactionTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / OneCompactionTest . java 
+ @ @ - 11 , 17 + 11 , 16 @ @ import static junit . framework . Assert . assertEquals ; 
+ 
+ public class OneCompactionTest 
+ { 
+ - @ Test 
+ - public void testOneCompaction ( ) throws IOException , ExecutionException , InterruptedException 
+ + private void testCompaction ( String columnFamilyName , int insertsPerTable ) throws IOException , ExecutionException , InterruptedException 
+ { 
+ Table table = Table . open ( " Table1 " ) ; 
+ - ColumnFamilyStore store = table . getColumnFamilyStore ( " Standard1 " ) ; 
+ + ColumnFamilyStore store = table . getColumnFamilyStore ( columnFamilyName ) ; 
+ 
+ Set < String > inserted = new HashSet < String > ( ) ; 
+ - for ( int j = 0 ; j < 2 ; j + + ) { 
+ + for ( int j = 0 ; j < insertsPerTable ; j + + ) { 
+ String key = " 0 " ; 
+ RowMutation rm = new RowMutation ( " Table1 " , key ) ; 
+ - rm . add ( " Standard1 : 0 " , new byte [ 0 ] , j ) ; 
+ + rm . add ( columnFamilyName + " : 0 " , new byte [ 0 ] , j ) ; 
+ rm . apply ( ) ; 
+ inserted . add ( key ) ; 
+ store . forceBlockingFlush ( ) ; 
+ @ @ - 30 , 4 + 29 , 16 @ @ public class OneCompactionTest 
+ store . doCompaction ( 2 ) ; 
+ assertEquals ( table . getKeyRange ( " " , " " , 10000 ) . size ( ) , inserted . size ( ) ) ; 
+ } 
+ + 
+ + @ Test 
+ + public void testCompaction1 ( ) throws IOException , ExecutionException , InterruptedException 
+ + { 
+ + testCompaction ( " Standard1 " , 1 ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testCompaction2 ( ) throws IOException , ExecutionException , InterruptedException 
+ + { 
+ + testCompaction ( " Standard2 " , 500 ) ; 
+ + } 
+ }

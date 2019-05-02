@@ -1,0 +1,256 @@
+BLEU SCORE: 0.04372912656590315
+
+TEST MSG: Scale memtable slab allocation logarithmically
+GENERATED MSG: Fix potential SlabAllocator yield - starvation
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 641b1f9 . . 2571a09 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 3 <nl> + * Scale memtable slab allocation logarithmically ( CASSANDRA - 7882 ) <nl> * cassandra - stress simultaneous inserts over same seed ( CASSANDRA - 7964 ) <nl> * Reduce cassandra - stress sampling memory requirements ( CASSANDRA - 7926 ) <nl> * Ensure memtable flush cannot expire commit log entries from its future ( CASSANDRA - 8383 ) <nl> diff - - git a / src / java / org / apache / cassandra / utils / memory / NativeAllocator . java b / src / java / org / apache / cassandra / utils / memory / NativeAllocator . java <nl> index 1b5dcf2 . . 0e15ed2 100644 <nl> - - - a / src / java / org / apache / cassandra / utils / memory / NativeAllocator . java <nl> + + + b / src / java / org / apache / cassandra / utils / memory / NativeAllocator . java <nl> @ @ - 18 , 13 + 18 , 15 @ @ <nl> package org . apache . cassandra . utils . memory ; <nl> <nl> import java . lang . reflect . Field ; <nl> - <nl> + import java . util . HashMap ; <nl> + import java . util . Map ; <nl> import java . util . concurrent . ConcurrentLinkedQueue ; <nl> + import java . util . concurrent . Semaphore ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> - import java . util . concurrent . atomic . AtomicLong ; <nl> import java . util . concurrent . atomic . AtomicReference ; <nl> <nl> import org . apache . cassandra . config . CFMetaData ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . Cell ; <nl> import org . apache . cassandra . db . CounterCell ; <nl> import org . apache . cassandra . db . DecoratedKey ; <nl> @ @ - 35 , 25 + 37 , 29 @ @ import org . apache . cassandra . db . NativeCounterCell ; <nl> import org . apache . cassandra . db . NativeDecoratedKey ; <nl> import org . apache . cassandra . db . NativeDeletedCell ; <nl> import org . apache . cassandra . db . NativeExpiringCell ; <nl> + import org . apache . cassandra . io . util . IAllocator ; <nl> import org . apache . cassandra . utils . concurrent . OpOrder ; <nl> - import org . slf4j . Logger ; <nl> - import org . slf4j . LoggerFactory ; <nl> import sun . misc . Unsafe ; <nl> <nl> public class NativeAllocator extends MemtableAllocator <nl> { <nl> - private static final Logger logger = LoggerFactory . getLogger ( NativeAllocator . class ) ; <nl> - <nl> - private final static int REGION _ SIZE = 1024 * 1024 ; <nl> + private final static int MAX _ REGION _ SIZE = 1 * 1024 * 1024 ; <nl> private final static int MAX _ CLONED _ SIZE = 128 * 1024 ; / / bigger than this don ' t go in the region <nl> + private final static int MIN _ REGION _ SIZE = 8 * 1024 ; <nl> + <nl> + private static final IAllocator allocator = DatabaseDescriptor . getoffHeapMemoryAllocator ( ) ; <nl> <nl> / / globally stash any Regions we allocate but are beaten to using , and use these up before allocating any more <nl> - private static final ConcurrentLinkedQueue < Region > RACE _ ALLOCATED = new ConcurrentLinkedQueue < > ( ) ; <nl> + private static final Map < Integer , RaceAllocated > RACE _ ALLOCATED = new HashMap < > ( ) ; <nl> + <nl> + static <nl> + { <nl> + for ( int i = MIN _ REGION _ SIZE ; i < = MAX _ REGION _ SIZE ; i * = 2 ) <nl> + RACE _ ALLOCATED . put ( i , new RaceAllocated ( ) ) ; <nl> + } <nl> <nl> private final AtomicReference < Region > currentRegion = new AtomicReference < > ( ) ; <nl> - private final AtomicInteger regionCount = new AtomicInteger ( 0 ) ; <nl> private final ConcurrentLinkedQueue < Region > regions = new ConcurrentLinkedQueue < > ( ) ; <nl> - private AtomicLong unslabbed = new AtomicLong ( 0 ) ; <nl> <nl> protected NativeAllocator ( NativePool pool ) <nl> { <nl> @ @ - 98 , 70 + 104 , 88 @ @ public class NativeAllocator extends MemtableAllocator <nl> public long allocate ( int size , OpOrder . Group opGroup ) <nl> { <nl> assert size > = 0 ; <nl> - offHeap ( ) . allocate ( size , opGroup ) ; <nl> - / / satisfy large allocations directly from JVM since they don ' t cause fragmentation <nl> - / / as badly , and fill up our regions quickly <nl> if ( size > MAX _ CLONED _ SIZE ) <nl> - { <nl> - unslabbed . addAndGet ( size ) ; <nl> - Region region = new Region ( unsafe . allocateMemory ( size ) , size ) ; <nl> - regions . add ( region ) ; <nl> - <nl> - long peer ; <nl> - if ( ( peer = region . allocate ( size ) ) = = - 1 ) <nl> - throw new AssertionError ( ) ; <nl> - <nl> - return peer ; <nl> - } <nl> + return allocateOversize ( size , opGroup ) ; <nl> <nl> while ( true ) <nl> { <nl> - Region region = getRegion ( ) ; <nl> - <nl> + Region region = currentRegion . get ( ) ; <nl> long peer ; <nl> - if ( ( peer = region . allocate ( size ) ) > 0 ) <nl> + if ( region ! = null & & ( peer = region . allocate ( size ) ) > 0 ) <nl> return peer ; <nl> <nl> - / / not enough space ! <nl> - currentRegion . compareAndSet ( region , null ) ; <nl> + trySwapRegion ( region , size ) ; <nl> } <nl> } <nl> <nl> + private void trySwapRegion ( Region current , int minSize ) <nl> + { <nl> + / / decide how big we want the new region to be : <nl> + / / * if there is no prior region , we set it to min size <nl> + / / * otherwise we double its size ; if it ' s too small to fit the allocation , we round it up to 4 - 8x its size <nl> + int size ; <nl> + if ( current = = null ) size = MIN _ REGION _ SIZE ; <nl> + else size = current . capacity * 2 ; <nl> + if ( minSize > size ) <nl> + size = Integer . highestOneBit ( minSize ) < < 3 ; <nl> + size = Math . min ( MAX _ REGION _ SIZE , size ) ; <nl> + <nl> + / / first we try and repurpose a previously allocated region <nl> + RaceAllocated raceAllocated = RACE _ ALLOCATED . get ( size ) ; <nl> + Region next = raceAllocated . poll ( ) ; <nl> + <nl> + / / if there are none , we allocate one <nl> + if ( next = = null ) <nl> + next = new Region ( allocator . allocate ( size ) , size ) ; <nl> + <nl> + / / we try to swap in the region we ' ve obtained ; <nl> + / / if we fail to swap the region , we try to stash it for repurposing later ; if we ' re out of stash room , we free it <nl> + if ( currentRegion . compareAndSet ( current , next ) ) <nl> + regions . add ( next ) ; <nl> + else if ( ! raceAllocated . stash ( next ) ) <nl> + allocator . free ( next . peer ) ; <nl> + } <nl> + <nl> + private long allocateOversize ( int size , OpOrder . Group opGroup ) <nl> + { <nl> + / / satisfy large allocations directly from JVM since they don ' t cause fragmentation <nl> + / / as badly , and fill up our regions quickly <nl> + offHeap ( ) . allocate ( size , opGroup ) ; <nl> + Region region = new Region ( allocator . allocate ( size ) , size ) ; <nl> + regions . add ( region ) ; <nl> + <nl> + long peer ; <nl> + if ( ( peer = region . allocate ( size ) ) = = - 1 ) <nl> + throw new AssertionError ( ) ; <nl> + <nl> + return peer ; <nl> + } <nl> + <nl> public void setDiscarded ( ) <nl> { <nl> for ( Region region : regions ) <nl> - unsafe . freeMemory ( region . peer ) ; <nl> + allocator . free ( region . peer ) ; <nl> super . setDiscarded ( ) ; <nl> } <nl> <nl> - / * * <nl> - * Get the current region , or , if there is no current region , allocate a new one <nl> - * / <nl> - private Region getRegion ( ) <nl> + / / used to ensure we don ' t keep loads of race allocated regions around indefinitely . keeps the total bound on wasted memory low . <nl> + private static class RaceAllocated <nl> { <nl> - while ( true ) <nl> + final ConcurrentLinkedQueue < Region > stash = new ConcurrentLinkedQueue < > ( ) ; <nl> + final Semaphore permits = new Semaphore ( 8 ) ; <nl> + boolean stash ( Region region ) <nl> { <nl> - / / Try to get the region <nl> - Region region = currentRegion . get ( ) ; <nl> - if ( region ! = null ) <nl> - return region ; <nl> - <nl> - / / No current region , so we want to allocate one . We race <nl> - / / against other allocators to CAS in a Region , and if we fail we stash the region for re - use <nl> - region = RACE _ ALLOCATED . poll ( ) ; <nl> - if ( region = = null ) <nl> - region = new Region ( unsafe . allocateMemory ( REGION _ SIZE ) , REGION _ SIZE ) ; <nl> - if ( currentRegion . compareAndSet ( null , region ) ) <nl> - { <nl> - regions . add ( region ) ; <nl> - regionCount . incrementAndGet ( ) ; <nl> - logger . trace ( " { } regions now allocated in { } " , regionCount , this ) ; <nl> - return region ; <nl> - } <nl> - <nl> - / / someone else won race - that ' s fine , we ' ll try to grab theirs <nl> - / / in the next iteration of the loop . <nl> - RACE _ ALLOCATED . add ( region ) ; <nl> + if ( ! permits . tryAcquire ( ) ) <nl> + return false ; <nl> + stash . add ( region ) ; <nl> + return true ; <nl> + } <nl> + Region poll ( ) <nl> + { <nl> + Region next = stash . poll ( ) ; <nl> + if ( next ! = null ) <nl> + permits . release ( ) ; <nl> + return next ; <nl> } <nl> } <nl> <nl> @ @ - 180 , 7 + 204 , 7 @ @ public class NativeAllocator extends MemtableAllocator <nl> * / <nl> private final long peer ; <nl> <nl> - private final long capacity ; <nl> + private final int capacity ; <nl> <nl> / * * <nl> * Offset for the next allocation , or the sentinel value - 1 <nl> @ @ - 199 , 7 + 223 , 7 @ @ public class NativeAllocator extends MemtableAllocator <nl> * <nl> * @ param peer peer <nl> * / <nl> - private Region ( long peer , long capacity ) <nl> + private Region ( long peer , int capacity ) <nl> { <nl> this . peer = peer ; <nl> this . capacity = capacity ; <nl> @ @ - 239 , 20 + 263 , 4 @ @ public class NativeAllocator extends MemtableAllocator <nl> } <nl> } <nl> <nl> - <nl> - static final Unsafe unsafe ; <nl> - <nl> - static <nl> - { <nl> - try <nl> - { <nl> - Field field = sun . misc . Unsafe . class . getDeclaredField ( " theUnsafe " ) ; <nl> - field . setAccessible ( true ) ; <nl> - unsafe = ( sun . misc . Unsafe ) field . get ( null ) ; <nl> - } <nl> - catch ( Exception e ) <nl> - { <nl> - throw new AssertionError ( e ) ; <nl> - } <nl> - } <nl> }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 641b1f9 . . 2571a09 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 3 
+ + * Scale memtable slab allocation logarithmically ( CASSANDRA - 7882 ) 
+ * cassandra - stress simultaneous inserts over same seed ( CASSANDRA - 7964 ) 
+ * Reduce cassandra - stress sampling memory requirements ( CASSANDRA - 7926 ) 
+ * Ensure memtable flush cannot expire commit log entries from its future ( CASSANDRA - 8383 ) 
+ diff - - git a / src / java / org / apache / cassandra / utils / memory / NativeAllocator . java b / src / java / org / apache / cassandra / utils / memory / NativeAllocator . java 
+ index 1b5dcf2 . . 0e15ed2 100644 
+ - - - a / src / java / org / apache / cassandra / utils / memory / NativeAllocator . java 
+ + + + b / src / java / org / apache / cassandra / utils / memory / NativeAllocator . java 
+ @ @ - 18 , 13 + 18 , 15 @ @ 
+ package org . apache . cassandra . utils . memory ; 
+ 
+ import java . lang . reflect . Field ; 
+ - 
+ + import java . util . HashMap ; 
+ + import java . util . Map ; 
+ import java . util . concurrent . ConcurrentLinkedQueue ; 
+ + import java . util . concurrent . Semaphore ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ - import java . util . concurrent . atomic . AtomicLong ; 
+ import java . util . concurrent . atomic . AtomicReference ; 
+ 
+ import org . apache . cassandra . config . CFMetaData ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . Cell ; 
+ import org . apache . cassandra . db . CounterCell ; 
+ import org . apache . cassandra . db . DecoratedKey ; 
+ @ @ - 35 , 25 + 37 , 29 @ @ import org . apache . cassandra . db . NativeCounterCell ; 
+ import org . apache . cassandra . db . NativeDecoratedKey ; 
+ import org . apache . cassandra . db . NativeDeletedCell ; 
+ import org . apache . cassandra . db . NativeExpiringCell ; 
+ + import org . apache . cassandra . io . util . IAllocator ; 
+ import org . apache . cassandra . utils . concurrent . OpOrder ; 
+ - import org . slf4j . Logger ; 
+ - import org . slf4j . LoggerFactory ; 
+ import sun . misc . Unsafe ; 
+ 
+ public class NativeAllocator extends MemtableAllocator 
+ { 
+ - private static final Logger logger = LoggerFactory . getLogger ( NativeAllocator . class ) ; 
+ - 
+ - private final static int REGION _ SIZE = 1024 * 1024 ; 
+ + private final static int MAX _ REGION _ SIZE = 1 * 1024 * 1024 ; 
+ private final static int MAX _ CLONED _ SIZE = 128 * 1024 ; / / bigger than this don ' t go in the region 
+ + private final static int MIN _ REGION _ SIZE = 8 * 1024 ; 
+ + 
+ + private static final IAllocator allocator = DatabaseDescriptor . getoffHeapMemoryAllocator ( ) ; 
+ 
+ / / globally stash any Regions we allocate but are beaten to using , and use these up before allocating any more 
+ - private static final ConcurrentLinkedQueue < Region > RACE _ ALLOCATED = new ConcurrentLinkedQueue < > ( ) ; 
+ + private static final Map < Integer , RaceAllocated > RACE _ ALLOCATED = new HashMap < > ( ) ; 
+ + 
+ + static 
+ + { 
+ + for ( int i = MIN _ REGION _ SIZE ; i < = MAX _ REGION _ SIZE ; i * = 2 ) 
+ + RACE _ ALLOCATED . put ( i , new RaceAllocated ( ) ) ; 
+ + } 
+ 
+ private final AtomicReference < Region > currentRegion = new AtomicReference < > ( ) ; 
+ - private final AtomicInteger regionCount = new AtomicInteger ( 0 ) ; 
+ private final ConcurrentLinkedQueue < Region > regions = new ConcurrentLinkedQueue < > ( ) ; 
+ - private AtomicLong unslabbed = new AtomicLong ( 0 ) ; 
+ 
+ protected NativeAllocator ( NativePool pool ) 
+ { 
+ @ @ - 98 , 70 + 104 , 88 @ @ public class NativeAllocator extends MemtableAllocator 
+ public long allocate ( int size , OpOrder . Group opGroup ) 
+ { 
+ assert size > = 0 ; 
+ - offHeap ( ) . allocate ( size , opGroup ) ; 
+ - / / satisfy large allocations directly from JVM since they don ' t cause fragmentation 
+ - / / as badly , and fill up our regions quickly 
+ if ( size > MAX _ CLONED _ SIZE ) 
+ - { 
+ - unslabbed . addAndGet ( size ) ; 
+ - Region region = new Region ( unsafe . allocateMemory ( size ) , size ) ; 
+ - regions . add ( region ) ; 
+ - 
+ - long peer ; 
+ - if ( ( peer = region . allocate ( size ) ) = = - 1 ) 
+ - throw new AssertionError ( ) ; 
+ - 
+ - return peer ; 
+ - } 
+ + return allocateOversize ( size , opGroup ) ; 
+ 
+ while ( true ) 
+ { 
+ - Region region = getRegion ( ) ; 
+ - 
+ + Region region = currentRegion . get ( ) ; 
+ long peer ; 
+ - if ( ( peer = region . allocate ( size ) ) > 0 ) 
+ + if ( region ! = null & & ( peer = region . allocate ( size ) ) > 0 ) 
+ return peer ; 
+ 
+ - / / not enough space ! 
+ - currentRegion . compareAndSet ( region , null ) ; 
+ + trySwapRegion ( region , size ) ; 
+ } 
+ } 
+ 
+ + private void trySwapRegion ( Region current , int minSize ) 
+ + { 
+ + / / decide how big we want the new region to be : 
+ + / / * if there is no prior region , we set it to min size 
+ + / / * otherwise we double its size ; if it ' s too small to fit the allocation , we round it up to 4 - 8x its size 
+ + int size ; 
+ + if ( current = = null ) size = MIN _ REGION _ SIZE ; 
+ + else size = current . capacity * 2 ; 
+ + if ( minSize > size ) 
+ + size = Integer . highestOneBit ( minSize ) < < 3 ; 
+ + size = Math . min ( MAX _ REGION _ SIZE , size ) ; 
+ + 
+ + / / first we try and repurpose a previously allocated region 
+ + RaceAllocated raceAllocated = RACE _ ALLOCATED . get ( size ) ; 
+ + Region next = raceAllocated . poll ( ) ; 
+ + 
+ + / / if there are none , we allocate one 
+ + if ( next = = null ) 
+ + next = new Region ( allocator . allocate ( size ) , size ) ; 
+ + 
+ + / / we try to swap in the region we ' ve obtained ; 
+ + / / if we fail to swap the region , we try to stash it for repurposing later ; if we ' re out of stash room , we free it 
+ + if ( currentRegion . compareAndSet ( current , next ) ) 
+ + regions . add ( next ) ; 
+ + else if ( ! raceAllocated . stash ( next ) ) 
+ + allocator . free ( next . peer ) ; 
+ + } 
+ + 
+ + private long allocateOversize ( int size , OpOrder . Group opGroup ) 
+ + { 
+ + / / satisfy large allocations directly from JVM since they don ' t cause fragmentation 
+ + / / as badly , and fill up our regions quickly 
+ + offHeap ( ) . allocate ( size , opGroup ) ; 
+ + Region region = new Region ( allocator . allocate ( size ) , size ) ; 
+ + regions . add ( region ) ; 
+ + 
+ + long peer ; 
+ + if ( ( peer = region . allocate ( size ) ) = = - 1 ) 
+ + throw new AssertionError ( ) ; 
+ + 
+ + return peer ; 
+ + } 
+ + 
+ public void setDiscarded ( ) 
+ { 
+ for ( Region region : regions ) 
+ - unsafe . freeMemory ( region . peer ) ; 
+ + allocator . free ( region . peer ) ; 
+ super . setDiscarded ( ) ; 
+ } 
+ 
+ - / * * 
+ - * Get the current region , or , if there is no current region , allocate a new one 
+ - * / 
+ - private Region getRegion ( ) 
+ + / / used to ensure we don ' t keep loads of race allocated regions around indefinitely . keeps the total bound on wasted memory low . 
+ + private static class RaceAllocated 
+ { 
+ - while ( true ) 
+ + final ConcurrentLinkedQueue < Region > stash = new ConcurrentLinkedQueue < > ( ) ; 
+ + final Semaphore permits = new Semaphore ( 8 ) ; 
+ + boolean stash ( Region region ) 
+ { 
+ - / / Try to get the region 
+ - Region region = currentRegion . get ( ) ; 
+ - if ( region ! = null ) 
+ - return region ; 
+ - 
+ - / / No current region , so we want to allocate one . We race 
+ - / / against other allocators to CAS in a Region , and if we fail we stash the region for re - use 
+ - region = RACE _ ALLOCATED . poll ( ) ; 
+ - if ( region = = null ) 
+ - region = new Region ( unsafe . allocateMemory ( REGION _ SIZE ) , REGION _ SIZE ) ; 
+ - if ( currentRegion . compareAndSet ( null , region ) ) 
+ - { 
+ - regions . add ( region ) ; 
+ - regionCount . incrementAndGet ( ) ; 
+ - logger . trace ( " { } regions now allocated in { } " , regionCount , this ) ; 
+ - return region ; 
+ - } 
+ - 
+ - / / someone else won race - that ' s fine , we ' ll try to grab theirs 
+ - / / in the next iteration of the loop . 
+ - RACE _ ALLOCATED . add ( region ) ; 
+ + if ( ! permits . tryAcquire ( ) ) 
+ + return false ; 
+ + stash . add ( region ) ; 
+ + return true ; 
+ + } 
+ + Region poll ( ) 
+ + { 
+ + Region next = stash . poll ( ) ; 
+ + if ( next ! = null ) 
+ + permits . release ( ) ; 
+ + return next ; 
+ } 
+ } 
+ 
+ @ @ - 180 , 7 + 204 , 7 @ @ public class NativeAllocator extends MemtableAllocator 
+ * / 
+ private final long peer ; 
+ 
+ - private final long capacity ; 
+ + private final int capacity ; 
+ 
+ / * * 
+ * Offset for the next allocation , or the sentinel value - 1 
+ @ @ - 199 , 7 + 223 , 7 @ @ public class NativeAllocator extends MemtableAllocator 
+ * 
+ * @ param peer peer 
+ * / 
+ - private Region ( long peer , long capacity ) 
+ + private Region ( long peer , int capacity ) 
+ { 
+ this . peer = peer ; 
+ this . capacity = capacity ; 
+ @ @ - 239 , 20 + 263 , 4 @ @ public class NativeAllocator extends MemtableAllocator 
+ } 
+ } 
+ 
+ - 
+ - static final Unsafe unsafe ; 
+ - 
+ - static 
+ - { 
+ - try 
+ - { 
+ - Field field = sun . misc . Unsafe . class . getDeclaredField ( " theUnsafe " ) ; 
+ - field . setAccessible ( true ) ; 
+ - unsafe = ( sun . misc . Unsafe ) field . get ( null ) ; 
+ - } 
+ - catch ( Exception e ) 
+ - { 
+ - throw new AssertionError ( e ) ; 
+ - } 
+ - } 
+ }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

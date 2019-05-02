@@ -1,0 +1,144 @@
+BLEU SCORE: 0.08295193507109855
+
+TEST MSG: Do not flush on truncate if durable _ writes is false
+GENERATED MSG: Fix truncate to always call flush on table
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index ddf4627 . . fc32426 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 0 . 10 <nl> + * Do not flush on truncate if durable _ writes is false ( CASSANDRA - 7750 ) <nl> * Give CRR a default input _ cql Statement ( CASSANDRA - 7226 ) <nl> * Better error message when adding a collection with the same name <nl> than a previously dropped one ( CASSANDRA - 6276 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index a3c080a . . 3da44de 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 2002 , 12 + 2002 , 31 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> / / position in the System keyspace . <nl> logger . debug ( " truncating { } " , name ) ; <nl> <nl> - / / flush the CF being truncated before forcing the new segment <nl> - forceBlockingFlush ( ) ; <nl> + if ( keyspace . metadata . durableWrites | | DatabaseDescriptor . isAutoSnapshot ( ) ) <nl> + { <nl> + / / flush the CF being truncated before forcing the new segment <nl> + forceBlockingFlush ( ) ; <nl> <nl> - / / sleep a little to make sure that our truncatedAt comes after any sstable <nl> - / / that was part of the flushed we forced ; otherwise on a tie , it won ' t get deleted . <nl> - Uninterruptibles . sleepUninterruptibly ( 1 , TimeUnit . MILLISECONDS ) ; <nl> + / / sleep a little to make sure that our truncatedAt comes after any sstable <nl> + / / that was part of the flushed we forced ; otherwise on a tie , it won ' t get deleted . <nl> + Uninterruptibles . sleepUninterruptibly ( 1 , TimeUnit . MILLISECONDS ) ; <nl> + } <nl> + else <nl> + { <nl> + Keyspace . switchLock . writeLock ( ) . lock ( ) ; <nl> + try <nl> + { <nl> + for ( ColumnFamilyStore cfs : concatWithIndexes ( ) ) <nl> + { <nl> + Memtable mt = cfs . getMemtableThreadSafe ( ) ; <nl> + if ( ! mt . isClean ( ) ) <nl> + mt . cfs . data . renewMemtable ( ) ; <nl> + } <nl> + } finally <nl> + { <nl> + Keyspace . switchLock . writeLock ( ) . unlock ( ) ; <nl> + } <nl> + } <nl> <nl> Runnable truncateRunnable = new Runnable ( ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / db / DataTracker . java b / src / java / org / apache / cassandra / db / DataTracker . java <nl> index a0f880a . . a9eef98 100644 <nl> - - - a / src / java / org / apache / cassandra / db / DataTracker . java <nl> + + + b / src / java / org / apache / cassandra / db / DataTracker . java <nl> @ @ - 123 , 6 + 123 , 24 @ @ public class DataTracker <nl> return toFlushMemtable ; <nl> } <nl> <nl> + / * * <nl> + * Renew the current memtable without putting the old one for a flush . <nl> + * Used when we flush but a memtable is clean ( in which case we must <nl> + * change it because it was frozen ) . <nl> + * / <nl> + public void renewMemtable ( ) <nl> + { <nl> + Memtable newMemtable = new Memtable ( cfstore , view . get ( ) . memtable ) ; <nl> + View currentView , newView ; <nl> + do <nl> + { <nl> + currentView = view . get ( ) ; <nl> + newView = currentView . renewMemtable ( newMemtable ) ; <nl> + } <nl> + while ( ! view . compareAndSet ( currentView , newView ) ) ; <nl> + notifyRenewed ( currentView . memtable ) ; <nl> + } <nl> + <nl> public void replaceFlushed ( Memtable memtable , SSTableReader sstable ) <nl> { <nl> / / sstable may be null if we flushed batchlog and nothing needed to be retained <nl> diff - - git a / test / unit / org / apache / cassandra / db / CommitLogTest . java b / test / unit / org / apache / cassandra / db / CommitLogTest . java <nl> index a7df871 . . 1be29a6 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / CommitLogTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / CommitLogTest . java <nl> @ @ - 32 , 13 + 32 , 16 @ @ import org . junit . Assert ; <nl> import org . junit . Test ; <nl> <nl> import org . apache . cassandra . SchemaLoader ; <nl> + import org . apache . cassandra . Util ; <nl> import org . apache . cassandra . config . Config ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . commitlog . CommitLog ; <nl> import org . apache . cassandra . db . commitlog . CommitLogDescriptor ; <nl> import org . apache . cassandra . db . commitlog . ReplayPosition ; <nl> + import org . apache . cassandra . db . filter . NamesQueryFilter ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> import org . apache . cassandra . service . StorageService ; <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> import static org . apache . cassandra . utils . ByteBufferUtil . bytes ; <nl> @ @ - 289 , 4 + 292 , 30 @ @ public class CommitLogTest extends SchemaLoader <nl> Assert . assertEquals ( 1 , CommitLog . instance . activeSegments ( ) ) ; <nl> } <nl> <nl> + @ Test <nl> + public void testTruncateWithoutSnapshotNonDurable ( ) throws ExecutionException , InterruptedException <nl> + { <nl> + CommitLog . instance . resetUnsafe ( ) ; <nl> + boolean prevAutoSnapshot = DatabaseDescriptor . isAutoSnapshot ( ) ; <nl> + DatabaseDescriptor . setAutoSnapshot ( false ) ; <nl> + Keyspace notDurableKs = Keyspace . open ( " NoCommitlogSpace " ) ; <nl> + Assert . assertFalse ( notDurableKs . metadata . durableWrites ) ; <nl> + ColumnFamilyStore cfs = notDurableKs . getColumnFamilyStore ( " Standard1 " ) ; <nl> + RowMutation rm ; <nl> + DecoratedKey dk = Util . dk ( " key1 " ) ; <nl> + <nl> + / / add data <nl> + rm = new RowMutation ( " NoCommitlogSpace " , dk . key ) ; <nl> + rm . add ( " Standard1 " , ByteBufferUtil . bytes ( " Column1 " ) , ByteBufferUtil . bytes ( " abcd " ) , 0 ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + ReadCommand command = new SliceByNamesReadCommand ( " Keyspace1 " , dk . key , " Standard1 " , System . currentTimeMillis ( ) , new NamesQueryFilter ( FBUtilities . singleton ( ByteBufferUtil . bytes ( " Column1 " ) , cfs . getComparator ( ) ) ) ) ; <nl> + Row row = command . getRow ( notDurableKs ) ; <nl> + Column col = row . cf . getColumn ( ByteBufferUtil . bytes ( " Column1 " ) ) ; <nl> + Assert . assertEquals ( col . value ( ) , ByteBuffer . wrap ( " abcd " . getBytes ( ) ) ) ; <nl> + cfs . truncateBlocking ( ) ; <nl> + DatabaseDescriptor . setAutoSnapshot ( prevAutoSnapshot ) ; <nl> + row = command . getRow ( notDurableKs ) ; <nl> + Assert . assertEquals ( null , row . cf ) ; <nl> + } <nl> }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index ddf4627 . . fc32426 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 0 . 10 
+ + * Do not flush on truncate if durable _ writes is false ( CASSANDRA - 7750 ) 
+ * Give CRR a default input _ cql Statement ( CASSANDRA - 7226 ) 
+ * Better error message when adding a collection with the same name 
+ than a previously dropped one ( CASSANDRA - 6276 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index a3c080a . . 3da44de 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 2002 , 12 + 2002 , 31 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ / / position in the System keyspace . 
+ logger . debug ( " truncating { } " , name ) ; 
+ 
+ - / / flush the CF being truncated before forcing the new segment 
+ - forceBlockingFlush ( ) ; 
+ + if ( keyspace . metadata . durableWrites | | DatabaseDescriptor . isAutoSnapshot ( ) ) 
+ + { 
+ + / / flush the CF being truncated before forcing the new segment 
+ + forceBlockingFlush ( ) ; 
+ 
+ - / / sleep a little to make sure that our truncatedAt comes after any sstable 
+ - / / that was part of the flushed we forced ; otherwise on a tie , it won ' t get deleted . 
+ - Uninterruptibles . sleepUninterruptibly ( 1 , TimeUnit . MILLISECONDS ) ; 
+ + / / sleep a little to make sure that our truncatedAt comes after any sstable 
+ + / / that was part of the flushed we forced ; otherwise on a tie , it won ' t get deleted . 
+ + Uninterruptibles . sleepUninterruptibly ( 1 , TimeUnit . MILLISECONDS ) ; 
+ + } 
+ + else 
+ + { 
+ + Keyspace . switchLock . writeLock ( ) . lock ( ) ; 
+ + try 
+ + { 
+ + for ( ColumnFamilyStore cfs : concatWithIndexes ( ) ) 
+ + { 
+ + Memtable mt = cfs . getMemtableThreadSafe ( ) ; 
+ + if ( ! mt . isClean ( ) ) 
+ + mt . cfs . data . renewMemtable ( ) ; 
+ + } 
+ + } finally 
+ + { 
+ + Keyspace . switchLock . writeLock ( ) . unlock ( ) ; 
+ + } 
+ + } 
+ 
+ Runnable truncateRunnable = new Runnable ( ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / db / DataTracker . java b / src / java / org / apache / cassandra / db / DataTracker . java 
+ index a0f880a . . a9eef98 100644 
+ - - - a / src / java / org / apache / cassandra / db / DataTracker . java 
+ + + + b / src / java / org / apache / cassandra / db / DataTracker . java 
+ @ @ - 123 , 6 + 123 , 24 @ @ public class DataTracker 
+ return toFlushMemtable ; 
+ } 
+ 
+ + / * * 
+ + * Renew the current memtable without putting the old one for a flush . 
+ + * Used when we flush but a memtable is clean ( in which case we must 
+ + * change it because it was frozen ) . 
+ + * / 
+ + public void renewMemtable ( ) 
+ + { 
+ + Memtable newMemtable = new Memtable ( cfstore , view . get ( ) . memtable ) ; 
+ + View currentView , newView ; 
+ + do 
+ + { 
+ + currentView = view . get ( ) ; 
+ + newView = currentView . renewMemtable ( newMemtable ) ; 
+ + } 
+ + while ( ! view . compareAndSet ( currentView , newView ) ) ; 
+ + notifyRenewed ( currentView . memtable ) ; 
+ + } 
+ + 
+ public void replaceFlushed ( Memtable memtable , SSTableReader sstable ) 
+ { 
+ / / sstable may be null if we flushed batchlog and nothing needed to be retained 
+ diff - - git a / test / unit / org / apache / cassandra / db / CommitLogTest . java b / test / unit / org / apache / cassandra / db / CommitLogTest . java 
+ index a7df871 . . 1be29a6 100644 
+ - - - a / test / unit / org / apache / cassandra / db / CommitLogTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / CommitLogTest . java 
+ @ @ - 32 , 13 + 32 , 16 @ @ import org . junit . Assert ; 
+ import org . junit . Test ; 
+ 
+ import org . apache . cassandra . SchemaLoader ; 
+ + import org . apache . cassandra . Util ; 
+ import org . apache . cassandra . config . Config ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . commitlog . CommitLog ; 
+ import org . apache . cassandra . db . commitlog . CommitLogDescriptor ; 
+ import org . apache . cassandra . db . commitlog . ReplayPosition ; 
+ + import org . apache . cassandra . db . filter . NamesQueryFilter ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ import org . apache . cassandra . service . StorageService ; 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ import static org . apache . cassandra . utils . ByteBufferUtil . bytes ; 
+ @ @ - 289 , 4 + 292 , 30 @ @ public class CommitLogTest extends SchemaLoader 
+ Assert . assertEquals ( 1 , CommitLog . instance . activeSegments ( ) ) ; 
+ } 
+ 
+ + @ Test 
+ + public void testTruncateWithoutSnapshotNonDurable ( ) throws ExecutionException , InterruptedException 
+ + { 
+ + CommitLog . instance . resetUnsafe ( ) ; 
+ + boolean prevAutoSnapshot = DatabaseDescriptor . isAutoSnapshot ( ) ; 
+ + DatabaseDescriptor . setAutoSnapshot ( false ) ; 
+ + Keyspace notDurableKs = Keyspace . open ( " NoCommitlogSpace " ) ; 
+ + Assert . assertFalse ( notDurableKs . metadata . durableWrites ) ; 
+ + ColumnFamilyStore cfs = notDurableKs . getColumnFamilyStore ( " Standard1 " ) ; 
+ + RowMutation rm ; 
+ + DecoratedKey dk = Util . dk ( " key1 " ) ; 
+ + 
+ + / / add data 
+ + rm = new RowMutation ( " NoCommitlogSpace " , dk . key ) ; 
+ + rm . add ( " Standard1 " , ByteBufferUtil . bytes ( " Column1 " ) , ByteBufferUtil . bytes ( " abcd " ) , 0 ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + ReadCommand command = new SliceByNamesReadCommand ( " Keyspace1 " , dk . key , " Standard1 " , System . currentTimeMillis ( ) , new NamesQueryFilter ( FBUtilities . singleton ( ByteBufferUtil . bytes ( " Column1 " ) , cfs . getComparator ( ) ) ) ) ; 
+ + Row row = command . getRow ( notDurableKs ) ; 
+ + Column col = row . cf . getColumn ( ByteBufferUtil . bytes ( " Column1 " ) ) ; 
+ + Assert . assertEquals ( col . value ( ) , ByteBuffer . wrap ( " abcd " . getBytes ( ) ) ) ; 
+ + cfs . truncateBlocking ( ) ; 
+ + DatabaseDescriptor . setAutoSnapshot ( prevAutoSnapshot ) ; 
+ + row = command . getRow ( notDurableKs ) ; 
+ + Assert . assertEquals ( null , row . cf ) ; 
+ + } 
+ }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

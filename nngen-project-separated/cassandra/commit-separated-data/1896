@@ -1,0 +1,412 @@
+BLEU SCORE: 0.029079340872079116
+
+TEST MSG: Add batch remove iterator to ABSC
+GENERATED MSG: Notify indexer of columns shadowed by range tombstones
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 6604783 . . 0d08cce 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 5 + 1 , 6 @ @ <nl> 2 . 0 . 13 : <nl> * Round up time deltas lower than 1ms in BulkLoader ( CASSANDRA - 8645 ) <nl> + * Add batch remove iterator to ABSC ( CASSANDRA - 8414 ) <nl> <nl> <nl> 2 . 0 . 12 : <nl> diff - - git a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> index 389e0f8 . . 8d553be 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> @ @ - 29 , 6 + 29 , 7 @ @ import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . db . filter . ColumnSlice ; <nl> import org . apache . cassandra . db . marshal . AbstractType ; <nl> import org . apache . cassandra . utils . Allocator ; <nl> + import org . apache . cassandra . utils . BatchRemoveIterator ; <nl> <nl> / * * <nl> * A ColumnFamily backed by an ArrayList . <nl> @ @ - 54 , 14 + 55 , 14 @ @ public class ArrayBackedSortedColumns extends AbstractThreadUnsafeSortedColumns <nl> { <nl> super ( metadata ) ; <nl> this . reversed = reversed ; <nl> - this . columns = new ArrayList < Column > ( ) ; <nl> + this . columns = new ArrayList < > ( ) ; <nl> } <nl> <nl> private ArrayBackedSortedColumns ( Collection < Column > columns , CFMetaData metadata , boolean reversed ) <nl> { <nl> super ( metadata ) ; <nl> this . reversed = reversed ; <nl> - this . columns = new ArrayList < Column > ( columns ) ; <nl> + this . columns = new ArrayList < > ( columns ) ; <nl> } <nl> <nl> public ColumnFamily . Factory getFactory ( ) <nl> @ @ - 292 , 6 + 293 , 90 @ @ public class ArrayBackedSortedColumns extends AbstractThreadUnsafeSortedColumns <nl> return new SlicesIterator ( columns , getComparator ( ) , slices , ! reversed ) ; <nl> } <nl> <nl> + @ Override <nl> + public BatchRemoveIterator < Column > batchRemoveIterator ( ) <nl> + { <nl> + return new BatchRemoveIterator < Column > ( ) <nl> + { <nl> + private Iterator < Column > iter = iterator ( ) ; <nl> + private BitSet removedIndexes = new BitSet ( columns . size ( ) ) ; <nl> + private int idx = - 1 ; <nl> + private boolean shouldCallNext = true ; <nl> + private boolean isCommitted = false ; <nl> + private boolean removedAnything = false ; <nl> + <nl> + public void commit ( ) <nl> + { <nl> + if ( isCommitted ) <nl> + throw new IllegalStateException ( ) ; <nl> + isCommitted = true ; <nl> + <nl> + if ( ! removedAnything ) <nl> + return ; <nl> + <nl> + / / the lowest index both not visited and known to be not removed <nl> + int keepIdx = removedIndexes . nextClearBit ( 0 ) ; <nl> + / / the running total of kept items <nl> + int resultLength = 0 ; <nl> + / / start from the first not - removed cell , and shift left . <nl> + int removeIdx = removedIndexes . nextSetBit ( keepIdx + 1 ) ; <nl> + while ( removeIdx > = 0 ) <nl> + { <nl> + int length = removeIdx - keepIdx ; <nl> + if ( length > 0 ) <nl> + { <nl> + copy ( keepIdx , resultLength , length ) ; <nl> + resultLength + = length ; <nl> + } <nl> + keepIdx = removedIndexes . nextClearBit ( removeIdx + 1 ) ; <nl> + if ( keepIdx < 0 ) <nl> + keepIdx = columns . size ( ) ; <nl> + removeIdx = removedIndexes . nextSetBit ( keepIdx + 1 ) ; <nl> + } <nl> + / / Copy everything after the last deleted column <nl> + int length = columns . size ( ) - keepIdx ; <nl> + if ( length > 0 ) <nl> + { <nl> + copy ( keepIdx , resultLength , length ) ; <nl> + resultLength + = length ; <nl> + } <nl> + <nl> + columns . subList ( resultLength , columns . size ( ) ) . clear ( ) ; <nl> + } <nl> + <nl> + private void copy ( int src , int dst , int len ) <nl> + { <nl> + / / [ src , src + len ) and [ dst , dst + len ) might overlap , but it ' s okay because we ' re going from left to right <nl> + assert dst < = src : " dst must not be greater than src " ; <nl> + <nl> + if ( dst < src ) <nl> + Collections . copy ( columns . subList ( dst , dst + len ) , columns . subList ( src , src + len ) ) ; <nl> + } <nl> + <nl> + public boolean hasNext ( ) <nl> + { <nl> + return iter . hasNext ( ) ; <nl> + } <nl> + <nl> + public Column next ( ) <nl> + { <nl> + idx + + ; <nl> + shouldCallNext = false ; <nl> + return iter . next ( ) ; <nl> + } <nl> + <nl> + public void remove ( ) <nl> + { <nl> + if ( shouldCallNext ) <nl> + throw new IllegalStateException ( ) ; <nl> + <nl> + removedIndexes . set ( reversed ? columns . size ( ) - idx - 1 : idx ) ; <nl> + removedAnything = true ; <nl> + shouldCallNext = true ; <nl> + } <nl> + } ; <nl> + } <nl> + <nl> private static class SlicesIterator extends AbstractIterator < Column > <nl> { <nl> private final List < Column > list ; <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> index 7edf825 . . 19f8c16 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> @ @ - 532 , 6 + 532 , 38 @ @ public abstract class ColumnFamily implements Iterable < Column > , IRowCacheEntry <nl> return ByteBuffer . wrap ( out . getData ( ) , 0 , out . getLength ( ) ) ; <nl> } <nl> <nl> + <nl> + / * * <nl> + * @ return an iterator where the removes are carried out once everything has been iterated <nl> + * / <nl> + public BatchRemoveIterator < Column > batchRemoveIterator ( ) <nl> + { <nl> + / / Default implementation is the ordinary iterator <nl> + return new BatchRemoveIterator < Column > ( ) <nl> + { <nl> + private final Iterator < Column > iter = iterator ( ) ; <nl> + <nl> + public void commit ( ) <nl> + { <nl> + } <nl> + <nl> + public boolean hasNext ( ) <nl> + { <nl> + return iter . hasNext ( ) ; <nl> + } <nl> + <nl> + public Column next ( ) <nl> + { <nl> + return iter . next ( ) ; <nl> + } <nl> + <nl> + public void remove ( ) <nl> + { <nl> + iter . remove ( ) ; <nl> + } <nl> + } ; <nl> + } <nl> + <nl> public abstract static class Factory < T extends ColumnFamily > <nl> { <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index e936473 . . 34d3f1d 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 953 , 7 + 953 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> * / <nl> public static long removeDeletedColumnsOnly ( ColumnFamily cf , int gcBefore , SecondaryIndexManager . Updater indexer ) <nl> { <nl> - Iterator < Column > iter = cf . iterator ( ) ; <nl> + BatchRemoveIterator < Column > iter = cf . batchRemoveIterator ( ) ; <nl> DeletionInfo . InOrderTester tester = cf . inOrderDeletionTester ( ) ; <nl> boolean hasDroppedColumns = ! cf . metadata . getDroppedColumns ( ) . isEmpty ( ) ; <nl> long removedBytes = 0 ; <nl> @ @ - 971 , 6 + 971 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> removedBytes + = c . dataSize ( ) ; <nl> } <nl> } <nl> + iter . commit ( ) ; <nl> return removedBytes ; <nl> } <nl> <nl> @ @ - 993 , 10 + 994 , 11 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> if ( cf = = null | | cf . metadata . getDroppedColumns ( ) . isEmpty ( ) ) <nl> return ; <nl> <nl> - Iterator < Column > iter = cf . iterator ( ) ; <nl> + BatchRemoveIterator < Column > iter = cf . batchRemoveIterator ( ) ; <nl> while ( iter . hasNext ( ) ) <nl> if ( isDroppedColumn ( iter . next ( ) , metadata ) ) <nl> iter . remove ( ) ; <nl> + iter . commit ( ) ; <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / utils / BatchRemoveIterator . java b / src / java / org / apache / cassandra / utils / BatchRemoveIterator . java <nl> new file mode 100644 <nl> index 0000000 . . 4377426 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / utils / BatchRemoveIterator . java <nl> @ @ - 0 , 0 + 1 , 32 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . utils ; <nl> + <nl> + import java . util . Iterator ; <nl> + <nl> + / * * <nl> + * Iterator that allows us to more efficiently remove many items <nl> + * / <nl> + public interface BatchRemoveIterator < T > extends Iterator < T > <nl> + { <nl> + / * * <nl> + * Commits the remove operations in this batch iterator . After this no more <nl> + * deletes can be made . Any further calls to remove ( ) or commit ( ) will throw IllegalStateException . <nl> + * / <nl> + void commit ( ) ; <nl> + } <nl> diff - - git a / test / unit / org / apache / cassandra / db / ArrayBackedSortedColumnsTest . java b / test / unit / org / apache / cassandra / db / ArrayBackedSortedColumnsTest . java <nl> index 06e2e75 . . 90cd70f 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / ArrayBackedSortedColumnsTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / ArrayBackedSortedColumnsTest . java <nl> @ @ - 28 , 10 + 28 , 12 @ @ import org . junit . Test ; <nl> import static org . junit . Assert . * ; <nl> <nl> import com . google . common . base . Functions ; <nl> + import com . google . common . collect . Sets ; <nl> <nl> import org . apache . cassandra . SchemaLoader ; <nl> import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . config . Schema ; <nl> + import org . apache . cassandra . utils . BatchRemoveIterator ; <nl> import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . db . filter . ColumnSlice ; <nl> import org . apache . cassandra . utils . HeapAllocator ; <nl> @ @ - 193 , 4 + 195 , 95 @ @ public class ArrayBackedSortedColumnsTest extends SchemaLoader <nl> iter . remove ( ) ; <nl> assertTrue ( ! iter . hasNext ( ) ) ; <nl> } <nl> + <nl> + @ Test ( expected = IllegalStateException . class ) <nl> + public void testBatchRemoveTwice ( ) <nl> + { <nl> + ColumnFamily map = ArrayBackedSortedColumns . factory . create ( metadata ( ) , false ) ; <nl> + map . addColumn ( new Column ( ByteBufferUtil . bytes ( 1 ) ) , HeapAllocator . instance ) ; <nl> + map . addColumn ( new Column ( ByteBufferUtil . bytes ( 2 ) ) , HeapAllocator . instance ) ; <nl> + <nl> + BatchRemoveIterator < Column > batchIter = map . batchRemoveIterator ( ) ; <nl> + batchIter . next ( ) ; <nl> + batchIter . remove ( ) ; <nl> + batchIter . remove ( ) ; <nl> + } <nl> + <nl> + @ Test ( expected = IllegalStateException . class ) <nl> + public void testBatchCommitTwice ( ) <nl> + { <nl> + ColumnFamily map = ArrayBackedSortedColumns . factory . create ( metadata ( ) , false ) ; <nl> + map . addColumn ( new Column ( ByteBufferUtil . bytes ( 1 ) ) , HeapAllocator . instance ) ; <nl> + map . addColumn ( new Column ( ByteBufferUtil . bytes ( 2 ) ) , HeapAllocator . instance ) ; <nl> + <nl> + BatchRemoveIterator < Column > batchIter = map . batchRemoveIterator ( ) ; <nl> + batchIter . next ( ) ; <nl> + batchIter . remove ( ) ; <nl> + batchIter . commit ( ) ; <nl> + batchIter . commit ( ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testBatchRemove ( ) <nl> + { <nl> + testBatchRemoveInternal ( false ) ; <nl> + testBatchRemoveInternal ( true ) ; <nl> + } <nl> + <nl> + public void testBatchRemoveInternal ( boolean reversed ) <nl> + { <nl> + ColumnFamily map = ArrayBackedSortedColumns . factory . create ( metadata ( ) , reversed ) ; <nl> + int [ ] values = new int [ ] { 1 , 2 , 3 , 5 } ; <nl> + <nl> + for ( int i = 0 ; i < values . length ; + + i ) <nl> + map . addColumn ( new Column ( ByteBufferUtil . bytes ( values [ reversed ? values . length - 1 - i : i ] ) ) , HeapAllocator . instance ) ; <nl> + <nl> + BatchRemoveIterator < Column > batchIter = map . batchRemoveIterator ( ) ; <nl> + batchIter . next ( ) ; <nl> + batchIter . remove ( ) ; <nl> + batchIter . next ( ) ; <nl> + batchIter . remove ( ) ; <nl> + <nl> + assertEquals ( " 1st column before commit " , 1 , map . iterator ( ) . next ( ) . name ( ) . getInt ( 0 ) ) ; <nl> + <nl> + batchIter . commit ( ) ; <nl> + <nl> + assertEquals ( " 1st column after commit " , 3 , map . iterator ( ) . next ( ) . name ( ) . getInt ( 0 ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testBatchRemoveCopy ( ) <nl> + { <nl> + / / Test delete some random columns and check the result <nl> + ColumnFamily map = ArrayBackedSortedColumns . factory . create ( metadata ( ) , false ) ; <nl> + int n = 127 ; <nl> + int [ ] values = new int [ n ] ; <nl> + for ( int i = 0 ; i < n ; i + + ) values [ i ] = i ; <nl> + Set < Integer > toRemove = Sets . newHashSet ( 3 , 12 , 13 , 15 , 58 , 103 , 112 ) ; <nl> + <nl> + for ( int value : values ) <nl> + map . addColumn ( new Column ( ByteBufferUtil . bytes ( value ) ) , HeapAllocator . instance ) ; <nl> + <nl> + BatchRemoveIterator < Column > batchIter = map . batchRemoveIterator ( ) ; <nl> + while ( batchIter . hasNext ( ) ) <nl> + if ( toRemove . contains ( batchIter . next ( ) . name ( ) . getInt ( 0 ) ) ) <nl> + batchIter . remove ( ) ; <nl> + <nl> + batchIter . commit ( ) ; <nl> + <nl> + int expected = 0 ; <nl> + <nl> + while ( toRemove . contains ( expected ) ) <nl> + expected + + ; <nl> + <nl> + for ( Column column : map ) <nl> + { <nl> + assertEquals ( expected , column . name ( ) . getInt ( 0 ) ) ; <nl> + expected + + ; <nl> + while ( toRemove . contains ( expected ) ) <nl> + expected + + ; <nl> + } <nl> + <nl> + assertEquals ( expected , n ) ; <nl> + } <nl> }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 69df3de . . 75b349f 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 3 + 1 , 7 @ @ <nl> + 1 . 1 . next <nl> + * Backport compaction exception handling from 1 . 2 <nl> + <nl> + <nl> 1 . 1 . 12 <nl> * Remove buggy thrift max message length option ( CASSANDRA - 5529 ) <nl> * Add retry mechanism to OTC for non - droppable _ verbs ( CASSANDRA - 5393 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionTask . java b / src / java / org / apache / cassandra / db / compaction / CompactionTask . java <nl> index 02d20cf . . b467a2f 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionTask . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionTask . java <nl> @ @ - 23 , 6 + 23 , 7 @ @ import java . io . IOException ; <nl> import java . util . * ; <nl> <nl> import com . google . common . base . Predicates ; <nl> + import com . google . common . base . Throwables ; <nl> import com . google . common . collect . Iterators ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 188 , 7 + 189 , 7 @ @ public class CompactionTask extends AbstractCompactionTask <nl> for ( SSTableWriter completedWriter : writers ) <nl> sstables . add ( completedWriter . closeAndOpenReader ( maxAge ) ) ; <nl> } <nl> - catch ( Exception e ) <nl> + catch ( Throwable t ) <nl> { <nl> for ( SSTableWriter writer : writers ) <nl> writer . abort ( ) ; <nl> @ @ - 198 , 7 + 199 , 7 @ @ public class CompactionTask extends AbstractCompactionTask <nl> sstable . markCompacted ( ) ; <nl> sstable . releaseReference ( ) ; <nl> } <nl> - throw FBUtilities . unchecked ( e ) ; <nl> + throw Throwables . propagate ( t ) ; <nl> } <nl> finally <nl> {
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 6604783 . . 0d08cce 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 5 + 1 , 6 @ @ 
+ 2 . 0 . 13 : 
+ * Round up time deltas lower than 1ms in BulkLoader ( CASSANDRA - 8645 ) 
+ + * Add batch remove iterator to ABSC ( CASSANDRA - 8414 ) 
+ 
+ 
+ 2 . 0 . 12 : 
+ diff - - git a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ index 389e0f8 . . 8d553be 100644 
+ - - - a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ @ @ - 29 , 6 + 29 , 7 @ @ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . db . filter . ColumnSlice ; 
+ import org . apache . cassandra . db . marshal . AbstractType ; 
+ import org . apache . cassandra . utils . Allocator ; 
+ + import org . apache . cassandra . utils . BatchRemoveIterator ; 
+ 
+ / * * 
+ * A ColumnFamily backed by an ArrayList . 
+ @ @ - 54 , 14 + 55 , 14 @ @ public class ArrayBackedSortedColumns extends AbstractThreadUnsafeSortedColumns 
+ { 
+ super ( metadata ) ; 
+ this . reversed = reversed ; 
+ - this . columns = new ArrayList < Column > ( ) ; 
+ + this . columns = new ArrayList < > ( ) ; 
+ } 
+ 
+ private ArrayBackedSortedColumns ( Collection < Column > columns , CFMetaData metadata , boolean reversed ) 
+ { 
+ super ( metadata ) ; 
+ this . reversed = reversed ; 
+ - this . columns = new ArrayList < Column > ( columns ) ; 
+ + this . columns = new ArrayList < > ( columns ) ; 
+ } 
+ 
+ public ColumnFamily . Factory getFactory ( ) 
+ @ @ - 292 , 6 + 293 , 90 @ @ public class ArrayBackedSortedColumns extends AbstractThreadUnsafeSortedColumns 
+ return new SlicesIterator ( columns , getComparator ( ) , slices , ! reversed ) ; 
+ } 
+ 
+ + @ Override 
+ + public BatchRemoveIterator < Column > batchRemoveIterator ( ) 
+ + { 
+ + return new BatchRemoveIterator < Column > ( ) 
+ + { 
+ + private Iterator < Column > iter = iterator ( ) ; 
+ + private BitSet removedIndexes = new BitSet ( columns . size ( ) ) ; 
+ + private int idx = - 1 ; 
+ + private boolean shouldCallNext = true ; 
+ + private boolean isCommitted = false ; 
+ + private boolean removedAnything = false ; 
+ + 
+ + public void commit ( ) 
+ + { 
+ + if ( isCommitted ) 
+ + throw new IllegalStateException ( ) ; 
+ + isCommitted = true ; 
+ + 
+ + if ( ! removedAnything ) 
+ + return ; 
+ + 
+ + / / the lowest index both not visited and known to be not removed 
+ + int keepIdx = removedIndexes . nextClearBit ( 0 ) ; 
+ + / / the running total of kept items 
+ + int resultLength = 0 ; 
+ + / / start from the first not - removed cell , and shift left . 
+ + int removeIdx = removedIndexes . nextSetBit ( keepIdx + 1 ) ; 
+ + while ( removeIdx > = 0 ) 
+ + { 
+ + int length = removeIdx - keepIdx ; 
+ + if ( length > 0 ) 
+ + { 
+ + copy ( keepIdx , resultLength , length ) ; 
+ + resultLength + = length ; 
+ + } 
+ + keepIdx = removedIndexes . nextClearBit ( removeIdx + 1 ) ; 
+ + if ( keepIdx < 0 ) 
+ + keepIdx = columns . size ( ) ; 
+ + removeIdx = removedIndexes . nextSetBit ( keepIdx + 1 ) ; 
+ + } 
+ + / / Copy everything after the last deleted column 
+ + int length = columns . size ( ) - keepIdx ; 
+ + if ( length > 0 ) 
+ + { 
+ + copy ( keepIdx , resultLength , length ) ; 
+ + resultLength + = length ; 
+ + } 
+ + 
+ + columns . subList ( resultLength , columns . size ( ) ) . clear ( ) ; 
+ + } 
+ + 
+ + private void copy ( int src , int dst , int len ) 
+ + { 
+ + / / [ src , src + len ) and [ dst , dst + len ) might overlap , but it ' s okay because we ' re going from left to right 
+ + assert dst < = src : " dst must not be greater than src " ; 
+ + 
+ + if ( dst < src ) 
+ + Collections . copy ( columns . subList ( dst , dst + len ) , columns . subList ( src , src + len ) ) ; 
+ + } 
+ + 
+ + public boolean hasNext ( ) 
+ + { 
+ + return iter . hasNext ( ) ; 
+ + } 
+ + 
+ + public Column next ( ) 
+ + { 
+ + idx + + ; 
+ + shouldCallNext = false ; 
+ + return iter . next ( ) ; 
+ + } 
+ + 
+ + public void remove ( ) 
+ + { 
+ + if ( shouldCallNext ) 
+ + throw new IllegalStateException ( ) ; 
+ + 
+ + removedIndexes . set ( reversed ? columns . size ( ) - idx - 1 : idx ) ; 
+ + removedAnything = true ; 
+ + shouldCallNext = true ; 
+ + } 
+ + } ; 
+ + } 
+ + 
+ private static class SlicesIterator extends AbstractIterator < Column > 
+ { 
+ private final List < Column > list ; 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ index 7edf825 . . 19f8c16 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ @ @ - 532 , 6 + 532 , 38 @ @ public abstract class ColumnFamily implements Iterable < Column > , IRowCacheEntry 
+ return ByteBuffer . wrap ( out . getData ( ) , 0 , out . getLength ( ) ) ; 
+ } 
+ 
+ + 
+ + / * * 
+ + * @ return an iterator where the removes are carried out once everything has been iterated 
+ + * / 
+ + public BatchRemoveIterator < Column > batchRemoveIterator ( ) 
+ + { 
+ + / / Default implementation is the ordinary iterator 
+ + return new BatchRemoveIterator < Column > ( ) 
+ + { 
+ + private final Iterator < Column > iter = iterator ( ) ; 
+ + 
+ + public void commit ( ) 
+ + { 
+ + } 
+ + 
+ + public boolean hasNext ( ) 
+ + { 
+ + return iter . hasNext ( ) ; 
+ + } 
+ + 
+ + public Column next ( ) 
+ + { 
+ + return iter . next ( ) ; 
+ + } 
+ + 
+ + public void remove ( ) 
+ + { 
+ + iter . remove ( ) ; 
+ + } 
+ + } ; 
+ + } 
+ + 
+ public abstract static class Factory < T extends ColumnFamily > 
+ { 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index e936473 . . 34d3f1d 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 953 , 7 + 953 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ * / 
+ public static long removeDeletedColumnsOnly ( ColumnFamily cf , int gcBefore , SecondaryIndexManager . Updater indexer ) 
+ { 
+ - Iterator < Column > iter = cf . iterator ( ) ; 
+ + BatchRemoveIterator < Column > iter = cf . batchRemoveIterator ( ) ; 
+ DeletionInfo . InOrderTester tester = cf . inOrderDeletionTester ( ) ; 
+ boolean hasDroppedColumns = ! cf . metadata . getDroppedColumns ( ) . isEmpty ( ) ; 
+ long removedBytes = 0 ; 
+ @ @ - 971 , 6 + 971 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ removedBytes + = c . dataSize ( ) ; 
+ } 
+ } 
+ + iter . commit ( ) ; 
+ return removedBytes ; 
+ } 
+ 
+ @ @ - 993 , 10 + 994 , 11 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ if ( cf = = null | | cf . metadata . getDroppedColumns ( ) . isEmpty ( ) ) 
+ return ; 
+ 
+ - Iterator < Column > iter = cf . iterator ( ) ; 
+ + BatchRemoveIterator < Column > iter = cf . batchRemoveIterator ( ) ; 
+ while ( iter . hasNext ( ) ) 
+ if ( isDroppedColumn ( iter . next ( ) , metadata ) ) 
+ iter . remove ( ) ; 
+ + iter . commit ( ) ; 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / utils / BatchRemoveIterator . java b / src / java / org / apache / cassandra / utils / BatchRemoveIterator . java 
+ new file mode 100644 
+ index 0000000 . . 4377426 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / utils / BatchRemoveIterator . java 
+ @ @ - 0 , 0 + 1 , 32 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . utils ; 
+ + 
+ + import java . util . Iterator ; 
+ + 
+ + / * * 
+ + * Iterator that allows us to more efficiently remove many items 
+ + * / 
+ + public interface BatchRemoveIterator < T > extends Iterator < T > 
+ + { 
+ + / * * 
+ + * Commits the remove operations in this batch iterator . After this no more 
+ + * deletes can be made . Any further calls to remove ( ) or commit ( ) will throw IllegalStateException . 
+ + * / 
+ + void commit ( ) ; 
+ + } 
+ diff - - git a / test / unit / org / apache / cassandra / db / ArrayBackedSortedColumnsTest . java b / test / unit / org / apache / cassandra / db / ArrayBackedSortedColumnsTest . java 
+ index 06e2e75 . . 90cd70f 100644 
+ - - - a / test / unit / org / apache / cassandra / db / ArrayBackedSortedColumnsTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / ArrayBackedSortedColumnsTest . java 
+ @ @ - 28 , 10 + 28 , 12 @ @ import org . junit . Test ; 
+ import static org . junit . Assert . * ; 
+ 
+ import com . google . common . base . Functions ; 
+ + import com . google . common . collect . Sets ; 
+ 
+ import org . apache . cassandra . SchemaLoader ; 
+ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . config . Schema ; 
+ + import org . apache . cassandra . utils . BatchRemoveIterator ; 
+ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . db . filter . ColumnSlice ; 
+ import org . apache . cassandra . utils . HeapAllocator ; 
+ @ @ - 193 , 4 + 195 , 95 @ @ public class ArrayBackedSortedColumnsTest extends SchemaLoader 
+ iter . remove ( ) ; 
+ assertTrue ( ! iter . hasNext ( ) ) ; 
+ } 
+ + 
+ + @ Test ( expected = IllegalStateException . class ) 
+ + public void testBatchRemoveTwice ( ) 
+ + { 
+ + ColumnFamily map = ArrayBackedSortedColumns . factory . create ( metadata ( ) , false ) ; 
+ + map . addColumn ( new Column ( ByteBufferUtil . bytes ( 1 ) ) , HeapAllocator . instance ) ; 
+ + map . addColumn ( new Column ( ByteBufferUtil . bytes ( 2 ) ) , HeapAllocator . instance ) ; 
+ + 
+ + BatchRemoveIterator < Column > batchIter = map . batchRemoveIterator ( ) ; 
+ + batchIter . next ( ) ; 
+ + batchIter . remove ( ) ; 
+ + batchIter . remove ( ) ; 
+ + } 
+ + 
+ + @ Test ( expected = IllegalStateException . class ) 
+ + public void testBatchCommitTwice ( ) 
+ + { 
+ + ColumnFamily map = ArrayBackedSortedColumns . factory . create ( metadata ( ) , false ) ; 
+ + map . addColumn ( new Column ( ByteBufferUtil . bytes ( 1 ) ) , HeapAllocator . instance ) ; 
+ + map . addColumn ( new Column ( ByteBufferUtil . bytes ( 2 ) ) , HeapAllocator . instance ) ; 
+ + 
+ + BatchRemoveIterator < Column > batchIter = map . batchRemoveIterator ( ) ; 
+ + batchIter . next ( ) ; 
+ + batchIter . remove ( ) ; 
+ + batchIter . commit ( ) ; 
+ + batchIter . commit ( ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testBatchRemove ( ) 
+ + { 
+ + testBatchRemoveInternal ( false ) ; 
+ + testBatchRemoveInternal ( true ) ; 
+ + } 
+ + 
+ + public void testBatchRemoveInternal ( boolean reversed ) 
+ + { 
+ + ColumnFamily map = ArrayBackedSortedColumns . factory . create ( metadata ( ) , reversed ) ; 
+ + int [ ] values = new int [ ] { 1 , 2 , 3 , 5 } ; 
+ + 
+ + for ( int i = 0 ; i < values . length ; + + i ) 
+ + map . addColumn ( new Column ( ByteBufferUtil . bytes ( values [ reversed ? values . length - 1 - i : i ] ) ) , HeapAllocator . instance ) ; 
+ + 
+ + BatchRemoveIterator < Column > batchIter = map . batchRemoveIterator ( ) ; 
+ + batchIter . next ( ) ; 
+ + batchIter . remove ( ) ; 
+ + batchIter . next ( ) ; 
+ + batchIter . remove ( ) ; 
+ + 
+ + assertEquals ( " 1st column before commit " , 1 , map . iterator ( ) . next ( ) . name ( ) . getInt ( 0 ) ) ; 
+ + 
+ + batchIter . commit ( ) ; 
+ + 
+ + assertEquals ( " 1st column after commit " , 3 , map . iterator ( ) . next ( ) . name ( ) . getInt ( 0 ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testBatchRemoveCopy ( ) 
+ + { 
+ + / / Test delete some random columns and check the result 
+ + ColumnFamily map = ArrayBackedSortedColumns . factory . create ( metadata ( ) , false ) ; 
+ + int n = 127 ; 
+ + int [ ] values = new int [ n ] ; 
+ + for ( int i = 0 ; i < n ; i + + ) values [ i ] = i ; 
+ + Set < Integer > toRemove = Sets . newHashSet ( 3 , 12 , 13 , 15 , 58 , 103 , 112 ) ; 
+ + 
+ + for ( int value : values ) 
+ + map . addColumn ( new Column ( ByteBufferUtil . bytes ( value ) ) , HeapAllocator . instance ) ; 
+ + 
+ + BatchRemoveIterator < Column > batchIter = map . batchRemoveIterator ( ) ; 
+ + while ( batchIter . hasNext ( ) ) 
+ + if ( toRemove . contains ( batchIter . next ( ) . name ( ) . getInt ( 0 ) ) ) 
+ + batchIter . remove ( ) ; 
+ + 
+ + batchIter . commit ( ) ; 
+ + 
+ + int expected = 0 ; 
+ + 
+ + while ( toRemove . contains ( expected ) ) 
+ + expected + + ; 
+ + 
+ + for ( Column column : map ) 
+ + { 
+ + assertEquals ( expected , column . name ( ) . getInt ( 0 ) ) ; 
+ + expected + + ; 
+ + while ( toRemove . contains ( expected ) ) 
+ + expected + + ; 
+ + } 
+ + 
+ + assertEquals ( expected , n ) ; 
+ + } 
+ }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 69df3de . . 75b349f 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 3 + 1 , 7 @ @ 
+ + 1 . 1 . next 
+ + * Backport compaction exception handling from 1 . 2 
+ + 
+ + 
+ 1 . 1 . 12 
+ * Remove buggy thrift max message length option ( CASSANDRA - 5529 ) 
+ * Add retry mechanism to OTC for non - droppable _ verbs ( CASSANDRA - 5393 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionTask . java b / src / java / org / apache / cassandra / db / compaction / CompactionTask . java 
+ index 02d20cf . . b467a2f 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionTask . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionTask . java 
+ @ @ - 23 , 6 + 23 , 7 @ @ import java . io . IOException ; 
+ import java . util . * ; 
+ 
+ import com . google . common . base . Predicates ; 
+ + import com . google . common . base . Throwables ; 
+ import com . google . common . collect . Iterators ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 188 , 7 + 189 , 7 @ @ public class CompactionTask extends AbstractCompactionTask 
+ for ( SSTableWriter completedWriter : writers ) 
+ sstables . add ( completedWriter . closeAndOpenReader ( maxAge ) ) ; 
+ } 
+ - catch ( Exception e ) 
+ + catch ( Throwable t ) 
+ { 
+ for ( SSTableWriter writer : writers ) 
+ writer . abort ( ) ; 
+ @ @ - 198 , 7 + 199 , 7 @ @ public class CompactionTask extends AbstractCompactionTask 
+ sstable . markCompacted ( ) ; 
+ sstable . releaseReference ( ) ; 
+ } 
+ - throw FBUtilities . unchecked ( e ) ; 
+ + throw Throwables . propagate ( t ) ; 
+ } 
+ finally 
+ {

@@ -1,0 +1,148 @@
+BLEU SCORE: 0.027611988917697356
+
+TEST MSG: Fix deadlock on truncation with secondary index .
+GENERATED MSG: optimize truncate when autosnapshot is disabled
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 88e22c0 . . 45486c1 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 2762 , 28 + 2762 , 30 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> final long truncatedAt ; <nl> final ReplayPosition replayAfter ; <nl> <nl> - synchronized ( data ) <nl> + if ( keyspace . getMetadata ( ) . durableWrites | | takeSnapshot ) <nl> { <nl> - if ( keyspace . getMetadata ( ) . durableWrites | | takeSnapshot ) <nl> - { <nl> - replayAfter = forceBlockingFlush ( ) ; <nl> - } <nl> - else <nl> + replayAfter = forceBlockingFlush ( ) ; <nl> + } <nl> + else <nl> + { <nl> + / / just nuke the memtable data w / o writing to disk first <nl> + Future < ReplayPosition > replayAfterFuture ; <nl> + synchronized ( data ) <nl> { <nl> - / / just nuke the memtable data w / o writing to disk first <nl> final Flush flush = new Flush ( true ) ; <nl> flushExecutor . execute ( flush ) ; <nl> - replayAfter = FBUtilities . waitOnFuture ( postFlushExecutor . submit ( flush . postFlush ) ) ; <nl> + replayAfterFuture = postFlushExecutor . submit ( flush . postFlush ) ; <nl> } <nl> - <nl> - long now = System . currentTimeMillis ( ) ; <nl> - / / make sure none of our sstables are somehow in the future ( clock drift , perhaps ) <nl> - for ( ColumnFamilyStore cfs : concatWithIndexes ( ) ) <nl> - for ( SSTableReader sstable : cfs . data . getSSTables ( ) ) <nl> - now = Math . max ( now , sstable . maxDataAge ) ; <nl> - truncatedAt = now ; <nl> + replayAfter = FBUtilities . waitOnFuture ( replayAfterFuture ) ; <nl> } <nl> <nl> + long now = System . currentTimeMillis ( ) ; <nl> + / / make sure none of our sstables are somehow in the future ( clock drift , perhaps ) <nl> + for ( ColumnFamilyStore cfs : concatWithIndexes ( ) ) <nl> + for ( SSTableReader sstable : cfs . data . getSSTables ( ) ) <nl> + now = Math . max ( now , sstable . maxDataAge ) ; <nl> + truncatedAt = now ; <nl> + <nl> Runnable truncateRunnable = new Runnable ( ) <nl> { <nl> public void run ( )
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index a539e66 . . 1b8377a 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 1 . 1 . 1 - dev <nl> + * optimize cleanup to drop entire sstables where possible ( CASSANDRA - 4079 ) <nl> * optimize truncate when autosnapshot is disabled ( CASSANDRA - 4153 ) <nl> * add support for commitlog archiving and point - in - time recovery <nl> ( CASSANDRA - 3647 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> index d14a13a . . 0ecac5c 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> @ @ - 40 , 6 + 40 , 7 @ @ import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . db . compaction . CompactionInfo . Holder ; <nl> import org . apache . cassandra . db . index . SecondaryIndex ; <nl> import org . apache . cassandra . db . index . SecondaryIndexBuilder ; <nl> + import org . apache . cassandra . dht . Bounds ; <nl> import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . io . sstable . * ; <nl> @ @ - 671 , 6 + 672 , 12 @ @ public class CompactionManager implements CompactionManagerMBean <nl> <nl> for ( SSTableReader sstable : sstables ) <nl> { <nl> + if ( ! new Bounds < Token > ( sstable . first . token , sstable . last . token ) . intersects ( ranges ) ) <nl> + { <nl> + cfs . replaceCompactedSSTables ( Arrays . asList ( sstable ) , Collections . < SSTableReader > emptyList ( ) , OperationType . CLEANUP ) ; <nl> + continue ; <nl> + } <nl> + <nl> CompactionController controller = new CompactionController ( cfs , Collections . singletonList ( sstable ) , getDefaultGcBefore ( cfs ) , false ) ; <nl> long startTime = System . currentTimeMillis ( ) ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / dht / AbstractBounds . java b / src / java / org / apache / cassandra / dht / AbstractBounds . java <nl> index da93292 . . 02f5f79 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / AbstractBounds . java <nl> + + + b / src / java / org / apache / cassandra / dht / AbstractBounds . java <nl> @ @ - 82 , 6 + 82 , 17 @ @ public abstract class AbstractBounds < T extends RingPosition > implements Serializ <nl> return 31 * left . hashCode ( ) + right . hashCode ( ) ; <nl> } <nl> <nl> + / * * return true if @ param range intersects any of the given @ param ranges * / <nl> + public boolean intersects ( Iterable < Range < T > > ranges ) <nl> + { <nl> + for ( Range < T > range2 : ranges ) <nl> + { <nl> + if ( range2 . intersects ( this ) ) <nl> + return true ; <nl> + } <nl> + return false ; <nl> + } <nl> + <nl> public abstract boolean contains ( T start ) ; <nl> <nl> public abstract List < ? extends AbstractBounds < T > > unwrap ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / dht / Range . java b / src / java / org / apache / cassandra / dht / Range . java <nl> index 888c0ca . . d6137d4 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / Range . java <nl> + + + b / src / java / org / apache / cassandra / dht / Range . java <nl> @ @ - 121 , 6 + 121 , 25 @ @ public class Range < T extends RingPosition > extends AbstractBounds < T > implements <nl> return intersectionWith ( that ) . size ( ) > 0 ; <nl> } <nl> <nl> + public boolean intersects ( AbstractBounds < T > that ) <nl> + { <nl> + / / implemented for cleanup compaction membership test , so only Range + Bounds are supported for now <nl> + if ( that instanceof Range ) <nl> + return intersects ( ( Range ) that ) ; <nl> + if ( that instanceof Bounds ) <nl> + return intersects ( ( Bounds ) that ) ; <nl> + throw new UnsupportedOperationException ( " Intersection is only supported for Bounds and Range objects ; found " + that . getClass ( ) ) ; <nl> + } <nl> + <nl> + / * * <nl> + * @ param that range to check for intersection <nl> + * @ return true if the given range intersects with this range . <nl> + * / <nl> + public boolean intersects ( Bounds < T > that ) <nl> + { <nl> + return intersects ( new Range < T > ( that . left , that . right ) ) | | contains ( that . right ) ; <nl> + } <nl> + <nl> public static < T extends RingPosition > Set < Range < T > > rangeSet ( Range < T > . . . ranges ) <nl> { <nl> return Collections . unmodifiableSet ( new HashSet < Range < T > > ( Arrays . asList ( ranges ) ) ) ;
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 88e22c0 . . 45486c1 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 2762 , 28 + 2762 , 30 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ final long truncatedAt ; 
+ final ReplayPosition replayAfter ; 
+ 
+ - synchronized ( data ) 
+ + if ( keyspace . getMetadata ( ) . durableWrites | | takeSnapshot ) 
+ { 
+ - if ( keyspace . getMetadata ( ) . durableWrites | | takeSnapshot ) 
+ - { 
+ - replayAfter = forceBlockingFlush ( ) ; 
+ - } 
+ - else 
+ + replayAfter = forceBlockingFlush ( ) ; 
+ + } 
+ + else 
+ + { 
+ + / / just nuke the memtable data w / o writing to disk first 
+ + Future < ReplayPosition > replayAfterFuture ; 
+ + synchronized ( data ) 
+ { 
+ - / / just nuke the memtable data w / o writing to disk first 
+ final Flush flush = new Flush ( true ) ; 
+ flushExecutor . execute ( flush ) ; 
+ - replayAfter = FBUtilities . waitOnFuture ( postFlushExecutor . submit ( flush . postFlush ) ) ; 
+ + replayAfterFuture = postFlushExecutor . submit ( flush . postFlush ) ; 
+ } 
+ - 
+ - long now = System . currentTimeMillis ( ) ; 
+ - / / make sure none of our sstables are somehow in the future ( clock drift , perhaps ) 
+ - for ( ColumnFamilyStore cfs : concatWithIndexes ( ) ) 
+ - for ( SSTableReader sstable : cfs . data . getSSTables ( ) ) 
+ - now = Math . max ( now , sstable . maxDataAge ) ; 
+ - truncatedAt = now ; 
+ + replayAfter = FBUtilities . waitOnFuture ( replayAfterFuture ) ; 
+ } 
+ 
+ + long now = System . currentTimeMillis ( ) ; 
+ + / / make sure none of our sstables are somehow in the future ( clock drift , perhaps ) 
+ + for ( ColumnFamilyStore cfs : concatWithIndexes ( ) ) 
+ + for ( SSTableReader sstable : cfs . data . getSSTables ( ) ) 
+ + now = Math . max ( now , sstable . maxDataAge ) ; 
+ + truncatedAt = now ; 
+ + 
+ Runnable truncateRunnable = new Runnable ( ) 
+ { 
+ public void run ( )
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index a539e66 . . 1b8377a 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 1 . 1 . 1 - dev 
+ + * optimize cleanup to drop entire sstables where possible ( CASSANDRA - 4079 ) 
+ * optimize truncate when autosnapshot is disabled ( CASSANDRA - 4153 ) 
+ * add support for commitlog archiving and point - in - time recovery 
+ ( CASSANDRA - 3647 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ index d14a13a . . 0ecac5c 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ @ @ - 40 , 6 + 40 , 7 @ @ import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . db . compaction . CompactionInfo . Holder ; 
+ import org . apache . cassandra . db . index . SecondaryIndex ; 
+ import org . apache . cassandra . db . index . SecondaryIndexBuilder ; 
+ + import org . apache . cassandra . dht . Bounds ; 
+ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . io . sstable . * ; 
+ @ @ - 671 , 6 + 672 , 12 @ @ public class CompactionManager implements CompactionManagerMBean 
+ 
+ for ( SSTableReader sstable : sstables ) 
+ { 
+ + if ( ! new Bounds < Token > ( sstable . first . token , sstable . last . token ) . intersects ( ranges ) ) 
+ + { 
+ + cfs . replaceCompactedSSTables ( Arrays . asList ( sstable ) , Collections . < SSTableReader > emptyList ( ) , OperationType . CLEANUP ) ; 
+ + continue ; 
+ + } 
+ + 
+ CompactionController controller = new CompactionController ( cfs , Collections . singletonList ( sstable ) , getDefaultGcBefore ( cfs ) , false ) ; 
+ long startTime = System . currentTimeMillis ( ) ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / dht / AbstractBounds . java b / src / java / org / apache / cassandra / dht / AbstractBounds . java 
+ index da93292 . . 02f5f79 100644 
+ - - - a / src / java / org / apache / cassandra / dht / AbstractBounds . java 
+ + + + b / src / java / org / apache / cassandra / dht / AbstractBounds . java 
+ @ @ - 82 , 6 + 82 , 17 @ @ public abstract class AbstractBounds < T extends RingPosition > implements Serializ 
+ return 31 * left . hashCode ( ) + right . hashCode ( ) ; 
+ } 
+ 
+ + / * * return true if @ param range intersects any of the given @ param ranges * / 
+ + public boolean intersects ( Iterable < Range < T > > ranges ) 
+ + { 
+ + for ( Range < T > range2 : ranges ) 
+ + { 
+ + if ( range2 . intersects ( this ) ) 
+ + return true ; 
+ + } 
+ + return false ; 
+ + } 
+ + 
+ public abstract boolean contains ( T start ) ; 
+ 
+ public abstract List < ? extends AbstractBounds < T > > unwrap ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / dht / Range . java b / src / java / org / apache / cassandra / dht / Range . java 
+ index 888c0ca . . d6137d4 100644 
+ - - - a / src / java / org / apache / cassandra / dht / Range . java 
+ + + + b / src / java / org / apache / cassandra / dht / Range . java 
+ @ @ - 121 , 6 + 121 , 25 @ @ public class Range < T extends RingPosition > extends AbstractBounds < T > implements 
+ return intersectionWith ( that ) . size ( ) > 0 ; 
+ } 
+ 
+ + public boolean intersects ( AbstractBounds < T > that ) 
+ + { 
+ + / / implemented for cleanup compaction membership test , so only Range + Bounds are supported for now 
+ + if ( that instanceof Range ) 
+ + return intersects ( ( Range ) that ) ; 
+ + if ( that instanceof Bounds ) 
+ + return intersects ( ( Bounds ) that ) ; 
+ + throw new UnsupportedOperationException ( " Intersection is only supported for Bounds and Range objects ; found " + that . getClass ( ) ) ; 
+ + } 
+ + 
+ + / * * 
+ + * @ param that range to check for intersection 
+ + * @ return true if the given range intersects with this range . 
+ + * / 
+ + public boolean intersects ( Bounds < T > that ) 
+ + { 
+ + return intersects ( new Range < T > ( that . left , that . right ) ) | | contains ( that . right ) ; 
+ + } 
+ + 
+ public static < T extends RingPosition > Set < Range < T > > rangeSet ( Range < T > . . . ranges ) 
+ { 
+ return Collections . unmodifiableSet ( new HashSet < Range < T > > ( Arrays . asList ( ranges ) ) ) ;

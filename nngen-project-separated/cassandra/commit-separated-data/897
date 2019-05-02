@@ -1,0 +1,1270 @@
+BLEU SCORE: 0.017110488113633058
+
+TEST MSG: Fix paging for range queries where all clustering columns are specified
+GENERATED MSG: convert gossip to use tcp . this finishes the removal of nio
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 46206b1 . . 268d011 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 6 <nl> + * Fix paging for range queries where all clustering columns are specified ( CASSANDRA - 11669 ) <nl> * Don ' t require HEAP _ NEW _ SIZE to be set when using G1 ( CASSANDRA - 11600 ) <nl> * Fix sstabledump not showing cells after tombstone marker ( CASSANDRA - 11654 ) <nl> * Ignore all LocalStrategy keyspaces for streaming and other related <nl> diff - - git a / src / java / org / apache / cassandra / db / PartitionRangeReadCommand . java b / src / java / org / apache / cassandra / db / PartitionRangeReadCommand . java <nl> index 9fce15e . . 9585b59 100644 <nl> - - - a / src / java / org / apache / cassandra / db / PartitionRangeReadCommand . java <nl> + + + b / src / java / org / apache / cassandra / db / PartitionRangeReadCommand . java <nl> @ @ - 165 , 10 + 165 , 7 @ @ public class PartitionRangeReadCommand extends ReadCommand <nl> <nl> public QueryPager getPager ( PagingState pagingState , int protocolVersion ) <nl> { <nl> - if ( isNamesQuery ( ) ) <nl> - return new RangeNamesQueryPager ( this , pagingState , protocolVersion ) ; <nl> - else <nl> - return new RangeSliceQueryPager ( this , pagingState , protocolVersion ) ; <nl> + return new PartitionRangeQueryPager ( this , pagingState , protocolVersion ) ; <nl> } <nl> <nl> protected void recordLatency ( TableMetrics metric , long latencyNanos ) <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / PartitionRangeQueryPager . java b / src / java / org / apache / cassandra / service / pager / PartitionRangeQueryPager . java <nl> new file mode 100644 <nl> index 0000000 . . 9c216e3 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / service / pager / PartitionRangeQueryPager . java <nl> @ @ - 0 , 0 + 1 , 130 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . service . pager ; <nl> + <nl> + import java . util . Optional ; <nl> + <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> + <nl> + import org . apache . cassandra . db . * ; <nl> + import org . apache . cassandra . db . filter . DataLimits ; <nl> + import org . apache . cassandra . db . rows . Row ; <nl> + import org . apache . cassandra . dht . * ; <nl> + import org . apache . cassandra . exceptions . RequestExecutionException ; <nl> + import org . apache . cassandra . index . Index ; <nl> + import org . apache . cassandra . schema . IndexMetadata ; <nl> + <nl> + / * * <nl> + * Pages a PartitionRangeReadCommand . <nl> + * <nl> + * Note : this only work for CQL3 queries for now ( because thrift queries expect <nl> + * a different limit on the rows than on the columns , which complicates it ) . <nl> + * / <nl> + public class PartitionRangeQueryPager extends AbstractQueryPager <nl> + { <nl> + private static final Logger logger = LoggerFactory . getLogger ( PartitionRangeQueryPager . class ) ; <nl> + <nl> + private volatile DecoratedKey lastReturnedKey ; <nl> + private volatile PagingState . RowMark lastReturnedRow ; <nl> + <nl> + public PartitionRangeQueryPager ( PartitionRangeReadCommand command , PagingState state , int protocolVersion ) <nl> + { <nl> + super ( command , protocolVersion ) ; <nl> + <nl> + if ( state ! = null ) <nl> + { <nl> + lastReturnedKey = command . metadata ( ) . decorateKey ( state . partitionKey ) ; <nl> + lastReturnedRow = state . rowMark ; <nl> + restoreState ( lastReturnedKey , state . remaining , state . remainingInPartition ) ; <nl> + } <nl> + } <nl> + <nl> + public PagingState state ( ) <nl> + { <nl> + return lastReturnedKey = = null <nl> + ? null <nl> + : new PagingState ( lastReturnedKey . getKey ( ) , lastReturnedRow , maxRemaining ( ) , remainingInPartition ( ) ) ; <nl> + } <nl> + <nl> + protected ReadCommand nextPageReadCommand ( int pageSize ) <nl> + throws RequestExecutionException <nl> + { <nl> + DataLimits limits ; <nl> + DataRange fullRange = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) ; <nl> + DataRange pageRange ; <nl> + if ( lastReturnedKey = = null ) <nl> + { <nl> + pageRange = fullRange ; <nl> + limits = command . limits ( ) . forPaging ( pageSize ) ; <nl> + } <nl> + else <nl> + { <nl> + / / We want to include the last returned key only if we haven ' t achieved our per - partition limit , otherwise , don ' t bother . <nl> + boolean includeLastKey = remainingInPartition ( ) > 0 & & lastReturnedRow ! = null ; <nl> + AbstractBounds < PartitionPosition > bounds = makeKeyBounds ( lastReturnedKey , includeLastKey ) ; <nl> + if ( includeLastKey ) <nl> + { <nl> + pageRange = fullRange . forPaging ( bounds , command . metadata ( ) . comparator , lastReturnedRow . clustering ( command . metadata ( ) ) , false ) ; <nl> + limits = command . limits ( ) . forPaging ( pageSize , lastReturnedKey . getKey ( ) , remainingInPartition ( ) ) ; <nl> + } <nl> + else <nl> + { <nl> + pageRange = fullRange . forSubRange ( bounds ) ; <nl> + limits = command . limits ( ) . forPaging ( pageSize ) ; <nl> + } <nl> + } <nl> + <nl> + Index index = command . getIndex ( Keyspace . openAndGetStore ( command . metadata ( ) ) ) ; <nl> + Optional < IndexMetadata > indexMetadata = index ! = null ? Optional . of ( index . getIndexMetadata ( ) ) : Optional . empty ( ) ; <nl> + return new PartitionRangeReadCommand ( command . metadata ( ) , command . nowInSec ( ) , command . columnFilter ( ) , command . rowFilter ( ) , limits , pageRange , indexMetadata ) ; <nl> + } <nl> + <nl> + protected void recordLast ( DecoratedKey key , Row last ) <nl> + { <nl> + if ( last ! = null ) <nl> + { <nl> + lastReturnedKey = key ; <nl> + if ( last . clustering ( ) ! = Clustering . STATIC _ CLUSTERING ) <nl> + lastReturnedRow = PagingState . RowMark . create ( command . metadata ( ) , last , protocolVersion ) ; <nl> + } <nl> + } <nl> + <nl> + protected boolean isPreviouslyReturnedPartition ( DecoratedKey key ) <nl> + { <nl> + / / Note that lastReturnedKey can be null , but key cannot . <nl> + return key . equals ( lastReturnedKey ) ; <nl> + } <nl> + <nl> + private AbstractBounds < PartitionPosition > makeKeyBounds ( PartitionPosition lastReturnedKey , boolean includeLastKey ) <nl> + { <nl> + AbstractBounds < PartitionPosition > bounds = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) . keyRange ( ) ; <nl> + if ( bounds instanceof Range | | bounds instanceof Bounds ) <nl> + { <nl> + return includeLastKey <nl> + ? new Bounds < PartitionPosition > ( lastReturnedKey , bounds . right ) <nl> + : new Range < PartitionPosition > ( lastReturnedKey , bounds . right ) ; <nl> + } <nl> + else <nl> + { <nl> + return includeLastKey <nl> + ? new IncludingExcludingBounds < PartitionPosition > ( lastReturnedKey , bounds . right ) <nl> + : new ExcludingBounds < PartitionPosition > ( lastReturnedKey , bounds . right ) ; <nl> + } <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / RangeNamesQueryPager . java b / src / java / org / apache / cassandra / service / pager / RangeNamesQueryPager . java <nl> deleted file mode 100644 <nl> index 9801565 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / service / pager / RangeNamesQueryPager . java <nl> + + + / dev / null <nl> @ @ - 1 , 92 + 0 , 0 @ @ <nl> - / * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - package org . apache . cassandra . service . pager ; <nl> - <nl> - import org . apache . cassandra . db . * ; <nl> - import org . apache . cassandra . db . rows . * ; <nl> - import org . apache . cassandra . dht . * ; <nl> - import org . apache . cassandra . exceptions . RequestExecutionException ; <nl> - <nl> - / * * <nl> - * Pages a RangeSliceCommand whose predicate is a name query . <nl> - * <nl> - * Note : this only work for NamesQueryFilter that have countCQL3Rows ( ) set , <nl> - * because this assumes the pageSize is counted in number of internal rows <nl> - * returned . More precisely , this doesn ' t do in - row paging so this assumes <nl> - * that the counter returned by columnCounter ( ) will count 1 for each internal <nl> - * row . <nl> - * / <nl> - public class RangeNamesQueryPager extends AbstractQueryPager <nl> - { <nl> - private volatile DecoratedKey lastReturnedKey ; <nl> - <nl> - public RangeNamesQueryPager ( PartitionRangeReadCommand command , PagingState state , int protocolVersion ) <nl> - { <nl> - super ( command , protocolVersion ) ; <nl> - assert command . isNamesQuery ( ) ; <nl> - <nl> - if ( state ! = null ) <nl> - { <nl> - lastReturnedKey = command . metadata ( ) . decorateKey ( state . partitionKey ) ; <nl> - restoreState ( lastReturnedKey , state . remaining , state . remainingInPartition ) ; <nl> - } <nl> - } <nl> - <nl> - public PagingState state ( ) <nl> - { <nl> - return lastReturnedKey = = null <nl> - ? null <nl> - : new PagingState ( lastReturnedKey . getKey ( ) , null , maxRemaining ( ) , remainingInPartition ( ) ) ; <nl> - } <nl> - <nl> - protected ReadCommand nextPageReadCommand ( int pageSize ) <nl> - throws RequestExecutionException <nl> - { <nl> - PartitionRangeReadCommand pageCmd = ( ( PartitionRangeReadCommand ) command ) . withUpdatedLimit ( command . limits ( ) . forPaging ( pageSize ) ) ; <nl> - if ( lastReturnedKey ! = null ) <nl> - pageCmd = pageCmd . forSubRange ( makeExcludingKeyBounds ( lastReturnedKey ) ) ; <nl> - <nl> - return pageCmd ; <nl> - } <nl> - <nl> - protected void recordLast ( DecoratedKey key , Row last ) <nl> - { <nl> - lastReturnedKey = key ; <nl> - } <nl> - <nl> - protected boolean isPreviouslyReturnedPartition ( DecoratedKey key ) <nl> - { <nl> - / / Note that lastReturnedKey can be null , but key cannot . <nl> - return key . equals ( lastReturnedKey ) ; <nl> - } <nl> - <nl> - private AbstractBounds < PartitionPosition > makeExcludingKeyBounds ( PartitionPosition lastReturnedKey ) <nl> - { <nl> - / / We return a range that always exclude lastReturnedKey , since we ' ve already <nl> - / / returned it . <nl> - AbstractBounds < PartitionPosition > bounds = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) . keyRange ( ) ; <nl> - if ( bounds instanceof Range | | bounds instanceof Bounds ) <nl> - { <nl> - return new Range < PartitionPosition > ( lastReturnedKey , bounds . right ) ; <nl> - } <nl> - else <nl> - { <nl> - return new ExcludingBounds < PartitionPosition > ( lastReturnedKey , bounds . right ) ; <nl> - } <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / service / pager / RangeSliceQueryPager . java b / src / java / org / apache / cassandra / service / pager / RangeSliceQueryPager . java <nl> deleted file mode 100644 <nl> index 6ad8649 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / service / pager / RangeSliceQueryPager . java <nl> + + + / dev / null <nl> @ @ - 1 , 131 + 0 , 0 @ @ <nl> - / * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - package org . apache . cassandra . service . pager ; <nl> - <nl> - import java . util . Optional ; <nl> - <nl> - import org . slf4j . Logger ; <nl> - import org . slf4j . LoggerFactory ; <nl> - <nl> - import org . apache . cassandra . db . * ; <nl> - import org . apache . cassandra . db . filter . DataLimits ; <nl> - import org . apache . cassandra . db . rows . Row ; <nl> - import org . apache . cassandra . dht . * ; <nl> - import org . apache . cassandra . exceptions . RequestExecutionException ; <nl> - import org . apache . cassandra . index . Index ; <nl> - import org . apache . cassandra . schema . IndexMetadata ; <nl> - <nl> - / * * <nl> - * Pages a RangeSliceCommand whose predicate is a slice query . <nl> - * <nl> - * Note : this only work for CQL3 queries for now ( because thrift queries expect <nl> - * a different limit on the rows than on the columns , which complicates it ) . <nl> - * / <nl> - public class RangeSliceQueryPager extends AbstractQueryPager <nl> - { <nl> - private static final Logger logger = LoggerFactory . getLogger ( RangeSliceQueryPager . class ) ; <nl> - <nl> - private volatile DecoratedKey lastReturnedKey ; <nl> - private volatile PagingState . RowMark lastReturnedRow ; <nl> - <nl> - public RangeSliceQueryPager ( PartitionRangeReadCommand command , PagingState state , int protocolVersion ) <nl> - { <nl> - super ( command , protocolVersion ) ; <nl> - assert ! command . isNamesQuery ( ) ; <nl> - <nl> - if ( state ! = null ) <nl> - { <nl> - lastReturnedKey = command . metadata ( ) . decorateKey ( state . partitionKey ) ; <nl> - lastReturnedRow = state . rowMark ; <nl> - restoreState ( lastReturnedKey , state . remaining , state . remainingInPartition ) ; <nl> - } <nl> - } <nl> - <nl> - public PagingState state ( ) <nl> - { <nl> - return lastReturnedKey = = null <nl> - ? null <nl> - : new PagingState ( lastReturnedKey . getKey ( ) , lastReturnedRow , maxRemaining ( ) , remainingInPartition ( ) ) ; <nl> - } <nl> - <nl> - protected ReadCommand nextPageReadCommand ( int pageSize ) <nl> - throws RequestExecutionException <nl> - { <nl> - DataLimits limits ; <nl> - DataRange fullRange = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) ; <nl> - DataRange pageRange ; <nl> - if ( lastReturnedKey = = null ) <nl> - { <nl> - pageRange = fullRange ; <nl> - limits = command . limits ( ) . forPaging ( pageSize ) ; <nl> - } <nl> - else <nl> - { <nl> - / / We want to include the last returned key only if we haven ' t achieved our per - partition limit , otherwise , don ' t bother . <nl> - boolean includeLastKey = remainingInPartition ( ) > 0 & & lastReturnedRow ! = null ; <nl> - AbstractBounds < PartitionPosition > bounds = makeKeyBounds ( lastReturnedKey , includeLastKey ) ; <nl> - if ( includeLastKey ) <nl> - { <nl> - pageRange = fullRange . forPaging ( bounds , command . metadata ( ) . comparator , lastReturnedRow . clustering ( command . metadata ( ) ) , false ) ; <nl> - limits = command . limits ( ) . forPaging ( pageSize , lastReturnedKey . getKey ( ) , remainingInPartition ( ) ) ; <nl> - } <nl> - else <nl> - { <nl> - pageRange = fullRange . forSubRange ( bounds ) ; <nl> - limits = command . limits ( ) . forPaging ( pageSize ) ; <nl> - } <nl> - } <nl> - <nl> - Index index = command . getIndex ( Keyspace . openAndGetStore ( command . metadata ( ) ) ) ; <nl> - Optional < IndexMetadata > indexMetadata = index ! = null ? Optional . of ( index . getIndexMetadata ( ) ) : Optional . empty ( ) ; <nl> - return new PartitionRangeReadCommand ( command . metadata ( ) , command . nowInSec ( ) , command . columnFilter ( ) , command . rowFilter ( ) , limits , pageRange , indexMetadata ) ; <nl> - } <nl> - <nl> - protected void recordLast ( DecoratedKey key , Row last ) <nl> - { <nl> - if ( last ! = null ) <nl> - { <nl> - lastReturnedKey = key ; <nl> - if ( last . clustering ( ) ! = Clustering . STATIC _ CLUSTERING ) <nl> - lastReturnedRow = PagingState . RowMark . create ( command . metadata ( ) , last , protocolVersion ) ; <nl> - } <nl> - } <nl> - <nl> - protected boolean isPreviouslyReturnedPartition ( DecoratedKey key ) <nl> - { <nl> - / / Note that lastReturnedKey can be null , but key cannot . <nl> - return key . equals ( lastReturnedKey ) ; <nl> - } <nl> - <nl> - private AbstractBounds < PartitionPosition > makeKeyBounds ( PartitionPosition lastReturnedKey , boolean includeLastKey ) <nl> - { <nl> - AbstractBounds < PartitionPosition > bounds = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) . keyRange ( ) ; <nl> - if ( bounds instanceof Range | | bounds instanceof Bounds ) <nl> - { <nl> - return includeLastKey <nl> - ? new Bounds < PartitionPosition > ( lastReturnedKey , bounds . right ) <nl> - : new Range < PartitionPosition > ( lastReturnedKey , bounds . right ) ; <nl> - } <nl> - else <nl> - { <nl> - return includeLastKey <nl> - ? new IncludingExcludingBounds < PartitionPosition > ( lastReturnedKey , bounds . right ) <nl> - : new ExcludingBounds < PartitionPosition > ( lastReturnedKey , bounds . right ) ; <nl> - } <nl> - } <nl> - }
+NEAREST DIFF (one line): diff - - git a / conf / storage - conf . xml b / conf / storage - conf . xml <nl> index b30029f . . b3b28ac 100644 <nl> - - - a / conf / storage - conf . xml <nl> + + + b / conf / storage - conf . xml <nl> @ @ - 221 , 10 + 221 , 8 @ @ <nl> ~ address associated with the hostname ( it might not be ) . <nl> - - > <nl> < ListenAddress > localhost < / ListenAddress > <nl> - < ! - - TCP port , for commands and data - - > <nl> + < ! - - internal communications port - - > <nl> < StoragePort > 7000 < / StoragePort > <nl> - < ! - - UDP port , for membership communications ( gossip ) - - > <nl> - < ControlPort > 7001 < / ControlPort > <nl> <nl> < ! - - <nl> ~ The address to bind the Thrift RPC service to . Unlike ListenAddress <nl> diff - - git a / src / java / org / apache / cassandra / gms / Gossiper . java b / src / java / org / apache / cassandra / gms / Gossiper . java <nl> index 52c8ae7 . . e563824 100644 <nl> - - - a / src / java / org / apache / cassandra / gms / Gossiper . java <nl> + + + b / src / java / org / apache / cassandra / gms / Gossiper . java <nl> @ @ - 308 , 7 + 308 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC <nl> InetAddress to = liveEndPoints . get ( index ) ; <nl> if ( logger _ . isTraceEnabled ( ) ) <nl> logger _ . trace ( " Sending a GossipDigestSynMessage to " + to + " . . . " ) ; <nl> - MessagingService . instance . sendUdpOneWay ( message , to ) ; <nl> + MessagingService . instance . sendOneWay ( message , to ) ; <nl> return seeds _ . contains ( to ) ; <nl> } <nl> <nl> @ @ - 887 , 7 + 887 , 7 @ @ class GossipDigestSynVerbHandler implements IVerbHandler <nl> Message gDigestAckMessage = Gossiper . instance . makeGossipDigestAckMessage ( gDigestAck ) ; <nl> if ( logger _ . isTraceEnabled ( ) ) <nl> logger _ . trace ( " Sending a GossipDigestAckMessage to " + from ) ; <nl> - MessagingService . instance . sendUdpOneWay ( gDigestAckMessage , from ) ; <nl> + MessagingService . instance . sendOneWay ( gDigestAckMessage , from ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> @ @ - 979 , 7 + 979 , 7 @ @ class GossipDigestAckVerbHandler implements IVerbHandler <nl> Message gDigestAck2Message = Gossiper . instance . makeGossipDigestAck2Message ( gDigestAck2 ) ; <nl> if ( logger _ . isTraceEnabled ( ) ) <nl> logger _ . trace ( " Sending a GossipDigestAck2Message to " + from ) ; <nl> - MessagingService . instance . sendUdpOneWay ( gDigestAck2Message , from ) ; <nl> + MessagingService . instance . sendOneWay ( gDigestAck2Message , from ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java <nl> index 0cc0d05 . . a24b4f2 100644 <nl> - - - a / src / java / org / apache / cassandra / net / MessagingService . java <nl> + + + b / src / java / org / apache / cassandra / net / MessagingService . java <nl> @ @ - 166 , 26 + 166 , 7 @ @ public class MessagingService implements IFailureDetectionEventListener <nl> } <nl> } , " ACCEPT - " + localEp ) . start ( ) ; <nl> } <nl> - <nl> - / * * <nl> - * Listen on the specified port . <nl> - * @ param localEp InetAddress whose port to listen on . <nl> - * / <nl> - public void listenUDP ( InetAddress localEp ) <nl> - { <nl> - UdpConnection connection = new UdpConnection ( ) ; <nl> - if ( logger _ . isDebugEnabled ( ) ) <nl> - logger _ . debug ( " Starting to listen on " + localEp ) ; <nl> - try <nl> - { <nl> - connection . init ( localEp ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> - } <nl> - <nl> + <nl> public static OutboundTcpConnectionPool getConnectionPool ( InetAddress from , InetAddress to ) <nl> { <nl> String key = from + " : " + to ; <nl> @ @ - 345 , 36 + 326 , 6 @ @ public class MessagingService implements IFailureDetectionEventListener <nl> } <nl> <nl> / * * <nl> - * Send a message to a given endpoint . This method adheres to the fire and forget <nl> - * style messaging . <nl> - * @ param message messages to be sent . <nl> - * @ param to endpoint to which the message needs to be sent <nl> - * / <nl> - public void sendUdpOneWay ( Message message , InetAddress to ) <nl> - { <nl> - if ( message . getFrom ( ) . equals ( to ) ) { <nl> - MessagingService . receive ( message ) ; <nl> - return ; <nl> - } <nl> - <nl> - UdpConnection connection = null ; <nl> - try <nl> - { <nl> - connection = new UdpConnection ( ) ; <nl> - connection . init ( ) ; <nl> - connection . write ( message , to ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> - finally <nl> - { <nl> - if ( connection ! = null ) <nl> - connection . close ( ) ; <nl> - } <nl> - } <nl> - / * * <nl> * Stream a file from source to destination . This is highly optimized <nl> * to not hold any of the contents of the file in memory . <nl> * @ param file name of file to stream . <nl> diff - - git a / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java b / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java <nl> index 8ad66ca . . 220abf7 100644 <nl> - - - a / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java <nl> + + + b / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java <nl> @ @ - 47 , 7 + 47 , 8 @ @ class OutboundTcpConnectionPool <nl> * / <nl> synchronized OutboundTcpConnection getConnection ( Message msg ) <nl> { <nl> - if ( StageManager . RESPONSE _ STAGE . equals ( msg . getMessageType ( ) ) ) <nl> + if ( StageManager . RESPONSE _ STAGE . equals ( msg . getMessageType ( ) ) <nl> + | | StageManager . GOSSIP _ STAGE . equals ( msg . getMessageType ( ) ) ) <nl> { <nl> if ( ackCon = = null ) <nl> ackCon = newCon ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / net / SelectionKeyHandler . java b / src / java / org / apache / cassandra / net / SelectionKeyHandler . java <nl> deleted file mode 100644 <nl> index 678c100 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / net / SelectionKeyHandler . java <nl> + + + / dev / null <nl> @ @ - 1 , 75 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . net ; <nl> - <nl> - import java . nio . channels . * ; <nl> - import java . io . IOException ; <nl> - <nl> - public class SelectionKeyHandler <nl> - { <nl> - / * * <nl> - * Method which is called when the key becomes acceptable . <nl> - * <nl> - * @ param key The key which is acceptable . <nl> - * / <nl> - public void accept ( SelectionKey key ) <nl> - { <nl> - throw new UnsupportedOperationException ( " accept ( ) cannot be called on " + getClass ( ) . getName ( ) + " ! " ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Method which is called when the key becomes connectable . <nl> - * <nl> - * @ param key The key which is connectable . <nl> - * / <nl> - public void connect ( SelectionKey key ) <nl> - { <nl> - throw new UnsupportedOperationException ( " connect ( ) cannot be called on " + getClass ( ) . getName ( ) + " ! " ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Method which is called when the key becomes readable . <nl> - * <nl> - * @ param key The key which is readable . <nl> - * / <nl> - public void read ( SelectionKey key ) throws IOException <nl> - { <nl> - throw new UnsupportedOperationException ( " read ( ) cannot be called on " + getClass ( ) . getName ( ) + " ! " ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Method which is called when the key becomes writable . <nl> - * <nl> - * @ param key The key which is writable . <nl> - * / <nl> - public void write ( SelectionKey key ) <nl> - { <nl> - throw new UnsupportedOperationException ( " write ( ) cannot be called on " + getClass ( ) . getName ( ) + " ! " ) ; <nl> - } <nl> - <nl> - protected static void turnOnInterestOps ( SelectionKey key , int ops ) <nl> - { <nl> - SelectorManager . getSelectorManager ( ) . turnOnInterestOps ( key , ops ) ; <nl> - } <nl> - <nl> - protected static void turnOffInterestOps ( SelectionKey key , int ops ) <nl> - { <nl> - SelectorManager . getSelectorManager ( ) . turnOffInterestOps ( key , ops ) ; <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / net / SelectorManager . java b / src / java / org / apache / cassandra / net / SelectorManager . java <nl> deleted file mode 100644 <nl> index 026ffc9 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / net / SelectorManager . java <nl> + + + / dev / null <nl> @ @ - 1 , 223 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . net ; <nl> - <nl> - import java . io . IOException ; <nl> - import java . nio . channels . SelectableChannel ; <nl> - import java . nio . channels . SelectionKey ; <nl> - import java . nio . channels . Selector ; <nl> - <nl> - import org . apache . log4j . Logger ; <nl> - <nl> - public class SelectorManager extends Thread <nl> - { <nl> - private static final Logger logger = Logger . getLogger ( SelectorManager . class ) ; <nl> - <nl> - / / the underlying selector used <nl> - protected Selector selector ; <nl> - <nl> - / / workaround JDK select / register bug <nl> - Object gate = new Object ( ) ; <nl> - <nl> - / / flag to indicate that shutdown has been requested . <nl> - private boolean shutdownRequested = false ; <nl> - <nl> - / / The static selector manager which is used by all applications <nl> - private static SelectorManager manager ; <nl> - <nl> - / / The static UDP selector manager which is used by all applications <nl> - private static SelectorManager udpManager ; <nl> - <nl> - private SelectorManager ( String name ) <nl> - { <nl> - super ( name ) ; <nl> - <nl> - try <nl> - { <nl> - selector = Selector . open ( ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> - <nl> - setDaemon ( false ) ; <nl> - } <nl> - <nl> - / * * <nl> - * Registers a new channel with the selector , and attaches the given <nl> - * SelectionKeyHandler as the handler for the newly created key . Operations <nl> - * which the handler is interested in will be called as available . <nl> - * <nl> - * @ param channel <nl> - * The channel to register with the selector <nl> - * @ param handler <nl> - * The handler to use for the callbacks <nl> - * @ param ops <nl> - * The initial interest operations <nl> - * @ return The SelectionKey which uniquely identifies this channel <nl> - * @ exception IOException if the channel is closed <nl> - * / <nl> - public SelectionKey register ( SelectableChannel channel , <nl> - SelectionKeyHandler handler , int ops ) throws IOException <nl> - { <nl> - assert channel ! = null ; <nl> - assert handler ! = null ; <nl> - <nl> - synchronized ( gate ) <nl> - { <nl> - selector . wakeup ( ) ; <nl> - return channel . register ( selector , ops , handler ) ; <nl> - } <nl> - } <nl> - <nl> - / / requests the thread to shutdown . However , it brings no guarantees . Added for testing . <nl> - private void requestShutdown ( ) <nl> - { <nl> - shutdownRequested = true ; <nl> - } <nl> - <nl> - / * * <nl> - * This method starts the socket manager listening for events . It is <nl> - * designed to be started when this thread ' s start ( ) method is invoked . <nl> - * / <nl> - public void run ( ) <nl> - { <nl> - while ( true ) <nl> - { <nl> - try <nl> - { <nl> - selector . select ( ) ; <nl> - doProcess ( ) ; <nl> - synchronized ( gate ) { } <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> - if ( shutdownRequested ) <nl> - { <nl> - shutdownRequested = false ; <nl> - break ; <nl> - } <nl> - } <nl> - } <nl> - <nl> - protected void doProcess ( ) throws IOException <nl> - { <nl> - SelectionKey [ ] keys = selector . selectedKeys ( ) . toArray ( new SelectionKey [ 0 ] ) ; <nl> - <nl> - for ( SelectionKey key : keys ) <nl> - { <nl> - selector . selectedKeys ( ) . remove ( key ) ; <nl> - <nl> - SelectionKeyHandler skh = ( SelectionKeyHandler ) key . attachment ( ) ; <nl> - <nl> - if ( skh ! = null ) <nl> - { <nl> - / / accept <nl> - if ( key . isValid ( ) & & key . isAcceptable ( ) ) <nl> - { <nl> - skh . accept ( key ) ; <nl> - } <nl> - <nl> - / / connect <nl> - if ( key . isValid ( ) & & key . isConnectable ( ) ) <nl> - { <nl> - skh . connect ( key ) ; <nl> - } <nl> - <nl> - / / read <nl> - if ( key . isValid ( ) & & key . isReadable ( ) ) <nl> - { <nl> - skh . read ( key ) ; <nl> - } <nl> - <nl> - / / write <nl> - if ( key . isValid ( ) & & key . isWritable ( ) ) <nl> - { <nl> - skh . write ( key ) ; <nl> - } <nl> - } <nl> - } <nl> - } <nl> - <nl> - / * * <nl> - * Intended to reset the singleton as part of testing . <nl> - * / <nl> - static void reset ( ) <nl> - { <nl> - synchronized ( SelectorManager . class ) <nl> - { <nl> - if ( manager ! = null ) <nl> - manager . requestShutdown ( ) ; <nl> - manager = null ; <nl> - if ( udpManager ! = null ) <nl> - udpManager . requestShutdown ( ) ; <nl> - udpManager = null ; <nl> - } <nl> - } <nl> - <nl> - / * * <nl> - * Returns the SelectorManager applications should use . <nl> - * <nl> - * @ return The SelectorManager which applications should use <nl> - * / <nl> - public static SelectorManager getSelectorManager ( ) <nl> - { <nl> - synchronized ( SelectorManager . class ) <nl> - { <nl> - if ( manager = = null ) <nl> - { <nl> - manager = new SelectorManager ( " TCP Selector Manager " ) ; <nl> - } <nl> - } <nl> - return manager ; <nl> - } <nl> - <nl> - public static SelectorManager getUdpSelectorManager ( ) <nl> - { <nl> - synchronized ( SelectorManager . class ) <nl> - { <nl> - if ( udpManager = = null ) <nl> - { <nl> - udpManager = new SelectorManager ( " UDP Selector Manager " ) ; <nl> - } <nl> - } <nl> - return udpManager ; <nl> - } <nl> - <nl> - protected void turnOnInterestOps ( SelectionKey key , int ops ) <nl> - { <nl> - synchronized ( gate ) <nl> - { <nl> - selector . wakeup ( ) ; <nl> - key . interestOps ( key . interestOps ( ) | ops ) ; <nl> - } <nl> - } <nl> - <nl> - protected void turnOffInterestOps ( SelectionKey key , int ops ) <nl> - { <nl> - synchronized ( gate ) <nl> - { <nl> - selector . wakeup ( ) ; <nl> - key . interestOps ( key . interestOps ( ) & ( ~ ops ) ) ; <nl> - } <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / net / UdpConnection . java b / src / java / org / apache / cassandra / net / UdpConnection . java <nl> deleted file mode 100644 <nl> index 17a8191 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / net / UdpConnection . java <nl> + + + / dev / null <nl> @ @ - 1 , 153 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . net ; <nl> - <nl> - import java . net . SocketAddress ; <nl> - import java . net . InetAddress ; <nl> - import java . net . InetSocketAddress ; <nl> - import java . nio . * ; <nl> - import java . nio . channels . * ; <nl> - import java . io . ByteArrayInputStream ; <nl> - import java . io . ByteArrayOutputStream ; <nl> - import java . io . DataInputStream ; <nl> - import java . io . DataOutputStream ; <nl> - import java . io . IOException ; <nl> - <nl> - import org . apache . log4j . Logger ; <nl> - <nl> - import org . apache . cassandra . utils . * ; <nl> - import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - <nl> - public class UdpConnection extends SelectionKeyHandler <nl> - { <nl> - private static Logger logger _ = Logger . getLogger ( UdpConnection . class ) ; <nl> - private static final int BUFFER _ SIZE = 4096 ; <nl> - private static final int protocol _ = 0xBADBEEF ; <nl> - <nl> - private DatagramChannel socketChannel _ ; <nl> - private SelectionKey key _ ; <nl> - <nl> - public void init ( ) throws IOException / / for outgoing messages <nl> - { <nl> - socketChannel _ = DatagramChannel . open ( ) ; <nl> - socketChannel _ . configureBlocking ( false ) ; <nl> - } <nl> - <nl> - public void init ( InetAddress localEp ) throws IOException <nl> - { <nl> - socketChannel _ = DatagramChannel . open ( ) ; <nl> - socketChannel _ . socket ( ) . setReuseAddress ( true ) ; <nl> - socketChannel _ . socket ( ) . bind ( new InetSocketAddress ( localEp , DatabaseDescriptor . getControlPort ( ) ) ) ; <nl> - socketChannel _ . configureBlocking ( false ) ; <nl> - key _ = SelectorManager . getUdpSelectorManager ( ) . register ( socketChannel _ , this , SelectionKey . OP _ READ ) ; <nl> - } <nl> - <nl> - public boolean write ( Message message , InetAddress to ) throws IOException <nl> - { <nl> - boolean bVal = true ; <nl> - ByteArrayOutputStream bos = new ByteArrayOutputStream ( ) ; <nl> - DataOutputStream dos = new DataOutputStream ( bos ) ; <nl> - Message . serializer ( ) . serialize ( message , dos ) ; <nl> - byte [ ] data = bos . toByteArray ( ) ; <nl> - if ( data . length > 0 ) <nl> - { <nl> - if ( logger _ . isTraceEnabled ( ) ) <nl> - logger _ . trace ( " Size of Gossip packet " + data . length ) ; <nl> - byte [ ] protocol = FBUtilities . toByteArray ( protocol _ ) ; <nl> - ByteBuffer buffer = ByteBuffer . allocate ( data . length + protocol . length ) ; <nl> - buffer . put ( protocol ) ; <nl> - buffer . put ( data ) ; <nl> - buffer . flip ( ) ; <nl> - <nl> - int n = socketChannel _ . send ( buffer , new InetSocketAddress ( to , DatabaseDescriptor . getControlPort ( ) ) ) ; <nl> - if ( n = = 0 ) <nl> - { <nl> - bVal = false ; <nl> - } <nl> - } <nl> - return bVal ; <nl> - } <nl> - <nl> - void close ( ) <nl> - { <nl> - try <nl> - { <nl> - if ( socketChannel _ ! = null ) <nl> - socketChannel _ . close ( ) ; <nl> - } <nl> - catch ( IOException ex ) <nl> - { <nl> - logger _ . error ( " error closing channel " , ex ) ; <nl> - } <nl> - } <nl> - <nl> - public DatagramChannel getDatagramChannel ( ) <nl> - { <nl> - return socketChannel _ ; <nl> - } <nl> - <nl> - private byte [ ] gobbleHeaderAndExtractBody ( ByteBuffer buffer ) <nl> - { <nl> - byte [ ] body = new byte [ 0 ] ; <nl> - byte [ ] protocol = new byte [ 4 ] ; <nl> - buffer = buffer . get ( protocol , 0 , protocol . length ) ; <nl> - int value = FBUtilities . byteArrayToInt ( protocol ) ; <nl> - <nl> - if ( protocol _ ! = value ) <nl> - { <nl> - logger _ . info ( " Invalid protocol header in the incoming message " + value ) ; <nl> - return body ; <nl> - } <nl> - body = new byte [ buffer . remaining ( ) ] ; <nl> - buffer . get ( body , 0 , body . length ) ; <nl> - return body ; <nl> - } <nl> - <nl> - public void read ( SelectionKey key ) throws IOException <nl> - { <nl> - turnOffInterestOps ( key , SelectionKey . OP _ READ ) ; <nl> - ByteBuffer buffer = ByteBuffer . allocate ( BUFFER _ SIZE ) ; <nl> - try <nl> - { <nl> - SocketAddress sa = socketChannel _ . receive ( buffer ) ; <nl> - if ( sa = = null ) <nl> - { <nl> - if ( logger _ . isDebugEnabled ( ) ) <nl> - logger _ . debug ( " * * * No datagram packet was available to be read * * * " ) ; <nl> - return ; <nl> - } <nl> - buffer . flip ( ) ; <nl> - <nl> - byte [ ] bytes = gobbleHeaderAndExtractBody ( buffer ) ; <nl> - if ( bytes . length > 0 ) <nl> - { <nl> - DataInputStream dis = new DataInputStream ( new ByteArrayInputStream ( bytes ) ) ; <nl> - Message message = Message . serializer ( ) . deserialize ( dis ) ; <nl> - if ( message ! = null ) <nl> - { <nl> - MessagingService . receive ( message ) ; <nl> - } <nl> - } <nl> - } <nl> - finally <nl> - { <nl> - turnOnInterestOps ( key _ , SelectionKey . OP _ READ ) ; <nl> - } <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index f6117f3 . . c3af192 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 232 , 11 + 232 , 6 @ @ public class StorageService implements IEndPointStateChangeSubscriber , StorageSe <nl> isClientMode = true ; <nl> logger _ . info ( " Starting up client gossip " ) ; <nl> MessagingService . instance . listen ( FBUtilities . getLocalAddress ( ) ) ; <nl> - MessagingService . instance . listenUDP ( FBUtilities . getLocalAddress ( ) ) ; <nl> - <nl> - SelectorManager . getSelectorManager ( ) . start ( ) ; <nl> - SelectorManager . getUdpSelectorManager ( ) . start ( ) ; <nl> - <nl> Gossiper . instance . register ( this ) ; <nl> Gossiper . instance . start ( FBUtilities . getLocalAddress ( ) , ( int ) ( System . currentTimeMillis ( ) / 1000 ) ) ; / / needed for node - ring gathering . <nl> } <nl> @ @ - 248 , 13 + 243 , 7 @ @ public class StorageService implements IEndPointStateChangeSubscriber , StorageSe <nl> DatabaseDescriptor . createAllDirectories ( ) ; <nl> logger _ . info ( " Starting up server gossip " ) ; <nl> <nl> - / * Listen for application messages * / <nl> MessagingService . instance . listen ( FBUtilities . getLocalAddress ( ) ) ; <nl> - / * Listen for control messages * / <nl> - MessagingService . instance . listenUDP ( FBUtilities . getLocalAddress ( ) ) ; <nl> - <nl> - SelectorManager . getSelectorManager ( ) . start ( ) ; <nl> - SelectorManager . getUdpSelectorManager ( ) . start ( ) ; <nl> <nl> StorageLoadBalancer . instance . startBroadcasting ( ) ; <nl> <nl> diff - - git a / test / conf / storage - conf . xml b / test / conf / storage - conf . xml <nl> index 0d975b2 . . 7ba0e12 100644 <nl> - - - a / test / conf / storage - conf . xml <nl> + + + b / test / conf / storage - conf . xml <nl> @ @ - 29 , 7 + 29 , 6 @ @ <nl> < RpcTimeoutInMillis > 5000 < / RpcTimeoutInMillis > <nl> < ListenAddress > 127 . 0 . 0 . 1 < / ListenAddress > <nl> < StoragePort > 7010 < / StoragePort > <nl> - < ControlPort > 7011 < / ControlPort > <nl> < ThriftPort > 9170 < / ThriftPort > <nl> < ColumnIndexSizeInKB > 4 < / ColumnIndexSizeInKB > <nl> < CommitLogDirectory > build / test / cassandra / commitlog < / CommitLogDirectory > <nl> diff - - git a / test / unit / org / apache / cassandra / net / NetPackageAccessor . java b / test / unit / org / apache / cassandra / net / NetPackageAccessor . java <nl> deleted file mode 100644 <nl> index 408bfba . . 0000000 <nl> - - - a / test / unit / org / apache / cassandra / net / NetPackageAccessor . java <nl> + + + / dev / null <nl> @ @ - 1 , 29 + 0 , 0 @ @ <nl> - / * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - package org . apache . cassandra . net ; <nl> - <nl> - / * * <nl> - For accesing package - level members created for the sole purpose of testing . <nl> - * / <nl> - public class NetPackageAccessor <nl> - { <nl> - public static void resetSelectorManager ( ) <nl> - { <nl> - SelectorManager . reset ( ) ; <nl> - } <nl> - } <nl> diff - - git a / test / unit / org / apache / cassandra / service / StorageServiceClientTest . java b / test / unit / org / apache / cassandra / service / StorageServiceClientTest . java <nl> new file mode 100644 <nl> index 0000000 . . 99cfaa5 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / service / StorageServiceClientTest . java <nl> @ @ - 0 , 0 + 1 , 47 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + <nl> + package org . apache . cassandra . service ; <nl> + <nl> + import org . apache . cassandra . CleanupHelper ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . junit . Test ; <nl> + import static org . junit . Assert . assertTrue ; <nl> + import static org . junit . Assert . assertFalse ; <nl> + <nl> + import java . io . File ; <nl> + import java . io . IOException ; <nl> + <nl> + public class StorageServiceClientTest <nl> + { <nl> + @ Test <nl> + public void testClientOnlyMode ( ) throws IOException <nl> + { <nl> + CleanupHelper . mkdirs ( ) ; <nl> + CleanupHelper . cleanup ( ) ; <nl> + StorageService . instance . initClient ( ) ; <nl> + <nl> + / / verify that no storage directories were created . <nl> + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) <nl> + { <nl> + assertFalse ( new File ( path ) . exists ( ) ) ; <nl> + } <nl> + StorageService . instance . stopClient ( ) ; <nl> + } <nl> + } <nl> diff - - git a / test / unit / org / apache / cassandra / service / StorageServiceServerTest . java b / test / unit / org / apache / cassandra / service / StorageServiceServerTest . java <nl> new file mode 100644 <nl> index 0000000 . . cf862bd <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / service / StorageServiceServerTest . java <nl> @ @ - 0 , 0 + 1 , 52 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + <nl> + package org . apache . cassandra . service ; <nl> + <nl> + import java . io . File ; <nl> + import java . io . IOException ; <nl> + <nl> + import org . junit . Test ; <nl> + <nl> + import org . apache . cassandra . CleanupHelper ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + <nl> + import static org . junit . Assert . assertFalse ; <nl> + import static org . junit . Assert . assertTrue ; <nl> + <nl> + public class StorageServiceServerTest <nl> + { <nl> + @ Test <nl> + public void testRegularMode ( ) throws IOException , InterruptedException <nl> + { <nl> + CleanupHelper . mkdirs ( ) ; <nl> + CleanupHelper . cleanup ( ) ; <nl> + StorageService . instance . initServer ( ) ; <nl> + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) <nl> + { <nl> + / / verify that storage directories are there . <nl> + assertTrue ( new File ( path ) . exists ( ) ) ; <nl> + } <nl> + / / a proper test would be to call decommission here , but decommission ( ) mixes both shutdown and datatransfer <nl> + / / calls . This test is only interested in the shutdown - related items which a properly handled by just <nl> + / / stopping the client . <nl> + / / StorageService . instance . decommission ( ) ; <nl> + StorageService . instance . stopClient ( ) ; <nl> + } <nl> + } <nl> \ No newline at end of file <nl> diff - - git a / test / unit / org / apache / cassandra / service / StorageServiceTest . java b / test / unit / org / apache / cassandra / service / StorageServiceTest . java <nl> deleted file mode 100644 <nl> index d3efa04 . . 0000000 <nl> - - - a / test / unit / org / apache / cassandra / service / StorageServiceTest . java <nl> + + + / dev / null <nl> @ @ - 1 , 68 + 0 , 0 @ @ <nl> - / * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , <nl> - * software distributed under the License is distributed on an <nl> - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> - * KIND , either express or implied . See the License for the <nl> - * specific language governing permissions and limitations <nl> - * under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . service ; <nl> - <nl> - import org . apache . cassandra . CleanupHelper ; <nl> - import org . apache . cassandra . config . DatabaseDescriptor ; <nl> - import org . apache . cassandra . net . NetPackageAccessor ; <nl> - import org . junit . Test ; <nl> - import static org . junit . Assert . assertTrue ; <nl> - import static org . junit . Assert . assertFalse ; <nl> - <nl> - import java . io . File ; <nl> - import java . io . IOException ; <nl> - <nl> - public class StorageServiceTest <nl> - { <nl> - @ Test <nl> - public void testClientOnlyMode ( ) throws IOException <nl> - { <nl> - CleanupHelper . mkdirs ( ) ; <nl> - CleanupHelper . cleanup ( ) ; <nl> - StorageService . instance . initClient ( ) ; <nl> - <nl> - / / verify that no storage directories were created . <nl> - for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) <nl> - { <nl> - assertFalse ( new File ( path ) . exists ( ) ) ; <nl> - } <nl> - StorageService . instance . stopClient ( ) ; <nl> - NetPackageAccessor . resetSelectorManager ( ) ; <nl> - } <nl> - <nl> - @ Test <nl> - public void testRegularMode ( ) throws IOException , InterruptedException <nl> - { <nl> - CleanupHelper . mkdirs ( ) ; <nl> - CleanupHelper . cleanup ( ) ; <nl> - StorageService . instance . initServer ( ) ; <nl> - for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) <nl> - { <nl> - / / verify that storage directories are there . <nl> - assertTrue ( new File ( path ) . exists ( ) ) ; <nl> - } <nl> - / / a proper test would be to call decommission here , but decommission ( ) mixes both shutdown and datatransfer <nl> - / / calls . This test is only interested in the shutdown - related items which a properly handled by just <nl> - / / stopping the client . <nl> - / / StorageService . instance . decommission ( ) ; <nl> - StorageService . instance . stopClient ( ) ; <nl> - NetPackageAccessor . resetSelectorManager ( ) ; <nl> - } <nl> - }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 46206b1 . . 268d011 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 6 
+ + * Fix paging for range queries where all clustering columns are specified ( CASSANDRA - 11669 ) 
+ * Don ' t require HEAP _ NEW _ SIZE to be set when using G1 ( CASSANDRA - 11600 ) 
+ * Fix sstabledump not showing cells after tombstone marker ( CASSANDRA - 11654 ) 
+ * Ignore all LocalStrategy keyspaces for streaming and other related 
+ diff - - git a / src / java / org / apache / cassandra / db / PartitionRangeReadCommand . java b / src / java / org / apache / cassandra / db / PartitionRangeReadCommand . java 
+ index 9fce15e . . 9585b59 100644 
+ - - - a / src / java / org / apache / cassandra / db / PartitionRangeReadCommand . java 
+ + + + b / src / java / org / apache / cassandra / db / PartitionRangeReadCommand . java 
+ @ @ - 165 , 10 + 165 , 7 @ @ public class PartitionRangeReadCommand extends ReadCommand 
+ 
+ public QueryPager getPager ( PagingState pagingState , int protocolVersion ) 
+ { 
+ - if ( isNamesQuery ( ) ) 
+ - return new RangeNamesQueryPager ( this , pagingState , protocolVersion ) ; 
+ - else 
+ - return new RangeSliceQueryPager ( this , pagingState , protocolVersion ) ; 
+ + return new PartitionRangeQueryPager ( this , pagingState , protocolVersion ) ; 
+ } 
+ 
+ protected void recordLatency ( TableMetrics metric , long latencyNanos ) 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / PartitionRangeQueryPager . java b / src / java / org / apache / cassandra / service / pager / PartitionRangeQueryPager . java 
+ new file mode 100644 
+ index 0000000 . . 9c216e3 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / service / pager / PartitionRangeQueryPager . java 
+ @ @ - 0 , 0 + 1 , 130 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . service . pager ; 
+ + 
+ + import java . util . Optional ; 
+ + 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ + 
+ + import org . apache . cassandra . db . * ; 
+ + import org . apache . cassandra . db . filter . DataLimits ; 
+ + import org . apache . cassandra . db . rows . Row ; 
+ + import org . apache . cassandra . dht . * ; 
+ + import org . apache . cassandra . exceptions . RequestExecutionException ; 
+ + import org . apache . cassandra . index . Index ; 
+ + import org . apache . cassandra . schema . IndexMetadata ; 
+ + 
+ + / * * 
+ + * Pages a PartitionRangeReadCommand . 
+ + * 
+ + * Note : this only work for CQL3 queries for now ( because thrift queries expect 
+ + * a different limit on the rows than on the columns , which complicates it ) . 
+ + * / 
+ + public class PartitionRangeQueryPager extends AbstractQueryPager 
+ + { 
+ + private static final Logger logger = LoggerFactory . getLogger ( PartitionRangeQueryPager . class ) ; 
+ + 
+ + private volatile DecoratedKey lastReturnedKey ; 
+ + private volatile PagingState . RowMark lastReturnedRow ; 
+ + 
+ + public PartitionRangeQueryPager ( PartitionRangeReadCommand command , PagingState state , int protocolVersion ) 
+ + { 
+ + super ( command , protocolVersion ) ; 
+ + 
+ + if ( state ! = null ) 
+ + { 
+ + lastReturnedKey = command . metadata ( ) . decorateKey ( state . partitionKey ) ; 
+ + lastReturnedRow = state . rowMark ; 
+ + restoreState ( lastReturnedKey , state . remaining , state . remainingInPartition ) ; 
+ + } 
+ + } 
+ + 
+ + public PagingState state ( ) 
+ + { 
+ + return lastReturnedKey = = null 
+ + ? null 
+ + : new PagingState ( lastReturnedKey . getKey ( ) , lastReturnedRow , maxRemaining ( ) , remainingInPartition ( ) ) ; 
+ + } 
+ + 
+ + protected ReadCommand nextPageReadCommand ( int pageSize ) 
+ + throws RequestExecutionException 
+ + { 
+ + DataLimits limits ; 
+ + DataRange fullRange = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) ; 
+ + DataRange pageRange ; 
+ + if ( lastReturnedKey = = null ) 
+ + { 
+ + pageRange = fullRange ; 
+ + limits = command . limits ( ) . forPaging ( pageSize ) ; 
+ + } 
+ + else 
+ + { 
+ + / / We want to include the last returned key only if we haven ' t achieved our per - partition limit , otherwise , don ' t bother . 
+ + boolean includeLastKey = remainingInPartition ( ) > 0 & & lastReturnedRow ! = null ; 
+ + AbstractBounds < PartitionPosition > bounds = makeKeyBounds ( lastReturnedKey , includeLastKey ) ; 
+ + if ( includeLastKey ) 
+ + { 
+ + pageRange = fullRange . forPaging ( bounds , command . metadata ( ) . comparator , lastReturnedRow . clustering ( command . metadata ( ) ) , false ) ; 
+ + limits = command . limits ( ) . forPaging ( pageSize , lastReturnedKey . getKey ( ) , remainingInPartition ( ) ) ; 
+ + } 
+ + else 
+ + { 
+ + pageRange = fullRange . forSubRange ( bounds ) ; 
+ + limits = command . limits ( ) . forPaging ( pageSize ) ; 
+ + } 
+ + } 
+ + 
+ + Index index = command . getIndex ( Keyspace . openAndGetStore ( command . metadata ( ) ) ) ; 
+ + Optional < IndexMetadata > indexMetadata = index ! = null ? Optional . of ( index . getIndexMetadata ( ) ) : Optional . empty ( ) ; 
+ + return new PartitionRangeReadCommand ( command . metadata ( ) , command . nowInSec ( ) , command . columnFilter ( ) , command . rowFilter ( ) , limits , pageRange , indexMetadata ) ; 
+ + } 
+ + 
+ + protected void recordLast ( DecoratedKey key , Row last ) 
+ + { 
+ + if ( last ! = null ) 
+ + { 
+ + lastReturnedKey = key ; 
+ + if ( last . clustering ( ) ! = Clustering . STATIC _ CLUSTERING ) 
+ + lastReturnedRow = PagingState . RowMark . create ( command . metadata ( ) , last , protocolVersion ) ; 
+ + } 
+ + } 
+ + 
+ + protected boolean isPreviouslyReturnedPartition ( DecoratedKey key ) 
+ + { 
+ + / / Note that lastReturnedKey can be null , but key cannot . 
+ + return key . equals ( lastReturnedKey ) ; 
+ + } 
+ + 
+ + private AbstractBounds < PartitionPosition > makeKeyBounds ( PartitionPosition lastReturnedKey , boolean includeLastKey ) 
+ + { 
+ + AbstractBounds < PartitionPosition > bounds = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) . keyRange ( ) ; 
+ + if ( bounds instanceof Range | | bounds instanceof Bounds ) 
+ + { 
+ + return includeLastKey 
+ + ? new Bounds < PartitionPosition > ( lastReturnedKey , bounds . right ) 
+ + : new Range < PartitionPosition > ( lastReturnedKey , bounds . right ) ; 
+ + } 
+ + else 
+ + { 
+ + return includeLastKey 
+ + ? new IncludingExcludingBounds < PartitionPosition > ( lastReturnedKey , bounds . right ) 
+ + : new ExcludingBounds < PartitionPosition > ( lastReturnedKey , bounds . right ) ; 
+ + } 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / RangeNamesQueryPager . java b / src / java / org / apache / cassandra / service / pager / RangeNamesQueryPager . java 
+ deleted file mode 100644 
+ index 9801565 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / service / pager / RangeNamesQueryPager . java 
+ + + + / dev / null 
+ @ @ - 1 , 92 + 0 , 0 @ @ 
+ - / * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - package org . apache . cassandra . service . pager ; 
+ - 
+ - import org . apache . cassandra . db . * ; 
+ - import org . apache . cassandra . db . rows . * ; 
+ - import org . apache . cassandra . dht . * ; 
+ - import org . apache . cassandra . exceptions . RequestExecutionException ; 
+ - 
+ - / * * 
+ - * Pages a RangeSliceCommand whose predicate is a name query . 
+ - * 
+ - * Note : this only work for NamesQueryFilter that have countCQL3Rows ( ) set , 
+ - * because this assumes the pageSize is counted in number of internal rows 
+ - * returned . More precisely , this doesn ' t do in - row paging so this assumes 
+ - * that the counter returned by columnCounter ( ) will count 1 for each internal 
+ - * row . 
+ - * / 
+ - public class RangeNamesQueryPager extends AbstractQueryPager 
+ - { 
+ - private volatile DecoratedKey lastReturnedKey ; 
+ - 
+ - public RangeNamesQueryPager ( PartitionRangeReadCommand command , PagingState state , int protocolVersion ) 
+ - { 
+ - super ( command , protocolVersion ) ; 
+ - assert command . isNamesQuery ( ) ; 
+ - 
+ - if ( state ! = null ) 
+ - { 
+ - lastReturnedKey = command . metadata ( ) . decorateKey ( state . partitionKey ) ; 
+ - restoreState ( lastReturnedKey , state . remaining , state . remainingInPartition ) ; 
+ - } 
+ - } 
+ - 
+ - public PagingState state ( ) 
+ - { 
+ - return lastReturnedKey = = null 
+ - ? null 
+ - : new PagingState ( lastReturnedKey . getKey ( ) , null , maxRemaining ( ) , remainingInPartition ( ) ) ; 
+ - } 
+ - 
+ - protected ReadCommand nextPageReadCommand ( int pageSize ) 
+ - throws RequestExecutionException 
+ - { 
+ - PartitionRangeReadCommand pageCmd = ( ( PartitionRangeReadCommand ) command ) . withUpdatedLimit ( command . limits ( ) . forPaging ( pageSize ) ) ; 
+ - if ( lastReturnedKey ! = null ) 
+ - pageCmd = pageCmd . forSubRange ( makeExcludingKeyBounds ( lastReturnedKey ) ) ; 
+ - 
+ - return pageCmd ; 
+ - } 
+ - 
+ - protected void recordLast ( DecoratedKey key , Row last ) 
+ - { 
+ - lastReturnedKey = key ; 
+ - } 
+ - 
+ - protected boolean isPreviouslyReturnedPartition ( DecoratedKey key ) 
+ - { 
+ - / / Note that lastReturnedKey can be null , but key cannot . 
+ - return key . equals ( lastReturnedKey ) ; 
+ - } 
+ - 
+ - private AbstractBounds < PartitionPosition > makeExcludingKeyBounds ( PartitionPosition lastReturnedKey ) 
+ - { 
+ - / / We return a range that always exclude lastReturnedKey , since we ' ve already 
+ - / / returned it . 
+ - AbstractBounds < PartitionPosition > bounds = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) . keyRange ( ) ; 
+ - if ( bounds instanceof Range | | bounds instanceof Bounds ) 
+ - { 
+ - return new Range < PartitionPosition > ( lastReturnedKey , bounds . right ) ; 
+ - } 
+ - else 
+ - { 
+ - return new ExcludingBounds < PartitionPosition > ( lastReturnedKey , bounds . right ) ; 
+ - } 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / service / pager / RangeSliceQueryPager . java b / src / java / org / apache / cassandra / service / pager / RangeSliceQueryPager . java 
+ deleted file mode 100644 
+ index 6ad8649 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / service / pager / RangeSliceQueryPager . java 
+ + + + / dev / null 
+ @ @ - 1 , 131 + 0 , 0 @ @ 
+ - / * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - package org . apache . cassandra . service . pager ; 
+ - 
+ - import java . util . Optional ; 
+ - 
+ - import org . slf4j . Logger ; 
+ - import org . slf4j . LoggerFactory ; 
+ - 
+ - import org . apache . cassandra . db . * ; 
+ - import org . apache . cassandra . db . filter . DataLimits ; 
+ - import org . apache . cassandra . db . rows . Row ; 
+ - import org . apache . cassandra . dht . * ; 
+ - import org . apache . cassandra . exceptions . RequestExecutionException ; 
+ - import org . apache . cassandra . index . Index ; 
+ - import org . apache . cassandra . schema . IndexMetadata ; 
+ - 
+ - / * * 
+ - * Pages a RangeSliceCommand whose predicate is a slice query . 
+ - * 
+ - * Note : this only work for CQL3 queries for now ( because thrift queries expect 
+ - * a different limit on the rows than on the columns , which complicates it ) . 
+ - * / 
+ - public class RangeSliceQueryPager extends AbstractQueryPager 
+ - { 
+ - private static final Logger logger = LoggerFactory . getLogger ( RangeSliceQueryPager . class ) ; 
+ - 
+ - private volatile DecoratedKey lastReturnedKey ; 
+ - private volatile PagingState . RowMark lastReturnedRow ; 
+ - 
+ - public RangeSliceQueryPager ( PartitionRangeReadCommand command , PagingState state , int protocolVersion ) 
+ - { 
+ - super ( command , protocolVersion ) ; 
+ - assert ! command . isNamesQuery ( ) ; 
+ - 
+ - if ( state ! = null ) 
+ - { 
+ - lastReturnedKey = command . metadata ( ) . decorateKey ( state . partitionKey ) ; 
+ - lastReturnedRow = state . rowMark ; 
+ - restoreState ( lastReturnedKey , state . remaining , state . remainingInPartition ) ; 
+ - } 
+ - } 
+ - 
+ - public PagingState state ( ) 
+ - { 
+ - return lastReturnedKey = = null 
+ - ? null 
+ - : new PagingState ( lastReturnedKey . getKey ( ) , lastReturnedRow , maxRemaining ( ) , remainingInPartition ( ) ) ; 
+ - } 
+ - 
+ - protected ReadCommand nextPageReadCommand ( int pageSize ) 
+ - throws RequestExecutionException 
+ - { 
+ - DataLimits limits ; 
+ - DataRange fullRange = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) ; 
+ - DataRange pageRange ; 
+ - if ( lastReturnedKey = = null ) 
+ - { 
+ - pageRange = fullRange ; 
+ - limits = command . limits ( ) . forPaging ( pageSize ) ; 
+ - } 
+ - else 
+ - { 
+ - / / We want to include the last returned key only if we haven ' t achieved our per - partition limit , otherwise , don ' t bother . 
+ - boolean includeLastKey = remainingInPartition ( ) > 0 & & lastReturnedRow ! = null ; 
+ - AbstractBounds < PartitionPosition > bounds = makeKeyBounds ( lastReturnedKey , includeLastKey ) ; 
+ - if ( includeLastKey ) 
+ - { 
+ - pageRange = fullRange . forPaging ( bounds , command . metadata ( ) . comparator , lastReturnedRow . clustering ( command . metadata ( ) ) , false ) ; 
+ - limits = command . limits ( ) . forPaging ( pageSize , lastReturnedKey . getKey ( ) , remainingInPartition ( ) ) ; 
+ - } 
+ - else 
+ - { 
+ - pageRange = fullRange . forSubRange ( bounds ) ; 
+ - limits = command . limits ( ) . forPaging ( pageSize ) ; 
+ - } 
+ - } 
+ - 
+ - Index index = command . getIndex ( Keyspace . openAndGetStore ( command . metadata ( ) ) ) ; 
+ - Optional < IndexMetadata > indexMetadata = index ! = null ? Optional . of ( index . getIndexMetadata ( ) ) : Optional . empty ( ) ; 
+ - return new PartitionRangeReadCommand ( command . metadata ( ) , command . nowInSec ( ) , command . columnFilter ( ) , command . rowFilter ( ) , limits , pageRange , indexMetadata ) ; 
+ - } 
+ - 
+ - protected void recordLast ( DecoratedKey key , Row last ) 
+ - { 
+ - if ( last ! = null ) 
+ - { 
+ - lastReturnedKey = key ; 
+ - if ( last . clustering ( ) ! = Clustering . STATIC _ CLUSTERING ) 
+ - lastReturnedRow = PagingState . RowMark . create ( command . metadata ( ) , last , protocolVersion ) ; 
+ - } 
+ - } 
+ - 
+ - protected boolean isPreviouslyReturnedPartition ( DecoratedKey key ) 
+ - { 
+ - / / Note that lastReturnedKey can be null , but key cannot . 
+ - return key . equals ( lastReturnedKey ) ; 
+ - } 
+ - 
+ - private AbstractBounds < PartitionPosition > makeKeyBounds ( PartitionPosition lastReturnedKey , boolean includeLastKey ) 
+ - { 
+ - AbstractBounds < PartitionPosition > bounds = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) . keyRange ( ) ; 
+ - if ( bounds instanceof Range | | bounds instanceof Bounds ) 
+ - { 
+ - return includeLastKey 
+ - ? new Bounds < PartitionPosition > ( lastReturnedKey , bounds . right ) 
+ - : new Range < PartitionPosition > ( lastReturnedKey , bounds . right ) ; 
+ - } 
+ - else 
+ - { 
+ - return includeLastKey 
+ - ? new IncludingExcludingBounds < PartitionPosition > ( lastReturnedKey , bounds . right ) 
+ - : new ExcludingBounds < PartitionPosition > ( lastReturnedKey , bounds . right ) ; 
+ - } 
+ - } 
+ - }
+
+NEAREST DIFF:
+diff - - git a / conf / storage - conf . xml b / conf / storage - conf . xml 
+ index b30029f . . b3b28ac 100644 
+ - - - a / conf / storage - conf . xml 
+ + + + b / conf / storage - conf . xml 
+ @ @ - 221 , 10 + 221 , 8 @ @ 
+ ~ address associated with the hostname ( it might not be ) . 
+ - - > 
+ < ListenAddress > localhost < / ListenAddress > 
+ - < ! - - TCP port , for commands and data - - > 
+ + < ! - - internal communications port - - > 
+ < StoragePort > 7000 < / StoragePort > 
+ - < ! - - UDP port , for membership communications ( gossip ) - - > 
+ - < ControlPort > 7001 < / ControlPort > 
+ 
+ < ! - - 
+ ~ The address to bind the Thrift RPC service to . Unlike ListenAddress 
+ diff - - git a / src / java / org / apache / cassandra / gms / Gossiper . java b / src / java / org / apache / cassandra / gms / Gossiper . java 
+ index 52c8ae7 . . e563824 100644 
+ - - - a / src / java / org / apache / cassandra / gms / Gossiper . java 
+ + + + b / src / java / org / apache / cassandra / gms / Gossiper . java 
+ @ @ - 308 , 7 + 308 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , IEndPointStateC 
+ InetAddress to = liveEndPoints . get ( index ) ; 
+ if ( logger _ . isTraceEnabled ( ) ) 
+ logger _ . trace ( " Sending a GossipDigestSynMessage to " + to + " . . . " ) ; 
+ - MessagingService . instance . sendUdpOneWay ( message , to ) ; 
+ + MessagingService . instance . sendOneWay ( message , to ) ; 
+ return seeds _ . contains ( to ) ; 
+ } 
+ 
+ @ @ - 887 , 7 + 887 , 7 @ @ class GossipDigestSynVerbHandler implements IVerbHandler 
+ Message gDigestAckMessage = Gossiper . instance . makeGossipDigestAckMessage ( gDigestAck ) ; 
+ if ( logger _ . isTraceEnabled ( ) ) 
+ logger _ . trace ( " Sending a GossipDigestAckMessage to " + from ) ; 
+ - MessagingService . instance . sendUdpOneWay ( gDigestAckMessage , from ) ; 
+ + MessagingService . instance . sendOneWay ( gDigestAckMessage , from ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ @ @ - 979 , 7 + 979 , 7 @ @ class GossipDigestAckVerbHandler implements IVerbHandler 
+ Message gDigestAck2Message = Gossiper . instance . makeGossipDigestAck2Message ( gDigestAck2 ) ; 
+ if ( logger _ . isTraceEnabled ( ) ) 
+ logger _ . trace ( " Sending a GossipDigestAck2Message to " + from ) ; 
+ - MessagingService . instance . sendUdpOneWay ( gDigestAck2Message , from ) ; 
+ + MessagingService . instance . sendOneWay ( gDigestAck2Message , from ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java 
+ index 0cc0d05 . . a24b4f2 100644 
+ - - - a / src / java / org / apache / cassandra / net / MessagingService . java 
+ + + + b / src / java / org / apache / cassandra / net / MessagingService . java 
+ @ @ - 166 , 26 + 166 , 7 @ @ public class MessagingService implements IFailureDetectionEventListener 
+ } 
+ } , " ACCEPT - " + localEp ) . start ( ) ; 
+ } 
+ - 
+ - / * * 
+ - * Listen on the specified port . 
+ - * @ param localEp InetAddress whose port to listen on . 
+ - * / 
+ - public void listenUDP ( InetAddress localEp ) 
+ - { 
+ - UdpConnection connection = new UdpConnection ( ) ; 
+ - if ( logger _ . isDebugEnabled ( ) ) 
+ - logger _ . debug ( " Starting to listen on " + localEp ) ; 
+ - try 
+ - { 
+ - connection . init ( localEp ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ - } 
+ - 
+ + 
+ public static OutboundTcpConnectionPool getConnectionPool ( InetAddress from , InetAddress to ) 
+ { 
+ String key = from + " : " + to ; 
+ @ @ - 345 , 36 + 326 , 6 @ @ public class MessagingService implements IFailureDetectionEventListener 
+ } 
+ 
+ / * * 
+ - * Send a message to a given endpoint . This method adheres to the fire and forget 
+ - * style messaging . 
+ - * @ param message messages to be sent . 
+ - * @ param to endpoint to which the message needs to be sent 
+ - * / 
+ - public void sendUdpOneWay ( Message message , InetAddress to ) 
+ - { 
+ - if ( message . getFrom ( ) . equals ( to ) ) { 
+ - MessagingService . receive ( message ) ; 
+ - return ; 
+ - } 
+ - 
+ - UdpConnection connection = null ; 
+ - try 
+ - { 
+ - connection = new UdpConnection ( ) ; 
+ - connection . init ( ) ; 
+ - connection . write ( message , to ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ - finally 
+ - { 
+ - if ( connection ! = null ) 
+ - connection . close ( ) ; 
+ - } 
+ - } 
+ - / * * 
+ * Stream a file from source to destination . This is highly optimized 
+ * to not hold any of the contents of the file in memory . 
+ * @ param file name of file to stream . 
+ diff - - git a / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java b / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java 
+ index 8ad66ca . . 220abf7 100644 
+ - - - a / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java 
+ + + + b / src / java / org / apache / cassandra / net / OutboundTcpConnectionPool . java 
+ @ @ - 47 , 7 + 47 , 8 @ @ class OutboundTcpConnectionPool 
+ * / 
+ synchronized OutboundTcpConnection getConnection ( Message msg ) 
+ { 
+ - if ( StageManager . RESPONSE _ STAGE . equals ( msg . getMessageType ( ) ) ) 
+ + if ( StageManager . RESPONSE _ STAGE . equals ( msg . getMessageType ( ) ) 
+ + | | StageManager . GOSSIP _ STAGE . equals ( msg . getMessageType ( ) ) ) 
+ { 
+ if ( ackCon = = null ) 
+ ackCon = newCon ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / net / SelectionKeyHandler . java b / src / java / org / apache / cassandra / net / SelectionKeyHandler . java 
+ deleted file mode 100644 
+ index 678c100 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / net / SelectionKeyHandler . java 
+ + + + / dev / null 
+ @ @ - 1 , 75 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . net ; 
+ - 
+ - import java . nio . channels . * ; 
+ - import java . io . IOException ; 
+ - 
+ - public class SelectionKeyHandler 
+ - { 
+ - / * * 
+ - * Method which is called when the key becomes acceptable . 
+ - * 
+ - * @ param key The key which is acceptable . 
+ - * / 
+ - public void accept ( SelectionKey key ) 
+ - { 
+ - throw new UnsupportedOperationException ( " accept ( ) cannot be called on " + getClass ( ) . getName ( ) + " ! " ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Method which is called when the key becomes connectable . 
+ - * 
+ - * @ param key The key which is connectable . 
+ - * / 
+ - public void connect ( SelectionKey key ) 
+ - { 
+ - throw new UnsupportedOperationException ( " connect ( ) cannot be called on " + getClass ( ) . getName ( ) + " ! " ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Method which is called when the key becomes readable . 
+ - * 
+ - * @ param key The key which is readable . 
+ - * / 
+ - public void read ( SelectionKey key ) throws IOException 
+ - { 
+ - throw new UnsupportedOperationException ( " read ( ) cannot be called on " + getClass ( ) . getName ( ) + " ! " ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Method which is called when the key becomes writable . 
+ - * 
+ - * @ param key The key which is writable . 
+ - * / 
+ - public void write ( SelectionKey key ) 
+ - { 
+ - throw new UnsupportedOperationException ( " write ( ) cannot be called on " + getClass ( ) . getName ( ) + " ! " ) ; 
+ - } 
+ - 
+ - protected static void turnOnInterestOps ( SelectionKey key , int ops ) 
+ - { 
+ - SelectorManager . getSelectorManager ( ) . turnOnInterestOps ( key , ops ) ; 
+ - } 
+ - 
+ - protected static void turnOffInterestOps ( SelectionKey key , int ops ) 
+ - { 
+ - SelectorManager . getSelectorManager ( ) . turnOffInterestOps ( key , ops ) ; 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / net / SelectorManager . java b / src / java / org / apache / cassandra / net / SelectorManager . java 
+ deleted file mode 100644 
+ index 026ffc9 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / net / SelectorManager . java 
+ + + + / dev / null 
+ @ @ - 1 , 223 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . net ; 
+ - 
+ - import java . io . IOException ; 
+ - import java . nio . channels . SelectableChannel ; 
+ - import java . nio . channels . SelectionKey ; 
+ - import java . nio . channels . Selector ; 
+ - 
+ - import org . apache . log4j . Logger ; 
+ - 
+ - public class SelectorManager extends Thread 
+ - { 
+ - private static final Logger logger = Logger . getLogger ( SelectorManager . class ) ; 
+ - 
+ - / / the underlying selector used 
+ - protected Selector selector ; 
+ - 
+ - / / workaround JDK select / register bug 
+ - Object gate = new Object ( ) ; 
+ - 
+ - / / flag to indicate that shutdown has been requested . 
+ - private boolean shutdownRequested = false ; 
+ - 
+ - / / The static selector manager which is used by all applications 
+ - private static SelectorManager manager ; 
+ - 
+ - / / The static UDP selector manager which is used by all applications 
+ - private static SelectorManager udpManager ; 
+ - 
+ - private SelectorManager ( String name ) 
+ - { 
+ - super ( name ) ; 
+ - 
+ - try 
+ - { 
+ - selector = Selector . open ( ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ - 
+ - setDaemon ( false ) ; 
+ - } 
+ - 
+ - / * * 
+ - * Registers a new channel with the selector , and attaches the given 
+ - * SelectionKeyHandler as the handler for the newly created key . Operations 
+ - * which the handler is interested in will be called as available . 
+ - * 
+ - * @ param channel 
+ - * The channel to register with the selector 
+ - * @ param handler 
+ - * The handler to use for the callbacks 
+ - * @ param ops 
+ - * The initial interest operations 
+ - * @ return The SelectionKey which uniquely identifies this channel 
+ - * @ exception IOException if the channel is closed 
+ - * / 
+ - public SelectionKey register ( SelectableChannel channel , 
+ - SelectionKeyHandler handler , int ops ) throws IOException 
+ - { 
+ - assert channel ! = null ; 
+ - assert handler ! = null ; 
+ - 
+ - synchronized ( gate ) 
+ - { 
+ - selector . wakeup ( ) ; 
+ - return channel . register ( selector , ops , handler ) ; 
+ - } 
+ - } 
+ - 
+ - / / requests the thread to shutdown . However , it brings no guarantees . Added for testing . 
+ - private void requestShutdown ( ) 
+ - { 
+ - shutdownRequested = true ; 
+ - } 
+ - 
+ - / * * 
+ - * This method starts the socket manager listening for events . It is 
+ - * designed to be started when this thread ' s start ( ) method is invoked . 
+ - * / 
+ - public void run ( ) 
+ - { 
+ - while ( true ) 
+ - { 
+ - try 
+ - { 
+ - selector . select ( ) ; 
+ - doProcess ( ) ; 
+ - synchronized ( gate ) { } 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ - if ( shutdownRequested ) 
+ - { 
+ - shutdownRequested = false ; 
+ - break ; 
+ - } 
+ - } 
+ - } 
+ - 
+ - protected void doProcess ( ) throws IOException 
+ - { 
+ - SelectionKey [ ] keys = selector . selectedKeys ( ) . toArray ( new SelectionKey [ 0 ] ) ; 
+ - 
+ - for ( SelectionKey key : keys ) 
+ - { 
+ - selector . selectedKeys ( ) . remove ( key ) ; 
+ - 
+ - SelectionKeyHandler skh = ( SelectionKeyHandler ) key . attachment ( ) ; 
+ - 
+ - if ( skh ! = null ) 
+ - { 
+ - / / accept 
+ - if ( key . isValid ( ) & & key . isAcceptable ( ) ) 
+ - { 
+ - skh . accept ( key ) ; 
+ - } 
+ - 
+ - / / connect 
+ - if ( key . isValid ( ) & & key . isConnectable ( ) ) 
+ - { 
+ - skh . connect ( key ) ; 
+ - } 
+ - 
+ - / / read 
+ - if ( key . isValid ( ) & & key . isReadable ( ) ) 
+ - { 
+ - skh . read ( key ) ; 
+ - } 
+ - 
+ - / / write 
+ - if ( key . isValid ( ) & & key . isWritable ( ) ) 
+ - { 
+ - skh . write ( key ) ; 
+ - } 
+ - } 
+ - } 
+ - } 
+ - 
+ - / * * 
+ - * Intended to reset the singleton as part of testing . 
+ - * / 
+ - static void reset ( ) 
+ - { 
+ - synchronized ( SelectorManager . class ) 
+ - { 
+ - if ( manager ! = null ) 
+ - manager . requestShutdown ( ) ; 
+ - manager = null ; 
+ - if ( udpManager ! = null ) 
+ - udpManager . requestShutdown ( ) ; 
+ - udpManager = null ; 
+ - } 
+ - } 
+ - 
+ - / * * 
+ - * Returns the SelectorManager applications should use . 
+ - * 
+ - * @ return The SelectorManager which applications should use 
+ - * / 
+ - public static SelectorManager getSelectorManager ( ) 
+ - { 
+ - synchronized ( SelectorManager . class ) 
+ - { 
+ - if ( manager = = null ) 
+ - { 
+ - manager = new SelectorManager ( " TCP Selector Manager " ) ; 
+ - } 
+ - } 
+ - return manager ; 
+ - } 
+ - 
+ - public static SelectorManager getUdpSelectorManager ( ) 
+ - { 
+ - synchronized ( SelectorManager . class ) 
+ - { 
+ - if ( udpManager = = null ) 
+ - { 
+ - udpManager = new SelectorManager ( " UDP Selector Manager " ) ; 
+ - } 
+ - } 
+ - return udpManager ; 
+ - } 
+ - 
+ - protected void turnOnInterestOps ( SelectionKey key , int ops ) 
+ - { 
+ - synchronized ( gate ) 
+ - { 
+ - selector . wakeup ( ) ; 
+ - key . interestOps ( key . interestOps ( ) | ops ) ; 
+ - } 
+ - } 
+ - 
+ - protected void turnOffInterestOps ( SelectionKey key , int ops ) 
+ - { 
+ - synchronized ( gate ) 
+ - { 
+ - selector . wakeup ( ) ; 
+ - key . interestOps ( key . interestOps ( ) & ( ~ ops ) ) ; 
+ - } 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / net / UdpConnection . java b / src / java / org / apache / cassandra / net / UdpConnection . java 
+ deleted file mode 100644 
+ index 17a8191 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / net / UdpConnection . java 
+ + + + / dev / null 
+ @ @ - 1 , 153 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . net ; 
+ - 
+ - import java . net . SocketAddress ; 
+ - import java . net . InetAddress ; 
+ - import java . net . InetSocketAddress ; 
+ - import java . nio . * ; 
+ - import java . nio . channels . * ; 
+ - import java . io . ByteArrayInputStream ; 
+ - import java . io . ByteArrayOutputStream ; 
+ - import java . io . DataInputStream ; 
+ - import java . io . DataOutputStream ; 
+ - import java . io . IOException ; 
+ - 
+ - import org . apache . log4j . Logger ; 
+ - 
+ - import org . apache . cassandra . utils . * ; 
+ - import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - 
+ - public class UdpConnection extends SelectionKeyHandler 
+ - { 
+ - private static Logger logger _ = Logger . getLogger ( UdpConnection . class ) ; 
+ - private static final int BUFFER _ SIZE = 4096 ; 
+ - private static final int protocol _ = 0xBADBEEF ; 
+ - 
+ - private DatagramChannel socketChannel _ ; 
+ - private SelectionKey key _ ; 
+ - 
+ - public void init ( ) throws IOException / / for outgoing messages 
+ - { 
+ - socketChannel _ = DatagramChannel . open ( ) ; 
+ - socketChannel _ . configureBlocking ( false ) ; 
+ - } 
+ - 
+ - public void init ( InetAddress localEp ) throws IOException 
+ - { 
+ - socketChannel _ = DatagramChannel . open ( ) ; 
+ - socketChannel _ . socket ( ) . setReuseAddress ( true ) ; 
+ - socketChannel _ . socket ( ) . bind ( new InetSocketAddress ( localEp , DatabaseDescriptor . getControlPort ( ) ) ) ; 
+ - socketChannel _ . configureBlocking ( false ) ; 
+ - key _ = SelectorManager . getUdpSelectorManager ( ) . register ( socketChannel _ , this , SelectionKey . OP _ READ ) ; 
+ - } 
+ - 
+ - public boolean write ( Message message , InetAddress to ) throws IOException 
+ - { 
+ - boolean bVal = true ; 
+ - ByteArrayOutputStream bos = new ByteArrayOutputStream ( ) ; 
+ - DataOutputStream dos = new DataOutputStream ( bos ) ; 
+ - Message . serializer ( ) . serialize ( message , dos ) ; 
+ - byte [ ] data = bos . toByteArray ( ) ; 
+ - if ( data . length > 0 ) 
+ - { 
+ - if ( logger _ . isTraceEnabled ( ) ) 
+ - logger _ . trace ( " Size of Gossip packet " + data . length ) ; 
+ - byte [ ] protocol = FBUtilities . toByteArray ( protocol _ ) ; 
+ - ByteBuffer buffer = ByteBuffer . allocate ( data . length + protocol . length ) ; 
+ - buffer . put ( protocol ) ; 
+ - buffer . put ( data ) ; 
+ - buffer . flip ( ) ; 
+ - 
+ - int n = socketChannel _ . send ( buffer , new InetSocketAddress ( to , DatabaseDescriptor . getControlPort ( ) ) ) ; 
+ - if ( n = = 0 ) 
+ - { 
+ - bVal = false ; 
+ - } 
+ - } 
+ - return bVal ; 
+ - } 
+ - 
+ - void close ( ) 
+ - { 
+ - try 
+ - { 
+ - if ( socketChannel _ ! = null ) 
+ - socketChannel _ . close ( ) ; 
+ - } 
+ - catch ( IOException ex ) 
+ - { 
+ - logger _ . error ( " error closing channel " , ex ) ; 
+ - } 
+ - } 
+ - 
+ - public DatagramChannel getDatagramChannel ( ) 
+ - { 
+ - return socketChannel _ ; 
+ - } 
+ - 
+ - private byte [ ] gobbleHeaderAndExtractBody ( ByteBuffer buffer ) 
+ - { 
+ - byte [ ] body = new byte [ 0 ] ; 
+ - byte [ ] protocol = new byte [ 4 ] ; 
+ - buffer = buffer . get ( protocol , 0 , protocol . length ) ; 
+ - int value = FBUtilities . byteArrayToInt ( protocol ) ; 
+ - 
+ - if ( protocol _ ! = value ) 
+ - { 
+ - logger _ . info ( " Invalid protocol header in the incoming message " + value ) ; 
+ - return body ; 
+ - } 
+ - body = new byte [ buffer . remaining ( ) ] ; 
+ - buffer . get ( body , 0 , body . length ) ; 
+ - return body ; 
+ - } 
+ - 
+ - public void read ( SelectionKey key ) throws IOException 
+ - { 
+ - turnOffInterestOps ( key , SelectionKey . OP _ READ ) ; 
+ - ByteBuffer buffer = ByteBuffer . allocate ( BUFFER _ SIZE ) ; 
+ - try 
+ - { 
+ - SocketAddress sa = socketChannel _ . receive ( buffer ) ; 
+ - if ( sa = = null ) 
+ - { 
+ - if ( logger _ . isDebugEnabled ( ) ) 
+ - logger _ . debug ( " * * * No datagram packet was available to be read * * * " ) ; 
+ - return ; 
+ - } 
+ - buffer . flip ( ) ; 
+ - 
+ - byte [ ] bytes = gobbleHeaderAndExtractBody ( buffer ) ; 
+ - if ( bytes . length > 0 ) 
+ - { 
+ - DataInputStream dis = new DataInputStream ( new ByteArrayInputStream ( bytes ) ) ; 
+ - Message message = Message . serializer ( ) . deserialize ( dis ) ; 
+ - if ( message ! = null ) 
+ - { 
+ - MessagingService . receive ( message ) ; 
+ - } 
+ - } 
+ - } 
+ - finally 
+ - { 
+ - turnOnInterestOps ( key _ , SelectionKey . OP _ READ ) ; 
+ - } 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index f6117f3 . . c3af192 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 232 , 11 + 232 , 6 @ @ public class StorageService implements IEndPointStateChangeSubscriber , StorageSe 
+ isClientMode = true ; 
+ logger _ . info ( " Starting up client gossip " ) ; 
+ MessagingService . instance . listen ( FBUtilities . getLocalAddress ( ) ) ; 
+ - MessagingService . instance . listenUDP ( FBUtilities . getLocalAddress ( ) ) ; 
+ - 
+ - SelectorManager . getSelectorManager ( ) . start ( ) ; 
+ - SelectorManager . getUdpSelectorManager ( ) . start ( ) ; 
+ - 
+ Gossiper . instance . register ( this ) ; 
+ Gossiper . instance . start ( FBUtilities . getLocalAddress ( ) , ( int ) ( System . currentTimeMillis ( ) / 1000 ) ) ; / / needed for node - ring gathering . 
+ } 
+ @ @ - 248 , 13 + 243 , 7 @ @ public class StorageService implements IEndPointStateChangeSubscriber , StorageSe 
+ DatabaseDescriptor . createAllDirectories ( ) ; 
+ logger _ . info ( " Starting up server gossip " ) ; 
+ 
+ - / * Listen for application messages * / 
+ MessagingService . instance . listen ( FBUtilities . getLocalAddress ( ) ) ; 
+ - / * Listen for control messages * / 
+ - MessagingService . instance . listenUDP ( FBUtilities . getLocalAddress ( ) ) ; 
+ - 
+ - SelectorManager . getSelectorManager ( ) . start ( ) ; 
+ - SelectorManager . getUdpSelectorManager ( ) . start ( ) ; 
+ 
+ StorageLoadBalancer . instance . startBroadcasting ( ) ; 
+ 
+ diff - - git a / test / conf / storage - conf . xml b / test / conf / storage - conf . xml 
+ index 0d975b2 . . 7ba0e12 100644 
+ - - - a / test / conf / storage - conf . xml 
+ + + + b / test / conf / storage - conf . xml 
+ @ @ - 29 , 7 + 29 , 6 @ @ 
+ < RpcTimeoutInMillis > 5000 < / RpcTimeoutInMillis > 
+ < ListenAddress > 127 . 0 . 0 . 1 < / ListenAddress > 
+ < StoragePort > 7010 < / StoragePort > 
+ - < ControlPort > 7011 < / ControlPort > 
+ < ThriftPort > 9170 < / ThriftPort > 
+ < ColumnIndexSizeInKB > 4 < / ColumnIndexSizeInKB > 
+ < CommitLogDirectory > build / test / cassandra / commitlog < / CommitLogDirectory > 
+ diff - - git a / test / unit / org / apache / cassandra / net / NetPackageAccessor . java b / test / unit / org / apache / cassandra / net / NetPackageAccessor . java 
+ deleted file mode 100644 
+ index 408bfba . . 0000000 
+ - - - a / test / unit / org / apache / cassandra / net / NetPackageAccessor . java 
+ + + + / dev / null 
+ @ @ - 1 , 29 + 0 , 0 @ @ 
+ - / * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - package org . apache . cassandra . net ; 
+ - 
+ - / * * 
+ - For accesing package - level members created for the sole purpose of testing . 
+ - * / 
+ - public class NetPackageAccessor 
+ - { 
+ - public static void resetSelectorManager ( ) 
+ - { 
+ - SelectorManager . reset ( ) ; 
+ - } 
+ - } 
+ diff - - git a / test / unit / org / apache / cassandra / service / StorageServiceClientTest . java b / test / unit / org / apache / cassandra / service / StorageServiceClientTest . java 
+ new file mode 100644 
+ index 0000000 . . 99cfaa5 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / service / StorageServiceClientTest . java 
+ @ @ - 0 , 0 + 1 , 47 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + 
+ + package org . apache . cassandra . service ; 
+ + 
+ + import org . apache . cassandra . CleanupHelper ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . junit . Test ; 
+ + import static org . junit . Assert . assertTrue ; 
+ + import static org . junit . Assert . assertFalse ; 
+ + 
+ + import java . io . File ; 
+ + import java . io . IOException ; 
+ + 
+ + public class StorageServiceClientTest 
+ + { 
+ + @ Test 
+ + public void testClientOnlyMode ( ) throws IOException 
+ + { 
+ + CleanupHelper . mkdirs ( ) ; 
+ + CleanupHelper . cleanup ( ) ; 
+ + StorageService . instance . initClient ( ) ; 
+ + 
+ + / / verify that no storage directories were created . 
+ + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) 
+ + { 
+ + assertFalse ( new File ( path ) . exists ( ) ) ; 
+ + } 
+ + StorageService . instance . stopClient ( ) ; 
+ + } 
+ + } 
+ diff - - git a / test / unit / org / apache / cassandra / service / StorageServiceServerTest . java b / test / unit / org / apache / cassandra / service / StorageServiceServerTest . java 
+ new file mode 100644 
+ index 0000000 . . cf862bd 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / service / StorageServiceServerTest . java 
+ @ @ - 0 , 0 + 1 , 52 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + 
+ + package org . apache . cassandra . service ; 
+ + 
+ + import java . io . File ; 
+ + import java . io . IOException ; 
+ + 
+ + import org . junit . Test ; 
+ + 
+ + import org . apache . cassandra . CleanupHelper ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + 
+ + import static org . junit . Assert . assertFalse ; 
+ + import static org . junit . Assert . assertTrue ; 
+ + 
+ + public class StorageServiceServerTest 
+ + { 
+ + @ Test 
+ + public void testRegularMode ( ) throws IOException , InterruptedException 
+ + { 
+ + CleanupHelper . mkdirs ( ) ; 
+ + CleanupHelper . cleanup ( ) ; 
+ + StorageService . instance . initServer ( ) ; 
+ + for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) 
+ + { 
+ + / / verify that storage directories are there . 
+ + assertTrue ( new File ( path ) . exists ( ) ) ; 
+ + } 
+ + / / a proper test would be to call decommission here , but decommission ( ) mixes both shutdown and datatransfer 
+ + / / calls . This test is only interested in the shutdown - related items which a properly handled by just 
+ + / / stopping the client . 
+ + / / StorageService . instance . decommission ( ) ; 
+ + StorageService . instance . stopClient ( ) ; 
+ + } 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / test / unit / org / apache / cassandra / service / StorageServiceTest . java b / test / unit / org / apache / cassandra / service / StorageServiceTest . java 
+ deleted file mode 100644 
+ index d3efa04 . . 0000000 
+ - - - a / test / unit / org / apache / cassandra / service / StorageServiceTest . java 
+ + + + / dev / null 
+ @ @ - 1 , 68 + 0 , 0 @ @ 
+ - / * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , 
+ - * software distributed under the License is distributed on an 
+ - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ - * KIND , either express or implied . See the License for the 
+ - * specific language governing permissions and limitations 
+ - * under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . service ; 
+ - 
+ - import org . apache . cassandra . CleanupHelper ; 
+ - import org . apache . cassandra . config . DatabaseDescriptor ; 
+ - import org . apache . cassandra . net . NetPackageAccessor ; 
+ - import org . junit . Test ; 
+ - import static org . junit . Assert . assertTrue ; 
+ - import static org . junit . Assert . assertFalse ; 
+ - 
+ - import java . io . File ; 
+ - import java . io . IOException ; 
+ - 
+ - public class StorageServiceTest 
+ - { 
+ - @ Test 
+ - public void testClientOnlyMode ( ) throws IOException 
+ - { 
+ - CleanupHelper . mkdirs ( ) ; 
+ - CleanupHelper . cleanup ( ) ; 
+ - StorageService . instance . initClient ( ) ; 
+ - 
+ - / / verify that no storage directories were created . 
+ - for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) 
+ - { 
+ - assertFalse ( new File ( path ) . exists ( ) ) ; 
+ - } 
+ - StorageService . instance . stopClient ( ) ; 
+ - NetPackageAccessor . resetSelectorManager ( ) ; 
+ - } 
+ - 
+ - @ Test 
+ - public void testRegularMode ( ) throws IOException , InterruptedException 
+ - { 
+ - CleanupHelper . mkdirs ( ) ; 
+ - CleanupHelper . cleanup ( ) ; 
+ - StorageService . instance . initServer ( ) ; 
+ - for ( String path : DatabaseDescriptor . getAllDataFileLocations ( ) ) 
+ - { 
+ - / / verify that storage directories are there . 
+ - assertTrue ( new File ( path ) . exists ( ) ) ; 
+ - } 
+ - / / a proper test would be to call decommission here , but decommission ( ) mixes both shutdown and datatransfer 
+ - / / calls . This test is only interested in the shutdown - related items which a properly handled by just 
+ - / / stopping the client . 
+ - / / StorageService . instance . decommission ( ) ; 
+ - StorageService . instance . stopClient ( ) ; 
+ - NetPackageAccessor . resetSelectorManager ( ) ; 
+ - } 
+ - }

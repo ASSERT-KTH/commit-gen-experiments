@@ -1,0 +1,205 @@
+BLEU SCORE: 0.002910282220536093
+
+TEST MSG: Ensure truncate without snapshot cannot return corrupt responses
+GENERATED MSG: combine switchMemtable and enqueueFlush so that they always operate on the same object . move forceFlush guts from MT to CFS since it encapsulates better there
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 75eb752 . . 9ce5680 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 6 <nl> + * Ensure truncate without snapshot cannot produce corrupt responses ( CASSANDRA - 9388 ) <nl> * Consistent error message when a table mixes counter and non - counter <nl> columns ( CASSANDRA - 9492 ) <nl> * Avoid getting unreadable keys during anticompaction ( CASSANDRA - 9508 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 5f47476 . . d686e67 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1078 , 7 + 1078 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> if ( memtable . isClean ( ) | | truncate ) <nl> { <nl> memtable . cfs . replaceFlushed ( memtable , null ) ; <nl> - memtable . setDiscarded ( ) ; <nl> + reclaim ( memtable ) ; <nl> iter . remove ( ) ; <nl> } <nl> } <nl> @ @ - 1091 , 27 + 1091 , 31 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> <nl> metric . memtableSwitchCount . inc ( ) ; <nl> <nl> - for ( final Memtable memtable : memtables ) <nl> + for ( Memtable memtable : memtables ) <nl> { <nl> / / flush the memtable <nl> MoreExecutors . sameThreadExecutor ( ) . execute ( memtable . flushRunnable ( ) ) ; <nl> - <nl> - / / issue a read barrier for reclaiming the memory , and offload the wait to another thread <nl> - final OpOrder . Barrier readBarrier = readOrdering . newBarrier ( ) ; <nl> - readBarrier . issue ( ) ; <nl> - reclaimExecutor . execute ( new WrappedRunnable ( ) <nl> - { <nl> - public void runMayThrow ( ) throws InterruptedException , ExecutionException <nl> - { <nl> - readBarrier . await ( ) ; <nl> - memtable . setDiscarded ( ) ; <nl> - } <nl> - } ) ; <nl> + reclaim ( memtable ) ; <nl> } <nl> <nl> / / signal the post - flush we ' ve done our work <nl> postFlush . latch . countDown ( ) ; <nl> } <nl> + <nl> + private void reclaim ( final Memtable memtable ) <nl> + { <nl> + / / issue a read barrier for reclaiming the memory , and offload the wait to another thread <nl> + final OpOrder . Barrier readBarrier = readOrdering . newBarrier ( ) ; <nl> + readBarrier . issue ( ) ; <nl> + reclaimExecutor . execute ( new WrappedRunnable ( ) <nl> + { <nl> + public void runMayThrow ( ) throws InterruptedException , ExecutionException <nl> + { <nl> + readBarrier . await ( ) ; <nl> + memtable . setDiscarded ( ) ; <nl> + } <nl> + } ) ; <nl> + } <nl> } <nl> <nl> / * *
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 510fd0d . . 7a272fd 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 394 , 13 + 394 , 19 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> columnFamily _ , SSTable . TEMPFILE _ MARKER , index ) ; <nl> } <nl> <nl> - void switchMemtable ( ) <nl> + void switchMemtable ( Memtable oldMemtable , CommitLog . CommitLogContext ctx ) <nl> { <nl> memtableLock _ . writeLock ( ) . lock ( ) ; <nl> try <nl> { <nl> + if ( oldMemtable . isFrozen ( ) ) <nl> + { <nl> + return ; <nl> + } <nl> logger _ . info ( columnFamily _ + " has reached its threshold ; switching in a fresh Memtable " ) ; <nl> - getMemtablesPendingFlushNotNull ( columnFamily _ ) . add ( memtable _ ) ; / / it ' s ok for the MT to briefly be both active and pendingFlush <nl> + oldMemtable . freeze ( ) ; <nl> + getMemtablesPendingFlushNotNull ( columnFamily _ ) . add ( oldMemtable ) ; / / it ' s ok for the MT to briefly be both active and pendingFlush <nl> + submitFlush ( oldMemtable , ctx ) ; <nl> memtable _ = new Memtable ( table _ , columnFamily _ ) ; <nl> } <nl> finally <nl> @ @ - 423 , 13 + 429 , 25 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> <nl> public void forceFlush ( ) <nl> { <nl> - memtable _ . forceflush ( ) ; <nl> + if ( memtable _ . isClean ( ) ) <nl> + return ; <nl> + <nl> + CommitLog . CommitLogContext ctx = null ; <nl> + try <nl> + { <nl> + ctx = CommitLog . open ( ) . getContext ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + switchMemtable ( memtable _ , ctx ) ; <nl> } <nl> <nl> void forceBlockingFlush ( ) throws IOException , ExecutionException , InterruptedException <nl> { <nl> Memtable oldMemtable = getMemtableThreadSafe ( ) ; <nl> - oldMemtable . forceflush ( ) ; <nl> + forceFlush ( ) ; <nl> / / block for flush to finish by adding a no - op action to the flush executorservice <nl> / / and waiting for that to finish . ( this works since flush ES is single - threaded . ) <nl> Future f = flusher _ . submit ( new Runnable ( ) <nl> @ @ - 463 , 8 + 481 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> Memtable initialMemtable = getMemtableThreadSafe ( ) ; <nl> if ( initialMemtable . isThresholdViolated ( ) ) <nl> { <nl> - switchMemtable ( ) ; <nl> - initialMemtable . enqueueFlush ( cLogCtx ) ; <nl> + switchMemtable ( initialMemtable , cLogCtx ) ; <nl> } <nl> memtableLock _ . writeLock ( ) . lock ( ) ; <nl> try <nl> @ @ - 1284 , 7 + 1301 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> } <nl> <nl> / * Submit memtables to be flushed to disk * / <nl> - public static void submitFlush ( final Memtable memtable , final CommitLog . CommitLogContext cLogCtx ) <nl> + private static void submitFlush ( final Memtable memtable , final CommitLog . CommitLogContext cLogCtx ) <nl> { <nl> logger _ . info ( " Enqueuing flush of " + memtable ) ; <nl> flusher _ . submit ( new Runnable ( ) <nl> diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java <nl> index b9637e6 . . d599adf 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Memtable . java <nl> + + + b / src / java / org / apache / cassandra / db / Memtable . java <nl> @ @ - 121 , 13 + 121 , 14 @ @ public class Memtable implements Comparable < Memtable > <nl> 	 return cfName _ ; <nl> } <nl> <nl> - synchronized void enqueueFlush ( CommitLog . CommitLogContext cLogCtx ) <nl> + boolean isFrozen ( ) <nl> { <nl> - if ( ! isFrozen _ ) <nl> - { <nl> - isFrozen _ = true ; <nl> - ColumnFamilyStore . submitFlush ( this , cLogCtx ) ; <nl> - } <nl> + return isFrozen _ ; <nl> + } <nl> + <nl> + void freeze ( ) <nl> + { <nl> + isFrozen _ = true ; <nl> } <nl> <nl> / * * <nl> @ @ - 142 , 27 + 143 , 6 @ @ public class Memtable implements Comparable < Memtable > <nl> resolve ( key , columnFamily ) ; <nl> } <nl> <nl> - / * <nl> - * This version is used to switch memtable and force flush . <nl> - * Flushing is still done in a separate executor - - forceFlush only blocks <nl> - * until the flush runnable is queued . <nl> - * / <nl> - public void forceflush ( ) <nl> - { <nl> - if ( isClean ( ) ) <nl> - return ; <nl> - <nl> - try <nl> - { <nl> - Table . open ( table _ ) . getColumnFamilyStore ( cfName _ ) . switchMemtable ( ) ; <nl> - enqueueFlush ( CommitLog . open ( ) . getContext ( ) ) ; <nl> - } <nl> - catch ( IOException ex ) <nl> - { <nl> - throw new RuntimeException ( ex ) ; <nl> - } <nl> - } <nl> - <nl> / * * flush synchronously ( in the current thread , not on the executor ) . <nl> * only the recover code should call this . * / <nl> void flushOnRecovery ( ) throws IOException {
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 75eb752 . . 9ce5680 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 6 
+ + * Ensure truncate without snapshot cannot produce corrupt responses ( CASSANDRA - 9388 ) 
+ * Consistent error message when a table mixes counter and non - counter 
+ columns ( CASSANDRA - 9492 ) 
+ * Avoid getting unreadable keys during anticompaction ( CASSANDRA - 9508 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 5f47476 . . d686e67 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1078 , 7 + 1078 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ if ( memtable . isClean ( ) | | truncate ) 
+ { 
+ memtable . cfs . replaceFlushed ( memtable , null ) ; 
+ - memtable . setDiscarded ( ) ; 
+ + reclaim ( memtable ) ; 
+ iter . remove ( ) ; 
+ } 
+ } 
+ @ @ - 1091 , 27 + 1091 , 31 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ 
+ metric . memtableSwitchCount . inc ( ) ; 
+ 
+ - for ( final Memtable memtable : memtables ) 
+ + for ( Memtable memtable : memtables ) 
+ { 
+ / / flush the memtable 
+ MoreExecutors . sameThreadExecutor ( ) . execute ( memtable . flushRunnable ( ) ) ; 
+ - 
+ - / / issue a read barrier for reclaiming the memory , and offload the wait to another thread 
+ - final OpOrder . Barrier readBarrier = readOrdering . newBarrier ( ) ; 
+ - readBarrier . issue ( ) ; 
+ - reclaimExecutor . execute ( new WrappedRunnable ( ) 
+ - { 
+ - public void runMayThrow ( ) throws InterruptedException , ExecutionException 
+ - { 
+ - readBarrier . await ( ) ; 
+ - memtable . setDiscarded ( ) ; 
+ - } 
+ - } ) ; 
+ + reclaim ( memtable ) ; 
+ } 
+ 
+ / / signal the post - flush we ' ve done our work 
+ postFlush . latch . countDown ( ) ; 
+ } 
+ + 
+ + private void reclaim ( final Memtable memtable ) 
+ + { 
+ + / / issue a read barrier for reclaiming the memory , and offload the wait to another thread 
+ + final OpOrder . Barrier readBarrier = readOrdering . newBarrier ( ) ; 
+ + readBarrier . issue ( ) ; 
+ + reclaimExecutor . execute ( new WrappedRunnable ( ) 
+ + { 
+ + public void runMayThrow ( ) throws InterruptedException , ExecutionException 
+ + { 
+ + readBarrier . await ( ) ; 
+ + memtable . setDiscarded ( ) ; 
+ + } 
+ + } ) ; 
+ + } 
+ } 
+ 
+ / * *
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 510fd0d . . 7a272fd 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 394 , 13 + 394 , 19 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ columnFamily _ , SSTable . TEMPFILE _ MARKER , index ) ; 
+ } 
+ 
+ - void switchMemtable ( ) 
+ + void switchMemtable ( Memtable oldMemtable , CommitLog . CommitLogContext ctx ) 
+ { 
+ memtableLock _ . writeLock ( ) . lock ( ) ; 
+ try 
+ { 
+ + if ( oldMemtable . isFrozen ( ) ) 
+ + { 
+ + return ; 
+ + } 
+ logger _ . info ( columnFamily _ + " has reached its threshold ; switching in a fresh Memtable " ) ; 
+ - getMemtablesPendingFlushNotNull ( columnFamily _ ) . add ( memtable _ ) ; / / it ' s ok for the MT to briefly be both active and pendingFlush 
+ + oldMemtable . freeze ( ) ; 
+ + getMemtablesPendingFlushNotNull ( columnFamily _ ) . add ( oldMemtable ) ; / / it ' s ok for the MT to briefly be both active and pendingFlush 
+ + submitFlush ( oldMemtable , ctx ) ; 
+ memtable _ = new Memtable ( table _ , columnFamily _ ) ; 
+ } 
+ finally 
+ @ @ - 423 , 13 + 429 , 25 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ 
+ public void forceFlush ( ) 
+ { 
+ - memtable _ . forceflush ( ) ; 
+ + if ( memtable _ . isClean ( ) ) 
+ + return ; 
+ + 
+ + CommitLog . CommitLogContext ctx = null ; 
+ + try 
+ + { 
+ + ctx = CommitLog . open ( ) . getContext ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + switchMemtable ( memtable _ , ctx ) ; 
+ } 
+ 
+ void forceBlockingFlush ( ) throws IOException , ExecutionException , InterruptedException 
+ { 
+ Memtable oldMemtable = getMemtableThreadSafe ( ) ; 
+ - oldMemtable . forceflush ( ) ; 
+ + forceFlush ( ) ; 
+ / / block for flush to finish by adding a no - op action to the flush executorservice 
+ / / and waiting for that to finish . ( this works since flush ES is single - threaded . ) 
+ Future f = flusher _ . submit ( new Runnable ( ) 
+ @ @ - 463 , 8 + 481 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ Memtable initialMemtable = getMemtableThreadSafe ( ) ; 
+ if ( initialMemtable . isThresholdViolated ( ) ) 
+ { 
+ - switchMemtable ( ) ; 
+ - initialMemtable . enqueueFlush ( cLogCtx ) ; 
+ + switchMemtable ( initialMemtable , cLogCtx ) ; 
+ } 
+ memtableLock _ . writeLock ( ) . lock ( ) ; 
+ try 
+ @ @ - 1284 , 7 + 1301 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ } 
+ 
+ / * Submit memtables to be flushed to disk * / 
+ - public static void submitFlush ( final Memtable memtable , final CommitLog . CommitLogContext cLogCtx ) 
+ + private static void submitFlush ( final Memtable memtable , final CommitLog . CommitLogContext cLogCtx ) 
+ { 
+ logger _ . info ( " Enqueuing flush of " + memtable ) ; 
+ flusher _ . submit ( new Runnable ( ) 
+ diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java 
+ index b9637e6 . . d599adf 100644 
+ - - - a / src / java / org / apache / cassandra / db / Memtable . java 
+ + + + b / src / java / org / apache / cassandra / db / Memtable . java 
+ @ @ - 121 , 13 + 121 , 14 @ @ public class Memtable implements Comparable < Memtable > 
+ 	 return cfName _ ; 
+ } 
+ 
+ - synchronized void enqueueFlush ( CommitLog . CommitLogContext cLogCtx ) 
+ + boolean isFrozen ( ) 
+ { 
+ - if ( ! isFrozen _ ) 
+ - { 
+ - isFrozen _ = true ; 
+ - ColumnFamilyStore . submitFlush ( this , cLogCtx ) ; 
+ - } 
+ + return isFrozen _ ; 
+ + } 
+ + 
+ + void freeze ( ) 
+ + { 
+ + isFrozen _ = true ; 
+ } 
+ 
+ / * * 
+ @ @ - 142 , 27 + 143 , 6 @ @ public class Memtable implements Comparable < Memtable > 
+ resolve ( key , columnFamily ) ; 
+ } 
+ 
+ - / * 
+ - * This version is used to switch memtable and force flush . 
+ - * Flushing is still done in a separate executor - - forceFlush only blocks 
+ - * until the flush runnable is queued . 
+ - * / 
+ - public void forceflush ( ) 
+ - { 
+ - if ( isClean ( ) ) 
+ - return ; 
+ - 
+ - try 
+ - { 
+ - Table . open ( table _ ) . getColumnFamilyStore ( cfName _ ) . switchMemtable ( ) ; 
+ - enqueueFlush ( CommitLog . open ( ) . getContext ( ) ) ; 
+ - } 
+ - catch ( IOException ex ) 
+ - { 
+ - throw new RuntimeException ( ex ) ; 
+ - } 
+ - } 
+ - 
+ / * * flush synchronously ( in the current thread , not on the executor ) . 
+ * only the recover code should call this . * / 
+ void flushOnRecovery ( ) throws IOException {

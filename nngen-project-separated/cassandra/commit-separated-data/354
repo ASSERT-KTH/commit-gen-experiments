@@ -1,0 +1,424 @@
+BLEU SCORE: 0.026341919627252283
+
+TEST MSG: Run repair with down replicas
+GENERATED MSG: Add support to one way targeted repair ( pull - repair )
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 866c6fd . . 6444994 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 6 @ @ <nl> 4 . 0 <nl> + * Run repair with down replicas ( CASSANDRA - 10446 ) <nl> + * Added started & completed repair metrics ( CASSANDRA - 13598 ) <nl> * Added started & completed repair metrics ( CASSANDRA - 13598 ) <nl> * Improve secondary index ( re ) build failure and concurrency handling ( CASSANDRA - 10130 ) <nl> * Improve calculation of available disk space for compaction ( CASSANDRA - 13068 ) <nl> diff - - git a / src / java / org / apache / cassandra / repair / RepairRunnable . java b / src / java / org / apache / cassandra / repair / RepairRunnable . java <nl> index eca162e . . 29347a4 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / RepairRunnable . java <nl> + + + b / src / java / org / apache / cassandra / repair / RepairRunnable . java <nl> @ @ - 289 , 9 + 289 , 18 @ @ public class RepairRunnable extends WrappedRunnable implements ProgressEventNoti <nl> / / filter out null ( = failed ) results and get successful ranges <nl> for ( RepairSessionResult sessionResult : results ) <nl> { <nl> + logger . debug ( " Repair result : { } " , results ) ; <nl> if ( sessionResult ! = null ) <nl> { <nl> - successfulRanges . addAll ( sessionResult . ranges ) ; <nl> + / / don ' t promote sstables for sessions we skipped replicas for <nl> + if ( ! sessionResult . skippedReplicas ) <nl> + { <nl> + successfulRanges . addAll ( sessionResult . ranges ) ; <nl> + } <nl> + else <nl> + { <nl> + logger . debug ( " Skipping anticompaction for { } " , results ) ; <nl> + } <nl> } <nl> else <nl> { <nl> @ @ - 424 , 6 + 433 , 7 @ @ public class RepairRunnable extends WrappedRunnable implements ProgressEventNoti <nl> p . left , <nl> isConsistent , <nl> options . isPullRepair ( ) , <nl> + options . isForcedRepair ( ) , <nl> options . getPreviewKind ( ) , <nl> executor , <nl> cfnames ) ; <nl> diff - - git a / src / java / org / apache / cassandra / repair / RepairSession . java b / src / java / org / apache / cassandra / repair / RepairSession . java <nl> index c1b3f41 . . 98ed1a3 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / RepairSession . java <nl> + + + b / src / java / org / apache / cassandra / repair / RepairSession . java <nl> @ @ - 36 , 6 + 36 , 7 @ @ import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . gms . * ; <nl> import org . apache . cassandra . streaming . PreviewKind ; <nl> import org . apache . cassandra . streaming . SessionSummary ; <nl> + import org . apache . cassandra . service . ActiveRepairService ; <nl> import org . apache . cassandra . tracing . Tracing ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . MerkleTrees ; <nl> @ @ - 89 , 6 + 90 , 10 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement <nl> private final String [ ] cfnames ; <nl> public final RepairParallelism parallelismDegree ; <nl> public final boolean pullRepair ; <nl> + <nl> + / / indicates some replicas were not included in the repair . Only relevant for - - force option <nl> + public final boolean skippedReplicas ; <nl> + <nl> / * * Range to repair * / <nl> public final Collection < Range < Token > > ranges ; <nl> public final Set < InetAddress > endpoints ; <nl> @ @ - 116 , 8 + 121 , 8 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement <nl> * @ param keyspace name of keyspace <nl> * @ param parallelismDegree specifies the degree of parallelism when calculating the merkle trees <nl> * @ param endpoints the data centers that should be part of the repair ; null for all DCs <nl> - * @ param repairedAt when the repair occurred ( millis ) <nl> * @ param pullRepair true if the repair should be one way ( from remote host to this host and only applicable between two hosts - - see RepairOption ) <nl> + * @ param force true if the repair should ignore dead endpoints ( instead of failing ) <nl> * @ param cfnames names of columnfamilies <nl> * / <nl> public RepairSession ( UUID parentRepairSession , <nl> @ @ - 128 , 6 + 133 , 7 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement <nl> Set < InetAddress > endpoints , <nl> boolean isConsistent , <nl> boolean pullRepair , <nl> + boolean force , <nl> PreviewKind previewKind , <nl> String . . . cfnames ) <nl> { <nl> @ @ - 139 , 10 + 145 , 35 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement <nl> this . keyspace = keyspace ; <nl> this . cfnames = cfnames ; <nl> this . ranges = ranges ; <nl> + <nl> + / / If force then filter out dead endpoints <nl> + boolean forceSkippedReplicas = false ; <nl> + if ( force ) <nl> + { <nl> + logger . debug ( " force flag set , removing dead endpoints " ) ; <nl> + final Set < InetAddress > removeCandidates = new HashSet < > ( ) ; <nl> + for ( final InetAddress endpoint : endpoints ) <nl> + { <nl> + if ( ! FailureDetector . instance . isAlive ( endpoint ) ) <nl> + { <nl> + logger . info ( " Removing a dead node from Repair due to - force " + endpoint ) ; <nl> + removeCandidates . add ( endpoint ) ; <nl> + } <nl> + } <nl> + if ( ! removeCandidates . isEmpty ( ) ) <nl> + { <nl> + / / we shouldn ' t be promoting sstables to repaired if any replicas are excluded from the repair <nl> + forceSkippedReplicas = true ; <nl> + endpoints = new HashSet < > ( endpoints ) ; <nl> + endpoints . removeAll ( removeCandidates ) ; <nl> + } <nl> + } <nl> + <nl> this . endpoints = endpoints ; <nl> this . isConsistent = isConsistent ; <nl> this . previewKind = previewKind ; <nl> this . pullRepair = pullRepair ; <nl> + this . skippedReplicas = forceSkippedReplicas ; <nl> } <nl> <nl> public UUID getId ( ) <nl> @ @ - 241 , 7 + 272 , 7 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement <nl> { <nl> logger . info ( " { } { } " , previewKind . logPrefix ( getId ( ) ) , message = String . format ( " No neighbors to repair with on range % s : session completed " , ranges ) ) ; <nl> Tracing . traceRepair ( message ) ; <nl> - set ( new RepairSessionResult ( id , keyspace , ranges , Lists . < RepairResult > newArrayList ( ) ) ) ; <nl> + set ( new RepairSessionResult ( id , keyspace , ranges , Lists . < RepairResult > newArrayList ( ) , skippedReplicas ) ) ; <nl> if ( ! previewKind . isPreview ( ) ) <nl> { <nl> SystemDistributedKeyspace . failRepairs ( getId ( ) , keyspace , cfnames , new RuntimeException ( message ) ) ; <nl> @ @ - 252 , 7 + 283 , 7 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement <nl> / / Checking all nodes are live <nl> for ( InetAddress endpoint : endpoints ) <nl> { <nl> - if ( ! FailureDetector . instance . isAlive ( endpoint ) ) <nl> + if ( ! FailureDetector . instance . isAlive ( endpoint ) & & ! skippedReplicas ) <nl> { <nl> message = String . format ( " Cannot proceed on repair because a neighbor ( % s ) is dead : session failed " , endpoint ) ; <nl> logger . error ( " { } { } " , previewKind . logPrefix ( getId ( ) ) , message ) ; <nl> @ @ - 283 , 7 + 314 , 7 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement <nl> / / this repair session is completed <nl> logger . info ( " { } { } " , previewKind . logPrefix ( getId ( ) ) , " Session completed successfully " ) ; <nl> Tracing . traceRepair ( " Completed sync of range { } " , ranges ) ; <nl> - set ( new RepairSessionResult ( id , keyspace , ranges , results ) ) ; <nl> + set ( new RepairSessionResult ( id , keyspace , ranges , results , skippedReplicas ) ) ; <nl> <nl> taskExecutor . shutdown ( ) ; <nl> / / mark this session as terminated <nl> diff - - git a / src / java / org / apache / cassandra / repair / RepairSessionResult . java b / src / java / org / apache / cassandra / repair / RepairSessionResult . java <nl> index d4fff37 . . 491ab2f 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / RepairSessionResult . java <nl> + + + b / src / java / org / apache / cassandra / repair / RepairSessionResult . java <nl> @ @ - 32 , 12 + 32 , 25 @ @ public class RepairSessionResult <nl> public final String keyspace ; <nl> public final Collection < Range < Token > > ranges ; <nl> public final Collection < RepairResult > repairJobResults ; <nl> + public final boolean skippedReplicas ; <nl> <nl> - public RepairSessionResult ( UUID sessionId , String keyspace , Collection < Range < Token > > ranges , Collection < RepairResult > repairJobResults ) <nl> + public RepairSessionResult ( UUID sessionId , String keyspace , Collection < Range < Token > > ranges , Collection < RepairResult > repairJobResults , boolean skippedReplicas ) <nl> { <nl> this . sessionId = sessionId ; <nl> this . keyspace = keyspace ; <nl> this . ranges = ranges ; <nl> this . repairJobResults = repairJobResults ; <nl> + this . skippedReplicas = skippedReplicas ; <nl> + } <nl> + <nl> + public String toString ( ) <nl> + { <nl> + return " RepairSessionResult { " + <nl> + " sessionId = " + sessionId + <nl> + " , keyspace = ' " + keyspace + ' \ ' ' + <nl> + " , ranges = " + ranges + <nl> + " , repairJobResults = " + repairJobResults + <nl> + " , skippedReplicas = " + skippedReplicas + <nl> + ' } ' ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / repair / messages / RepairOption . java b / src / java / org / apache / cassandra / repair / messages / RepairOption . java <nl> index 6d69cf0 . . a95ee19 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / messages / RepairOption . java <nl> + + + b / src / java / org / apache / cassandra / repair / messages / RepairOption . java <nl> @ @ - 48 , 6 + 48 , 7 @ @ public class RepairOption <nl> public static final String TRACE _ KEY = " trace " ; <nl> public static final String SUB _ RANGE _ REPAIR _ KEY = " sub _ range _ repair " ; <nl> public static final String PULL _ REPAIR _ KEY = " pullRepair " ; <nl> + public static final String FORCE _ REPAIR _ KEY = " forceRepair " ; <nl> public static final String PREVIEW = " previewKind " ; <nl> <nl> / / we don ' t want to push nodes too much for repair <nl> @ @ - 125 , 6 + 126 , 11 @ @ public class RepairOption <nl> * This is only allowed if exactly 2 hosts are specified along with a token range that they share . < / td > <nl> * < td > false < / td > <nl> * < / tr > <nl> + * < tr > <nl> + * < td > forceRepair < / td > <nl> + * < td > " true " if the repair should continue , even if one of the replicas involved is down . <nl> + * < td > false < / td > <nl> + * < / tr > <nl> * < / tbody > <nl> * < / table > <nl> * <nl> @ @ - 140 , 6 + 146 , 7 @ @ public class RepairOption <nl> boolean incremental = Boolean . parseBoolean ( options . get ( INCREMENTAL _ KEY ) ) ; <nl> PreviewKind previewKind = PreviewKind . valueOf ( options . getOrDefault ( PREVIEW , PreviewKind . NONE . toString ( ) ) ) ; <nl> boolean trace = Boolean . parseBoolean ( options . get ( TRACE _ KEY ) ) ; <nl> + boolean force = Boolean . parseBoolean ( options . get ( FORCE _ REPAIR _ KEY ) ) ; <nl> boolean pullRepair = Boolean . parseBoolean ( options . get ( PULL _ REPAIR _ KEY ) ) ; <nl> <nl> int jobThreads = 1 ; <nl> @ @ - 178 , 7 + 185 , 7 @ @ public class RepairOption <nl> } <nl> } <nl> <nl> - RepairOption option = new RepairOption ( parallelism , primaryRange , incremental , trace , jobThreads , ranges , ! ranges . isEmpty ( ) , pullRepair , previewKind ) ; <nl> + RepairOption option = new RepairOption ( parallelism , primaryRange , incremental , trace , jobThreads , ranges , ! ranges . isEmpty ( ) , pullRepair , force , previewKind ) ; <nl> <nl> / / data centers <nl> String dataCentersStr = options . get ( DATACENTERS _ KEY ) ; <nl> @ @ - 249 , 6 + 256 , 11 @ @ public class RepairOption <nl> throw new IllegalArgumentException ( " Incremental repairs cannot be run against a subset of tokens or ranges " ) ; <nl> } <nl> <nl> + if ( option . isIncremental ( ) & & option . isForcedRepair ( ) ) <nl> + { <nl> + throw new IllegalArgumentException ( " Cannot force incremental repair " ) ; <nl> + } <nl> + <nl> return option ; <nl> } <nl> <nl> @ @ - 259 , 6 + 271 , 7 @ @ public class RepairOption <nl> private final int jobThreads ; <nl> private final boolean isSubrangeRepair ; <nl> private final boolean pullRepair ; <nl> + private final boolean forceRepair ; <nl> private final PreviewKind previewKind ; <nl> <nl> private final Collection < String > columnFamilies = new HashSet < > ( ) ; <nl> @ @ - 266 , 7 + 279 , 7 @ @ public class RepairOption <nl> private final Collection < String > hosts = new HashSet < > ( ) ; <nl> private final Collection < Range < Token > > ranges = new HashSet < > ( ) ; <nl> <nl> - public RepairOption ( RepairParallelism parallelism , boolean primaryRange , boolean incremental , boolean trace , int jobThreads , Collection < Range < Token > > ranges , boolean isSubrangeRepair , boolean pullRepair , PreviewKind previewKind ) <nl> + public RepairOption ( RepairParallelism parallelism , boolean primaryRange , boolean incremental , boolean trace , int jobThreads , Collection < Range < Token > > ranges , boolean isSubrangeRepair , boolean pullRepair , boolean forceRepair , PreviewKind previewKind ) <nl> { <nl> if ( FBUtilities . isWindows & & <nl> ( DatabaseDescriptor . getDiskAccessMode ( ) ! = Config . DiskAccessMode . standard | | DatabaseDescriptor . getIndexAccessMode ( ) ! = Config . DiskAccessMode . standard ) & & <nl> @ @ - 285 , 6 + 298 , 7 @ @ public class RepairOption <nl> this . ranges . addAll ( ranges ) ; <nl> this . isSubrangeRepair = isSubrangeRepair ; <nl> this . pullRepair = pullRepair ; <nl> + this . forceRepair = forceRepair ; <nl> this . previewKind = previewKind ; <nl> } <nl> <nl> @ @ - 313 , 6 + 327 , 11 @ @ public class RepairOption <nl> return pullRepair ; <nl> } <nl> <nl> + public boolean isForcedRepair ( ) <nl> + { <nl> + return forceRepair ; <nl> + } <nl> + <nl> public int getJobThreads ( ) <nl> { <nl> return jobThreads ; <nl> @ @ - 376 , 6 + 395 , 7 @ @ public class RepairOption <nl> " , previewKind : " + previewKind + <nl> " , # of ranges : " + ranges . size ( ) + <nl> " , pull repair : " + pullRepair + <nl> + " , force repair : " + forceRepair + <nl> ' ) ' ; <nl> } <nl> <nl> @ @ - 393 , 6 + 413 , 7 @ @ public class RepairOption <nl> options . put ( TRACE _ KEY , Boolean . toString ( trace ) ) ; <nl> options . put ( RANGES _ KEY , Joiner . on ( " , " ) . join ( ranges ) ) ; <nl> options . put ( PULL _ REPAIR _ KEY , Boolean . toString ( pullRepair ) ) ; <nl> + options . put ( FORCE _ REPAIR _ KEY , Boolean . toString ( forceRepair ) ) ; <nl> options . put ( PREVIEW , previewKind . toString ( ) ) ; <nl> return options ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / ActiveRepairService . java b / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> index a397ca2 . . d50dc3f 100644 <nl> - - - a / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> + + + b / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> @ @ - 187 , 6 + 187 , 7 @ @ public class ActiveRepairService implements IEndpointStateChangeSubscriber , IFai <nl> Set < InetAddress > endpoints , <nl> boolean isConsistent , <nl> boolean pullRepair , <nl> + boolean force , <nl> PreviewKind previewKind , <nl> ListeningExecutorService executor , <nl> String . . . cfnames ) <nl> @ @ - 197 , 7 + 198 , 7 @ @ public class ActiveRepairService implements IEndpointStateChangeSubscriber , IFai <nl> if ( cfnames . length = = 0 ) <nl> return null ; <nl> <nl> - final RepairSession session = new RepairSession ( parentRepairSession , UUIDGen . getTimeUUID ( ) , range , keyspace , parallelismDegree , endpoints , isConsistent , pullRepair , previewKind , cfnames ) ; <nl> + final RepairSession session = new RepairSession ( parentRepairSession , UUIDGen . getTimeUUID ( ) , range , keyspace , parallelismDegree , endpoints , isConsistent , pullRepair , force , previewKind , cfnames ) ; <nl> <nl> sessions . put ( session . getId ( ) , session ) ; <nl> / / register listeners <nl> @ @ - 389 , 8 + 390 , 16 @ @ public class ActiveRepairService implements IEndpointStateChangeSubscriber , IFai <nl> } <nl> else <nl> { <nl> - / / bailout early to avoid potentially waiting for a long time . <nl> - failRepair ( parentRepairSession , " Endpoint not alive : " + neighbour ) ; <nl> + if ( options . isForcedRepair ( ) ) <nl> + { <nl> + prepareLatch . countDown ( ) ; <nl> + } <nl> + else <nl> + { <nl> + / / bailout early to avoid potentially waiting for a long time . <nl> + failRepair ( parentRepairSession , " Endpoint not alive : " + neighbour ) ; <nl> + } <nl> + <nl> } <nl> } <nl> try <nl> diff - - git a / src / java / org / apache / cassandra / tools / nodetool / Repair . java b / src / java / org / apache / cassandra / tools / nodetool / Repair . java <nl> index 317a677 . . 77ad214 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / nodetool / Repair . java <nl> + + + b / src / java / org / apache / cassandra / tools / nodetool / Repair . java <nl> @ @ - 74 , 6 + 74 , 9 @ @ public class Repair extends NodeToolCmd <nl> @ Option ( title = " full " , name = { " - full " , " - - full " } , description = " Use - full to issue a full repair . " ) <nl> private boolean fullRepair = false ; <nl> <nl> + @ Option ( title = " force " , name = { " - force " , " - - force " } , description = " Use - force to filter out down endpoints " ) <nl> + private boolean force = false ; <nl> + <nl> @ Option ( title = " preview " , name = { " - prv " , " - - preview " } , description = " Determine ranges and amount of data to be streamed , but don ' t actually perform repair " ) <nl> private boolean preview = false ; <nl> <nl> @ @ - 139 , 6 + 142 , 7 @ @ public class Repair extends NodeToolCmd <nl> options . put ( RepairOption . TRACE _ KEY , Boolean . toString ( trace ) ) ; <nl> options . put ( RepairOption . COLUMNFAMILIES _ KEY , StringUtils . join ( cfnames , " , " ) ) ; <nl> options . put ( RepairOption . PULL _ REPAIR _ KEY , Boolean . toString ( pullRepair ) ) ; <nl> + options . put ( RepairOption . FORCE _ REPAIR _ KEY , Boolean . toString ( force ) ) ; <nl> options . put ( RepairOption . PREVIEW , getPreviewKind ( ) . toString ( ) ) ; <nl> <nl> if ( ! startToken . isEmpty ( ) | | ! endToken . isEmpty ( ) ) <nl> diff - - git a / test / unit / org / apache / cassandra / repair / RepairSessionTest . java b / test / unit / org / apache / cassandra / repair / RepairSessionTest . java <nl> index 5a4e5b1 . . efae538 100644 <nl> - - - a / test / unit / org / apache / cassandra / repair / RepairSessionTest . java <nl> + + + b / test / unit / org / apache / cassandra / repair / RepairSessionTest . java <nl> @ @ - 65 , 7 + 65 , 7 @ @ public class RepairSessionTest <nl> Set < InetAddress > endpoints = Sets . newHashSet ( remote ) ; <nl> RepairSession session = new RepairSession ( parentSessionId , sessionId , Arrays . asList ( repairRange ) , <nl> " Keyspace1 " , RepairParallelism . SEQUENTIAL , <nl> - endpoints , false , false , <nl> + endpoints , false , false , false , <nl> PreviewKind . NONE , " Standard1 " ) ; <nl> <nl> / / perform convict <nl> diff - - git a / test / unit / org / apache / cassandra / repair / consistent / CoordinatorSessionTest . java b / test / unit / org / apache / cassandra / repair / consistent / CoordinatorSessionTest . java <nl> index 4f5b7e6 . . 3c27b5e 100644 <nl> - - - a / test / unit / org / apache / cassandra / repair / consistent / CoordinatorSessionTest . java <nl> + + + b / test / unit / org / apache / cassandra / repair / consistent / CoordinatorSessionTest . java <nl> @ @ - 76 , 7 + 76 , 7 @ @ public class CoordinatorSessionTest extends AbstractRepairTest <nl> <nl> private static RepairSessionResult createResult ( CoordinatorSession coordinator ) <nl> { <nl> - return new RepairSessionResult ( coordinator . sessionID , " ks " , coordinator . ranges , null ) ; <nl> + return new RepairSessionResult ( coordinator . sessionID , " ks " , coordinator . ranges , null , false ) ; <nl> } <nl> <nl> private static void assertMessageSent ( InstrumentedCoordinatorSession coordinator , InetAddress participant , RepairMessage expected ) <nl> diff - - git a / test / unit / org / apache / cassandra / repair / messages / RepairOptionTest . java b / test / unit / org / apache / cassandra / repair / messages / RepairOptionTest . java <nl> index 9eb7c86 . . 13d7575 100644 <nl> - - - a / test / unit / org / apache / cassandra / repair / messages / RepairOptionTest . java <nl> + + + b / test / unit / org / apache / cassandra / repair / messages / RepairOptionTest . java <nl> @ @ - 23 , 6 + 23 , 7 @ @ import java . util . HashSet ; <nl> import java . util . Map ; <nl> import java . util . Set ; <nl> <nl> + import org . junit . Assert ; <nl> import org . junit . Test ; <nl> <nl> import com . google . common . collect . ImmutableMap ; <nl> @ @ - 161 , 6 + 162 , 27 @ @ public class RepairOptionTest <nl> <nl> } <nl> <nl> + @ Test <nl> + public void testForceOption ( ) throws Exception <nl> + { <nl> + RepairOption option ; <nl> + Map < String , String > options = new HashMap < > ( ) ; <nl> + <nl> + / / default value <nl> + option = RepairOption . parse ( options , Murmur3Partitioner . instance ) ; <nl> + Assert . assertFalse ( option . isForcedRepair ( ) ) ; <nl> + <nl> + / / explicit true <nl> + options . put ( RepairOption . FORCE _ REPAIR _ KEY , " true " ) ; <nl> + option = RepairOption . parse ( options , Murmur3Partitioner . instance ) ; <nl> + Assert . assertTrue ( option . isForcedRepair ( ) ) ; <nl> + <nl> + / / explicit false <nl> + options . put ( RepairOption . FORCE _ REPAIR _ KEY , " false " ) ; <nl> + option = RepairOption . parse ( options , Murmur3Partitioner . instance ) ; <nl> + Assert . assertFalse ( option . isForcedRepair ( ) ) ; <nl> + } <nl> + <nl> private void assertParseThrowsIllegalArgumentExceptionWithMessage ( Map < String , String > optionsToParse , String expectedErrorMessage ) <nl> { <nl> try
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 866c6fd . . 6444994 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 6 @ @ 
+ 4 . 0 
+ + * Run repair with down replicas ( CASSANDRA - 10446 ) 
+ + * Added started & completed repair metrics ( CASSANDRA - 13598 ) 
+ * Added started & completed repair metrics ( CASSANDRA - 13598 ) 
+ * Improve secondary index ( re ) build failure and concurrency handling ( CASSANDRA - 10130 ) 
+ * Improve calculation of available disk space for compaction ( CASSANDRA - 13068 ) 
+ diff - - git a / src / java / org / apache / cassandra / repair / RepairRunnable . java b / src / java / org / apache / cassandra / repair / RepairRunnable . java 
+ index eca162e . . 29347a4 100644 
+ - - - a / src / java / org / apache / cassandra / repair / RepairRunnable . java 
+ + + + b / src / java / org / apache / cassandra / repair / RepairRunnable . java 
+ @ @ - 289 , 9 + 289 , 18 @ @ public class RepairRunnable extends WrappedRunnable implements ProgressEventNoti 
+ / / filter out null ( = failed ) results and get successful ranges 
+ for ( RepairSessionResult sessionResult : results ) 
+ { 
+ + logger . debug ( " Repair result : { } " , results ) ; 
+ if ( sessionResult ! = null ) 
+ { 
+ - successfulRanges . addAll ( sessionResult . ranges ) ; 
+ + / / don ' t promote sstables for sessions we skipped replicas for 
+ + if ( ! sessionResult . skippedReplicas ) 
+ + { 
+ + successfulRanges . addAll ( sessionResult . ranges ) ; 
+ + } 
+ + else 
+ + { 
+ + logger . debug ( " Skipping anticompaction for { } " , results ) ; 
+ + } 
+ } 
+ else 
+ { 
+ @ @ - 424 , 6 + 433 , 7 @ @ public class RepairRunnable extends WrappedRunnable implements ProgressEventNoti 
+ p . left , 
+ isConsistent , 
+ options . isPullRepair ( ) , 
+ + options . isForcedRepair ( ) , 
+ options . getPreviewKind ( ) , 
+ executor , 
+ cfnames ) ; 
+ diff - - git a / src / java / org / apache / cassandra / repair / RepairSession . java b / src / java / org / apache / cassandra / repair / RepairSession . java 
+ index c1b3f41 . . 98ed1a3 100644 
+ - - - a / src / java / org / apache / cassandra / repair / RepairSession . java 
+ + + + b / src / java / org / apache / cassandra / repair / RepairSession . java 
+ @ @ - 36 , 6 + 36 , 7 @ @ import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . gms . * ; 
+ import org . apache . cassandra . streaming . PreviewKind ; 
+ import org . apache . cassandra . streaming . SessionSummary ; 
+ + import org . apache . cassandra . service . ActiveRepairService ; 
+ import org . apache . cassandra . tracing . Tracing ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . MerkleTrees ; 
+ @ @ - 89 , 6 + 90 , 10 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement 
+ private final String [ ] cfnames ; 
+ public final RepairParallelism parallelismDegree ; 
+ public final boolean pullRepair ; 
+ + 
+ + / / indicates some replicas were not included in the repair . Only relevant for - - force option 
+ + public final boolean skippedReplicas ; 
+ + 
+ / * * Range to repair * / 
+ public final Collection < Range < Token > > ranges ; 
+ public final Set < InetAddress > endpoints ; 
+ @ @ - 116 , 8 + 121 , 8 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement 
+ * @ param keyspace name of keyspace 
+ * @ param parallelismDegree specifies the degree of parallelism when calculating the merkle trees 
+ * @ param endpoints the data centers that should be part of the repair ; null for all DCs 
+ - * @ param repairedAt when the repair occurred ( millis ) 
+ * @ param pullRepair true if the repair should be one way ( from remote host to this host and only applicable between two hosts - - see RepairOption ) 
+ + * @ param force true if the repair should ignore dead endpoints ( instead of failing ) 
+ * @ param cfnames names of columnfamilies 
+ * / 
+ public RepairSession ( UUID parentRepairSession , 
+ @ @ - 128 , 6 + 133 , 7 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement 
+ Set < InetAddress > endpoints , 
+ boolean isConsistent , 
+ boolean pullRepair , 
+ + boolean force , 
+ PreviewKind previewKind , 
+ String . . . cfnames ) 
+ { 
+ @ @ - 139 , 10 + 145 , 35 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement 
+ this . keyspace = keyspace ; 
+ this . cfnames = cfnames ; 
+ this . ranges = ranges ; 
+ + 
+ + / / If force then filter out dead endpoints 
+ + boolean forceSkippedReplicas = false ; 
+ + if ( force ) 
+ + { 
+ + logger . debug ( " force flag set , removing dead endpoints " ) ; 
+ + final Set < InetAddress > removeCandidates = new HashSet < > ( ) ; 
+ + for ( final InetAddress endpoint : endpoints ) 
+ + { 
+ + if ( ! FailureDetector . instance . isAlive ( endpoint ) ) 
+ + { 
+ + logger . info ( " Removing a dead node from Repair due to - force " + endpoint ) ; 
+ + removeCandidates . add ( endpoint ) ; 
+ + } 
+ + } 
+ + if ( ! removeCandidates . isEmpty ( ) ) 
+ + { 
+ + / / we shouldn ' t be promoting sstables to repaired if any replicas are excluded from the repair 
+ + forceSkippedReplicas = true ; 
+ + endpoints = new HashSet < > ( endpoints ) ; 
+ + endpoints . removeAll ( removeCandidates ) ; 
+ + } 
+ + } 
+ + 
+ this . endpoints = endpoints ; 
+ this . isConsistent = isConsistent ; 
+ this . previewKind = previewKind ; 
+ this . pullRepair = pullRepair ; 
+ + this . skippedReplicas = forceSkippedReplicas ; 
+ } 
+ 
+ public UUID getId ( ) 
+ @ @ - 241 , 7 + 272 , 7 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement 
+ { 
+ logger . info ( " { } { } " , previewKind . logPrefix ( getId ( ) ) , message = String . format ( " No neighbors to repair with on range % s : session completed " , ranges ) ) ; 
+ Tracing . traceRepair ( message ) ; 
+ - set ( new RepairSessionResult ( id , keyspace , ranges , Lists . < RepairResult > newArrayList ( ) ) ) ; 
+ + set ( new RepairSessionResult ( id , keyspace , ranges , Lists . < RepairResult > newArrayList ( ) , skippedReplicas ) ) ; 
+ if ( ! previewKind . isPreview ( ) ) 
+ { 
+ SystemDistributedKeyspace . failRepairs ( getId ( ) , keyspace , cfnames , new RuntimeException ( message ) ) ; 
+ @ @ - 252 , 7 + 283 , 7 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement 
+ / / Checking all nodes are live 
+ for ( InetAddress endpoint : endpoints ) 
+ { 
+ - if ( ! FailureDetector . instance . isAlive ( endpoint ) ) 
+ + if ( ! FailureDetector . instance . isAlive ( endpoint ) & & ! skippedReplicas ) 
+ { 
+ message = String . format ( " Cannot proceed on repair because a neighbor ( % s ) is dead : session failed " , endpoint ) ; 
+ logger . error ( " { } { } " , previewKind . logPrefix ( getId ( ) ) , message ) ; 
+ @ @ - 283 , 7 + 314 , 7 @ @ public class RepairSession extends AbstractFuture < RepairSessionResult > implement 
+ / / this repair session is completed 
+ logger . info ( " { } { } " , previewKind . logPrefix ( getId ( ) ) , " Session completed successfully " ) ; 
+ Tracing . traceRepair ( " Completed sync of range { } " , ranges ) ; 
+ - set ( new RepairSessionResult ( id , keyspace , ranges , results ) ) ; 
+ + set ( new RepairSessionResult ( id , keyspace , ranges , results , skippedReplicas ) ) ; 
+ 
+ taskExecutor . shutdown ( ) ; 
+ / / mark this session as terminated 
+ diff - - git a / src / java / org / apache / cassandra / repair / RepairSessionResult . java b / src / java / org / apache / cassandra / repair / RepairSessionResult . java 
+ index d4fff37 . . 491ab2f 100644 
+ - - - a / src / java / org / apache / cassandra / repair / RepairSessionResult . java 
+ + + + b / src / java / org / apache / cassandra / repair / RepairSessionResult . java 
+ @ @ - 32 , 12 + 32 , 25 @ @ public class RepairSessionResult 
+ public final String keyspace ; 
+ public final Collection < Range < Token > > ranges ; 
+ public final Collection < RepairResult > repairJobResults ; 
+ + public final boolean skippedReplicas ; 
+ 
+ - public RepairSessionResult ( UUID sessionId , String keyspace , Collection < Range < Token > > ranges , Collection < RepairResult > repairJobResults ) 
+ + public RepairSessionResult ( UUID sessionId , String keyspace , Collection < Range < Token > > ranges , Collection < RepairResult > repairJobResults , boolean skippedReplicas ) 
+ { 
+ this . sessionId = sessionId ; 
+ this . keyspace = keyspace ; 
+ this . ranges = ranges ; 
+ this . repairJobResults = repairJobResults ; 
+ + this . skippedReplicas = skippedReplicas ; 
+ + } 
+ + 
+ + public String toString ( ) 
+ + { 
+ + return " RepairSessionResult { " + 
+ + " sessionId = " + sessionId + 
+ + " , keyspace = ' " + keyspace + ' \ ' ' + 
+ + " , ranges = " + ranges + 
+ + " , repairJobResults = " + repairJobResults + 
+ + " , skippedReplicas = " + skippedReplicas + 
+ + ' } ' ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / repair / messages / RepairOption . java b / src / java / org / apache / cassandra / repair / messages / RepairOption . java 
+ index 6d69cf0 . . a95ee19 100644 
+ - - - a / src / java / org / apache / cassandra / repair / messages / RepairOption . java 
+ + + + b / src / java / org / apache / cassandra / repair / messages / RepairOption . java 
+ @ @ - 48 , 6 + 48 , 7 @ @ public class RepairOption 
+ public static final String TRACE _ KEY = " trace " ; 
+ public static final String SUB _ RANGE _ REPAIR _ KEY = " sub _ range _ repair " ; 
+ public static final String PULL _ REPAIR _ KEY = " pullRepair " ; 
+ + public static final String FORCE _ REPAIR _ KEY = " forceRepair " ; 
+ public static final String PREVIEW = " previewKind " ; 
+ 
+ / / we don ' t want to push nodes too much for repair 
+ @ @ - 125 , 6 + 126 , 11 @ @ public class RepairOption 
+ * This is only allowed if exactly 2 hosts are specified along with a token range that they share . < / td > 
+ * < td > false < / td > 
+ * < / tr > 
+ + * < tr > 
+ + * < td > forceRepair < / td > 
+ + * < td > " true " if the repair should continue , even if one of the replicas involved is down . 
+ + * < td > false < / td > 
+ + * < / tr > 
+ * < / tbody > 
+ * < / table > 
+ * 
+ @ @ - 140 , 6 + 146 , 7 @ @ public class RepairOption 
+ boolean incremental = Boolean . parseBoolean ( options . get ( INCREMENTAL _ KEY ) ) ; 
+ PreviewKind previewKind = PreviewKind . valueOf ( options . getOrDefault ( PREVIEW , PreviewKind . NONE . toString ( ) ) ) ; 
+ boolean trace = Boolean . parseBoolean ( options . get ( TRACE _ KEY ) ) ; 
+ + boolean force = Boolean . parseBoolean ( options . get ( FORCE _ REPAIR _ KEY ) ) ; 
+ boolean pullRepair = Boolean . parseBoolean ( options . get ( PULL _ REPAIR _ KEY ) ) ; 
+ 
+ int jobThreads = 1 ; 
+ @ @ - 178 , 7 + 185 , 7 @ @ public class RepairOption 
+ } 
+ } 
+ 
+ - RepairOption option = new RepairOption ( parallelism , primaryRange , incremental , trace , jobThreads , ranges , ! ranges . isEmpty ( ) , pullRepair , previewKind ) ; 
+ + RepairOption option = new RepairOption ( parallelism , primaryRange , incremental , trace , jobThreads , ranges , ! ranges . isEmpty ( ) , pullRepair , force , previewKind ) ; 
+ 
+ / / data centers 
+ String dataCentersStr = options . get ( DATACENTERS _ KEY ) ; 
+ @ @ - 249 , 6 + 256 , 11 @ @ public class RepairOption 
+ throw new IllegalArgumentException ( " Incremental repairs cannot be run against a subset of tokens or ranges " ) ; 
+ } 
+ 
+ + if ( option . isIncremental ( ) & & option . isForcedRepair ( ) ) 
+ + { 
+ + throw new IllegalArgumentException ( " Cannot force incremental repair " ) ; 
+ + } 
+ + 
+ return option ; 
+ } 
+ 
+ @ @ - 259 , 6 + 271 , 7 @ @ public class RepairOption 
+ private final int jobThreads ; 
+ private final boolean isSubrangeRepair ; 
+ private final boolean pullRepair ; 
+ + private final boolean forceRepair ; 
+ private final PreviewKind previewKind ; 
+ 
+ private final Collection < String > columnFamilies = new HashSet < > ( ) ; 
+ @ @ - 266 , 7 + 279 , 7 @ @ public class RepairOption 
+ private final Collection < String > hosts = new HashSet < > ( ) ; 
+ private final Collection < Range < Token > > ranges = new HashSet < > ( ) ; 
+ 
+ - public RepairOption ( RepairParallelism parallelism , boolean primaryRange , boolean incremental , boolean trace , int jobThreads , Collection < Range < Token > > ranges , boolean isSubrangeRepair , boolean pullRepair , PreviewKind previewKind ) 
+ + public RepairOption ( RepairParallelism parallelism , boolean primaryRange , boolean incremental , boolean trace , int jobThreads , Collection < Range < Token > > ranges , boolean isSubrangeRepair , boolean pullRepair , boolean forceRepair , PreviewKind previewKind ) 
+ { 
+ if ( FBUtilities . isWindows & & 
+ ( DatabaseDescriptor . getDiskAccessMode ( ) ! = Config . DiskAccessMode . standard | | DatabaseDescriptor . getIndexAccessMode ( ) ! = Config . DiskAccessMode . standard ) & & 
+ @ @ - 285 , 6 + 298 , 7 @ @ public class RepairOption 
+ this . ranges . addAll ( ranges ) ; 
+ this . isSubrangeRepair = isSubrangeRepair ; 
+ this . pullRepair = pullRepair ; 
+ + this . forceRepair = forceRepair ; 
+ this . previewKind = previewKind ; 
+ } 
+ 
+ @ @ - 313 , 6 + 327 , 11 @ @ public class RepairOption 
+ return pullRepair ; 
+ } 
+ 
+ + public boolean isForcedRepair ( ) 
+ + { 
+ + return forceRepair ; 
+ + } 
+ + 
+ public int getJobThreads ( ) 
+ { 
+ return jobThreads ; 
+ @ @ - 376 , 6 + 395 , 7 @ @ public class RepairOption 
+ " , previewKind : " + previewKind + 
+ " , # of ranges : " + ranges . size ( ) + 
+ " , pull repair : " + pullRepair + 
+ + " , force repair : " + forceRepair + 
+ ' ) ' ; 
+ } 
+ 
+ @ @ - 393 , 6 + 413 , 7 @ @ public class RepairOption 
+ options . put ( TRACE _ KEY , Boolean . toString ( trace ) ) ; 
+ options . put ( RANGES _ KEY , Joiner . on ( " , " ) . join ( ranges ) ) ; 
+ options . put ( PULL _ REPAIR _ KEY , Boolean . toString ( pullRepair ) ) ; 
+ + options . put ( FORCE _ REPAIR _ KEY , Boolean . toString ( forceRepair ) ) ; 
+ options . put ( PREVIEW , previewKind . toString ( ) ) ; 
+ return options ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / ActiveRepairService . java b / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ index a397ca2 . . d50dc3f 100644 
+ - - - a / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ + + + b / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ @ @ - 187 , 6 + 187 , 7 @ @ public class ActiveRepairService implements IEndpointStateChangeSubscriber , IFai 
+ Set < InetAddress > endpoints , 
+ boolean isConsistent , 
+ boolean pullRepair , 
+ + boolean force , 
+ PreviewKind previewKind , 
+ ListeningExecutorService executor , 
+ String . . . cfnames ) 
+ @ @ - 197 , 7 + 198 , 7 @ @ public class ActiveRepairService implements IEndpointStateChangeSubscriber , IFai 
+ if ( cfnames . length = = 0 ) 
+ return null ; 
+ 
+ - final RepairSession session = new RepairSession ( parentRepairSession , UUIDGen . getTimeUUID ( ) , range , keyspace , parallelismDegree , endpoints , isConsistent , pullRepair , previewKind , cfnames ) ; 
+ + final RepairSession session = new RepairSession ( parentRepairSession , UUIDGen . getTimeUUID ( ) , range , keyspace , parallelismDegree , endpoints , isConsistent , pullRepair , force , previewKind , cfnames ) ; 
+ 
+ sessions . put ( session . getId ( ) , session ) ; 
+ / / register listeners 
+ @ @ - 389 , 8 + 390 , 16 @ @ public class ActiveRepairService implements IEndpointStateChangeSubscriber , IFai 
+ } 
+ else 
+ { 
+ - / / bailout early to avoid potentially waiting for a long time . 
+ - failRepair ( parentRepairSession , " Endpoint not alive : " + neighbour ) ; 
+ + if ( options . isForcedRepair ( ) ) 
+ + { 
+ + prepareLatch . countDown ( ) ; 
+ + } 
+ + else 
+ + { 
+ + / / bailout early to avoid potentially waiting for a long time . 
+ + failRepair ( parentRepairSession , " Endpoint not alive : " + neighbour ) ; 
+ + } 
+ + 
+ } 
+ } 
+ try 
+ diff - - git a / src / java / org / apache / cassandra / tools / nodetool / Repair . java b / src / java / org / apache / cassandra / tools / nodetool / Repair . java 
+ index 317a677 . . 77ad214 100644 
+ - - - a / src / java / org / apache / cassandra / tools / nodetool / Repair . java 
+ + + + b / src / java / org / apache / cassandra / tools / nodetool / Repair . java 
+ @ @ - 74 , 6 + 74 , 9 @ @ public class Repair extends NodeToolCmd 
+ @ Option ( title = " full " , name = { " - full " , " - - full " } , description = " Use - full to issue a full repair . " ) 
+ private boolean fullRepair = false ; 
+ 
+ + @ Option ( title = " force " , name = { " - force " , " - - force " } , description = " Use - force to filter out down endpoints " ) 
+ + private boolean force = false ; 
+ + 
+ @ Option ( title = " preview " , name = { " - prv " , " - - preview " } , description = " Determine ranges and amount of data to be streamed , but don ' t actually perform repair " ) 
+ private boolean preview = false ; 
+ 
+ @ @ - 139 , 6 + 142 , 7 @ @ public class Repair extends NodeToolCmd 
+ options . put ( RepairOption . TRACE _ KEY , Boolean . toString ( trace ) ) ; 
+ options . put ( RepairOption . COLUMNFAMILIES _ KEY , StringUtils . join ( cfnames , " , " ) ) ; 
+ options . put ( RepairOption . PULL _ REPAIR _ KEY , Boolean . toString ( pullRepair ) ) ; 
+ + options . put ( RepairOption . FORCE _ REPAIR _ KEY , Boolean . toString ( force ) ) ; 
+ options . put ( RepairOption . PREVIEW , getPreviewKind ( ) . toString ( ) ) ; 
+ 
+ if ( ! startToken . isEmpty ( ) | | ! endToken . isEmpty ( ) ) 
+ diff - - git a / test / unit / org / apache / cassandra / repair / RepairSessionTest . java b / test / unit / org / apache / cassandra / repair / RepairSessionTest . java 
+ index 5a4e5b1 . . efae538 100644 
+ - - - a / test / unit / org / apache / cassandra / repair / RepairSessionTest . java 
+ + + + b / test / unit / org / apache / cassandra / repair / RepairSessionTest . java 
+ @ @ - 65 , 7 + 65 , 7 @ @ public class RepairSessionTest 
+ Set < InetAddress > endpoints = Sets . newHashSet ( remote ) ; 
+ RepairSession session = new RepairSession ( parentSessionId , sessionId , Arrays . asList ( repairRange ) , 
+ " Keyspace1 " , RepairParallelism . SEQUENTIAL , 
+ - endpoints , false , false , 
+ + endpoints , false , false , false , 
+ PreviewKind . NONE , " Standard1 " ) ; 
+ 
+ / / perform convict 
+ diff - - git a / test / unit / org / apache / cassandra / repair / consistent / CoordinatorSessionTest . java b / test / unit / org / apache / cassandra / repair / consistent / CoordinatorSessionTest . java 
+ index 4f5b7e6 . . 3c27b5e 100644 
+ - - - a / test / unit / org / apache / cassandra / repair / consistent / CoordinatorSessionTest . java 
+ + + + b / test / unit / org / apache / cassandra / repair / consistent / CoordinatorSessionTest . java 
+ @ @ - 76 , 7 + 76 , 7 @ @ public class CoordinatorSessionTest extends AbstractRepairTest 
+ 
+ private static RepairSessionResult createResult ( CoordinatorSession coordinator ) 
+ { 
+ - return new RepairSessionResult ( coordinator . sessionID , " ks " , coordinator . ranges , null ) ; 
+ + return new RepairSessionResult ( coordinator . sessionID , " ks " , coordinator . ranges , null , false ) ; 
+ } 
+ 
+ private static void assertMessageSent ( InstrumentedCoordinatorSession coordinator , InetAddress participant , RepairMessage expected ) 
+ diff - - git a / test / unit / org / apache / cassandra / repair / messages / RepairOptionTest . java b / test / unit / org / apache / cassandra / repair / messages / RepairOptionTest . java 
+ index 9eb7c86 . . 13d7575 100644 
+ - - - a / test / unit / org / apache / cassandra / repair / messages / RepairOptionTest . java 
+ + + + b / test / unit / org / apache / cassandra / repair / messages / RepairOptionTest . java 
+ @ @ - 23 , 6 + 23 , 7 @ @ import java . util . HashSet ; 
+ import java . util . Map ; 
+ import java . util . Set ; 
+ 
+ + import org . junit . Assert ; 
+ import org . junit . Test ; 
+ 
+ import com . google . common . collect . ImmutableMap ; 
+ @ @ - 161 , 6 + 162 , 27 @ @ public class RepairOptionTest 
+ 
+ } 
+ 
+ + @ Test 
+ + public void testForceOption ( ) throws Exception 
+ + { 
+ + RepairOption option ; 
+ + Map < String , String > options = new HashMap < > ( ) ; 
+ + 
+ + / / default value 
+ + option = RepairOption . parse ( options , Murmur3Partitioner . instance ) ; 
+ + Assert . assertFalse ( option . isForcedRepair ( ) ) ; 
+ + 
+ + / / explicit true 
+ + options . put ( RepairOption . FORCE _ REPAIR _ KEY , " true " ) ; 
+ + option = RepairOption . parse ( options , Murmur3Partitioner . instance ) ; 
+ + Assert . assertTrue ( option . isForcedRepair ( ) ) ; 
+ + 
+ + / / explicit false 
+ + options . put ( RepairOption . FORCE _ REPAIR _ KEY , " false " ) ; 
+ + option = RepairOption . parse ( options , Murmur3Partitioner . instance ) ; 
+ + Assert . assertFalse ( option . isForcedRepair ( ) ) ; 
+ + } 
+ + 
+ private void assertParseThrowsIllegalArgumentExceptionWithMessage ( Map < String , String > optionsToParse , String expectedErrorMessage ) 
+ { 
+ try
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

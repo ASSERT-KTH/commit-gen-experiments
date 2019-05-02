@@ -1,0 +1,713 @@
+BLEU SCORE: 0.05428210647032972
+
+TEST MSG: feat ( server : rpc , push ) : implement unregister push methods
+GENERATED MSG: refactor ( sequence ) : creds management inside SeqUpdatesManager ; no more Envelope matching in actor
+
+TEST DIFF (one line): diff - - git a / actor - server / actor - core / src / main / protobuf / sequence . proto b / actor - server / actor - core / src / main / protobuf / sequence . proto < nl > index fb353a2 . . 1878c5f 100644 < nl > - - - a / actor - server / actor - core / src / main / protobuf / sequence . proto < nl > + + + b / actor - server / actor - core / src / main / protobuf / sequence . proto < nl > @ @ - 73 , 9 + 73 , 15 @ @ message UserSequenceCommands { < nl > message UnregisterPushCredentials { < nl > option ( scalapb . message ) . extends = " im . actor . server . sequence . VendorPushCommand " ; < nl > < nl > - int64 auth _ id = 1 ; < nl > + oneof creds { < nl > + GooglePushCredentials google = 1 ; < nl > + ApplePushCredentials apple = 2 ; < nl > + ActorPushCredentials actor = 3 ; < nl > + } < nl > } < nl > < nl > + message UnregisterPushCredentialsAck { } < nl > + < nl > message DeliverPush { < nl > option ( scalapb . message ) . extends = " im . actor . server . sequence . VendorPushCommand " ; < nl > < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / PushFutureListener . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / PushFutureListener . scala < nl > index f34cdae . . 5ad356b 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / PushFutureListener . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / PushFutureListener . scala < nl > @ @ - 38 , 7 + 38 , 7 @ @ final class PushFutureListener ( userId : Int , creds : ApplePushCredentials , credsId < nl > ) < nl > Option ( response . getTokenInvalidationTimestamp ) foreach { ts ⇒ < nl > log . warning ( " APNS token : { } for user : { } invalidated at { } . Deleting token now " , tokenString , userId , ts ) < nl > - seqUpdExt . deleteApplePushCredentials ( tokenBytes ) < nl > + seqUpdExt . unregisterApplePushCredentials ( tokenBytes ) < nl > } < nl > } < nl > case Failure ( e ) ⇒ < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > index 9fb3daf . . b698ad6 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > @ @ - 3 , 6 + 3 , 7 @ @ package im . actor . server . sequence < nl > import akka . actor . _ < nl > import akka . cluster . pubsub . { DistributedPubSub , DistributedPubSubMediator } < nl > import akka . event . Logging < nl > + import akka . http . scaladsl . util . FastFuture < nl > import akka . pattern . ask < nl > import akka . stream . ActorMaterializer < nl > import akka . util . Timeout < nl > @ @ - 14 , 8 + 15 , 9 @ @ import im . actor . server . db . DbExtension < nl > import im . actor . server . model . _ < nl > import im . actor . server . model . push . { PushCredentials , ActorPushCredentials ⇒ ActorPushCredentialsModel , ApplePushCredentials ⇒ ApplePushCredentialsModel , GooglePushCredentials ⇒ GooglePushCredentialsModel } < nl > import im . actor . server . persist . AuthSessionRepo < nl > - import im . actor . server . persist . push . ApplePushCredentialsRepo < nl > + import im . actor . server . persist . push . { ActorPushCredentialsRepo , ApplePushCredentialsRepo , GooglePushCredentialsRepo } < nl > import im . actor . server . persist . sequence . UserSequenceRepo < nl > + import scodec . bits . BitVector < nl > import slick . dbio . DBIO < nl > < nl > import scala . annotation . tailrec < nl > @ @ - 228 , 23 + 230 , 56 @ @ final class SeqUpdatesExtension ( _ system : ActorSystem ) extends Extension { < nl > Future . successful ( ( ) ) < nl > } < nl > < nl > - / / TODO : real future < nl > - def deletePushCredentials ( authId : Long ) : Future [ Unit ] = < nl > - withAuthSession ( authId ) { session ⇒ < nl > - region . ref ! Envelope ( session . userId ) . withUnregisterPushCredentials ( UnregisterPushCredentials ( authId ) ) < nl > - Future . successful ( ( ) ) < nl > + def unregisterAllPushCredentials ( authId : Long ) : Future [ Unit ] = < nl > + findAllPushCredentials ( authId ) map { creds ⇒ < nl > + creds map ( c ⇒ unregisterPushCredentials ( c . authId , makeUnregister ( c ) ) ) < nl > + } < nl > + < nl > + def unregisterActorPushCredentials ( endpoint : String ) : Future [ Unit ] = < nl > + db . run ( ActorPushCredentialsRepo . findByTopic ( endpoint ) . headOption ) flatMap { < nl > + case Some ( creds ) ⇒ < nl > + unregisterPushCredentials ( creds . authId , UnregisterPushCredentials ( ) . withActor ( creds ) ) < nl > + case None ⇒ < nl > + log . warning ( " Actor push credentials not found for endpoint : { } " , endpoint ) < nl > + FastFuture . successful ( ( ) ) < nl > } < nl > < nl > - def deleteApplePushCredentials ( token : Array [ Byte ] ) : Future [ Unit ] = < nl > + def unregisterApplePushCredentials ( token : Array [ Byte ] ) : Future [ Unit ] = < nl > db . run ( ApplePushCredentialsRepo . findByToken ( token ) . headOption ) flatMap { < nl > case Some ( creds ) ⇒ < nl > - deletePushCredentials ( creds . authId ) < nl > + unregisterPushCredentials ( creds . authId , UnregisterPushCredentials ( ) . withApple ( creds ) ) < nl > case None ⇒ < nl > - val err = new RuntimeException ( " Apple push credentials not found " ) < nl > - log . error ( err , err . getMessage ) < nl > - throw err < nl > + log . warning ( " Apple push credentials not found for token : { } " , BitVector ( token ) . toHex ) < nl > + FastFuture . successful ( ( ) ) < nl > } < nl > < nl > + def unregisterGooglePushCredentials ( token : String ) : Future [ Unit ] = < nl > + db . run ( GooglePushCredentialsRepo . findByToken ( token ) ) flatMap { < nl > + case Some ( creds ) ⇒ < nl > + unregisterPushCredentials ( creds . authId , UnregisterPushCredentials ( ) . withGoogle ( creds ) ) < nl > + case None ⇒ < nl > + log . warning ( " Google push credentials not found for token : { } " , token ) < nl > + FastFuture . successful ( ( ) ) < nl > + } < nl > + < nl > + private def unregisterPushCredentials ( authId : Long , unregister : UnregisterPushCredentials ) : Future [ Unit ] = < nl > + withAuthSession ( authId ) { session ⇒ < nl > + ( region . ref ? Envelope ( session . userId ) . withUnregisterPushCredentials ( unregister ) ) . mapTo [ UnregisterPushCredentialsAck ] map ( _ ⇒ ( ) ) < nl > + } < nl > + < nl > + private def makeUnregister : PartialFunction [ PushCredentials , UnregisterPushCredentials ] = { < nl > + case actor : ActorPushCredentialsModel ⇒ UnregisterPushCredentials ( ) . withActor ( actor ) < nl > + case apple : ApplePushCredentialsModel ⇒ UnregisterPushCredentials ( ) . withApple ( apple ) < nl > + case google : GooglePushCredentialsModel ⇒ UnregisterPushCredentials ( ) . withGoogle ( google ) < nl > + } < nl > + < nl > + private def findAllPushCredentials ( authId : Long ) : Future [ Seq [ PushCredentials ] ] = < nl > + db . run ( for { < nl > + google ← GooglePushCredentialsRepo . find ( authId ) < nl > + apple ← ApplePushCredentialsRepo . find ( authId ) < nl > + actor ← ActorPushCredentialsRepo . find ( authId ) < nl > + } yield Seq ( google , apple , actor ) . flatten ) < nl > + < nl > private def withAuthSession [ A ] ( authId : Long ) ( f : AuthSession ⇒ Future [ A ] ) : Future [ A ] = { < nl > db . run ( AuthSessionRepo . findByAuthId ( authId ) ) flatMap { < nl > case Some ( session ) ⇒ f ( session ) < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala < nl > index 067e6a6 . . 243f7b2 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala < nl > @ @ - 14 , 6 + 14 , 7 @ @ import im . actor . server . userconfig . SettingsKeys < nl > import slick . dbio . DBIO < nl > < nl > import scala . concurrent . Future < nl > + import scala . util . control . NoStackTrace < nl > < nl > private [ sequence ] trait VendorPushCommand < nl > < nl > @ @ - 32 , 6 + 33 , 8 @ @ private final case class NotificationSettings ( < nl > peers : Map [ Peer , Boolean ] = Map . empty < nl > ) < nl > < nl > + private case object FailedToUnregister extends RuntimeException ( " Failed to unregister push credentials " ) < nl > + < nl > private [ sequence ] object VendorPush { < nl > < nl > private final case class Initialized ( creds : Seq [ ( PushCredentials , PushCredentialsInfo ) ] ) < nl > @ @ - 133 , 14 + 136 , 18 @ @ private [ sequence ] final class VendorPush ( userId : Int ) extends Actor with ActorLo < nl > def initialized = commands orElse internal < nl > < nl > def commands : Receive = { < nl > + case r : RegisterPushCredentials if r . creds . isActor ⇒ < nl > + register ( r . getActor ) < nl > case r : RegisterPushCredentials if r . creds . isApple ⇒ < nl > register ( r . getApple ) < nl > case r : RegisterPushCredentials if r . creds . isGoogle ⇒ < nl > register ( r . getGoogle ) < nl > - case r : RegisterPushCredentials if r . creds . isActor ⇒ < nl > - register ( r . getActor ) < nl > - case UnregisterPushCredentials ( authId ) ⇒ < nl > - unregister ( authId ) < nl > + case u : UnregisterPushCredentials if u . creds . isActor ⇒ < nl > + unregister ( u . getActor ) < nl > + case u : UnregisterPushCredentials if u . creds . isApple ⇒ < nl > + unregister ( u . getApple ) < nl > + case u : UnregisterPushCredentials if u . creds . isGoogle ⇒ < nl > + unregister ( u . getGoogle ) < nl > case DeliverPush ( seq , rules ) ⇒ < nl > deliver ( seq , rules . getOrElse ( PushRules ( ) ) ) < nl > case r : ReloadSettings ⇒ < nl > @ @ - 306 , 19 + 313 , 23 @ @ private [ sequence ] final class VendorPush ( userId : Int ) extends Actor with ActorLo < nl > private def remove ( creds : PushCredentials ) : Unit = < nl > mapping - = creds < nl > < nl > - private def unregister ( authId : Long ) : Unit = < nl > - mapping . keys filter ( _ . authId = = authId ) foreach unregister < nl > - < nl > - private def unregister ( creds : PushCredentials ) : Unit = < nl > + private def unregister ( creds : PushCredentials ) : Unit = { < nl > + val replyTo = sender ( ) < nl > if ( mapping . contains ( creds ) ) { < nl > remove ( creds ) < nl > - < nl > - db . run ( creds match { < nl > - case c : GooglePushCredentials ⇒ GooglePushCredentialsRepo . delete ( c . authId ) < nl > - case c : ApplePushCredentials ⇒ ApplePushCredentialsRepo . delete ( c . authId ) < nl > - case c : ActorPushCredentials ⇒ ActorPushCredentialsRepo . delete ( c . authId ) < nl > - } ) onFailure { < nl > - case e ⇒ log . error ( " Failed to unregister creds " ) < nl > + val removeFu = db . run ( creds match { < nl > + case c : GooglePushCredentials ⇒ GooglePushCredentialsRepo . deleteByToken ( c . regId ) < nl > + case c : ApplePushCredentials ⇒ ApplePushCredentialsRepo . deleteByToken ( c . token . toByteArray ) < nl > + case c : ActorPushCredentials ⇒ ActorPushCredentialsRepo . deleteByTopic ( c . endpoint ) < nl > + } ) map ( _ ⇒ UnregisterPushCredentialsAck ( ) ) pipeTo replyTo < nl > + < nl > + removeFu onFailure { < nl > + case e ⇒ < nl > + log . error ( " Failed to unregister creds : { } " , creds ) < nl > + replyTo ! Status . Failure ( FailedToUnregister ) < nl > } < nl > + } else { < nl > + replyTo ! UnregisterPushCredentialsAck ( ) < nl > } < nl > + } < nl > } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala < nl > index 8b2ff36 . . b217f40 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala < nl > @ @ - 329 , 7 + 329 , 7 @ @ private [ user ] sealed trait AuthCommands { < nl > log . warning ( s " Terminating AuthSession $ { session . id } of user $ { session . userId } and authId $ { session . authId } " ) < nl > for { < nl > _ ← removeAuth ( session . userId , session . authId ) < nl > - _ ← SeqUpdatesExtension ( system ) . deletePushCredentials ( session . authId ) < nl > + _ ← SeqUpdatesExtension ( system ) . unregisterAllPushCredentials ( session . authId ) < nl > _ ← db . run ( p . AuthSessionRepo . delete ( session . userId , session . id ) ) < nl > } yield publishAuthIdInvalidated ( session . authId ) < nl > } < nl > diff - - git a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / push / GooglePushCredentialsRepo . scala b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / push / GooglePushCredentialsRepo . scala < nl > index c51c687 . . 26fea88 100644 < nl > - - - a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / push / GooglePushCredentialsRepo . scala < nl > + + + b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / push / GooglePushCredentialsRepo . scala < nl > @ @ - 20 , 13 + 20 , 6 @ @ final class GooglePushCredentialsTable ( tag : Tag ) extends Table [ GooglePushCredent < nl > object GooglePushCredentialsRepo { < nl > val creds = TableQuery [ GooglePushCredentialsTable ] < nl > < nl > - def createOrUpdate ( authId : Long , projectId : Long , regId : String ) ( implicit ec : ExecutionContext ) = { < nl > - for { < nl > - _ ← creds . filterNot ( _ . authId = = = authId ) . filter ( c ⇒ c . projectId = = = projectId & & c . regId = = = regId ) . delete < nl > - r ← creds . insertOrUpdate ( GooglePushCredentials ( authId , projectId , regId ) ) < nl > - } yield r < nl > - } < nl > - < nl > def createOrUpdate ( c : GooglePushCredentials ) = < nl > creds . insertOrUpdate ( c ) < nl > < nl > @ @ - 46 , 6 + 39 , 9 @ @ object GooglePushCredentialsRepo { < nl > creds ← find ( authIds map ( _ . id ) toSet ) < nl > } yield creds < nl > < nl > + def findByToken ( token : String ) : DBIO [ Option [ GooglePushCredentials ] ] = < nl > + creds . filter ( _ . regId = = = token ) . result . headOption < nl > + < nl > def delete ( authId : Long ) = < nl > creds . filter ( _ . authId = = = authId ) . delete < nl > < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala < nl > index 892da13 . . ed94d12 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala < nl > @ @ - 29 , 13 + 29 , 8 @ @ final class PushServiceImpl ( < nl > private implicit val db : Database = DbExtension ( actorSystem ) . db < nl > private implicit val seqUpdExt : SeqUpdatesExtension = SeqUpdatesExtension ( actorSystem ) < nl > < nl > - override def doHandleUnregisterPush ( clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { < nl > - authorized ( clientData ) { client ⇒ < nl > - for { < nl > - _ ← seqUpdExt . deletePushCredentials ( client . authId ) < nl > - } yield Ok ( ResponseVoid ) < nl > - } < nl > - } < nl > + private val OkVoid = Ok ( ResponseVoid ) < nl > + private val ErrWrongToken = Error ( PushRpcErrors . WrongToken ) < nl > < nl > override def doHandleRegisterGooglePush ( projectId : Long , token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { < nl > val creds = GooglePushCredentials ( clientData . authId , projectId , token ) < nl > @ @ - 43 , 10 + 38 , 10 @ @ final class PushServiceImpl ( < nl > _ ← db . run ( GooglePushCredentialsRepo . deleteByToken ( token ) ) < nl > _ ← db . run ( GooglePushCredentialsRepo . createOrUpdate ( creds ) ) < nl > _ = seqUpdExt . registerGooglePushCredentials ( creds ) < nl > - } yield Ok ( ResponseVoid ) < nl > + } yield OkVoid < nl > } < nl > < nl > - override def doHandleRegisterApplePush ( apnsKey : Int , token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { < nl > + override def doHandleRegisterApplePush ( apnsKey : Int , token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = < nl > BitVector . fromHex ( token ) match { < nl > case Some ( tokenBits ) ⇒ < nl > val tokenBytes = tokenBits . toByteArray < nl > @ @ - 60 , 12 + 55 , 11 @ @ final class PushServiceImpl ( < nl > _ ← ApplePushCredentialsRepo . deleteByToken ( tokenBytes ) < nl > _ ← ApplePushCredentialsRepo . createOrUpdate ( creds ) < nl > _ = seqUpdExt . registerApplePushCredentials ( creds ) < nl > - } yield Ok ( ResponseVoid ) < nl > + } yield OkVoid < nl > db . run ( action ) < nl > case None ⇒ < nl > - Future . successful ( Error ( PushRpcErrors . WrongToken ) ) < nl > + Future . successful ( ErrWrongToken ) < nl > } < nl > - } < nl > < nl > override def doHandleRegisterActorPush ( < nl > topic : String , < nl > @ @ - 78 , 15 + 72 , 9 @ @ final class PushServiceImpl ( < nl > _ ← ActorPushCredentialsRepo . deleteByTopic ( topic ) < nl > _ ← ActorPushCredentialsRepo . createOrUpdate ( clientData . authId , topic ) < nl > _ = seqUpdExt . registerActorPushCredentials ( creds ) < nl > - } yield Ok ( ResponseVoid ) ) < nl > + } yield OkVoid ) < nl > } < nl > < nl > - / * * < nl > - * Registration of a new Apple ' s PushKit tokens < nl > - * < nl > - * @ param apnsKey APNS key id < nl > - * @ param token token value @ note Contains sensitive data ! ! ! < nl > - * / < nl > override protected def doHandleRegisterApplePushKit ( < nl > apnsKey : Int , < nl > token : String , < nl > @ @ - 104 , 17 + 92 , 11 @ @ final class PushServiceImpl ( < nl > val action : DBIO [ HandlerResult [ ResponseVoid ] ] = for { < nl > _ ← ApplePushCredentialsRepo . deleteByToken ( tokenBytes ) < nl > _ ← ApplePushCredentialsRepo . createOrUpdate ( creds ) < nl > - } yield Ok ( ResponseVoid ) < nl > + } yield OkVoid < nl > db . run ( action ) < nl > - case None ⇒ Future . successful ( Error ( PushRpcErrors . WrongToken ) ) < nl > + case None ⇒ Future . successful ( ErrWrongToken ) < nl > } < nl > < nl > - / * * < nl > - * Registering Apple Push Token < nl > - * < nl > - * @ param bundleId Bundle Id of app < nl > - * @ param token Push token < nl > - * / < nl > override protected def doHandleRegisterApplePushToken ( < nl > bundleId : String , < nl > token : String , < nl > @ @ - 133 , 10 + 115 , 44 @ @ final class PushServiceImpl ( < nl > _ ← ApplePushCredentialsRepo . deleteByToken ( tokenBytes ) < nl > _ ← ApplePushCredentialsRepo . createOrUpdate ( creds ) < nl > _ = seqUpdExt . registerApplePushCredentials ( creds ) < nl > - } yield Ok ( ResponseVoid ) < nl > + } yield OkVoid < nl > db . run ( action ) < nl > case None ⇒ < nl > - Future . successful ( Error ( PushRpcErrors . WrongToken ) ) < nl > + Future . successful ( ErrWrongToken ) < nl > + } < nl > + < nl > + / / TODO : figure out , should user be authorized ? < nl > + override protected def doHandleUnregisterGooglePush ( token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = < nl > + seqUpdExt . unregisterGooglePushCredentials ( token ) map ( _ ⇒ OkVoid ) < nl > + < nl > + / / TODO : figure out , should user be authorized ? < nl > + override protected def doHandleUnregisterActorPush ( endpoint : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = < nl > + seqUpdExt . unregisterActorPushCredentials ( endpoint ) map ( _ ⇒ OkVoid ) < nl > + < nl > + / / TODO : figure out , should user be authorized ? < nl > + override protected def doHandleUnregisterApplePush ( token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = < nl > + unregisterApple ( token ) < nl > + < nl > + / / TODO : figure out , should user be authorized ? < nl > + override protected def doHandleUnregisterApplePushToken ( token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = < nl > + unregisterApple ( token ) < nl > + < nl > + / / TODO : figure out , should user be authorized ? < nl > + override protected def doHandleUnregisterApplePushKit ( token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = < nl > + BitVector . fromHex ( token ) match { < nl > + case Some ( tokenBits ) ⇒ < nl > + val tokenBytes = tokenBits . toByteArray < nl > + db . run ( ApplePushCredentialsRepo . deleteByToken ( tokenBytes ) ) map ( _ ⇒ OkVoid ) < nl > + case None ⇒ Future . successful ( ErrWrongToken ) < nl > + } < nl > + < nl > + private def unregisterApple ( token : String ) = < nl > + BitVector . fromHex ( token ) match { < nl > + case Some ( tokenBits ) ⇒ < nl > + val tokenBytes = tokenBits . toByteArray < nl > + seqUpdExt . unregisterApplePushCredentials ( tokenBytes ) map ( _ ⇒ OkVoid ) < nl > + case None ⇒ < nl > + Future . successful ( ErrWrongToken ) < nl > } < nl > < nl > } < nl > \ No newline at end of file
+NEAREST DIFF (one line): diff - - git a / actor - server / actor - models / src / main / scala / im / actor / server / models / push / ApplePushCredentials . scala b / actor - server / actor - models / src / main / scala / im / actor / server / models / push / ApplePushCredentials . scala < nl > deleted file mode 100644 < nl > index 336d0c8 . . 0000000 < nl > - - - a / actor - server / actor - models / src / main / scala / im / actor / server / models / push / ApplePushCredentials . scala < nl > + + + / dev / null < nl > @ @ - 1 , 4 + 0 , 0 @ @ < nl > - package im . actor . server . models . push < nl > - < nl > - @ SerialVersionUID ( 1L ) < nl > - case class ApplePushCredentials ( authId : Long , apnsKey : Int , token : Array [ Byte ] ) < nl > diff - - git a / actor - server / actor - models / src / main / scala / im / actor / server / models / push / GooglePushCredentials . scala b / actor - server / actor - models / src / main / scala / im / actor / server / models / push / GooglePushCredentials . scala < nl > deleted file mode 100644 < nl > index 396b73a . . 0000000 < nl > - - - a / actor - server / actor - models / src / main / scala / im / actor / server / models / push / GooglePushCredentials . scala < nl > + + + / dev / null < nl > @ @ - 1 , 4 + 0 , 0 @ @ < nl > - package im . actor . server . models . push < nl > - < nl > - @ SerialVersionUID ( 1L ) < nl > - case class GooglePushCredentials ( authId : Long , projectId : Long , regId : String ) < nl > diff - - git a / actor - server / actor - models / src / main / scala / im / actor / server / models / push / PushCredentials . scala b / actor - server / actor - models / src / main / scala / im / actor / server / models / push / PushCredentials . scala < nl > new file mode 100644 < nl > index 0000000 . . a35c546 < nl > - - - / dev / null < nl > + + + b / actor - server / actor - models / src / main / scala / im / actor / server / models / push / PushCredentials . scala < nl > @ @ - 0 , 0 + 1 , 9 @ @ < nl > + package im . actor . server . models . push < nl > + < nl > + sealed trait PushCredentials < nl > + < nl > + @ SerialVersionUID ( 1L ) < nl > + case class GooglePushCredentials ( authId : Long , projectId : Long , regId : String ) extends PushCredentials < nl > + < nl > + @ SerialVersionUID ( 1L ) < nl > + case class ApplePushCredentials ( authId : Long , apnsKey : Int , token : Array [ Byte ] ) extends PushCredentials < nl > diff - - git a / actor - server / actor - push / src / main / scala / im / actor / server / push / SeqUpdatesManager . scala b / actor - server / actor - push / src / main / scala / im / actor / server / push / SeqUpdatesManager . scala < nl > index b69c121 . . 7d1cd67 100644 < nl > - - - a / actor - server / actor - push / src / main / scala / im / actor / server / push / SeqUpdatesManager . scala < nl > + + + b / actor - server / actor - push / src / main / scala / im / actor / server / push / SeqUpdatesManager . scala < nl > @ @ - 70 , 14 + 70 , 10 @ @ object SeqUpdatesManager { < nl > private [ push ] case class SubscribeAck ( consumer : ActorRef ) extends Message < nl > < nl > @ SerialVersionUID ( 1L ) < nl > - private [ push ] case class GooglePushCredentialsUpdated ( credsOpt : Option [ models . push . GooglePushCredentials ] ) extends Message < nl > - < nl > - @ SerialVersionUID ( 1L ) < nl > - private [ push ] case class ApplePushCredentialsUpdated ( credsOpt : Option [ models . push . ApplePushCredentials ] ) extends Message < nl > + private [ push ] case class PushCredentialsUpdated ( credsOpt : Option [ models . push . PushCredentials ] ) extends Message < nl > < nl > @ SerialVersionUID ( 1L ) < nl > private case class Initialized ( < nl > - authId : Long , < nl > timestamp : Long , < nl > googleCredsOpt : Option [ models . push . GooglePushCredentials ] , < nl > appleCredsOpt : Option [ models . push . ApplePushCredentials ] < nl > @ @ - 102 , 7 + 98 , 7 @ @ object SeqUpdatesManager { < nl > private val noop1 : Any ⇒ Unit = _ ⇒ ( ) < nl > < nl > private val idExtractor : ShardRegion . IdExtractor = { < nl > - case env @ Envelope ( authId , payload ) ⇒ ( authId . toString , env ) < nl > + case env @ Envelope ( authId , payload ) ⇒ ( authId . toString , payload ) < nl > } < nl > < nl > private val shardResolver : ShardRegion . ShardResolver = msg ⇒ msg match { < nl > @ @ - 332 , 12 + 328 , 12 @ @ object SeqUpdatesManager { < nl > notifyUserUpdate ( client . userId , client . authId , header , serializedData , userIds , groupIds , pushText , originPeer , isFat ) < nl > } < nl > < nl > - def setUpdatedGooglePushCredentials ( authId : Long , credsOpt : Option [ models . push . GooglePushCredentials ] ) ( implicit seqUpdManagerRegion : SeqUpdatesManagerRegion ) : Unit = { < nl > - seqUpdManagerRegion . ref ! Envelope ( authId , GooglePushCredentialsUpdated ( credsOpt ) ) < nl > + def setPushCredentials ( authId : Long , creds : models . push . PushCredentials ) ( implicit region : SeqUpdatesManagerRegion ) : Unit = { < nl > + region . ref ! Envelope ( authId , PushCredentialsUpdated ( Some ( creds ) ) ) < nl > } < nl > < nl > - def setUpdatedApplePushCredentials ( authId : Long , credsOpt : Option [ models . push . ApplePushCredentials ] ) ( implicit seqUpdManagerRegion : SeqUpdatesManagerRegion ) : Unit = { < nl > - seqUpdManagerRegion . ref ! Envelope ( authId , ApplePushCredentialsUpdated ( credsOpt ) ) < nl > + def deletePushCredentials ( authId : Long ) ( implicit region : SeqUpdatesManagerRegion ) : Unit = { < nl > + region . ref ! Envelope ( authId , PushCredentialsUpdated ( None ) ) < nl > } < nl > < nl > def getDifference ( authId : Long , timestamp : Long , maxSizeInBytes : Long ) ( implicit ec : ExecutionContext ) : DBIO [ ( Vector [ models . sequence . SeqUpdate ] , Boolean ) ] = { < nl > @ @ - 496 , 6 + 492 , 9 @ @ class SeqUpdatesManager ( < nl > override def persistenceId : String = self . path . parent . name + " - " + self . path . name < nl > < nl > implicit private val system : ActorSystem = context . system < nl > + implicit private val ec : ExecutionContext = context . dispatcher < nl > + < nl > + private val authId : Long = self . path . name . toLong < nl > < nl > / / FIXME : move to props < nl > private val receiveTimeout = context . system . settings . config . getDuration ( " push . seq - updates - manager . receive - timeout " , TimeUnit . SECONDS ) . seconds < nl > @ @ - 515 , 18 + 514 , 20 @ @ class SeqUpdatesManager ( < nl > private [ this ] val applePusher = new ApplePusher ( applePushManager , db ) < nl > private [ this ] val googlePusher = new GooglePusher ( googlePushManager , db ) < nl > < nl > + initialize ( ) < nl > + < nl > def receiveInitialized : Receive = { < nl > - case Envelope ( _ , GetSequenceState ) ⇒ < nl > + case GetSequenceState ⇒ < nl > sender ( ) ! sequenceState ( seq , timestampToBytes ( lastTimestamp ) ) < nl > - case Envelope ( authId , PushUpdate ( header , updBytes , userIds , groupIds , pushText , originPeer , isFat ) ) ⇒ < nl > + case PushUpdate ( header , updBytes , userIds , groupIds , pushText , originPeer , isFat ) ⇒ < nl > pushUpdate ( authId , header , updBytes , userIds , groupIds , pushText , originPeer , isFat ) < nl > - case Envelope ( authId , PushUpdateGetSequenceState ( header , serializedData , userIds , groupIds , pushText , originPeer , isFat ) ) ⇒ < nl > + case PushUpdateGetSequenceState ( header , serializedData , userIds , groupIds , pushText , originPeer , isFat ) ⇒ < nl > val replyTo = sender ( ) < nl > < nl > pushUpdate ( authId , header , serializedData , userIds , groupIds , pushText , originPeer , isFat , { seqstate : SequenceState ⇒ < nl > replyTo ! seqstate < nl > } ) < nl > - case Envelope ( authId , Subscribe ( consumer : ActorRef ) ) ⇒ < nl > + case Subscribe ( consumer : ActorRef ) ⇒ < nl > if ( ! consumers . contains ( consumer ) ) { < nl > context . watch ( consumer ) < nl > } < nl > @ @ - 536 , 10 + 537 , 19 @ @ class SeqUpdatesManager ( < nl > log . debug ( " Consumer subscribed { } " , consumer ) < nl > < nl > sender ( ) ! SubscribeAck ( consumer ) < nl > - case Envelope ( _ , GooglePushCredentialsUpdated ( credsOpt ) ) ⇒ < nl > - this . googleCredsOpt = credsOpt < nl > - case Envelope ( _ , ApplePushCredentialsUpdated ( credsOpt ) ) ⇒ < nl > - this . appleCredsOpt = credsOpt < nl > + case PushCredentialsUpdated ( credsOpt ) ⇒ < nl > + credsOpt match { < nl > + case Some ( c : models . push . GooglePushCredentials ) ⇒ < nl > + googleCredsOpt = Some ( c ) < nl > + db . run ( setPushCredentials ( c ) ) < nl > + case Some ( c : models . push . ApplePushCredentials ) ⇒ < nl > + appleCredsOpt = Some ( c ) < nl > + db . run ( setPushCredentials ( c ) ) < nl > + case None ⇒ < nl > + googleCredsOpt = None < nl > + appleCredsOpt = None < nl > + db . run ( deletePushCredentials ( authId ) ) < nl > + } < nl > case ReceiveTimeout ⇒ < nl > if ( consumers . isEmpty ) { < nl > context . parent ! Passivate ( stopMessage = PoisonPill ) < nl > @ @ - 550 , 7 + 560 , 7 @ @ class SeqUpdatesManager ( < nl > } < nl > < nl > def stashing : Receive = { < nl > - case Initialized ( authId , timestamp , googleCredsOpt , appleCredsOpt ) ⇒ < nl > + case Initialized ( timestamp , googleCredsOpt , appleCredsOpt ) ⇒ < nl > this . lastTimestamp = timestamp < nl > this . googleCredsOpt = googleCredsOpt < nl > this . appleCredsOpt = appleCredsOpt < nl > @ @ - 560 , 36 + 570 , 7 @ @ class SeqUpdatesManager ( < nl > case msg ⇒ stash ( ) < nl > } < nl > < nl > - def waitingForEnvelope : Receive = { < nl > - case env @ Envelope ( authId , _ ) ⇒ < nl > - stash ( ) < nl > - context . become ( stashing ) < nl > - < nl > - / / TODO : pinned dispatcher ? < nl > - implicit val ec = context . dispatcher < nl > - < nl > - val initiatedFuture : Future [ Initialized ] = for { < nl > - seqUpdOpt ← db . run ( p . sequence . SeqUpdate . findLast ( authId ) ) < nl > - googleCredsOpt ← db . run ( p . push . GooglePushCredentials . find ( authId ) ) < nl > - appleCredsOpt ← db . run ( p . push . ApplePushCredentials . find ( authId ) ) < nl > - } yield Initialized ( < nl > - authId , < nl > - seqUpdOpt . map ( _ . timestamp ) . getOrElse ( 0 ) , < nl > - googleCredsOpt , < nl > - appleCredsOpt < nl > - ) < nl > - < nl > - initiatedFuture . onFailure { < nl > - case e ⇒ < nl > - log . error ( e , " Failed initiating SeqUpdatesManager " ) < nl > - context . parent ! Passivate ( stopMessage = PoisonPill ) < nl > - } < nl > - < nl > - initiatedFuture . pipeTo ( self ) < nl > - case msg ⇒ stash ( ) < nl > - } < nl > - < nl > - override def receiveCommand : Receive = waitingForEnvelope < nl > + override def receiveCommand : Receive = stashing < nl > < nl > override def receiveRecover : Receive = { < nl > case SeqChangedKryo ( value ) ⇒ < nl > @ @ - 618 , 6 + 599 , 26 @ @ class SeqUpdatesManager ( < nl > log . error ( reason , " SeqUpdatesManager exception , message option : { } " , message ) < nl > } < nl > < nl > + private def initialize ( ) : Unit = { < nl > + val initiatedFuture : Future [ Initialized ] = for { < nl > + seqUpdOpt ← db . run ( p . sequence . SeqUpdate . findLast ( authId ) ) < nl > + googleCredsOpt ← db . run ( p . push . GooglePushCredentials . find ( authId ) ) < nl > + appleCredsOpt ← db . run ( p . push . ApplePushCredentials . find ( authId ) ) < nl > + } yield Initialized ( < nl > + seqUpdOpt . map ( _ . timestamp ) . getOrElse ( 0 ) , < nl > + googleCredsOpt , < nl > + appleCredsOpt < nl > + ) < nl > + < nl > + initiatedFuture . onFailure { < nl > + case e ⇒ < nl > + log . error ( e , " Failed initiating SeqUpdatesManager " ) < nl > + context . parent ! Passivate ( stopMessage = PoisonPill ) < nl > + } < nl > + < nl > + initiatedFuture pipeTo self < nl > + } < nl > + < nl > private def pushUpdate ( < nl > authId : Long , < nl > header : Int , < nl > diff - - git a / actor - server / actor - push / src / main / scala / im / actor / server / push / VendorPush . scala b / actor - server / actor - push / src / main / scala / im / actor / server / push / VendorPush . scala < nl > index 610e149 . . 7214f86 100644 < nl > - - - a / actor - server / actor - push / src / main / scala / im / actor / server / push / VendorPush . scala < nl > + + + b / actor - server / actor - push / src / main / scala / im / actor / server / push / VendorPush . scala < nl > @ @ - 3 , 12 + 3 , 25 @ @ package im . actor . server . push < nl > import scala . concurrent . ExecutionContext < nl > < nl > import slick . dbio . Effect . Read < nl > - import slick . dbio . { NoStream , DBIOAction } < nl > + import slick . dbio . { DBIO , NoStream , DBIOAction } < nl > < nl > import im . actor . api . rpc . peers . { PeerType , Peer } < nl > + import im . actor . server . models < nl > import im . actor . server . persist < nl > < nl > private [ push ] trait VendorPush { < nl > + protected def setPushCredentials ( creds : models . push . ApplePushCredentials ) : DBIO [ Int ] = < nl > + persist . push . ApplePushCredentials . createOrUpdate ( creds ) < nl > + < nl > + protected def setPushCredentials ( creds : models . push . GooglePushCredentials ) : DBIO [ Int ] = < nl > + persist . push . GooglePushCredentials . createOrUpdate ( creds ) < nl > + < nl > + protected def deletePushCredentials ( authId : Long ) ( implicit ec : ExecutionContext ) : DBIO [ Int ] = < nl > + for { < nl > + a ← persist . push . ApplePushCredentials . delete ( authId ) < nl > + g ← persist . push . GooglePushCredentials . delete ( authId ) < nl > + } yield a + g < nl > + < nl > protected def getShowText ( userId : Int , paramBase : String ) ( implicit ec : ExecutionContext ) : DBIOAction [ Boolean , NoStream , Read ] = { < nl > persist . configs . Parameter . findValue ( userId , s " $ { paramBase } . show _ text " ) map { < nl > case Some ( " true " ) ⇒ true < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala < nl > index e9bc2dd . . 8991e3d 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala < nl > @ @ - 1 , 16 + 1 , 15 @ @ < nl > package im . actor . server . api . rpc . service . push < nl > < nl > - import scala . concurrent . { ExecutionContext , Future } < nl > - < nl > import akka . actor . ActorSystem < nl > - import scodec . bits . BitVector < nl > - import slick . driver . PostgresDriver . api . _ < nl > - < nl > import im . actor . api . rpc . _ < nl > import im . actor . api . rpc . misc . ResponseVoid < nl > import im . actor . api . rpc . push . PushService < nl > - import im . actor . server . { models , persist } < nl > + import im . actor . server . models < nl > import im . actor . server . push . { SeqUpdatesManager , SeqUpdatesManagerRegion } < nl > + import scodec . bits . BitVector < nl > + import slick . driver . PostgresDriver . api . _ < nl > + < nl > + import scala . concurrent . { ExecutionContext , Future } < nl > < nl > class PushServiceImpl ( < nl > implicit < nl > @ @ - 18 , 46 + 17 , 25 @ @ class PushServiceImpl ( < nl > db : Database , < nl > actorSystem : ActorSystem < nl > ) extends PushService { < nl > - import SeqUpdatesManager . _ < nl > - < nl > override implicit val ec : ExecutionContext = actorSystem . dispatcher < nl > < nl > override def jhandleUnregisterPush ( clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { < nl > - val action = for { < nl > - _ ← persist . push . ApplePushCredentials . delete ( clientData . authId ) . asTry < nl > - _ ← persist . push . GooglePushCredentials . delete ( clientData . authId ) . asTry < nl > - } yield Ok ( ResponseVoid ) < nl > - < nl > - setUpdatedApplePushCredentials ( clientData . authId , None ) < nl > - setUpdatedGooglePushCredentials ( clientData . authId , None ) < nl > - < nl > - db . run ( action ) < nl > + SeqUpdatesManager . deletePushCredentials ( clientData . authId ) < nl > + Future . successful ( Ok ( ResponseVoid ) ) < nl > } < nl > < nl > override def jhandleRegisterGooglePush ( projectId : Long , token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { < nl > val creds = models . push . GooglePushCredentials ( clientData . authId , projectId , token ) < nl > - < nl > - val action = for { < nl > - _ ← persist . push . GooglePushCredentials . createOrUpdate ( creds ) < nl > - } yield Ok ( ResponseVoid ) < nl > - < nl > - setUpdatedGooglePushCredentials ( clientData . authId , Some ( creds ) ) < nl > - < nl > - db . run ( action ) < nl > + SeqUpdatesManager . setPushCredentials ( clientData . authId , creds ) < nl > + Future . successful ( Ok ( ResponseVoid ) ) < nl > } < nl > < nl > override def jhandleRegisterApplePush ( apnsKey : Int , token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { < nl > BitVector . fromHex ( token ) match { < nl > case Some ( tokenBits ) ⇒ < nl > val creds = models . push . ApplePushCredentials ( clientData . authId , apnsKey , tokenBits . toByteArray ) < nl > - < nl > - val action = for { < nl > - _ ← persist . push . ApplePushCredentials . createOrUpdate ( creds ) < nl > - } yield ( Ok ( ResponseVoid ) ) < nl > - < nl > - setUpdatedApplePushCredentials ( clientData . authId , Some ( creds ) ) < nl > - < nl > - db . run ( action ) < nl > + SeqUpdatesManager . setPushCredentials ( clientData . authId , creds ) < nl > + Future . successful ( Ok ( ResponseVoid ) ) < nl > case None ⇒ < nl > Future . successful ( Error ( RpcError ( 400 , " WRONG _ TOKEN " , " Wrong APNS Token " , false , None ) ) ) < nl > }
+
+TEST DIFF:
+diff - - git a / actor - server / actor - core / src / main / protobuf / sequence . proto b / actor - server / actor - core / src / main / protobuf / sequence . proto 
+ index fb353a2 . . 1878c5f 100644 
+ - - - a / actor - server / actor - core / src / main / protobuf / sequence . proto 
+ + + + b / actor - server / actor - core / src / main / protobuf / sequence . proto 
+ @ @ - 73 , 9 + 73 , 15 @ @ message UserSequenceCommands { 
+ message UnregisterPushCredentials { 
+ option ( scalapb . message ) . extends = " im . actor . server . sequence . VendorPushCommand " ; 
+ 
+ - int64 auth _ id = 1 ; 
+ + oneof creds { 
+ + GooglePushCredentials google = 1 ; 
+ + ApplePushCredentials apple = 2 ; 
+ + ActorPushCredentials actor = 3 ; 
+ + } 
+ } 
+ 
+ + message UnregisterPushCredentialsAck { } 
+ + 
+ message DeliverPush { 
+ option ( scalapb . message ) . extends = " im . actor . server . sequence . VendorPushCommand " ; 
+ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / PushFutureListener . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / PushFutureListener . scala 
+ index f34cdae . . 5ad356b 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / PushFutureListener . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / PushFutureListener . scala 
+ @ @ - 38 , 7 + 38 , 7 @ @ final class PushFutureListener ( userId : Int , creds : ApplePushCredentials , credsId 
+ ) 
+ Option ( response . getTokenInvalidationTimestamp ) foreach { ts ⇒ 
+ log . warning ( " APNS token : { } for user : { } invalidated at { } . Deleting token now " , tokenString , userId , ts ) 
+ - seqUpdExt . deleteApplePushCredentials ( tokenBytes ) 
+ + seqUpdExt . unregisterApplePushCredentials ( tokenBytes ) 
+ } 
+ } 
+ case Failure ( e ) ⇒ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ index 9fb3daf . . b698ad6 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ @ @ - 3 , 6 + 3 , 7 @ @ package im . actor . server . sequence 
+ import akka . actor . _ 
+ import akka . cluster . pubsub . { DistributedPubSub , DistributedPubSubMediator } 
+ import akka . event . Logging 
+ + import akka . http . scaladsl . util . FastFuture 
+ import akka . pattern . ask 
+ import akka . stream . ActorMaterializer 
+ import akka . util . Timeout 
+ @ @ - 14 , 8 + 15 , 9 @ @ import im . actor . server . db . DbExtension 
+ import im . actor . server . model . _ 
+ import im . actor . server . model . push . { PushCredentials , ActorPushCredentials ⇒ ActorPushCredentialsModel , ApplePushCredentials ⇒ ApplePushCredentialsModel , GooglePushCredentials ⇒ GooglePushCredentialsModel } 
+ import im . actor . server . persist . AuthSessionRepo 
+ - import im . actor . server . persist . push . ApplePushCredentialsRepo 
+ + import im . actor . server . persist . push . { ActorPushCredentialsRepo , ApplePushCredentialsRepo , GooglePushCredentialsRepo } 
+ import im . actor . server . persist . sequence . UserSequenceRepo 
+ + import scodec . bits . BitVector 
+ import slick . dbio . DBIO 
+ 
+ import scala . annotation . tailrec 
+ @ @ - 228 , 23 + 230 , 56 @ @ final class SeqUpdatesExtension ( _ system : ActorSystem ) extends Extension { 
+ Future . successful ( ( ) ) 
+ } 
+ 
+ - / / TODO : real future 
+ - def deletePushCredentials ( authId : Long ) : Future [ Unit ] = 
+ - withAuthSession ( authId ) { session ⇒ 
+ - region . ref ! Envelope ( session . userId ) . withUnregisterPushCredentials ( UnregisterPushCredentials ( authId ) ) 
+ - Future . successful ( ( ) ) 
+ + def unregisterAllPushCredentials ( authId : Long ) : Future [ Unit ] = 
+ + findAllPushCredentials ( authId ) map { creds ⇒ 
+ + creds map ( c ⇒ unregisterPushCredentials ( c . authId , makeUnregister ( c ) ) ) 
+ + } 
+ + 
+ + def unregisterActorPushCredentials ( endpoint : String ) : Future [ Unit ] = 
+ + db . run ( ActorPushCredentialsRepo . findByTopic ( endpoint ) . headOption ) flatMap { 
+ + case Some ( creds ) ⇒ 
+ + unregisterPushCredentials ( creds . authId , UnregisterPushCredentials ( ) . withActor ( creds ) ) 
+ + case None ⇒ 
+ + log . warning ( " Actor push credentials not found for endpoint : { } " , endpoint ) 
+ + FastFuture . successful ( ( ) ) 
+ } 
+ 
+ - def deleteApplePushCredentials ( token : Array [ Byte ] ) : Future [ Unit ] = 
+ + def unregisterApplePushCredentials ( token : Array [ Byte ] ) : Future [ Unit ] = 
+ db . run ( ApplePushCredentialsRepo . findByToken ( token ) . headOption ) flatMap { 
+ case Some ( creds ) ⇒ 
+ - deletePushCredentials ( creds . authId ) 
+ + unregisterPushCredentials ( creds . authId , UnregisterPushCredentials ( ) . withApple ( creds ) ) 
+ case None ⇒ 
+ - val err = new RuntimeException ( " Apple push credentials not found " ) 
+ - log . error ( err , err . getMessage ) 
+ - throw err 
+ + log . warning ( " Apple push credentials not found for token : { } " , BitVector ( token ) . toHex ) 
+ + FastFuture . successful ( ( ) ) 
+ } 
+ 
+ + def unregisterGooglePushCredentials ( token : String ) : Future [ Unit ] = 
+ + db . run ( GooglePushCredentialsRepo . findByToken ( token ) ) flatMap { 
+ + case Some ( creds ) ⇒ 
+ + unregisterPushCredentials ( creds . authId , UnregisterPushCredentials ( ) . withGoogle ( creds ) ) 
+ + case None ⇒ 
+ + log . warning ( " Google push credentials not found for token : { } " , token ) 
+ + FastFuture . successful ( ( ) ) 
+ + } 
+ + 
+ + private def unregisterPushCredentials ( authId : Long , unregister : UnregisterPushCredentials ) : Future [ Unit ] = 
+ + withAuthSession ( authId ) { session ⇒ 
+ + ( region . ref ? Envelope ( session . userId ) . withUnregisterPushCredentials ( unregister ) ) . mapTo [ UnregisterPushCredentialsAck ] map ( _ ⇒ ( ) ) 
+ + } 
+ + 
+ + private def makeUnregister : PartialFunction [ PushCredentials , UnregisterPushCredentials ] = { 
+ + case actor : ActorPushCredentialsModel ⇒ UnregisterPushCredentials ( ) . withActor ( actor ) 
+ + case apple : ApplePushCredentialsModel ⇒ UnregisterPushCredentials ( ) . withApple ( apple ) 
+ + case google : GooglePushCredentialsModel ⇒ UnregisterPushCredentials ( ) . withGoogle ( google ) 
+ + } 
+ + 
+ + private def findAllPushCredentials ( authId : Long ) : Future [ Seq [ PushCredentials ] ] = 
+ + db . run ( for { 
+ + google ← GooglePushCredentialsRepo . find ( authId ) 
+ + apple ← ApplePushCredentialsRepo . find ( authId ) 
+ + actor ← ActorPushCredentialsRepo . find ( authId ) 
+ + } yield Seq ( google , apple , actor ) . flatten ) 
+ + 
+ private def withAuthSession [ A ] ( authId : Long ) ( f : AuthSession ⇒ Future [ A ] ) : Future [ A ] = { 
+ db . run ( AuthSessionRepo . findByAuthId ( authId ) ) flatMap { 
+ case Some ( session ) ⇒ f ( session ) 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala 
+ index 067e6a6 . . 243f7b2 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala 
+ @ @ - 14 , 6 + 14 , 7 @ @ import im . actor . server . userconfig . SettingsKeys 
+ import slick . dbio . DBIO 
+ 
+ import scala . concurrent . Future 
+ + import scala . util . control . NoStackTrace 
+ 
+ private [ sequence ] trait VendorPushCommand 
+ 
+ @ @ - 32 , 6 + 33 , 8 @ @ private final case class NotificationSettings ( 
+ peers : Map [ Peer , Boolean ] = Map . empty 
+ ) 
+ 
+ + private case object FailedToUnregister extends RuntimeException ( " Failed to unregister push credentials " ) 
+ + 
+ private [ sequence ] object VendorPush { 
+ 
+ private final case class Initialized ( creds : Seq [ ( PushCredentials , PushCredentialsInfo ) ] ) 
+ @ @ - 133 , 14 + 136 , 18 @ @ private [ sequence ] final class VendorPush ( userId : Int ) extends Actor with ActorLo 
+ def initialized = commands orElse internal 
+ 
+ def commands : Receive = { 
+ + case r : RegisterPushCredentials if r . creds . isActor ⇒ 
+ + register ( r . getActor ) 
+ case r : RegisterPushCredentials if r . creds . isApple ⇒ 
+ register ( r . getApple ) 
+ case r : RegisterPushCredentials if r . creds . isGoogle ⇒ 
+ register ( r . getGoogle ) 
+ - case r : RegisterPushCredentials if r . creds . isActor ⇒ 
+ - register ( r . getActor ) 
+ - case UnregisterPushCredentials ( authId ) ⇒ 
+ - unregister ( authId ) 
+ + case u : UnregisterPushCredentials if u . creds . isActor ⇒ 
+ + unregister ( u . getActor ) 
+ + case u : UnregisterPushCredentials if u . creds . isApple ⇒ 
+ + unregister ( u . getApple ) 
+ + case u : UnregisterPushCredentials if u . creds . isGoogle ⇒ 
+ + unregister ( u . getGoogle ) 
+ case DeliverPush ( seq , rules ) ⇒ 
+ deliver ( seq , rules . getOrElse ( PushRules ( ) ) ) 
+ case r : ReloadSettings ⇒ 
+ @ @ - 306 , 19 + 313 , 23 @ @ private [ sequence ] final class VendorPush ( userId : Int ) extends Actor with ActorLo 
+ private def remove ( creds : PushCredentials ) : Unit = 
+ mapping - = creds 
+ 
+ - private def unregister ( authId : Long ) : Unit = 
+ - mapping . keys filter ( _ . authId = = authId ) foreach unregister 
+ - 
+ - private def unregister ( creds : PushCredentials ) : Unit = 
+ + private def unregister ( creds : PushCredentials ) : Unit = { 
+ + val replyTo = sender ( ) 
+ if ( mapping . contains ( creds ) ) { 
+ remove ( creds ) 
+ - 
+ - db . run ( creds match { 
+ - case c : GooglePushCredentials ⇒ GooglePushCredentialsRepo . delete ( c . authId ) 
+ - case c : ApplePushCredentials ⇒ ApplePushCredentialsRepo . delete ( c . authId ) 
+ - case c : ActorPushCredentials ⇒ ActorPushCredentialsRepo . delete ( c . authId ) 
+ - } ) onFailure { 
+ - case e ⇒ log . error ( " Failed to unregister creds " ) 
+ + val removeFu = db . run ( creds match { 
+ + case c : GooglePushCredentials ⇒ GooglePushCredentialsRepo . deleteByToken ( c . regId ) 
+ + case c : ApplePushCredentials ⇒ ApplePushCredentialsRepo . deleteByToken ( c . token . toByteArray ) 
+ + case c : ActorPushCredentials ⇒ ActorPushCredentialsRepo . deleteByTopic ( c . endpoint ) 
+ + } ) map ( _ ⇒ UnregisterPushCredentialsAck ( ) ) pipeTo replyTo 
+ + 
+ + removeFu onFailure { 
+ + case e ⇒ 
+ + log . error ( " Failed to unregister creds : { } " , creds ) 
+ + replyTo ! Status . Failure ( FailedToUnregister ) 
+ } 
+ + } else { 
+ + replyTo ! UnregisterPushCredentialsAck ( ) 
+ } 
+ + } 
+ } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala 
+ index 8b2ff36 . . b217f40 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala 
+ @ @ - 329 , 7 + 329 , 7 @ @ private [ user ] sealed trait AuthCommands { 
+ log . warning ( s " Terminating AuthSession $ { session . id } of user $ { session . userId } and authId $ { session . authId } " ) 
+ for { 
+ _ ← removeAuth ( session . userId , session . authId ) 
+ - _ ← SeqUpdatesExtension ( system ) . deletePushCredentials ( session . authId ) 
+ + _ ← SeqUpdatesExtension ( system ) . unregisterAllPushCredentials ( session . authId ) 
+ _ ← db . run ( p . AuthSessionRepo . delete ( session . userId , session . id ) ) 
+ } yield publishAuthIdInvalidated ( session . authId ) 
+ } 
+ diff - - git a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / push / GooglePushCredentialsRepo . scala b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / push / GooglePushCredentialsRepo . scala 
+ index c51c687 . . 26fea88 100644 
+ - - - a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / push / GooglePushCredentialsRepo . scala 
+ + + + b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / push / GooglePushCredentialsRepo . scala 
+ @ @ - 20 , 13 + 20 , 6 @ @ final class GooglePushCredentialsTable ( tag : Tag ) extends Table [ GooglePushCredent 
+ object GooglePushCredentialsRepo { 
+ val creds = TableQuery [ GooglePushCredentialsTable ] 
+ 
+ - def createOrUpdate ( authId : Long , projectId : Long , regId : String ) ( implicit ec : ExecutionContext ) = { 
+ - for { 
+ - _ ← creds . filterNot ( _ . authId = = = authId ) . filter ( c ⇒ c . projectId = = = projectId & & c . regId = = = regId ) . delete 
+ - r ← creds . insertOrUpdate ( GooglePushCredentials ( authId , projectId , regId ) ) 
+ - } yield r 
+ - } 
+ - 
+ def createOrUpdate ( c : GooglePushCredentials ) = 
+ creds . insertOrUpdate ( c ) 
+ 
+ @ @ - 46 , 6 + 39 , 9 @ @ object GooglePushCredentialsRepo { 
+ creds ← find ( authIds map ( _ . id ) toSet ) 
+ } yield creds 
+ 
+ + def findByToken ( token : String ) : DBIO [ Option [ GooglePushCredentials ] ] = 
+ + creds . filter ( _ . regId = = = token ) . result . headOption 
+ + 
+ def delete ( authId : Long ) = 
+ creds . filter ( _ . authId = = = authId ) . delete 
+ 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala 
+ index 892da13 . . ed94d12 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala 
+ @ @ - 29 , 13 + 29 , 8 @ @ final class PushServiceImpl ( 
+ private implicit val db : Database = DbExtension ( actorSystem ) . db 
+ private implicit val seqUpdExt : SeqUpdatesExtension = SeqUpdatesExtension ( actorSystem ) 
+ 
+ - override def doHandleUnregisterPush ( clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { 
+ - authorized ( clientData ) { client ⇒ 
+ - for { 
+ - _ ← seqUpdExt . deletePushCredentials ( client . authId ) 
+ - } yield Ok ( ResponseVoid ) 
+ - } 
+ - } 
+ + private val OkVoid = Ok ( ResponseVoid ) 
+ + private val ErrWrongToken = Error ( PushRpcErrors . WrongToken ) 
+ 
+ override def doHandleRegisterGooglePush ( projectId : Long , token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { 
+ val creds = GooglePushCredentials ( clientData . authId , projectId , token ) 
+ @ @ - 43 , 10 + 38 , 10 @ @ final class PushServiceImpl ( 
+ _ ← db . run ( GooglePushCredentialsRepo . deleteByToken ( token ) ) 
+ _ ← db . run ( GooglePushCredentialsRepo . createOrUpdate ( creds ) ) 
+ _ = seqUpdExt . registerGooglePushCredentials ( creds ) 
+ - } yield Ok ( ResponseVoid ) 
+ + } yield OkVoid 
+ } 
+ 
+ - override def doHandleRegisterApplePush ( apnsKey : Int , token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { 
+ + override def doHandleRegisterApplePush ( apnsKey : Int , token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = 
+ BitVector . fromHex ( token ) match { 
+ case Some ( tokenBits ) ⇒ 
+ val tokenBytes = tokenBits . toByteArray 
+ @ @ - 60 , 12 + 55 , 11 @ @ final class PushServiceImpl ( 
+ _ ← ApplePushCredentialsRepo . deleteByToken ( tokenBytes ) 
+ _ ← ApplePushCredentialsRepo . createOrUpdate ( creds ) 
+ _ = seqUpdExt . registerApplePushCredentials ( creds ) 
+ - } yield Ok ( ResponseVoid ) 
+ + } yield OkVoid 
+ db . run ( action ) 
+ case None ⇒ 
+ - Future . successful ( Error ( PushRpcErrors . WrongToken ) ) 
+ + Future . successful ( ErrWrongToken ) 
+ } 
+ - } 
+ 
+ override def doHandleRegisterActorPush ( 
+ topic : String , 
+ @ @ - 78 , 15 + 72 , 9 @ @ final class PushServiceImpl ( 
+ _ ← ActorPushCredentialsRepo . deleteByTopic ( topic ) 
+ _ ← ActorPushCredentialsRepo . createOrUpdate ( clientData . authId , topic ) 
+ _ = seqUpdExt . registerActorPushCredentials ( creds ) 
+ - } yield Ok ( ResponseVoid ) ) 
+ + } yield OkVoid ) 
+ } 
+ 
+ - / * * 
+ - * Registration of a new Apple ' s PushKit tokens 
+ - * 
+ - * @ param apnsKey APNS key id 
+ - * @ param token token value @ note Contains sensitive data ! ! ! 
+ - * / 
+ override protected def doHandleRegisterApplePushKit ( 
+ apnsKey : Int , 
+ token : String , 
+ @ @ - 104 , 17 + 92 , 11 @ @ final class PushServiceImpl ( 
+ val action : DBIO [ HandlerResult [ ResponseVoid ] ] = for { 
+ _ ← ApplePushCredentialsRepo . deleteByToken ( tokenBytes ) 
+ _ ← ApplePushCredentialsRepo . createOrUpdate ( creds ) 
+ - } yield Ok ( ResponseVoid ) 
+ + } yield OkVoid 
+ db . run ( action ) 
+ - case None ⇒ Future . successful ( Error ( PushRpcErrors . WrongToken ) ) 
+ + case None ⇒ Future . successful ( ErrWrongToken ) 
+ } 
+ 
+ - / * * 
+ - * Registering Apple Push Token 
+ - * 
+ - * @ param bundleId Bundle Id of app 
+ - * @ param token Push token 
+ - * / 
+ override protected def doHandleRegisterApplePushToken ( 
+ bundleId : String , 
+ token : String , 
+ @ @ - 133 , 10 + 115 , 44 @ @ final class PushServiceImpl ( 
+ _ ← ApplePushCredentialsRepo . deleteByToken ( tokenBytes ) 
+ _ ← ApplePushCredentialsRepo . createOrUpdate ( creds ) 
+ _ = seqUpdExt . registerApplePushCredentials ( creds ) 
+ - } yield Ok ( ResponseVoid ) 
+ + } yield OkVoid 
+ db . run ( action ) 
+ case None ⇒ 
+ - Future . successful ( Error ( PushRpcErrors . WrongToken ) ) 
+ + Future . successful ( ErrWrongToken ) 
+ + } 
+ + 
+ + / / TODO : figure out , should user be authorized ? 
+ + override protected def doHandleUnregisterGooglePush ( token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = 
+ + seqUpdExt . unregisterGooglePushCredentials ( token ) map ( _ ⇒ OkVoid ) 
+ + 
+ + / / TODO : figure out , should user be authorized ? 
+ + override protected def doHandleUnregisterActorPush ( endpoint : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = 
+ + seqUpdExt . unregisterActorPushCredentials ( endpoint ) map ( _ ⇒ OkVoid ) 
+ + 
+ + / / TODO : figure out , should user be authorized ? 
+ + override protected def doHandleUnregisterApplePush ( token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = 
+ + unregisterApple ( token ) 
+ + 
+ + / / TODO : figure out , should user be authorized ? 
+ + override protected def doHandleUnregisterApplePushToken ( token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = 
+ + unregisterApple ( token ) 
+ + 
+ + / / TODO : figure out , should user be authorized ? 
+ + override protected def doHandleUnregisterApplePushKit ( token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = 
+ + BitVector . fromHex ( token ) match { 
+ + case Some ( tokenBits ) ⇒ 
+ + val tokenBytes = tokenBits . toByteArray 
+ + db . run ( ApplePushCredentialsRepo . deleteByToken ( tokenBytes ) ) map ( _ ⇒ OkVoid ) 
+ + case None ⇒ Future . successful ( ErrWrongToken ) 
+ + } 
+ + 
+ + private def unregisterApple ( token : String ) = 
+ + BitVector . fromHex ( token ) match { 
+ + case Some ( tokenBits ) ⇒ 
+ + val tokenBytes = tokenBits . toByteArray 
+ + seqUpdExt . unregisterApplePushCredentials ( tokenBytes ) map ( _ ⇒ OkVoid ) 
+ + case None ⇒ 
+ + Future . successful ( ErrWrongToken ) 
+ } 
+ 
+ } 
+ \ No newline at end of file
+
+NEAREST DIFF:
+diff - - git a / actor - server / actor - models / src / main / scala / im / actor / server / models / push / ApplePushCredentials . scala b / actor - server / actor - models / src / main / scala / im / actor / server / models / push / ApplePushCredentials . scala 
+ deleted file mode 100644 
+ index 336d0c8 . . 0000000 
+ - - - a / actor - server / actor - models / src / main / scala / im / actor / server / models / push / ApplePushCredentials . scala 
+ + + + / dev / null 
+ @ @ - 1 , 4 + 0 , 0 @ @ 
+ - package im . actor . server . models . push 
+ - 
+ - @ SerialVersionUID ( 1L ) 
+ - case class ApplePushCredentials ( authId : Long , apnsKey : Int , token : Array [ Byte ] ) 
+ diff - - git a / actor - server / actor - models / src / main / scala / im / actor / server / models / push / GooglePushCredentials . scala b / actor - server / actor - models / src / main / scala / im / actor / server / models / push / GooglePushCredentials . scala 
+ deleted file mode 100644 
+ index 396b73a . . 0000000 
+ - - - a / actor - server / actor - models / src / main / scala / im / actor / server / models / push / GooglePushCredentials . scala 
+ + + + / dev / null 
+ @ @ - 1 , 4 + 0 , 0 @ @ 
+ - package im . actor . server . models . push 
+ - 
+ - @ SerialVersionUID ( 1L ) 
+ - case class GooglePushCredentials ( authId : Long , projectId : Long , regId : String ) 
+ diff - - git a / actor - server / actor - models / src / main / scala / im / actor / server / models / push / PushCredentials . scala b / actor - server / actor - models / src / main / scala / im / actor / server / models / push / PushCredentials . scala 
+ new file mode 100644 
+ index 0000000 . . a35c546 
+ - - - / dev / null 
+ + + + b / actor - server / actor - models / src / main / scala / im / actor / server / models / push / PushCredentials . scala 
+ @ @ - 0 , 0 + 1 , 9 @ @ 
+ + package im . actor . server . models . push 
+ + 
+ + sealed trait PushCredentials 
+ + 
+ + @ SerialVersionUID ( 1L ) 
+ + case class GooglePushCredentials ( authId : Long , projectId : Long , regId : String ) extends PushCredentials 
+ + 
+ + @ SerialVersionUID ( 1L ) 
+ + case class ApplePushCredentials ( authId : Long , apnsKey : Int , token : Array [ Byte ] ) extends PushCredentials 
+ diff - - git a / actor - server / actor - push / src / main / scala / im / actor / server / push / SeqUpdatesManager . scala b / actor - server / actor - push / src / main / scala / im / actor / server / push / SeqUpdatesManager . scala 
+ index b69c121 . . 7d1cd67 100644 
+ - - - a / actor - server / actor - push / src / main / scala / im / actor / server / push / SeqUpdatesManager . scala 
+ + + + b / actor - server / actor - push / src / main / scala / im / actor / server / push / SeqUpdatesManager . scala 
+ @ @ - 70 , 14 + 70 , 10 @ @ object SeqUpdatesManager { 
+ private [ push ] case class SubscribeAck ( consumer : ActorRef ) extends Message 
+ 
+ @ SerialVersionUID ( 1L ) 
+ - private [ push ] case class GooglePushCredentialsUpdated ( credsOpt : Option [ models . push . GooglePushCredentials ] ) extends Message 
+ - 
+ - @ SerialVersionUID ( 1L ) 
+ - private [ push ] case class ApplePushCredentialsUpdated ( credsOpt : Option [ models . push . ApplePushCredentials ] ) extends Message 
+ + private [ push ] case class PushCredentialsUpdated ( credsOpt : Option [ models . push . PushCredentials ] ) extends Message 
+ 
+ @ SerialVersionUID ( 1L ) 
+ private case class Initialized ( 
+ - authId : Long , 
+ timestamp : Long , 
+ googleCredsOpt : Option [ models . push . GooglePushCredentials ] , 
+ appleCredsOpt : Option [ models . push . ApplePushCredentials ] 
+ @ @ - 102 , 7 + 98 , 7 @ @ object SeqUpdatesManager { 
+ private val noop1 : Any ⇒ Unit = _ ⇒ ( ) 
+ 
+ private val idExtractor : ShardRegion . IdExtractor = { 
+ - case env @ Envelope ( authId , payload ) ⇒ ( authId . toString , env ) 
+ + case env @ Envelope ( authId , payload ) ⇒ ( authId . toString , payload ) 
+ } 
+ 
+ private val shardResolver : ShardRegion . ShardResolver = msg ⇒ msg match { 
+ @ @ - 332 , 12 + 328 , 12 @ @ object SeqUpdatesManager { 
+ notifyUserUpdate ( client . userId , client . authId , header , serializedData , userIds , groupIds , pushText , originPeer , isFat ) 
+ } 
+ 
+ - def setUpdatedGooglePushCredentials ( authId : Long , credsOpt : Option [ models . push . GooglePushCredentials ] ) ( implicit seqUpdManagerRegion : SeqUpdatesManagerRegion ) : Unit = { 
+ - seqUpdManagerRegion . ref ! Envelope ( authId , GooglePushCredentialsUpdated ( credsOpt ) ) 
+ + def setPushCredentials ( authId : Long , creds : models . push . PushCredentials ) ( implicit region : SeqUpdatesManagerRegion ) : Unit = { 
+ + region . ref ! Envelope ( authId , PushCredentialsUpdated ( Some ( creds ) ) ) 
+ } 
+ 
+ - def setUpdatedApplePushCredentials ( authId : Long , credsOpt : Option [ models . push . ApplePushCredentials ] ) ( implicit seqUpdManagerRegion : SeqUpdatesManagerRegion ) : Unit = { 
+ - seqUpdManagerRegion . ref ! Envelope ( authId , ApplePushCredentialsUpdated ( credsOpt ) ) 
+ + def deletePushCredentials ( authId : Long ) ( implicit region : SeqUpdatesManagerRegion ) : Unit = { 
+ + region . ref ! Envelope ( authId , PushCredentialsUpdated ( None ) ) 
+ } 
+ 
+ def getDifference ( authId : Long , timestamp : Long , maxSizeInBytes : Long ) ( implicit ec : ExecutionContext ) : DBIO [ ( Vector [ models . sequence . SeqUpdate ] , Boolean ) ] = { 
+ @ @ - 496 , 6 + 492 , 9 @ @ class SeqUpdatesManager ( 
+ override def persistenceId : String = self . path . parent . name + " - " + self . path . name 
+ 
+ implicit private val system : ActorSystem = context . system 
+ + implicit private val ec : ExecutionContext = context . dispatcher 
+ + 
+ + private val authId : Long = self . path . name . toLong 
+ 
+ / / FIXME : move to props 
+ private val receiveTimeout = context . system . settings . config . getDuration ( " push . seq - updates - manager . receive - timeout " , TimeUnit . SECONDS ) . seconds 
+ @ @ - 515 , 18 + 514 , 20 @ @ class SeqUpdatesManager ( 
+ private [ this ] val applePusher = new ApplePusher ( applePushManager , db ) 
+ private [ this ] val googlePusher = new GooglePusher ( googlePushManager , db ) 
+ 
+ + initialize ( ) 
+ + 
+ def receiveInitialized : Receive = { 
+ - case Envelope ( _ , GetSequenceState ) ⇒ 
+ + case GetSequenceState ⇒ 
+ sender ( ) ! sequenceState ( seq , timestampToBytes ( lastTimestamp ) ) 
+ - case Envelope ( authId , PushUpdate ( header , updBytes , userIds , groupIds , pushText , originPeer , isFat ) ) ⇒ 
+ + case PushUpdate ( header , updBytes , userIds , groupIds , pushText , originPeer , isFat ) ⇒ 
+ pushUpdate ( authId , header , updBytes , userIds , groupIds , pushText , originPeer , isFat ) 
+ - case Envelope ( authId , PushUpdateGetSequenceState ( header , serializedData , userIds , groupIds , pushText , originPeer , isFat ) ) ⇒ 
+ + case PushUpdateGetSequenceState ( header , serializedData , userIds , groupIds , pushText , originPeer , isFat ) ⇒ 
+ val replyTo = sender ( ) 
+ 
+ pushUpdate ( authId , header , serializedData , userIds , groupIds , pushText , originPeer , isFat , { seqstate : SequenceState ⇒ 
+ replyTo ! seqstate 
+ } ) 
+ - case Envelope ( authId , Subscribe ( consumer : ActorRef ) ) ⇒ 
+ + case Subscribe ( consumer : ActorRef ) ⇒ 
+ if ( ! consumers . contains ( consumer ) ) { 
+ context . watch ( consumer ) 
+ } 
+ @ @ - 536 , 10 + 537 , 19 @ @ class SeqUpdatesManager ( 
+ log . debug ( " Consumer subscribed { } " , consumer ) 
+ 
+ sender ( ) ! SubscribeAck ( consumer ) 
+ - case Envelope ( _ , GooglePushCredentialsUpdated ( credsOpt ) ) ⇒ 
+ - this . googleCredsOpt = credsOpt 
+ - case Envelope ( _ , ApplePushCredentialsUpdated ( credsOpt ) ) ⇒ 
+ - this . appleCredsOpt = credsOpt 
+ + case PushCredentialsUpdated ( credsOpt ) ⇒ 
+ + credsOpt match { 
+ + case Some ( c : models . push . GooglePushCredentials ) ⇒ 
+ + googleCredsOpt = Some ( c ) 
+ + db . run ( setPushCredentials ( c ) ) 
+ + case Some ( c : models . push . ApplePushCredentials ) ⇒ 
+ + appleCredsOpt = Some ( c ) 
+ + db . run ( setPushCredentials ( c ) ) 
+ + case None ⇒ 
+ + googleCredsOpt = None 
+ + appleCredsOpt = None 
+ + db . run ( deletePushCredentials ( authId ) ) 
+ + } 
+ case ReceiveTimeout ⇒ 
+ if ( consumers . isEmpty ) { 
+ context . parent ! Passivate ( stopMessage = PoisonPill ) 
+ @ @ - 550 , 7 + 560 , 7 @ @ class SeqUpdatesManager ( 
+ } 
+ 
+ def stashing : Receive = { 
+ - case Initialized ( authId , timestamp , googleCredsOpt , appleCredsOpt ) ⇒ 
+ + case Initialized ( timestamp , googleCredsOpt , appleCredsOpt ) ⇒ 
+ this . lastTimestamp = timestamp 
+ this . googleCredsOpt = googleCredsOpt 
+ this . appleCredsOpt = appleCredsOpt 
+ @ @ - 560 , 36 + 570 , 7 @ @ class SeqUpdatesManager ( 
+ case msg ⇒ stash ( ) 
+ } 
+ 
+ - def waitingForEnvelope : Receive = { 
+ - case env @ Envelope ( authId , _ ) ⇒ 
+ - stash ( ) 
+ - context . become ( stashing ) 
+ - 
+ - / / TODO : pinned dispatcher ? 
+ - implicit val ec = context . dispatcher 
+ - 
+ - val initiatedFuture : Future [ Initialized ] = for { 
+ - seqUpdOpt ← db . run ( p . sequence . SeqUpdate . findLast ( authId ) ) 
+ - googleCredsOpt ← db . run ( p . push . GooglePushCredentials . find ( authId ) ) 
+ - appleCredsOpt ← db . run ( p . push . ApplePushCredentials . find ( authId ) ) 
+ - } yield Initialized ( 
+ - authId , 
+ - seqUpdOpt . map ( _ . timestamp ) . getOrElse ( 0 ) , 
+ - googleCredsOpt , 
+ - appleCredsOpt 
+ - ) 
+ - 
+ - initiatedFuture . onFailure { 
+ - case e ⇒ 
+ - log . error ( e , " Failed initiating SeqUpdatesManager " ) 
+ - context . parent ! Passivate ( stopMessage = PoisonPill ) 
+ - } 
+ - 
+ - initiatedFuture . pipeTo ( self ) 
+ - case msg ⇒ stash ( ) 
+ - } 
+ - 
+ - override def receiveCommand : Receive = waitingForEnvelope 
+ + override def receiveCommand : Receive = stashing 
+ 
+ override def receiveRecover : Receive = { 
+ case SeqChangedKryo ( value ) ⇒ 
+ @ @ - 618 , 6 + 599 , 26 @ @ class SeqUpdatesManager ( 
+ log . error ( reason , " SeqUpdatesManager exception , message option : { } " , message ) 
+ } 
+ 
+ + private def initialize ( ) : Unit = { 
+ + val initiatedFuture : Future [ Initialized ] = for { 
+ + seqUpdOpt ← db . run ( p . sequence . SeqUpdate . findLast ( authId ) ) 
+ + googleCredsOpt ← db . run ( p . push . GooglePushCredentials . find ( authId ) ) 
+ + appleCredsOpt ← db . run ( p . push . ApplePushCredentials . find ( authId ) ) 
+ + } yield Initialized ( 
+ + seqUpdOpt . map ( _ . timestamp ) . getOrElse ( 0 ) , 
+ + googleCredsOpt , 
+ + appleCredsOpt 
+ + ) 
+ + 
+ + initiatedFuture . onFailure { 
+ + case e ⇒ 
+ + log . error ( e , " Failed initiating SeqUpdatesManager " ) 
+ + context . parent ! Passivate ( stopMessage = PoisonPill ) 
+ + } 
+ + 
+ + initiatedFuture pipeTo self 
+ + } 
+ + 
+ private def pushUpdate ( 
+ authId : Long , 
+ header : Int , 
+ diff - - git a / actor - server / actor - push / src / main / scala / im / actor / server / push / VendorPush . scala b / actor - server / actor - push / src / main / scala / im / actor / server / push / VendorPush . scala 
+ index 610e149 . . 7214f86 100644 
+ - - - a / actor - server / actor - push / src / main / scala / im / actor / server / push / VendorPush . scala 
+ + + + b / actor - server / actor - push / src / main / scala / im / actor / server / push / VendorPush . scala 
+ @ @ - 3 , 12 + 3 , 25 @ @ package im . actor . server . push 
+ import scala . concurrent . ExecutionContext 
+ 
+ import slick . dbio . Effect . Read 
+ - import slick . dbio . { NoStream , DBIOAction } 
+ + import slick . dbio . { DBIO , NoStream , DBIOAction } 
+ 
+ import im . actor . api . rpc . peers . { PeerType , Peer } 
+ + import im . actor . server . models 
+ import im . actor . server . persist 
+ 
+ private [ push ] trait VendorPush { 
+ + protected def setPushCredentials ( creds : models . push . ApplePushCredentials ) : DBIO [ Int ] = 
+ + persist . push . ApplePushCredentials . createOrUpdate ( creds ) 
+ + 
+ + protected def setPushCredentials ( creds : models . push . GooglePushCredentials ) : DBIO [ Int ] = 
+ + persist . push . GooglePushCredentials . createOrUpdate ( creds ) 
+ + 
+ + protected def deletePushCredentials ( authId : Long ) ( implicit ec : ExecutionContext ) : DBIO [ Int ] = 
+ + for { 
+ + a ← persist . push . ApplePushCredentials . delete ( authId ) 
+ + g ← persist . push . GooglePushCredentials . delete ( authId ) 
+ + } yield a + g 
+ + 
+ protected def getShowText ( userId : Int , paramBase : String ) ( implicit ec : ExecutionContext ) : DBIOAction [ Boolean , NoStream , Read ] = { 
+ persist . configs . Parameter . findValue ( userId , s " $ { paramBase } . show _ text " ) map { 
+ case Some ( " true " ) ⇒ true 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala 
+ index e9bc2dd . . 8991e3d 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / push / PushServiceImpl . scala 
+ @ @ - 1 , 16 + 1 , 15 @ @ 
+ package im . actor . server . api . rpc . service . push 
+ 
+ - import scala . concurrent . { ExecutionContext , Future } 
+ - 
+ import akka . actor . ActorSystem 
+ - import scodec . bits . BitVector 
+ - import slick . driver . PostgresDriver . api . _ 
+ - 
+ import im . actor . api . rpc . _ 
+ import im . actor . api . rpc . misc . ResponseVoid 
+ import im . actor . api . rpc . push . PushService 
+ - import im . actor . server . { models , persist } 
+ + import im . actor . server . models 
+ import im . actor . server . push . { SeqUpdatesManager , SeqUpdatesManagerRegion } 
+ + import scodec . bits . BitVector 
+ + import slick . driver . PostgresDriver . api . _ 
+ + 
+ + import scala . concurrent . { ExecutionContext , Future } 
+ 
+ class PushServiceImpl ( 
+ implicit 
+ @ @ - 18 , 46 + 17 , 25 @ @ class PushServiceImpl ( 
+ db : Database , 
+ actorSystem : ActorSystem 
+ ) extends PushService { 
+ - import SeqUpdatesManager . _ 
+ - 
+ override implicit val ec : ExecutionContext = actorSystem . dispatcher 
+ 
+ override def jhandleUnregisterPush ( clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { 
+ - val action = for { 
+ - _ ← persist . push . ApplePushCredentials . delete ( clientData . authId ) . asTry 
+ - _ ← persist . push . GooglePushCredentials . delete ( clientData . authId ) . asTry 
+ - } yield Ok ( ResponseVoid ) 
+ - 
+ - setUpdatedApplePushCredentials ( clientData . authId , None ) 
+ - setUpdatedGooglePushCredentials ( clientData . authId , None ) 
+ - 
+ - db . run ( action ) 
+ + SeqUpdatesManager . deletePushCredentials ( clientData . authId ) 
+ + Future . successful ( Ok ( ResponseVoid ) ) 
+ } 
+ 
+ override def jhandleRegisterGooglePush ( projectId : Long , token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { 
+ val creds = models . push . GooglePushCredentials ( clientData . authId , projectId , token ) 
+ - 
+ - val action = for { 
+ - _ ← persist . push . GooglePushCredentials . createOrUpdate ( creds ) 
+ - } yield Ok ( ResponseVoid ) 
+ - 
+ - setUpdatedGooglePushCredentials ( clientData . authId , Some ( creds ) ) 
+ - 
+ - db . run ( action ) 
+ + SeqUpdatesManager . setPushCredentials ( clientData . authId , creds ) 
+ + Future . successful ( Ok ( ResponseVoid ) ) 
+ } 
+ 
+ override def jhandleRegisterApplePush ( apnsKey : Int , token : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseVoid ] ] = { 
+ BitVector . fromHex ( token ) match { 
+ case Some ( tokenBits ) ⇒ 
+ val creds = models . push . ApplePushCredentials ( clientData . authId , apnsKey , tokenBits . toByteArray ) 
+ - 
+ - val action = for { 
+ - _ ← persist . push . ApplePushCredentials . createOrUpdate ( creds ) 
+ - } yield ( Ok ( ResponseVoid ) ) 
+ - 
+ - setUpdatedApplePushCredentials ( clientData . authId , Some ( creds ) ) 
+ - 
+ - db . run ( action ) 
+ + SeqUpdatesManager . setPushCredentials ( clientData . authId , creds ) 
+ + Future . successful ( Ok ( ResponseVoid ) ) 
+ case None ⇒ 
+ Future . successful ( Error ( RpcError ( 400 , " WRONG _ TOKEN " , " Wrong APNS Token " , false , None ) ) ) 
+ }

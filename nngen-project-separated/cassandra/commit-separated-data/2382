@@ -1,0 +1,187 @@
+BLEU SCORE: 0.018738883683389617
+
+TEST MSG: Don ' t insert tombstones that hide indexed values into 2i
+GENERATED MSG: fix duplicate results from CFS . scan
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 28b5f29 . . 18929d5 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 6 + 1 , 8 @ @ <nl> 1 . 2 . 17 <nl> + * Don ' t insert tombstones that hide indexed values into 2i ( CASSANDRA - 7268 ) <nl> * Track metrics at a keyspace level ( CASSANDRA - 6539 ) <nl> - * Add replace _ address _ first _ boot flag to only replace if not bootstrapped ( CASSANDRA - 7356 ) <nl> + * Add replace _ address _ first _ boot flag to only replace if not bootstrapped <nl> + ( CASSANDRA - 7356 ) <nl> * Enable keepalive for native protocol ( CASSANDRA - 7380 ) <nl> * Check internal addresses for seeds ( CASSANDRA - 6523 ) <nl> * Fix potential / by 0 in HHOM page size calculation ( CASSANDRA - 7354 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / index / SecondaryIndexManager . java b / src / java / org / apache / cassandra / db / index / SecondaryIndexManager . java <nl> index c4e4129 . . 7fefa13 100644 <nl> - - - a / src / java / org / apache / cassandra / db / index / SecondaryIndexManager . java <nl> + + + b / src / java / org / apache / cassandra / db / index / SecondaryIndexManager . java <nl> @ @ - 29 , 7 + 29 , 6 @ @ import org . apache . cassandra . config . ColumnDefinition ; <nl> import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . db . compaction . CompactionManager ; <nl> import org . apache . cassandra . db . filter . IDiskAtomFilter ; <nl> - import org . apache . cassandra . db . marshal . AbstractType ; <nl> import org . apache . cassandra . dht . AbstractBounds ; <nl> import org . apache . cassandra . exceptions . ConfigurationException ; <nl> import org . apache . cassandra . io . sstable . ReducingKeyIterator ; <nl> @ @ - 650 , 7 + 649 , 14 @ @ public class SecondaryIndexManager <nl> / / where the row is invisible to both queries ( the opposite seems preferable ) ; see CASSANDRA - 5540 <nl> if ( ! column . isMarkedForDelete ( ) ) <nl> ( ( PerColumnSecondaryIndex ) index ) . insert ( key . key , column ) ; <nl> - ( ( PerColumnSecondaryIndex ) index ) . delete ( key . key , oldColumn ) ; <nl> + <nl> + / / Usually we want to delete the old value from the index , except when <nl> + / / name / value / timestamp are all equal , but the columns themselves <nl> + / / are not ( as is the case when overwriting expiring columns with <nl> + / / identical values and ttl ) Then , we don ' t want to delete as the <nl> + / / tombstone will hide the new value we just inserted ; see CASSANDRA - 7268 <nl> + if ( shouldCleanupOldValue ( oldColumn , column ) ) <nl> + ( ( PerColumnSecondaryIndex ) index ) . delete ( key . key , oldColumn ) ; <nl> } <nl> } <nl> <nl> @ @ - 672 , 5 + 678 , 21 @ @ public class SecondaryIndexManager <nl> for ( SecondaryIndex index : rowLevelIndexMap . values ( ) ) <nl> ( ( PerRowSecondaryIndex ) index ) . index ( key . key , cf ) ; <nl> } <nl> + <nl> + private boolean shouldCleanupOldValue ( IColumn oldColumn , IColumn newColumn ) <nl> + { <nl> + / / If any one of name / value / timestamp are different , then we <nl> + / / should delete from the index . If not , then we can infer that <nl> + / / at least one of the columns is an ExpiringColumn and that the <nl> + / / difference is in the expiry time . In this case , we don ' t want to <nl> + / / delete the old value from the index as the tombstone we insert <nl> + / / will just hide the inserted value . <nl> + / / Completely identical columns ( including expiring columns with <nl> + / / identical ttl & localExpirationTime ) will not get this far due <nl> + / / to the oldColumn . equals ( newColumn ) in StandardUpdater . update <nl> + return ! oldColumn . name ( ) . equals ( newColumn . name ( ) ) <nl> + | | ! oldColumn . value ( ) . equals ( newColumn . value ( ) ) <nl> + | | oldColumn . timestamp ( ) ! = newColumn . timestamp ( ) ; <nl> + } <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / db / ColumnFamilyStoreTest . java b / test / unit / org / apache / cassandra / db / ColumnFamilyStoreTest . java <nl> index cd30297 . . e5354ed 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / ColumnFamilyStoreTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / ColumnFamilyStoreTest . java <nl> @ @ - 25 , 6 + 25 , 7 @ @ import java . nio . charset . CharacterCodingException ; <nl> import java . util . * ; <nl> import java . util . concurrent . ExecutionException ; <nl> import java . util . concurrent . Future ; <nl> + import java . util . concurrent . TimeUnit ; <nl> <nl> import com . google . common . base . Function ; <nl> import com . google . common . collect . Iterables ; <nl> @ @ - 418 , 6 + 419 , 60 @ @ public class ColumnFamilyStoreTest extends SchemaLoader <nl> } <nl> <nl> @ Test <nl> + public void testIndexUpdateOverwritingExpiringColumns ( ) throws Exception <nl> + { <nl> + / / see CASSANDRA - 7268 <nl> + Table table = Table . open ( " Keyspace2 " ) ; <nl> + <nl> + / / create a row and update the birthdate value with an expiring column <nl> + RowMutation rm ; <nl> + rm = new RowMutation ( " Keyspace2 " , ByteBufferUtil . bytes ( " k100 " ) ) ; <nl> + rm . add ( new QueryPath ( " Indexed1 " , null , ByteBufferUtil . bytes ( " birthdate " ) ) , ByteBufferUtil . bytes ( 100L ) , 1 , 1000 ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + IndexExpression expr = new IndexExpression ( ByteBufferUtil . bytes ( " birthdate " ) , IndexOperator . EQ , ByteBufferUtil . bytes ( 100L ) ) ; <nl> + List < IndexExpression > clause = Arrays . asList ( expr ) ; <nl> + IDiskAtomFilter filter = new IdentityQueryFilter ( ) ; <nl> + Range < RowPosition > range = Util . range ( " " , " " ) ; <nl> + List < Row > rows = table . getColumnFamilyStore ( " Indexed1 " ) . search ( clause , range , 100 , filter ) ; <nl> + assertEquals ( 1 , rows . size ( ) ) ; <nl> + <nl> + / / requires a 1s sleep because we calculate local expiry time as ( now ( ) / 1000 ) + ttl <nl> + TimeUnit . SECONDS . sleep ( 1 ) ; <nl> + <nl> + / / now overwrite with the same name / value / ttl , but the local expiry time will be different <nl> + rm = new RowMutation ( " Keyspace2 " , ByteBufferUtil . bytes ( " k100 " ) ) ; <nl> + rm . add ( new QueryPath ( " Indexed1 " , null , ByteBufferUtil . bytes ( " birthdate " ) ) , ByteBufferUtil . bytes ( 100L ) , 1 , 1000 ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + rows = table . getColumnFamilyStore ( " Indexed1 " ) . search ( clause , range , 100 , filter ) ; <nl> + assertEquals ( 1 , rows . size ( ) ) ; <nl> + <nl> + / / check that modifying the indexed value using the same timestamp behaves as expected <nl> + rm = new RowMutation ( " Keyspace2 " , ByteBufferUtil . bytes ( " k101 " ) ) ; <nl> + rm . add ( new QueryPath ( " Indexed1 " , null , ByteBufferUtil . bytes ( " birthdate " ) ) , ByteBufferUtil . bytes ( 101L ) , 1 , 1000 ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + expr = new IndexExpression ( ByteBufferUtil . bytes ( " birthdate " ) , IndexOperator . EQ , ByteBufferUtil . bytes ( 101L ) ) ; <nl> + clause = Arrays . asList ( expr ) ; <nl> + rows = table . getColumnFamilyStore ( " Indexed1 " ) . search ( clause , range , 100 , filter ) ; <nl> + assertEquals ( 1 , rows . size ( ) ) ; <nl> + <nl> + TimeUnit . SECONDS . sleep ( 1 ) ; <nl> + rm = new RowMutation ( " Keyspace2 " , ByteBufferUtil . bytes ( " k101 " ) ) ; <nl> + rm . add ( new QueryPath ( " Indexed1 " , null , ByteBufferUtil . bytes ( " birthdate " ) ) , ByteBufferUtil . bytes ( 102L ) , 1 , 1000 ) ; <nl> + rm . apply ( ) ; <nl> + / / search for the old value <nl> + rows = table . getColumnFamilyStore ( " Indexed1 " ) . search ( clause , range , 100 , filter ) ; <nl> + assertEquals ( 0 , rows . size ( ) ) ; <nl> + / / and for the new <nl> + expr = new IndexExpression ( ByteBufferUtil . bytes ( " birthdate " ) , IndexOperator . EQ , ByteBufferUtil . bytes ( 102L ) ) ; <nl> + clause = Arrays . asList ( expr ) ; <nl> + rows = table . getColumnFamilyStore ( " Indexed1 " ) . search ( clause , range , 100 , filter ) ; <nl> + assertEquals ( 1 , rows . size ( ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> public void testDeleteOfInconsistentValuesInKeysIndex ( ) throws Exception <nl> { <nl> String keySpace = " Keyspace2 " ;
+NEAREST DIFF (one line): diff - - git a / src / avro / internode . genavro b / src / avro / internode . genavro <nl> index 2e0a40a . . 3cfaab2 100644 <nl> - - - a / src / avro / internode . genavro <nl> + + + b / src / avro / internode . genavro <nl> @ @ - 73 , 6 + 73 , 7 @ @ protocol InterNode { <nl> string name ; <nl> string strategy _ class ; <nl> union { map < string > , null } strategy _ options ; <nl> + union { int , null } replication _ factor ; <nl> array < CfDef > cf _ defs ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / config / KSMetaData . java b / src / java / org / apache / cassandra / config / KSMetaData . java <nl> index b6248f1 . . d8e2777 100644 <nl> - - - a / src / java / org / apache / cassandra / config / KSMetaData . java <nl> + + + b / src / java / org / apache / cassandra / config / KSMetaData . java <nl> @ @ - 115 , 16 + 115 , 19 @ @ public final class KSMetaData <nl> { <nl> throw new RuntimeException ( " Could not create ReplicationStrategy of type " + ks . strategy _ class , ex ) ; <nl> } <nl> - Map < String , String > strategyOptions = null ; <nl> + <nl> + Map < String , String > strategyOptions = new HashMap < String , String > ( ) ; <nl> if ( ks . strategy _ options ! = null ) <nl> { <nl> - strategyOptions = new HashMap < String , String > ( ) ; <nl> for ( Map . Entry < CharSequence , CharSequence > e : ks . strategy _ options . entrySet ( ) ) <nl> { <nl> strategyOptions . put ( e . getKey ( ) . toString ( ) , e . getValue ( ) . toString ( ) ) ; <nl> } <nl> } <nl> - int cfsz = ( int ) ks . cf _ defs . size ( ) ; <nl> + if ( ks . replication _ factor ! = null ) <nl> + strategyOptions . put ( " replication _ factor " , ks . replication _ factor . toString ( ) ) ; <nl> + <nl> + int cfsz = ks . cf _ defs . size ( ) ; <nl> CFMetaData [ ] cfMetaData = new CFMetaData [ cfsz ] ; <nl> Iterator < org . apache . cassandra . db . migration . avro . CfDef > cfiter = ks . cf _ defs . iterator ( ) ; <nl> for ( int i = 0 ; i < cfsz ; i + + )
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 28b5f29 . . 18929d5 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 6 + 1 , 8 @ @ 
+ 1 . 2 . 17 
+ + * Don ' t insert tombstones that hide indexed values into 2i ( CASSANDRA - 7268 ) 
+ * Track metrics at a keyspace level ( CASSANDRA - 6539 ) 
+ - * Add replace _ address _ first _ boot flag to only replace if not bootstrapped ( CASSANDRA - 7356 ) 
+ + * Add replace _ address _ first _ boot flag to only replace if not bootstrapped 
+ + ( CASSANDRA - 7356 ) 
+ * Enable keepalive for native protocol ( CASSANDRA - 7380 ) 
+ * Check internal addresses for seeds ( CASSANDRA - 6523 ) 
+ * Fix potential / by 0 in HHOM page size calculation ( CASSANDRA - 7354 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / index / SecondaryIndexManager . java b / src / java / org / apache / cassandra / db / index / SecondaryIndexManager . java 
+ index c4e4129 . . 7fefa13 100644 
+ - - - a / src / java / org / apache / cassandra / db / index / SecondaryIndexManager . java 
+ + + + b / src / java / org / apache / cassandra / db / index / SecondaryIndexManager . java 
+ @ @ - 29 , 7 + 29 , 6 @ @ import org . apache . cassandra . config . ColumnDefinition ; 
+ import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . db . compaction . CompactionManager ; 
+ import org . apache . cassandra . db . filter . IDiskAtomFilter ; 
+ - import org . apache . cassandra . db . marshal . AbstractType ; 
+ import org . apache . cassandra . dht . AbstractBounds ; 
+ import org . apache . cassandra . exceptions . ConfigurationException ; 
+ import org . apache . cassandra . io . sstable . ReducingKeyIterator ; 
+ @ @ - 650 , 7 + 649 , 14 @ @ public class SecondaryIndexManager 
+ / / where the row is invisible to both queries ( the opposite seems preferable ) ; see CASSANDRA - 5540 
+ if ( ! column . isMarkedForDelete ( ) ) 
+ ( ( PerColumnSecondaryIndex ) index ) . insert ( key . key , column ) ; 
+ - ( ( PerColumnSecondaryIndex ) index ) . delete ( key . key , oldColumn ) ; 
+ + 
+ + / / Usually we want to delete the old value from the index , except when 
+ + / / name / value / timestamp are all equal , but the columns themselves 
+ + / / are not ( as is the case when overwriting expiring columns with 
+ + / / identical values and ttl ) Then , we don ' t want to delete as the 
+ + / / tombstone will hide the new value we just inserted ; see CASSANDRA - 7268 
+ + if ( shouldCleanupOldValue ( oldColumn , column ) ) 
+ + ( ( PerColumnSecondaryIndex ) index ) . delete ( key . key , oldColumn ) ; 
+ } 
+ } 
+ 
+ @ @ - 672 , 5 + 678 , 21 @ @ public class SecondaryIndexManager 
+ for ( SecondaryIndex index : rowLevelIndexMap . values ( ) ) 
+ ( ( PerRowSecondaryIndex ) index ) . index ( key . key , cf ) ; 
+ } 
+ + 
+ + private boolean shouldCleanupOldValue ( IColumn oldColumn , IColumn newColumn ) 
+ + { 
+ + / / If any one of name / value / timestamp are different , then we 
+ + / / should delete from the index . If not , then we can infer that 
+ + / / at least one of the columns is an ExpiringColumn and that the 
+ + / / difference is in the expiry time . In this case , we don ' t want to 
+ + / / delete the old value from the index as the tombstone we insert 
+ + / / will just hide the inserted value . 
+ + / / Completely identical columns ( including expiring columns with 
+ + / / identical ttl & localExpirationTime ) will not get this far due 
+ + / / to the oldColumn . equals ( newColumn ) in StandardUpdater . update 
+ + return ! oldColumn . name ( ) . equals ( newColumn . name ( ) ) 
+ + | | ! oldColumn . value ( ) . equals ( newColumn . value ( ) ) 
+ + | | oldColumn . timestamp ( ) ! = newColumn . timestamp ( ) ; 
+ + } 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / db / ColumnFamilyStoreTest . java b / test / unit / org / apache / cassandra / db / ColumnFamilyStoreTest . java 
+ index cd30297 . . e5354ed 100644 
+ - - - a / test / unit / org / apache / cassandra / db / ColumnFamilyStoreTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / ColumnFamilyStoreTest . java 
+ @ @ - 25 , 6 + 25 , 7 @ @ import java . nio . charset . CharacterCodingException ; 
+ import java . util . * ; 
+ import java . util . concurrent . ExecutionException ; 
+ import java . util . concurrent . Future ; 
+ + import java . util . concurrent . TimeUnit ; 
+ 
+ import com . google . common . base . Function ; 
+ import com . google . common . collect . Iterables ; 
+ @ @ - 418 , 6 + 419 , 60 @ @ public class ColumnFamilyStoreTest extends SchemaLoader 
+ } 
+ 
+ @ Test 
+ + public void testIndexUpdateOverwritingExpiringColumns ( ) throws Exception 
+ + { 
+ + / / see CASSANDRA - 7268 
+ + Table table = Table . open ( " Keyspace2 " ) ; 
+ + 
+ + / / create a row and update the birthdate value with an expiring column 
+ + RowMutation rm ; 
+ + rm = new RowMutation ( " Keyspace2 " , ByteBufferUtil . bytes ( " k100 " ) ) ; 
+ + rm . add ( new QueryPath ( " Indexed1 " , null , ByteBufferUtil . bytes ( " birthdate " ) ) , ByteBufferUtil . bytes ( 100L ) , 1 , 1000 ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + IndexExpression expr = new IndexExpression ( ByteBufferUtil . bytes ( " birthdate " ) , IndexOperator . EQ , ByteBufferUtil . bytes ( 100L ) ) ; 
+ + List < IndexExpression > clause = Arrays . asList ( expr ) ; 
+ + IDiskAtomFilter filter = new IdentityQueryFilter ( ) ; 
+ + Range < RowPosition > range = Util . range ( " " , " " ) ; 
+ + List < Row > rows = table . getColumnFamilyStore ( " Indexed1 " ) . search ( clause , range , 100 , filter ) ; 
+ + assertEquals ( 1 , rows . size ( ) ) ; 
+ + 
+ + / / requires a 1s sleep because we calculate local expiry time as ( now ( ) / 1000 ) + ttl 
+ + TimeUnit . SECONDS . sleep ( 1 ) ; 
+ + 
+ + / / now overwrite with the same name / value / ttl , but the local expiry time will be different 
+ + rm = new RowMutation ( " Keyspace2 " , ByteBufferUtil . bytes ( " k100 " ) ) ; 
+ + rm . add ( new QueryPath ( " Indexed1 " , null , ByteBufferUtil . bytes ( " birthdate " ) ) , ByteBufferUtil . bytes ( 100L ) , 1 , 1000 ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + rows = table . getColumnFamilyStore ( " Indexed1 " ) . search ( clause , range , 100 , filter ) ; 
+ + assertEquals ( 1 , rows . size ( ) ) ; 
+ + 
+ + / / check that modifying the indexed value using the same timestamp behaves as expected 
+ + rm = new RowMutation ( " Keyspace2 " , ByteBufferUtil . bytes ( " k101 " ) ) ; 
+ + rm . add ( new QueryPath ( " Indexed1 " , null , ByteBufferUtil . bytes ( " birthdate " ) ) , ByteBufferUtil . bytes ( 101L ) , 1 , 1000 ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + expr = new IndexExpression ( ByteBufferUtil . bytes ( " birthdate " ) , IndexOperator . EQ , ByteBufferUtil . bytes ( 101L ) ) ; 
+ + clause = Arrays . asList ( expr ) ; 
+ + rows = table . getColumnFamilyStore ( " Indexed1 " ) . search ( clause , range , 100 , filter ) ; 
+ + assertEquals ( 1 , rows . size ( ) ) ; 
+ + 
+ + TimeUnit . SECONDS . sleep ( 1 ) ; 
+ + rm = new RowMutation ( " Keyspace2 " , ByteBufferUtil . bytes ( " k101 " ) ) ; 
+ + rm . add ( new QueryPath ( " Indexed1 " , null , ByteBufferUtil . bytes ( " birthdate " ) ) , ByteBufferUtil . bytes ( 102L ) , 1 , 1000 ) ; 
+ + rm . apply ( ) ; 
+ + / / search for the old value 
+ + rows = table . getColumnFamilyStore ( " Indexed1 " ) . search ( clause , range , 100 , filter ) ; 
+ + assertEquals ( 0 , rows . size ( ) ) ; 
+ + / / and for the new 
+ + expr = new IndexExpression ( ByteBufferUtil . bytes ( " birthdate " ) , IndexOperator . EQ , ByteBufferUtil . bytes ( 102L ) ) ; 
+ + clause = Arrays . asList ( expr ) ; 
+ + rows = table . getColumnFamilyStore ( " Indexed1 " ) . search ( clause , range , 100 , filter ) ; 
+ + assertEquals ( 1 , rows . size ( ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ public void testDeleteOfInconsistentValuesInKeysIndex ( ) throws Exception 
+ { 
+ String keySpace = " Keyspace2 " ;
+
+NEAREST DIFF:
+diff - - git a / src / avro / internode . genavro b / src / avro / internode . genavro 
+ index 2e0a40a . . 3cfaab2 100644 
+ - - - a / src / avro / internode . genavro 
+ + + + b / src / avro / internode . genavro 
+ @ @ - 73 , 6 + 73 , 7 @ @ protocol InterNode { 
+ string name ; 
+ string strategy _ class ; 
+ union { map < string > , null } strategy _ options ; 
+ + union { int , null } replication _ factor ; 
+ array < CfDef > cf _ defs ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / config / KSMetaData . java b / src / java / org / apache / cassandra / config / KSMetaData . java 
+ index b6248f1 . . d8e2777 100644 
+ - - - a / src / java / org / apache / cassandra / config / KSMetaData . java 
+ + + + b / src / java / org / apache / cassandra / config / KSMetaData . java 
+ @ @ - 115 , 16 + 115 , 19 @ @ public final class KSMetaData 
+ { 
+ throw new RuntimeException ( " Could not create ReplicationStrategy of type " + ks . strategy _ class , ex ) ; 
+ } 
+ - Map < String , String > strategyOptions = null ; 
+ + 
+ + Map < String , String > strategyOptions = new HashMap < String , String > ( ) ; 
+ if ( ks . strategy _ options ! = null ) 
+ { 
+ - strategyOptions = new HashMap < String , String > ( ) ; 
+ for ( Map . Entry < CharSequence , CharSequence > e : ks . strategy _ options . entrySet ( ) ) 
+ { 
+ strategyOptions . put ( e . getKey ( ) . toString ( ) , e . getValue ( ) . toString ( ) ) ; 
+ } 
+ } 
+ - int cfsz = ( int ) ks . cf _ defs . size ( ) ; 
+ + if ( ks . replication _ factor ! = null ) 
+ + strategyOptions . put ( " replication _ factor " , ks . replication _ factor . toString ( ) ) ; 
+ + 
+ + int cfsz = ks . cf _ defs . size ( ) ; 
+ CFMetaData [ ] cfMetaData = new CFMetaData [ cfsz ] ; 
+ Iterator < org . apache . cassandra . db . migration . avro . CfDef > cfiter = ks . cf _ defs . iterator ( ) ; 
+ for ( int i = 0 ; i < cfsz ; i + + )

@@ -1,0 +1,313 @@
+BLEU SCORE: 0.07495553473355841
+
+TEST MSG: refactor ( server : config ) : moved user config to extension
+GENERATED MSG: feat ( configs ) : configs service
+
+TEST DIFF (one line): diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / userconfig / UserConfigExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / userconfig / UserConfigExtension . scala < nl > new file mode 100644 < nl > index 0000000 . . d6990a4 < nl > - - - / dev / null < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / userconfig / UserConfigExtension . scala < nl > @ @ - 0 , 0 + 1 , 45 @ @ < nl > + package im . actor . server . userconfig < nl > + < nl > + import akka . actor . { ActorSystem , ExtendedActorSystem , Extension , ExtensionId , ExtensionIdProvider } < nl > + import im . actor . api . rpc . configs . UpdateParameterChanged < nl > + import im . actor . server . db . DbExtension < nl > + import im . actor . server . model . configs . Parameter < nl > + import im . actor . server . persist . configs . ParameterRepo < nl > + import im . actor . server . sequence . { SeqState , SeqUpdatesExtension } < nl > + import im . actor . server . user . UserExtension < nl > + < nl > + import scala . concurrent . Future < nl > + < nl > + object UserConfigExtension extends ExtensionId [ UserConfigExtension ] with ExtensionIdProvider { < nl > + override def createExtension ( system : ExtendedActorSystem ) = new UserConfigExtension ( system ) < nl > + < nl > + override def lookup ( ) : ExtensionId [ _ < : Extension ] = UserConfigExtension < nl > + } < nl > + < nl > + final class UserConfigExtension ( system : ActorSystem ) extends Extension { < nl > + import system . dispatcher < nl > + < nl > + private lazy val db = DbExtension ( system ) . db < nl > + private lazy val userExt = UserExtension ( system ) < nl > + private lazy val seqUpdExt = SeqUpdatesExtension ( system ) < nl > + < nl > + def fetchParameters ( userId : Int ) : Future [ Seq [ ( String , Option [ String ] ) ] ] = { < nl > + for { < nl > + params ← db . run ( ParameterRepo . find ( userId ) ) < nl > + } yield params . map ( p ⇒ p . key → p . value ) < nl > + } < nl > + < nl > + def editParameter ( userId : Int , rawKey : String , value : Option [ String ] ) : Future [ SeqState ] = { < nl > + val key = rawKey . trim < nl > + < nl > + val update = UpdateParameterChanged ( key , value ) < nl > + < nl > + for { < nl > + _ ← db . run ( ParameterRepo . createOrUpdate ( Parameter ( userId , key , value ) ) ) < nl > + seqstate ← seqUpdExt . deliverSingleUpdate ( userId , update ) < nl > + } yield { < nl > + seqUpdExt . reloadSettings ( userId ) < nl > + seqstate < nl > + } < nl > + } < nl > + } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala < nl > index dc5603a . . d76c66e 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala < nl > @ @ - 3 , 52 + 3 , 36 @ @ package im . actor . server . api . rpc . service . configs < nl > import akka . actor . ActorSystem < nl > import akka . util . Timeout < nl > import im . actor . api . rpc . _ < nl > - import im . actor . api . rpc . configs . { ApiParameter , ConfigsService , ResponseGetParameters , UpdateParameterChanged } < nl > + import im . actor . api . rpc . configs . { ApiParameter , ConfigsService , ResponseGetParameters } < nl > import im . actor . api . rpc . misc . ResponseSeq < nl > - import im . actor . server . db . DbExtension < nl > - import im . actor . server . model . configs . Parameter < nl > - import im . actor . server . persist . configs . ParameterRepo < nl > - import im . actor . server . sequence . { SeqUpdatesExtension , SeqState } < nl > - import im . actor . server . user . UserExtension < nl > - import slick . driver . PostgresDriver . api . _ < nl > + import im . actor . server . sequence . SeqState < nl > + import im . actor . server . userconfig . UserConfigExtension < nl > < nl > - import scala . concurrent . duration . _ < nl > import scala . concurrent . { ExecutionContext , Future } < nl > + import scala . concurrent . duration . _ < nl > < nl > - final class ConfigsServiceImpl ( implicit actorSystem : ActorSystem ) extends ConfigsService { < nl > - private val db : Database = DbExtension ( actorSystem ) . db < nl > - < nl > - override implicit val ec : ExecutionContext = actorSystem . dispatcher < nl > - < nl > + final class ConfigsServiceImpl ( implicit system : ActorSystem ) extends ConfigsService { < nl > + override implicit protected val ec : ExecutionContext = system . dispatcher < nl > private implicit val timeout = Timeout ( 10 . seconds ) < nl > - private val seqUpdExt = SeqUpdatesExtension ( actorSystem ) < nl > + private val configExt = UserConfigExtension ( system ) < nl > < nl > override def doHandleEditParameter ( rawKey : String , value : Option [ String ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseSeq ] ] = < nl > authorized ( clientData ) { implicit client ⇒ < nl > - val key = rawKey . trim < nl > - < nl > - val update = UpdateParameterChanged ( key , value ) < nl > - < nl > - val action = for { < nl > - _ ← ParameterRepo . createOrUpdate ( Parameter ( client . userId , key , value ) ) < nl > - SeqState ( seq , state ) ← DBIO . from ( UserExtension ( actorSystem ) . broadcastClientUpdate ( update , None , isFat = false ) ) < nl > - } yield { < nl > - seqUpdExt . reloadSettings ( client . userId ) < nl > - Ok ( ResponseSeq ( seq , state . toByteArray ) ) < nl > - } < nl > - db . run ( action ) < nl > + for { < nl > + SeqState ( seq , state ) ← configExt . editParameter ( client . userId , rawKey , value ) < nl > + } yield Ok ( ResponseSeq ( seq , state . toByteArray ) ) < nl > } < nl > < nl > override def doHandleGetParameters ( clientData : ClientData ) : Future [ HandlerResult [ ResponseGetParameters ] ] = < nl > authorized ( clientData ) { implicit client ⇒ < nl > - val action = for { < nl > - params ← ParameterRepo . find ( client . userId ) < nl > + for { < nl > + params ← configExt . fetchParameters ( client . userId ) < nl > } yield { < nl > - val paramsStructs = params map { param ⇒ < nl > - ApiParameter ( param . key , param . value . getOrElse ( " " ) ) < nl > + val paramsStructs = params map { < nl > + case ( key , value ) ⇒ < nl > + ApiParameter ( key , value . getOrElse ( " " ) ) < nl > } < nl > Ok ( ResponseGetParameters ( paramsStructs . toVector ) ) < nl > } < nl > - db . run ( action ) < nl > } < nl > }
+NEAREST DIFF (one line): diff - - git a / actor - models / src / main / scala / im / actor / server / models / configs / Parameter . scala b / actor - models / src / main / scala / im / actor / server / models / configs / Parameter . scala < nl > new file mode 100644 < nl > index 0000000 . . 895998d < nl > - - - / dev / null < nl > + + + b / actor - models / src / main / scala / im / actor / server / models / configs / Parameter . scala < nl > @ @ - 0 , 0 + 1 , 4 @ @ < nl > + package im . actor . server . models . configs < nl > + < nl > + @ SerialVersionUID ( 1L ) < nl > + case class Parameter ( userId : Int , key : String , value : Option [ String ] ) < nl > \ No newline at end of file < nl > diff - - git a / actor - persist / src / main / resources / sql / migration / V1504221855 _ _ CreateParameters . sql b / actor - persist / src / main / resources / sql / migration / V1504221855 _ _ CreateParameters . sql < nl > new file mode 100644 < nl > index 0000000 . . a32822c < nl > - - - / dev / null < nl > + + + b / actor - persist / src / main / resources / sql / migration / V1504221855 _ _ CreateParameters . sql < nl > @ @ - 0 , 0 + 1 , 6 @ @ < nl > + CREATE TABLE config _ parameters ( < nl > + user _ id int NOT NULL , < nl > + key text NOT NULL , < nl > + value text NOT NULL , < nl > + PRIMARY KEY ( user _ id , key ) < nl > + ) < nl > \ No newline at end of file < nl > diff - - git a / actor - persist / src / main / scala / im / actor / server / persist / configs / Parameter . scala b / actor - persist / src / main / scala / im / actor / server / persist / configs / Parameter . scala < nl > new file mode 100644 < nl > index 0000000 . . b1ab2b5 < nl > - - - / dev / null < nl > + + + b / actor - persist / src / main / scala / im / actor / server / persist / configs / Parameter . scala < nl > @ @ - 0 , 0 + 1 , 25 @ @ < nl > + package im . actor . server . persist . configs < nl > + < nl > + import slick . driver . PostgresDriver . api . _ < nl > + < nl > + import im . actor . server . models < nl > + < nl > + class ParameterTable ( tag : Tag ) extends Table [ models . configs . Parameter ] ( tag , " config _ parameters " ) { < nl > + def userId = column [ Int ] ( " user _ id " , O . PrimaryKey ) < nl > + < nl > + def key = column [ String ] ( " key " , O . PrimaryKey ) < nl > + < nl > + def value = column [ Option [ String ] ] ( " value " ) < nl > + < nl > + def * = ( userId , key , value ) < > ( models . configs . Parameter . tupled , models . configs . Parameter . unapply ) < nl > + } < nl > + < nl > + object Parameter { < nl > + val parameters = TableQuery [ ParameterTable ] < nl > + < nl > + def createOrUpdate ( parameter : models . configs . Parameter ) = < nl > + parameters . insertOrUpdate ( parameter ) < nl > + < nl > + def find ( userId : Int ) = < nl > + parameters . filter ( _ . userId = = = userId ) . result < nl > + } < nl > \ No newline at end of file < nl > diff - - git a / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala b / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala < nl > new file mode 100644 < nl > index 0000000 . . 54a8ce9 < nl > - - - / dev / null < nl > + + + b / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala < nl > @ @ - 0 , 0 + 1 , 55 @ @ < nl > + package im . actor . server . api . rpc . service . configs < nl > + < nl > + import scala . concurrent . { ExecutionContext , Future } < nl > + < nl > + import akka . actor . ActorSystem < nl > + import slick . driver . PostgresDriver . api . _ < nl > + < nl > + import im . actor . api . rpc . _ < nl > + import im . actor . api . rpc . configs . { ConfigsService , Parameter , ResponseGetParameters , UpdateParameterChanged } < nl > + import im . actor . api . rpc . misc . ResponseSeq < nl > + import im . actor . server . { models , persist } < nl > + import im . actor . server . push . SeqUpdatesManagerRegion < nl > + < nl > + class ConfigsServiceImpl ( implicit seqUpdManagerRegion : SeqUpdatesManagerRegion , db : Database , actorSystem : ActorSystem ) extends ConfigsService { < nl > + < nl > + import im . actor . server . push . SeqUpdatesManager . _ < nl > + < nl > + override implicit val ec : ExecutionContext = actorSystem . dispatcher < nl > + < nl > + override def jhandleEditParameter ( rawKey : String , rawValue : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseSeq ] ] = { < nl > + val authorizedAction = requireAuth ( clientData ) . map { implicit client = > < nl > + val key = rawKey . trim < nl > + val value = < nl > + rawValue match { < nl > + case " " = > None < nl > + case s = > Some ( s ) < nl > + } < nl > + < nl > + val update = UpdateParameterChanged ( key , value ) < nl > + < nl > + for { < nl > + _ < - persist . configs . Parameter . createOrUpdate ( models . configs . Parameter ( client . userId , key , value ) ) < nl > + seqstate < - broadcastClientUpdate ( update ) < nl > + } yield Ok ( ResponseSeq ( seqstate . _ 1 , seqstate . _ 2 ) ) < nl > + } < nl > + < nl > + db . run ( toDBIOAction ( authorizedAction ) ) < nl > + } < nl > + < nl > + override def jhandleGetParameters ( clientData : ClientData ) : Future [ HandlerResult [ ResponseGetParameters ] ] = { < nl > + val authorizedAction = requireAuth ( clientData ) . map { implicit client = > < nl > + for { < nl > + params < - persist . configs . Parameter . find ( client . userId ) < nl > + } yield { < nl > + val paramsStructs = params map { param = > < nl > + Parameter ( param . key , param . value . getOrElse ( " " ) ) < nl > + } < nl > + < nl > + Ok ( ResponseGetParameters ( paramsStructs . toVector ) ) < nl > + } < nl > + } < nl > + < nl > + db . run ( toDBIOAction ( authorizedAction ) ) < nl > + } < nl > + } < nl > diff - - git a / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ConfigsServiceSpec . scala b / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ConfigsServiceSpec . scala < nl > new file mode 100644 < nl > index 0000000 . . 4bd638d < nl > - - - / dev / null < nl > + + + b / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ConfigsServiceSpec . scala < nl > @ @ - 0 , 0 + 1 , 55 @ @ < nl > + package im . actor . server . api . rpc . service < nl > + < nl > + import im . actor . api . rpc . _ < nl > + import im . actor . api . rpc . configs . _ < nl > + import im . actor . api . rpc . misc . ResponseSeq < nl > + import im . actor . server . api . rpc . RpcApiService < nl > + import im . actor . server . api . rpc . service . configs . ConfigsServiceImpl < nl > + import im . actor . server . presences . PresenceManager < nl > + import im . actor . server . push . { SeqUpdatesManager , WeakUpdatesManager } < nl > + import im . actor . server . session . Session < nl > + < nl > + class ConfigsServiceSpec extends BaseServiceSuite { < nl > + behavior of " Configs Service " < nl > + < nl > + it should " save parameter even if it already exists " in e1 ( ) < nl > + < nl > + it should " get parameters " in e2 ( ) < nl > + < nl > + val rpcApiService = system . actorOf ( RpcApiService . props ( ) ) < nl > + implicit val seqUpdManagerRegion = SeqUpdatesManager . startRegion ( ) < nl > + implicit val weakUpdManagerRegion = WeakUpdatesManager . startRegion ( ) < nl > + implicit val presenceManagerRegion = PresenceManager . startRegion ( ) < nl > + implicit val sessionRegion = Session . startRegion ( Some ( Session . props ( rpcApiService ) ) ) < nl > + implicit val authService = buildAuthService ( ) < nl > + < nl > + val service = new ConfigsServiceImpl < nl > + < nl > + val ( user , _ , _ ) = createUser ( ) < nl > + val authId = createAuthId ( ) < nl > + val sessionId = createSessionId ( ) < nl > + < nl > + implicit val clientData = ClientData ( authId , sessionId , Some ( user . id ) ) < nl > + < nl > + def e1 ( ) = { < nl > + whenReady ( service . handleEditParameter ( " par1 " , " val1 " ) ) { resp = > < nl > + resp should matchPattern { < nl > + case Ok ( ResponseSeq ( _ , _ ) ) = > < nl > + } < nl > + } < nl > + < nl > + whenReady ( service . handleEditParameter ( " par1 " , " val2 " ) ) { resp = > < nl > + resp should matchPattern { < nl > + case Ok ( ResponseSeq ( _ , _ ) ) = > < nl > + } < nl > + } < nl > + } < nl > + < nl > + def e2 ( ) = { < nl > + whenReady ( service . handleGetParameters ( ) ) { resp = > < nl > + resp should matchPattern { < nl > + case Ok ( ResponseGetParameters ( Vector ( Parameter ( " par1 " , " val2 " ) ) ) ) = > < nl > + } < nl > + } < nl > + } < nl > + }
+
+TEST DIFF:
+diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / userconfig / UserConfigExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / userconfig / UserConfigExtension . scala 
+ new file mode 100644 
+ index 0000000 . . d6990a4 
+ - - - / dev / null 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / userconfig / UserConfigExtension . scala 
+ @ @ - 0 , 0 + 1 , 45 @ @ 
+ + package im . actor . server . userconfig 
+ + 
+ + import akka . actor . { ActorSystem , ExtendedActorSystem , Extension , ExtensionId , ExtensionIdProvider } 
+ + import im . actor . api . rpc . configs . UpdateParameterChanged 
+ + import im . actor . server . db . DbExtension 
+ + import im . actor . server . model . configs . Parameter 
+ + import im . actor . server . persist . configs . ParameterRepo 
+ + import im . actor . server . sequence . { SeqState , SeqUpdatesExtension } 
+ + import im . actor . server . user . UserExtension 
+ + 
+ + import scala . concurrent . Future 
+ + 
+ + object UserConfigExtension extends ExtensionId [ UserConfigExtension ] with ExtensionIdProvider { 
+ + override def createExtension ( system : ExtendedActorSystem ) = new UserConfigExtension ( system ) 
+ + 
+ + override def lookup ( ) : ExtensionId [ _ < : Extension ] = UserConfigExtension 
+ + } 
+ + 
+ + final class UserConfigExtension ( system : ActorSystem ) extends Extension { 
+ + import system . dispatcher 
+ + 
+ + private lazy val db = DbExtension ( system ) . db 
+ + private lazy val userExt = UserExtension ( system ) 
+ + private lazy val seqUpdExt = SeqUpdatesExtension ( system ) 
+ + 
+ + def fetchParameters ( userId : Int ) : Future [ Seq [ ( String , Option [ String ] ) ] ] = { 
+ + for { 
+ + params ← db . run ( ParameterRepo . find ( userId ) ) 
+ + } yield params . map ( p ⇒ p . key → p . value ) 
+ + } 
+ + 
+ + def editParameter ( userId : Int , rawKey : String , value : Option [ String ] ) : Future [ SeqState ] = { 
+ + val key = rawKey . trim 
+ + 
+ + val update = UpdateParameterChanged ( key , value ) 
+ + 
+ + for { 
+ + _ ← db . run ( ParameterRepo . createOrUpdate ( Parameter ( userId , key , value ) ) ) 
+ + seqstate ← seqUpdExt . deliverSingleUpdate ( userId , update ) 
+ + } yield { 
+ + seqUpdExt . reloadSettings ( userId ) 
+ + seqstate 
+ + } 
+ + } 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala 
+ index dc5603a . . d76c66e 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala 
+ @ @ - 3 , 52 + 3 , 36 @ @ package im . actor . server . api . rpc . service . configs 
+ import akka . actor . ActorSystem 
+ import akka . util . Timeout 
+ import im . actor . api . rpc . _ 
+ - import im . actor . api . rpc . configs . { ApiParameter , ConfigsService , ResponseGetParameters , UpdateParameterChanged } 
+ + import im . actor . api . rpc . configs . { ApiParameter , ConfigsService , ResponseGetParameters } 
+ import im . actor . api . rpc . misc . ResponseSeq 
+ - import im . actor . server . db . DbExtension 
+ - import im . actor . server . model . configs . Parameter 
+ - import im . actor . server . persist . configs . ParameterRepo 
+ - import im . actor . server . sequence . { SeqUpdatesExtension , SeqState } 
+ - import im . actor . server . user . UserExtension 
+ - import slick . driver . PostgresDriver . api . _ 
+ + import im . actor . server . sequence . SeqState 
+ + import im . actor . server . userconfig . UserConfigExtension 
+ 
+ - import scala . concurrent . duration . _ 
+ import scala . concurrent . { ExecutionContext , Future } 
+ + import scala . concurrent . duration . _ 
+ 
+ - final class ConfigsServiceImpl ( implicit actorSystem : ActorSystem ) extends ConfigsService { 
+ - private val db : Database = DbExtension ( actorSystem ) . db 
+ - 
+ - override implicit val ec : ExecutionContext = actorSystem . dispatcher 
+ - 
+ + final class ConfigsServiceImpl ( implicit system : ActorSystem ) extends ConfigsService { 
+ + override implicit protected val ec : ExecutionContext = system . dispatcher 
+ private implicit val timeout = Timeout ( 10 . seconds ) 
+ - private val seqUpdExt = SeqUpdatesExtension ( actorSystem ) 
+ + private val configExt = UserConfigExtension ( system ) 
+ 
+ override def doHandleEditParameter ( rawKey : String , value : Option [ String ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseSeq ] ] = 
+ authorized ( clientData ) { implicit client ⇒ 
+ - val key = rawKey . trim 
+ - 
+ - val update = UpdateParameterChanged ( key , value ) 
+ - 
+ - val action = for { 
+ - _ ← ParameterRepo . createOrUpdate ( Parameter ( client . userId , key , value ) ) 
+ - SeqState ( seq , state ) ← DBIO . from ( UserExtension ( actorSystem ) . broadcastClientUpdate ( update , None , isFat = false ) ) 
+ - } yield { 
+ - seqUpdExt . reloadSettings ( client . userId ) 
+ - Ok ( ResponseSeq ( seq , state . toByteArray ) ) 
+ - } 
+ - db . run ( action ) 
+ + for { 
+ + SeqState ( seq , state ) ← configExt . editParameter ( client . userId , rawKey , value ) 
+ + } yield Ok ( ResponseSeq ( seq , state . toByteArray ) ) 
+ } 
+ 
+ override def doHandleGetParameters ( clientData : ClientData ) : Future [ HandlerResult [ ResponseGetParameters ] ] = 
+ authorized ( clientData ) { implicit client ⇒ 
+ - val action = for { 
+ - params ← ParameterRepo . find ( client . userId ) 
+ + for { 
+ + params ← configExt . fetchParameters ( client . userId ) 
+ } yield { 
+ - val paramsStructs = params map { param ⇒ 
+ - ApiParameter ( param . key , param . value . getOrElse ( " " ) ) 
+ + val paramsStructs = params map { 
+ + case ( key , value ) ⇒ 
+ + ApiParameter ( key , value . getOrElse ( " " ) ) 
+ } 
+ Ok ( ResponseGetParameters ( paramsStructs . toVector ) ) 
+ } 
+ - db . run ( action ) 
+ } 
+ }
+
+NEAREST DIFF:
+diff - - git a / actor - models / src / main / scala / im / actor / server / models / configs / Parameter . scala b / actor - models / src / main / scala / im / actor / server / models / configs / Parameter . scala 
+ new file mode 100644 
+ index 0000000 . . 895998d 
+ - - - / dev / null 
+ + + + b / actor - models / src / main / scala / im / actor / server / models / configs / Parameter . scala 
+ @ @ - 0 , 0 + 1 , 4 @ @ 
+ + package im . actor . server . models . configs 
+ + 
+ + @ SerialVersionUID ( 1L ) 
+ + case class Parameter ( userId : Int , key : String , value : Option [ String ] ) 
+ \ No newline at end of file 
+ diff - - git a / actor - persist / src / main / resources / sql / migration / V1504221855 _ _ CreateParameters . sql b / actor - persist / src / main / resources / sql / migration / V1504221855 _ _ CreateParameters . sql 
+ new file mode 100644 
+ index 0000000 . . a32822c 
+ - - - / dev / null 
+ + + + b / actor - persist / src / main / resources / sql / migration / V1504221855 _ _ CreateParameters . sql 
+ @ @ - 0 , 0 + 1 , 6 @ @ 
+ + CREATE TABLE config _ parameters ( 
+ + user _ id int NOT NULL , 
+ + key text NOT NULL , 
+ + value text NOT NULL , 
+ + PRIMARY KEY ( user _ id , key ) 
+ + ) 
+ \ No newline at end of file 
+ diff - - git a / actor - persist / src / main / scala / im / actor / server / persist / configs / Parameter . scala b / actor - persist / src / main / scala / im / actor / server / persist / configs / Parameter . scala 
+ new file mode 100644 
+ index 0000000 . . b1ab2b5 
+ - - - / dev / null 
+ + + + b / actor - persist / src / main / scala / im / actor / server / persist / configs / Parameter . scala 
+ @ @ - 0 , 0 + 1 , 25 @ @ 
+ + package im . actor . server . persist . configs 
+ + 
+ + import slick . driver . PostgresDriver . api . _ 
+ + 
+ + import im . actor . server . models 
+ + 
+ + class ParameterTable ( tag : Tag ) extends Table [ models . configs . Parameter ] ( tag , " config _ parameters " ) { 
+ + def userId = column [ Int ] ( " user _ id " , O . PrimaryKey ) 
+ + 
+ + def key = column [ String ] ( " key " , O . PrimaryKey ) 
+ + 
+ + def value = column [ Option [ String ] ] ( " value " ) 
+ + 
+ + def * = ( userId , key , value ) < > ( models . configs . Parameter . tupled , models . configs . Parameter . unapply ) 
+ + } 
+ + 
+ + object Parameter { 
+ + val parameters = TableQuery [ ParameterTable ] 
+ + 
+ + def createOrUpdate ( parameter : models . configs . Parameter ) = 
+ + parameters . insertOrUpdate ( parameter ) 
+ + 
+ + def find ( userId : Int ) = 
+ + parameters . filter ( _ . userId = = = userId ) . result 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala b / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala 
+ new file mode 100644 
+ index 0000000 . . 54a8ce9 
+ - - - / dev / null 
+ + + + b / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / configs / ConfigsServiceImpl . scala 
+ @ @ - 0 , 0 + 1 , 55 @ @ 
+ + package im . actor . server . api . rpc . service . configs 
+ + 
+ + import scala . concurrent . { ExecutionContext , Future } 
+ + 
+ + import akka . actor . ActorSystem 
+ + import slick . driver . PostgresDriver . api . _ 
+ + 
+ + import im . actor . api . rpc . _ 
+ + import im . actor . api . rpc . configs . { ConfigsService , Parameter , ResponseGetParameters , UpdateParameterChanged } 
+ + import im . actor . api . rpc . misc . ResponseSeq 
+ + import im . actor . server . { models , persist } 
+ + import im . actor . server . push . SeqUpdatesManagerRegion 
+ + 
+ + class ConfigsServiceImpl ( implicit seqUpdManagerRegion : SeqUpdatesManagerRegion , db : Database , actorSystem : ActorSystem ) extends ConfigsService { 
+ + 
+ + import im . actor . server . push . SeqUpdatesManager . _ 
+ + 
+ + override implicit val ec : ExecutionContext = actorSystem . dispatcher 
+ + 
+ + override def jhandleEditParameter ( rawKey : String , rawValue : String , clientData : ClientData ) : Future [ HandlerResult [ ResponseSeq ] ] = { 
+ + val authorizedAction = requireAuth ( clientData ) . map { implicit client = > 
+ + val key = rawKey . trim 
+ + val value = 
+ + rawValue match { 
+ + case " " = > None 
+ + case s = > Some ( s ) 
+ + } 
+ + 
+ + val update = UpdateParameterChanged ( key , value ) 
+ + 
+ + for { 
+ + _ < - persist . configs . Parameter . createOrUpdate ( models . configs . Parameter ( client . userId , key , value ) ) 
+ + seqstate < - broadcastClientUpdate ( update ) 
+ + } yield Ok ( ResponseSeq ( seqstate . _ 1 , seqstate . _ 2 ) ) 
+ + } 
+ + 
+ + db . run ( toDBIOAction ( authorizedAction ) ) 
+ + } 
+ + 
+ + override def jhandleGetParameters ( clientData : ClientData ) : Future [ HandlerResult [ ResponseGetParameters ] ] = { 
+ + val authorizedAction = requireAuth ( clientData ) . map { implicit client = > 
+ + for { 
+ + params < - persist . configs . Parameter . find ( client . userId ) 
+ + } yield { 
+ + val paramsStructs = params map { param = > 
+ + Parameter ( param . key , param . value . getOrElse ( " " ) ) 
+ + } 
+ + 
+ + Ok ( ResponseGetParameters ( paramsStructs . toVector ) ) 
+ + } 
+ + } 
+ + 
+ + db . run ( toDBIOAction ( authorizedAction ) ) 
+ + } 
+ + } 
+ diff - - git a / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ConfigsServiceSpec . scala b / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ConfigsServiceSpec . scala 
+ new file mode 100644 
+ index 0000000 . . 4bd638d 
+ - - - / dev / null 
+ + + + b / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ConfigsServiceSpec . scala 
+ @ @ - 0 , 0 + 1 , 55 @ @ 
+ + package im . actor . server . api . rpc . service 
+ + 
+ + import im . actor . api . rpc . _ 
+ + import im . actor . api . rpc . configs . _ 
+ + import im . actor . api . rpc . misc . ResponseSeq 
+ + import im . actor . server . api . rpc . RpcApiService 
+ + import im . actor . server . api . rpc . service . configs . ConfigsServiceImpl 
+ + import im . actor . server . presences . PresenceManager 
+ + import im . actor . server . push . { SeqUpdatesManager , WeakUpdatesManager } 
+ + import im . actor . server . session . Session 
+ + 
+ + class ConfigsServiceSpec extends BaseServiceSuite { 
+ + behavior of " Configs Service " 
+ + 
+ + it should " save parameter even if it already exists " in e1 ( ) 
+ + 
+ + it should " get parameters " in e2 ( ) 
+ + 
+ + val rpcApiService = system . actorOf ( RpcApiService . props ( ) ) 
+ + implicit val seqUpdManagerRegion = SeqUpdatesManager . startRegion ( ) 
+ + implicit val weakUpdManagerRegion = WeakUpdatesManager . startRegion ( ) 
+ + implicit val presenceManagerRegion = PresenceManager . startRegion ( ) 
+ + implicit val sessionRegion = Session . startRegion ( Some ( Session . props ( rpcApiService ) ) ) 
+ + implicit val authService = buildAuthService ( ) 
+ + 
+ + val service = new ConfigsServiceImpl 
+ + 
+ + val ( user , _ , _ ) = createUser ( ) 
+ + val authId = createAuthId ( ) 
+ + val sessionId = createSessionId ( ) 
+ + 
+ + implicit val clientData = ClientData ( authId , sessionId , Some ( user . id ) ) 
+ + 
+ + def e1 ( ) = { 
+ + whenReady ( service . handleEditParameter ( " par1 " , " val1 " ) ) { resp = > 
+ + resp should matchPattern { 
+ + case Ok ( ResponseSeq ( _ , _ ) ) = > 
+ + } 
+ + } 
+ + 
+ + whenReady ( service . handleEditParameter ( " par1 " , " val2 " ) ) { resp = > 
+ + resp should matchPattern { 
+ + case Ok ( ResponseSeq ( _ , _ ) ) = > 
+ + } 
+ + } 
+ + } 
+ + 
+ + def e2 ( ) = { 
+ + whenReady ( service . handleGetParameters ( ) ) { resp = > 
+ + resp should matchPattern { 
+ + case Ok ( ResponseGetParameters ( Vector ( Parameter ( " par1 " , " val2 " ) ) ) ) = > 
+ + } 
+ + } 
+ + } 
+ + }

@@ -1,0 +1,122 @@
+BLEU SCORE: 0.02383853510228548
+
+TEST MSG: Add flag to allow dropping oversized read repair mutations
+GENERATED MSG: Re - apply MV updates on commitlog replay
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index e3026aa . . a3c43fd 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 16 <nl> + * Add flag to allow dropping oversized read repair mutations ( CASSANDRA - 13975 ) <nl> * Fix SSTableLoader logger message ( CASSANDRA - 14003 ) <nl> * Fix repair race that caused gossip to block ( CASSANDRA - 13849 ) <nl> * Tracing interferes with digest requests when using RandomPartitioner ( CASSANDRA - 13964 ) <nl> @ @ - 8 , 6 + 9 , 7 @ @ <nl> * Mishandling of cells for removed / dropped columns when reading legacy files ( CASSANDRA - 13939 ) <nl> * Deserialise sstable metadata in nodetool verify ( CASSANDRA - 13922 ) <nl> <nl> + <nl> 3 . 0 . 15 <nl> * Improve TRUNCATE performance ( CASSANDRA - 13909 ) <nl> * Implement short read protection on partition boundaries ( CASSANDRA - 13595 ) <nl> diff - - git a / src / java / org / apache / cassandra / metrics / TableMetrics . java b / src / java / org / apache / cassandra / metrics / TableMetrics . java <nl> index fe88a63 . . eb56ed9 100644 <nl> - - - a / src / java / org / apache / cassandra / metrics / TableMetrics . java <nl> + + + b / src / java / org / apache / cassandra / metrics / TableMetrics . java <nl> @ @ - 151 , 6 + 151 , 7 @ @ public class TableMetrics <nl> public final static LatencyMetrics globalWriteLatency = new LatencyMetrics ( globalFactory , globalAliasFactory , " Write " ) ; <nl> public final static LatencyMetrics globalRangeLatency = new LatencyMetrics ( globalFactory , globalAliasFactory , " Range " ) ; <nl> <nl> + public final Meter readRepairRequests ; <nl> public final Meter shortReadProtectionRequests ; <nl> <nl> public final Map < Sampler , TopKSampler < ByteBuffer > > samplers ; <nl> @ @ - 648 , 6 + 649 , 7 @ @ public class TableMetrics <nl> casPropose = new LatencyMetrics ( factory , " CasPropose " , cfs . keyspace . metric . casPropose ) ; <nl> casCommit = new LatencyMetrics ( factory , " CasCommit " , cfs . keyspace . metric . casCommit ) ; <nl> <nl> + readRepairRequests = Metrics . meter ( factory . createMetricName ( " ReadRepairRequests " ) ) ; <nl> shortReadProtectionRequests = Metrics . meter ( factory . createMetricName ( " ShortReadProtectionRequests " ) ) ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / service / DataResolver . java b / src / java / org / apache / cassandra / service / DataResolver . java <nl> index 5fb34c6 . . f02b565 100644 <nl> - - - a / src / java / org / apache / cassandra / service / DataResolver . java <nl> + + + b / src / java / org / apache / cassandra / service / DataResolver . java <nl> @ @ - 44 , 6 + 44 , 9 @ @ import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> public class DataResolver extends ResponseResolver <nl> { <nl> + private static final boolean DROP _ OVERSIZED _ READ _ REPAIR _ MUTATIONS = <nl> + Boolean . getBoolean ( " cassandra . drop _ oversized _ readrepair _ mutations " ) ; <nl> + <nl> @ VisibleForTesting <nl> final List < AsyncOneResponse > repairResults = Collections . synchronizedList ( new ArrayList < > ( ) ) ; <nl> <nl> @ @ - 452 , 15 + 455 , 49 @ @ public class DataResolver extends ResponseResolver <nl> public void close ( ) <nl> { <nl> for ( int i = 0 ; i < repairs . length ; i + + ) <nl> + if ( null ! = repairs [ i ] ) <nl> + sendRepairMutation ( repairs [ i ] , sources [ i ] ) ; <nl> + } <nl> + <nl> + private void sendRepairMutation ( PartitionUpdate partition , InetAddress destination ) <nl> + { <nl> + Mutation mutation = new Mutation ( partition ) ; <nl> + int messagingVersion = MessagingService . instance ( ) . getVersion ( destination ) ; <nl> + <nl> + int mutationSize = ( int ) Mutation . serializer . serializedSize ( mutation , messagingVersion ) ; <nl> + int maxMutationSize = DatabaseDescriptor . getMaxMutationSize ( ) ; <nl> + <nl> + if ( mutationSize < = maxMutationSize ) <nl> { <nl> - if ( repairs [ i ] = = null ) <nl> - continue ; <nl> - <nl> - / / use a separate verb here because we don ' t want these to be get the white glove hint - <nl> - / / on - timeout behavior that a " real " mutation gets <nl> - Tracing . trace ( " Sending read - repair - mutation to { } " , sources [ i ] ) ; <nl> - MessageOut < Mutation > msg = new Mutation ( repairs [ i ] ) . createMessage ( MessagingService . Verb . READ _ REPAIR ) ; <nl> - repairResults . add ( MessagingService . instance ( ) . sendRR ( msg , sources [ i ] ) ) ; <nl> + Tracing . trace ( " Sending read - repair - mutation to { } " , destination ) ; <nl> + / / use a separate verb here to avoid writing hints on timeouts <nl> + MessageOut < Mutation > message = mutation . createMessage ( MessagingService . Verb . READ _ REPAIR ) ; <nl> + repairResults . add ( MessagingService . instance ( ) . sendRR ( message , destination ) ) ; <nl> + ColumnFamilyStore . metricsFor ( command . metadata ( ) . cfId ) . readRepairRequests . mark ( ) ; <nl> + } <nl> + else if ( DROP _ OVERSIZED _ READ _ REPAIR _ MUTATIONS ) <nl> + { <nl> + logger . debug ( " Encountered an oversized ( { } / { } ) read repair mutation for table { } . { } , key { } , node { } " , <nl> + mutationSize , <nl> + maxMutationSize , <nl> + command . metadata ( ) . ksName , <nl> + command . metadata ( ) . cfName , <nl> + command . metadata ( ) . getKeyValidator ( ) . getString ( partitionKey . getKey ( ) ) , <nl> + destination ) ; <nl> + } <nl> + else <nl> + { <nl> + logger . warn ( " Encountered an oversized ( { } / { } ) read repair mutation for table { } . { } , key { } , node { } " , <nl> + mutationSize , <nl> + maxMutationSize , <nl> + command . metadata ( ) . ksName , <nl> + command . metadata ( ) . cfName , <nl> + command . metadata ( ) . getKeyValidator ( ) . getString ( partitionKey . getKey ( ) ) , <nl> + destination ) ; <nl> + <nl> + int blockFor = consistency . blockFor ( keyspace ) ; <nl> + Tracing . trace ( " Timed out while read - repairing after receiving all { } data and digest responses " , blockFor ) ; <nl> + throw new ReadTimeoutException ( consistency , blockFor - 1 , blockFor , true ) ; <nl> } <nl> } <nl> }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index e3026aa . . a3c43fd 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 16 
+ + * Add flag to allow dropping oversized read repair mutations ( CASSANDRA - 13975 ) 
+ * Fix SSTableLoader logger message ( CASSANDRA - 14003 ) 
+ * Fix repair race that caused gossip to block ( CASSANDRA - 13849 ) 
+ * Tracing interferes with digest requests when using RandomPartitioner ( CASSANDRA - 13964 ) 
+ @ @ - 8 , 6 + 9 , 7 @ @ 
+ * Mishandling of cells for removed / dropped columns when reading legacy files ( CASSANDRA - 13939 ) 
+ * Deserialise sstable metadata in nodetool verify ( CASSANDRA - 13922 ) 
+ 
+ + 
+ 3 . 0 . 15 
+ * Improve TRUNCATE performance ( CASSANDRA - 13909 ) 
+ * Implement short read protection on partition boundaries ( CASSANDRA - 13595 ) 
+ diff - - git a / src / java / org / apache / cassandra / metrics / TableMetrics . java b / src / java / org / apache / cassandra / metrics / TableMetrics . java 
+ index fe88a63 . . eb56ed9 100644 
+ - - - a / src / java / org / apache / cassandra / metrics / TableMetrics . java 
+ + + + b / src / java / org / apache / cassandra / metrics / TableMetrics . java 
+ @ @ - 151 , 6 + 151 , 7 @ @ public class TableMetrics 
+ public final static LatencyMetrics globalWriteLatency = new LatencyMetrics ( globalFactory , globalAliasFactory , " Write " ) ; 
+ public final static LatencyMetrics globalRangeLatency = new LatencyMetrics ( globalFactory , globalAliasFactory , " Range " ) ; 
+ 
+ + public final Meter readRepairRequests ; 
+ public final Meter shortReadProtectionRequests ; 
+ 
+ public final Map < Sampler , TopKSampler < ByteBuffer > > samplers ; 
+ @ @ - 648 , 6 + 649 , 7 @ @ public class TableMetrics 
+ casPropose = new LatencyMetrics ( factory , " CasPropose " , cfs . keyspace . metric . casPropose ) ; 
+ casCommit = new LatencyMetrics ( factory , " CasCommit " , cfs . keyspace . metric . casCommit ) ; 
+ 
+ + readRepairRequests = Metrics . meter ( factory . createMetricName ( " ReadRepairRequests " ) ) ; 
+ shortReadProtectionRequests = Metrics . meter ( factory . createMetricName ( " ShortReadProtectionRequests " ) ) ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / service / DataResolver . java b / src / java / org / apache / cassandra / service / DataResolver . java 
+ index 5fb34c6 . . f02b565 100644 
+ - - - a / src / java / org / apache / cassandra / service / DataResolver . java 
+ + + + b / src / java / org / apache / cassandra / service / DataResolver . java 
+ @ @ - 44 , 6 + 44 , 9 @ @ import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ public class DataResolver extends ResponseResolver 
+ { 
+ + private static final boolean DROP _ OVERSIZED _ READ _ REPAIR _ MUTATIONS = 
+ + Boolean . getBoolean ( " cassandra . drop _ oversized _ readrepair _ mutations " ) ; 
+ + 
+ @ VisibleForTesting 
+ final List < AsyncOneResponse > repairResults = Collections . synchronizedList ( new ArrayList < > ( ) ) ; 
+ 
+ @ @ - 452 , 15 + 455 , 49 @ @ public class DataResolver extends ResponseResolver 
+ public void close ( ) 
+ { 
+ for ( int i = 0 ; i < repairs . length ; i + + ) 
+ + if ( null ! = repairs [ i ] ) 
+ + sendRepairMutation ( repairs [ i ] , sources [ i ] ) ; 
+ + } 
+ + 
+ + private void sendRepairMutation ( PartitionUpdate partition , InetAddress destination ) 
+ + { 
+ + Mutation mutation = new Mutation ( partition ) ; 
+ + int messagingVersion = MessagingService . instance ( ) . getVersion ( destination ) ; 
+ + 
+ + int mutationSize = ( int ) Mutation . serializer . serializedSize ( mutation , messagingVersion ) ; 
+ + int maxMutationSize = DatabaseDescriptor . getMaxMutationSize ( ) ; 
+ + 
+ + if ( mutationSize < = maxMutationSize ) 
+ { 
+ - if ( repairs [ i ] = = null ) 
+ - continue ; 
+ - 
+ - / / use a separate verb here because we don ' t want these to be get the white glove hint - 
+ - / / on - timeout behavior that a " real " mutation gets 
+ - Tracing . trace ( " Sending read - repair - mutation to { } " , sources [ i ] ) ; 
+ - MessageOut < Mutation > msg = new Mutation ( repairs [ i ] ) . createMessage ( MessagingService . Verb . READ _ REPAIR ) ; 
+ - repairResults . add ( MessagingService . instance ( ) . sendRR ( msg , sources [ i ] ) ) ; 
+ + Tracing . trace ( " Sending read - repair - mutation to { } " , destination ) ; 
+ + / / use a separate verb here to avoid writing hints on timeouts 
+ + MessageOut < Mutation > message = mutation . createMessage ( MessagingService . Verb . READ _ REPAIR ) ; 
+ + repairResults . add ( MessagingService . instance ( ) . sendRR ( message , destination ) ) ; 
+ + ColumnFamilyStore . metricsFor ( command . metadata ( ) . cfId ) . readRepairRequests . mark ( ) ; 
+ + } 
+ + else if ( DROP _ OVERSIZED _ READ _ REPAIR _ MUTATIONS ) 
+ + { 
+ + logger . debug ( " Encountered an oversized ( { } / { } ) read repair mutation for table { } . { } , key { } , node { } " , 
+ + mutationSize , 
+ + maxMutationSize , 
+ + command . metadata ( ) . ksName , 
+ + command . metadata ( ) . cfName , 
+ + command . metadata ( ) . getKeyValidator ( ) . getString ( partitionKey . getKey ( ) ) , 
+ + destination ) ; 
+ + } 
+ + else 
+ + { 
+ + logger . warn ( " Encountered an oversized ( { } / { } ) read repair mutation for table { } . { } , key { } , node { } " , 
+ + mutationSize , 
+ + maxMutationSize , 
+ + command . metadata ( ) . ksName , 
+ + command . metadata ( ) . cfName , 
+ + command . metadata ( ) . getKeyValidator ( ) . getString ( partitionKey . getKey ( ) ) , 
+ + destination ) ; 
+ + 
+ + int blockFor = consistency . blockFor ( keyspace ) ; 
+ + Tracing . trace ( " Timed out while read - repairing after receiving all { } data and digest responses " , blockFor ) ; 
+ + throw new ReadTimeoutException ( consistency , blockFor - 1 , blockFor , true ) ; 
+ } 
+ } 
+ }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

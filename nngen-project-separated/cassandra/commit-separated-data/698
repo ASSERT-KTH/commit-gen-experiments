@@ -1,0 +1,422 @@
+BLEU SCORE: 0.022882533035912193
+
+TEST MSG: Make decommission operation resumable
+GENERATED MSG: Add command to rebuild node without merkle tree calculations
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index bba64c6 . . e215ad9 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 10 <nl> + * Make decommission operation resumable ( CASSANDRA - 12008 ) <nl> * Add support to one - way targeted repair ( CASSANDRA - 9876 ) <nl> * Remove clientutil jar ( CASSANDRA - 11635 ) <nl> * Fix compaction throughput throttle ( CASSANDRA - 12366 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / SystemKeyspace . java b / src / java / org / apache / cassandra / db / SystemKeyspace . java <nl> index 2bfa88d . . 2083d54 100644 <nl> - - - a / src / java / org / apache / cassandra / db / SystemKeyspace . java <nl> + + + b / src / java / org / apache / cassandra / db / SystemKeyspace . java <nl> @ @ - 30 , 6 + 30 , 7 @ @ import javax . management . openmbean . OpenDataException ; <nl> import javax . management . openmbean . TabularData ; <nl> <nl> import com . google . common . collect . HashMultimap ; <nl> + import com . google . common . collect . ImmutableMap ; <nl> import com . google . common . collect . ImmutableSet ; <nl> import com . google . common . collect . SetMultimap ; <nl> import com . google . common . io . ByteStreams ; <nl> @ @ - 96 , 6 + 97 , 7 @ @ public final class SystemKeyspace <nl> public static final String SSTABLE _ ACTIVITY = " sstable _ activity " ; <nl> public static final String SIZE _ ESTIMATES = " size _ estimates " ; <nl> public static final String AVAILABLE _ RANGES = " available _ ranges " ; <nl> + public static final String TRANSFERRED _ RANGES = " transferred _ ranges " ; <nl> public static final String VIEWS _ BUILDS _ IN _ PROGRESS = " views _ builds _ in _ progress " ; <nl> public static final String BUILT _ VIEWS = " built _ views " ; <nl> public static final String PREPARED _ STATEMENTS = " prepared _ statements " ; <nl> @ @ - 248 , 6 + 250 , 16 @ @ public final class SystemKeyspace <nl> + " ranges set < blob > , " <nl> + " PRIMARY KEY ( ( keyspace _ name ) ) ) " ) ; <nl> <nl> + private static final CFMetaData TransferredRanges = <nl> + compile ( TRANSFERRED _ RANGES , <nl> + " record of transferred ranges for streaming operation " , <nl> + " CREATE TABLE % s ( " <nl> + + " operation text , " <nl> + + " peer inet , " <nl> + + " keyspace _ name text , " <nl> + + " ranges set < blob > , " <nl> + + " PRIMARY KEY ( ( operation , keyspace _ name ) , peer ) ) " ) ; <nl> + <nl> private static final CFMetaData ViewsBuildsInProgress = <nl> compile ( VIEWS _ BUILDS _ IN _ PROGRESS , <nl> " views builds current progress " , <nl> @ @ - 442 , 6 + 454 , 7 @ @ public final class SystemKeyspace <nl> SSTableActivity , <nl> SizeEstimates , <nl> AvailableRanges , <nl> + TransferredRanges , <nl> ViewsBuildsInProgress , <nl> BuiltViews , <nl> LegacyHints , <nl> @ @ - 1297 , 6 + 1310 , 39 @ @ public final class SystemKeyspace <nl> availableRanges . truncateBlocking ( ) ; <nl> } <nl> <nl> + public static synchronized void updateTransferredRanges ( String description , <nl> + InetAddress peer , <nl> + String keyspace , <nl> + Collection < Range < Token > > streamedRanges ) <nl> + { <nl> + String cql = " UPDATE system . % s SET ranges = ranges + ? WHERE operation = ? AND peer = ? AND keyspace _ name = ? " ; <nl> + Set < ByteBuffer > rangesToUpdate = new HashSet < > ( streamedRanges . size ( ) ) ; <nl> + for ( Range < Token > range : streamedRanges ) <nl> + { <nl> + rangesToUpdate . add ( rangeToBytes ( range ) ) ; <nl> + } <nl> + executeInternal ( String . format ( cql , TRANSFERRED _ RANGES ) , rangesToUpdate , description , peer , keyspace ) ; <nl> + } <nl> + <nl> + public static synchronized Map < InetAddress , Set < Range < Token > > > getTransferredRanges ( String description , String keyspace , IPartitioner partitioner ) <nl> + { <nl> + Map < InetAddress , Set < Range < Token > > > result = new HashMap < > ( ) ; <nl> + String query = " SELECT * FROM system . % s WHERE operation = ? AND keyspace _ name = ? " ; <nl> + UntypedResultSet rs = executeInternal ( String . format ( query , TRANSFERRED _ RANGES ) , description , keyspace ) ; <nl> + for ( UntypedResultSet . Row row : rs ) <nl> + { <nl> + InetAddress peer = row . getInetAddress ( " peer " ) ; <nl> + Set < ByteBuffer > rawRanges = rawRanges = row . getSet ( " ranges " , BytesType . instance ) ; <nl> + Set < Range < Token > > ranges = new HashSet < > ( ) ; <nl> + for ( ByteBuffer rawRange : rawRanges ) <nl> + { <nl> + ranges . add ( byteBufferToRange ( rawRange , partitioner ) ) ; <nl> + } <nl> + result . put ( peer , ranges ) ; <nl> + } <nl> + return ImmutableMap . copyOf ( result ) ; <nl> + } <nl> + <nl> / * * <nl> * Compare the release version in the system . local table with the one included in the distro . <nl> * If they don ' t match , snapshot all tables in the system keyspace . This is intended to be <nl> diff - - git a / src / java / org / apache / cassandra / dht / StreamStateStore . java b / src / java / org / apache / cassandra / dht / StreamStateStore . java <nl> index f6046aa . . 47b3072 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / StreamStateStore . java <nl> + + + b / src / java / org / apache / cassandra / dht / StreamStateStore . java <nl> @ @ - 66 , 6 + 66 , 11 @ @ public class StreamStateStore implements StreamEventHandler <nl> StreamEvent . SessionCompleteEvent se = ( StreamEvent . SessionCompleteEvent ) event ; <nl> if ( se . success ) <nl> { <nl> + Set < String > keyspaces = se . transferredRangesPerKeyspace . keySet ( ) ; <nl> + for ( String keyspace : keyspaces ) <nl> + { <nl> + SystemKeyspace . updateTransferredRanges ( se . description , se . peer , keyspace , se . transferredRangesPerKeyspace . get ( keyspace ) ) ; <nl> + } <nl> for ( StreamRequest request : se . requests ) <nl> { <nl> SystemKeyspace . updateAvailableRanges ( request . keyspace , request . ranges ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index 2810e2f . . 3d2037a 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 171 , 6 + 171 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> private boolean isSurveyMode = Boolean . parseBoolean ( System . getProperty ( " cassandra . write _ survey " , " false " ) ) ; <nl> / * true if node is rebuilding and receiving data * / <nl> private final AtomicBoolean isRebuilding = new AtomicBoolean ( ) ; <nl> + private final AtomicBoolean isDecommissioning = new AtomicBoolean ( ) ; <nl> <nl> private volatile boolean initialized = false ; <nl> private volatile boolean joined = false ; <nl> @ @ - 3665 , 41 + 3666 , 63 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> throw new UnsupportedOperationException ( " local node is not a member of the token ring yet " ) ; <nl> if ( tokenMetadata . cloneAfterAllLeft ( ) . sortedTokens ( ) . size ( ) < 2 ) <nl> throw new UnsupportedOperationException ( " no other normal nodes in the ring ; decommission would be pointless " ) ; <nl> - if ( operationMode ! = Mode . NORMAL ) <nl> + if ( operationMode ! = Mode . LEAVING & & operationMode ! = Mode . NORMAL ) <nl> throw new UnsupportedOperationException ( " Node in " + operationMode + " state ; wait for status to become normal or restart " ) ; <nl> - <nl> - PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> - for ( String keyspaceName : Schema . instance . getNonLocalStrategyKeyspaces ( ) ) <nl> - { <nl> - if ( tokenMetadata . getPendingRanges ( keyspaceName , FBUtilities . getBroadcastAddress ( ) ) . size ( ) > 0 ) <nl> - throw new UnsupportedOperationException ( " data is currently moving to this node ; unable to leave the ring " ) ; <nl> - } <nl> + if ( isDecommissioning . compareAndSet ( true , true ) ) <nl> + throw new IllegalStateException ( " Node is still decommissioning . Check nodetool netstats . " ) ; <nl> <nl> if ( logger . isDebugEnabled ( ) ) <nl> logger . debug ( " DECOMMISSIONING " ) ; <nl> - startLeaving ( ) ; <nl> - long timeout = Math . max ( RING _ DELAY , BatchlogManager . instance . getBatchlogTimeout ( ) ) ; <nl> - setMode ( Mode . LEAVING , " sleeping " + timeout + " ms for batch processing and pending range setup " , true ) ; <nl> - Thread . sleep ( timeout ) ; <nl> <nl> - Runnable finishLeaving = new Runnable ( ) <nl> + try <nl> { <nl> - public void run ( ) <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> + for ( String keyspaceName : Schema . instance . getNonLocalStrategyKeyspaces ( ) ) <nl> { <nl> - shutdownClientServers ( ) ; <nl> - Gossiper . instance . stop ( ) ; <nl> - try { <nl> - MessagingService . instance ( ) . shutdown ( ) ; <nl> - } catch ( IOError ioe ) { <nl> - logger . info ( " failed to shutdown message service : { } " , ioe ) ; <nl> - } <nl> - StageManager . shutdownNow ( ) ; <nl> - SystemKeyspace . setBootstrapState ( SystemKeyspace . BootstrapState . DECOMMISSIONED ) ; <nl> - setMode ( Mode . DECOMMISSIONED , true ) ; <nl> - / / let op be responsible for killing the process <nl> + if ( tokenMetadata . getPendingRanges ( keyspaceName , FBUtilities . getBroadcastAddress ( ) ) . size ( ) > 0 ) <nl> + throw new UnsupportedOperationException ( " data is currently moving to this node ; unable to leave the ring " ) ; <nl> } <nl> - } ; <nl> - unbootstrap ( finishLeaving ) ; <nl> + <nl> + startLeaving ( ) ; <nl> + long timeout = Math . max ( RING _ DELAY , BatchlogManager . instance . getBatchlogTimeout ( ) ) ; <nl> + setMode ( Mode . LEAVING , " sleeping " + timeout + " ms for batch processing and pending range setup " , true ) ; <nl> + Thread . sleep ( timeout ) ; <nl> + <nl> + Runnable finishLeaving = new Runnable ( ) <nl> + { <nl> + public void run ( ) <nl> + { <nl> + shutdownClientServers ( ) ; <nl> + Gossiper . instance . stop ( ) ; <nl> + try <nl> + { <nl> + MessagingService . instance ( ) . shutdown ( ) ; <nl> + } <nl> + catch ( IOError ioe ) <nl> + { <nl> + logger . info ( " failed to shutdown message service : { } " , ioe ) ; <nl> + } <nl> + StageManager . shutdownNow ( ) ; <nl> + SystemKeyspace . setBootstrapState ( SystemKeyspace . BootstrapState . DECOMMISSIONED ) ; <nl> + setMode ( Mode . DECOMMISSIONED , true ) ; <nl> + / / let op be responsible for killing the process <nl> + } <nl> + } ; <nl> + unbootstrap ( finishLeaving ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + throw new RuntimeException ( " Node interrupted while decommissioning " ) ; <nl> + } <nl> + catch ( ExecutionException e ) <nl> + { <nl> + logger . error ( " Error while decommissioning node " , e . getCause ( ) ) ; <nl> + throw new RuntimeException ( " Error while decommissioning node : " + e . getCause ( ) . getMessage ( ) ) ; <nl> + } <nl> + finally <nl> + { <nl> + isDecommissioning . set ( false ) ; <nl> + } <nl> } <nl> <nl> private void leaveRing ( ) <nl> @ @ - 3714 , 7 + 3737 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> Uninterruptibles . sleepUninterruptibly ( delay , TimeUnit . MILLISECONDS ) ; <nl> } <nl> <nl> - private void unbootstrap ( Runnable onFinish ) <nl> + private void unbootstrap ( Runnable onFinish ) throws ExecutionException , InterruptedException <nl> { <nl> Map < String , Multimap < Range < Token > , InetAddress > > rangesToStream = new HashMap < > ( ) ; <nl> <nl> @ @ - 3736 , 14 + 3759 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> <nl> / / Wait for batch log to complete before streaming hints . <nl> logger . debug ( " waiting for batch log processing . " ) ; <nl> - try <nl> - { <nl> - batchlogReplay . get ( ) ; <nl> - } <nl> - catch ( ExecutionException | InterruptedException e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> + batchlogReplay . get ( ) ; <nl> <nl> setMode ( Mode . LEAVING , " streaming hints to other nodes " , true ) ; <nl> <nl> @ @ - 3751 , 15 + 3767 , 8 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> <nl> / / wait for the transfer runnables to signal the latch . <nl> logger . debug ( " waiting for stream acks . " ) ; <nl> - try <nl> - { <nl> - streamSuccess . get ( ) ; <nl> - hintsSuccess . get ( ) ; <nl> - } <nl> - catch ( ExecutionException | InterruptedException e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> + streamSuccess . get ( ) ; <nl> + hintsSuccess . get ( ) ; <nl> logger . debug ( " stream acks all received . " ) ; <nl> leaveRing ( ) ; <nl> onFinish . run ( ) ; <nl> @ @ - 4541 , 6 + 4550 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> { <nl> / / First , we build a list of ranges to stream to each host , per table <nl> Map < String , Map < InetAddress , List < Range < Token > > > > sessionsToStreamByKeyspace = new HashMap < > ( ) ; <nl> + <nl> for ( Map . Entry < String , Multimap < Range < Token > , InetAddress > > entry : rangesToStreamByKeyspace . entrySet ( ) ) <nl> { <nl> String keyspace = entry . getKey ( ) ; <nl> @ @ - 4549 , 12 + 4559 , 22 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> if ( rangesWithEndpoints . isEmpty ( ) ) <nl> continue ; <nl> <nl> + Map < InetAddress , Set < Range < Token > > > transferredRangePerKeyspace = SystemKeyspace . getTransferredRanges ( " Unbootstrap " , <nl> + keyspace , <nl> + StorageService . instance . getTokenMetadata ( ) . partitioner ) ; <nl> Map < InetAddress , List < Range < Token > > > rangesPerEndpoint = new HashMap < > ( ) ; <nl> for ( Map . Entry < Range < Token > , InetAddress > endPointEntry : rangesWithEndpoints . entries ( ) ) <nl> { <nl> Range < Token > range = endPointEntry . getKey ( ) ; <nl> InetAddress endpoint = endPointEntry . getValue ( ) ; <nl> <nl> + Set < Range < Token > > transferredRanges = transferredRangePerKeyspace . get ( endpoint ) ; <nl> + if ( transferredRanges ! = null & & transferredRanges . contains ( range ) ) <nl> + { <nl> + logger . debug ( " Skipping transferred range { } of keyspace { } , endpoint { } " , range , keyspace , endpoint ) ; <nl> + continue ; <nl> + } <nl> + <nl> List < Range < Token > > curRanges = rangesPerEndpoint . get ( endpoint ) ; <nl> if ( curRanges = = null ) <nl> { <nl> @ @ - 4568 , 6 + 4588 , 10 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> } <nl> <nl> StreamPlan streamPlan = new StreamPlan ( " Unbootstrap " ) ; <nl> + <nl> + / / Vinculate StreamStateStore to current StreamPlan to update transferred ranges per StreamSession <nl> + streamPlan . listeners ( streamStateStore ) ; <nl> + <nl> for ( Map . Entry < String , Map < InetAddress , List < Range < Token > > > > entry : sessionsToStreamByKeyspace . entrySet ( ) ) <nl> { <nl> String keyspaceName = entry . getKey ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamEvent . java b / src / java / org / apache / cassandra / streaming / StreamEvent . java <nl> index de3db9c . . 49172fb 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamEvent . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamEvent . java <nl> @ @ - 18 , 11 + 18 , 16 @ @ <nl> package org . apache . cassandra . streaming ; <nl> <nl> import java . net . InetAddress ; <nl> + import java . util . Collections ; <nl> + import java . util . Map ; <nl> import java . util . Set ; <nl> import java . util . UUID ; <nl> <nl> import com . google . common . collect . ImmutableSet ; <nl> <nl> + import org . apache . cassandra . dht . Range ; <nl> + import org . apache . cassandra . dht . Token ; <nl> + <nl> public abstract class StreamEvent <nl> { <nl> public static enum Type <nl> @ @ - 47 , 6 + 52 , 8 @ @ public abstract class StreamEvent <nl> public final boolean success ; <nl> public final int sessionIndex ; <nl> public final Set < StreamRequest > requests ; <nl> + public final String description ; <nl> + public final Map < String , Set < Range < Token > > > transferredRangesPerKeyspace ; <nl> <nl> public SessionCompleteEvent ( StreamSession session ) <nl> { <nl> @ @ - 55 , 6 + 62 , 8 @ @ public abstract class StreamEvent <nl> this . success = session . isSuccess ( ) ; <nl> this . sessionIndex = session . sessionIndex ( ) ; <nl> this . requests = ImmutableSet . copyOf ( session . requests ) ; <nl> + this . description = session . description ( ) ; <nl> + this . transferredRangesPerKeyspace = Collections . unmodifiableMap ( session . transferredRangesPerKeyspace ) ; <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamSession . java b / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> index 11b0847 . . 3af31f8 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> @ @ - 142 , 6 + 142 , 8 @ @ public class StreamSession implements IEndpointStateChangeSubscriber <nl> / * can be null when session is created in remote * / <nl> private final StreamConnectionFactory factory ; <nl> <nl> + public final Map < String , Set < Range < Token > > > transferredRangesPerKeyspace = new HashMap < > ( ) ; <nl> + <nl> public final ConnectionHandler handler ; <nl> <nl> private AtomicBoolean isAborted = new AtomicBoolean ( false ) ; <nl> @ @ - 289 , 6 + 291 , 13 @ @ public class StreamSession implements IEndpointStateChangeSubscriber <nl> try <nl> { <nl> addTransferFiles ( sections ) ; <nl> + Set < Range < Token > > toBeUpdated = transferredRangesPerKeyspace . get ( keyspace ) ; <nl> + if ( toBeUpdated = = null ) <nl> + { <nl> + toBeUpdated = new HashSet < > ( ) ; <nl> + } <nl> + toBeUpdated . addAll ( ranges ) ; <nl> + transferredRangesPerKeyspace . put ( keyspace , toBeUpdated ) ; <nl> } <nl> finally <nl> {
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java b / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java <nl> index 1095a72 . . c0568b9 100644 <nl> - - - a / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java <nl> + + + b / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java <nl> @ @ - 37 , 6 + 37 , 7 @ @ import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . config . ColumnDefinition ; <nl> import org . apache . cassandra . config . ConfigurationException ; <nl> import org . apache . cassandra . db . ColumnFamilyType ; <nl> + import org . apache . cassandra . db . compaction . AbstractCompactionStrategy ; <nl> import org . apache . cassandra . db . marshal . AbstractType ; <nl> import org . apache . cassandra . db . marshal . TypeParser ; <nl> import org . apache . cassandra . thrift . InvalidRequestException ; <nl> @ @ - 114 , 6 + 115 , 7 @ @ public class CreateColumnFamilyStatement <nl> private final Map < String , String > properties = new HashMap < String , String > ( ) ; <nl> private List < String > keyValidator = new ArrayList < String > ( ) ; <nl> private ByteBuffer keyAlias = null ; <nl> + private Class < ? extends AbstractCompactionStrategy > compactionStrategyClass ; <nl> private final Map < String , String > compactionStrategyOptions = new HashMap < String , String > ( ) ; <nl> private final Map < String , String > compressionParameters = new HashMap < String , String > ( ) ; <nl> <nl> @ @ - 125 , 6 + 127 , 17 @ @ public class CreateColumnFamilyStatement <nl> / * * Perform validation of parsed params * / <nl> private void validate ( ) throws InvalidRequestException <nl> { <nl> + String compStrategy = getPropertyString ( KW _ COMPACTION _ STRATEGY _ CLASS , CFMetaData . DEFAULT _ COMPACTION _ STRATEGY _ CLASS ) ; <nl> + <nl> + try <nl> + { <nl> + compactionStrategyClass = CFMetaData . createCompactionStrategy ( compStrategy ) ; <nl> + } <nl> + catch ( ConfigurationException e ) <nl> + { <nl> + throw new InvalidRequestException ( e . getMessage ( ) ) ; <nl> + } <nl> + <nl> / / we need to remove parent : key = value pairs from the main properties <nl> Set < String > propsToRemove = new HashSet < String > ( ) ; <nl> <nl> @ @ - 338 , 6 + 351 , 7 @ @ public class CreateColumnFamilyStatement <nl> . keyValidator ( TypeParser . parse ( comparators . get ( getKeyType ( ) ) ) ) <nl> . rowCacheProvider ( FBUtilities . newCacheProvider ( getPropertyString ( KW _ ROW _ CACHE _ PROVIDER , CFMetaData . DEFAULT _ ROW _ CACHE _ PROVIDER . getClass ( ) . getName ( ) ) ) ) <nl> . keyAlias ( keyAlias ) <nl> + . compactionStrategyClass ( compactionStrategyClass ) <nl> . compactionStrategyOptions ( compactionStrategyOptions ) <nl> . compressionParameters ( CompressionParameters . create ( compressionParameters ) ) <nl> . validate ( ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index bba64c6 . . e215ad9 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 10 
+ + * Make decommission operation resumable ( CASSANDRA - 12008 ) 
+ * Add support to one - way targeted repair ( CASSANDRA - 9876 ) 
+ * Remove clientutil jar ( CASSANDRA - 11635 ) 
+ * Fix compaction throughput throttle ( CASSANDRA - 12366 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / SystemKeyspace . java b / src / java / org / apache / cassandra / db / SystemKeyspace . java 
+ index 2bfa88d . . 2083d54 100644 
+ - - - a / src / java / org / apache / cassandra / db / SystemKeyspace . java 
+ + + + b / src / java / org / apache / cassandra / db / SystemKeyspace . java 
+ @ @ - 30 , 6 + 30 , 7 @ @ import javax . management . openmbean . OpenDataException ; 
+ import javax . management . openmbean . TabularData ; 
+ 
+ import com . google . common . collect . HashMultimap ; 
+ + import com . google . common . collect . ImmutableMap ; 
+ import com . google . common . collect . ImmutableSet ; 
+ import com . google . common . collect . SetMultimap ; 
+ import com . google . common . io . ByteStreams ; 
+ @ @ - 96 , 6 + 97 , 7 @ @ public final class SystemKeyspace 
+ public static final String SSTABLE _ ACTIVITY = " sstable _ activity " ; 
+ public static final String SIZE _ ESTIMATES = " size _ estimates " ; 
+ public static final String AVAILABLE _ RANGES = " available _ ranges " ; 
+ + public static final String TRANSFERRED _ RANGES = " transferred _ ranges " ; 
+ public static final String VIEWS _ BUILDS _ IN _ PROGRESS = " views _ builds _ in _ progress " ; 
+ public static final String BUILT _ VIEWS = " built _ views " ; 
+ public static final String PREPARED _ STATEMENTS = " prepared _ statements " ; 
+ @ @ - 248 , 6 + 250 , 16 @ @ public final class SystemKeyspace 
+ + " ranges set < blob > , " 
+ + " PRIMARY KEY ( ( keyspace _ name ) ) ) " ) ; 
+ 
+ + private static final CFMetaData TransferredRanges = 
+ + compile ( TRANSFERRED _ RANGES , 
+ + " record of transferred ranges for streaming operation " , 
+ + " CREATE TABLE % s ( " 
+ + + " operation text , " 
+ + + " peer inet , " 
+ + + " keyspace _ name text , " 
+ + + " ranges set < blob > , " 
+ + + " PRIMARY KEY ( ( operation , keyspace _ name ) , peer ) ) " ) ; 
+ + 
+ private static final CFMetaData ViewsBuildsInProgress = 
+ compile ( VIEWS _ BUILDS _ IN _ PROGRESS , 
+ " views builds current progress " , 
+ @ @ - 442 , 6 + 454 , 7 @ @ public final class SystemKeyspace 
+ SSTableActivity , 
+ SizeEstimates , 
+ AvailableRanges , 
+ + TransferredRanges , 
+ ViewsBuildsInProgress , 
+ BuiltViews , 
+ LegacyHints , 
+ @ @ - 1297 , 6 + 1310 , 39 @ @ public final class SystemKeyspace 
+ availableRanges . truncateBlocking ( ) ; 
+ } 
+ 
+ + public static synchronized void updateTransferredRanges ( String description , 
+ + InetAddress peer , 
+ + String keyspace , 
+ + Collection < Range < Token > > streamedRanges ) 
+ + { 
+ + String cql = " UPDATE system . % s SET ranges = ranges + ? WHERE operation = ? AND peer = ? AND keyspace _ name = ? " ; 
+ + Set < ByteBuffer > rangesToUpdate = new HashSet < > ( streamedRanges . size ( ) ) ; 
+ + for ( Range < Token > range : streamedRanges ) 
+ + { 
+ + rangesToUpdate . add ( rangeToBytes ( range ) ) ; 
+ + } 
+ + executeInternal ( String . format ( cql , TRANSFERRED _ RANGES ) , rangesToUpdate , description , peer , keyspace ) ; 
+ + } 
+ + 
+ + public static synchronized Map < InetAddress , Set < Range < Token > > > getTransferredRanges ( String description , String keyspace , IPartitioner partitioner ) 
+ + { 
+ + Map < InetAddress , Set < Range < Token > > > result = new HashMap < > ( ) ; 
+ + String query = " SELECT * FROM system . % s WHERE operation = ? AND keyspace _ name = ? " ; 
+ + UntypedResultSet rs = executeInternal ( String . format ( query , TRANSFERRED _ RANGES ) , description , keyspace ) ; 
+ + for ( UntypedResultSet . Row row : rs ) 
+ + { 
+ + InetAddress peer = row . getInetAddress ( " peer " ) ; 
+ + Set < ByteBuffer > rawRanges = rawRanges = row . getSet ( " ranges " , BytesType . instance ) ; 
+ + Set < Range < Token > > ranges = new HashSet < > ( ) ; 
+ + for ( ByteBuffer rawRange : rawRanges ) 
+ + { 
+ + ranges . add ( byteBufferToRange ( rawRange , partitioner ) ) ; 
+ + } 
+ + result . put ( peer , ranges ) ; 
+ + } 
+ + return ImmutableMap . copyOf ( result ) ; 
+ + } 
+ + 
+ / * * 
+ * Compare the release version in the system . local table with the one included in the distro . 
+ * If they don ' t match , snapshot all tables in the system keyspace . This is intended to be 
+ diff - - git a / src / java / org / apache / cassandra / dht / StreamStateStore . java b / src / java / org / apache / cassandra / dht / StreamStateStore . java 
+ index f6046aa . . 47b3072 100644 
+ - - - a / src / java / org / apache / cassandra / dht / StreamStateStore . java 
+ + + + b / src / java / org / apache / cassandra / dht / StreamStateStore . java 
+ @ @ - 66 , 6 + 66 , 11 @ @ public class StreamStateStore implements StreamEventHandler 
+ StreamEvent . SessionCompleteEvent se = ( StreamEvent . SessionCompleteEvent ) event ; 
+ if ( se . success ) 
+ { 
+ + Set < String > keyspaces = se . transferredRangesPerKeyspace . keySet ( ) ; 
+ + for ( String keyspace : keyspaces ) 
+ + { 
+ + SystemKeyspace . updateTransferredRanges ( se . description , se . peer , keyspace , se . transferredRangesPerKeyspace . get ( keyspace ) ) ; 
+ + } 
+ for ( StreamRequest request : se . requests ) 
+ { 
+ SystemKeyspace . updateAvailableRanges ( request . keyspace , request . ranges ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index 2810e2f . . 3d2037a 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 171 , 6 + 171 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ private boolean isSurveyMode = Boolean . parseBoolean ( System . getProperty ( " cassandra . write _ survey " , " false " ) ) ; 
+ / * true if node is rebuilding and receiving data * / 
+ private final AtomicBoolean isRebuilding = new AtomicBoolean ( ) ; 
+ + private final AtomicBoolean isDecommissioning = new AtomicBoolean ( ) ; 
+ 
+ private volatile boolean initialized = false ; 
+ private volatile boolean joined = false ; 
+ @ @ - 3665 , 41 + 3666 , 63 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ throw new UnsupportedOperationException ( " local node is not a member of the token ring yet " ) ; 
+ if ( tokenMetadata . cloneAfterAllLeft ( ) . sortedTokens ( ) . size ( ) < 2 ) 
+ throw new UnsupportedOperationException ( " no other normal nodes in the ring ; decommission would be pointless " ) ; 
+ - if ( operationMode ! = Mode . NORMAL ) 
+ + if ( operationMode ! = Mode . LEAVING & & operationMode ! = Mode . NORMAL ) 
+ throw new UnsupportedOperationException ( " Node in " + operationMode + " state ; wait for status to become normal or restart " ) ; 
+ - 
+ - PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ - for ( String keyspaceName : Schema . instance . getNonLocalStrategyKeyspaces ( ) ) 
+ - { 
+ - if ( tokenMetadata . getPendingRanges ( keyspaceName , FBUtilities . getBroadcastAddress ( ) ) . size ( ) > 0 ) 
+ - throw new UnsupportedOperationException ( " data is currently moving to this node ; unable to leave the ring " ) ; 
+ - } 
+ + if ( isDecommissioning . compareAndSet ( true , true ) ) 
+ + throw new IllegalStateException ( " Node is still decommissioning . Check nodetool netstats . " ) ; 
+ 
+ if ( logger . isDebugEnabled ( ) ) 
+ logger . debug ( " DECOMMISSIONING " ) ; 
+ - startLeaving ( ) ; 
+ - long timeout = Math . max ( RING _ DELAY , BatchlogManager . instance . getBatchlogTimeout ( ) ) ; 
+ - setMode ( Mode . LEAVING , " sleeping " + timeout + " ms for batch processing and pending range setup " , true ) ; 
+ - Thread . sleep ( timeout ) ; 
+ 
+ - Runnable finishLeaving = new Runnable ( ) 
+ + try 
+ { 
+ - public void run ( ) 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ + for ( String keyspaceName : Schema . instance . getNonLocalStrategyKeyspaces ( ) ) 
+ { 
+ - shutdownClientServers ( ) ; 
+ - Gossiper . instance . stop ( ) ; 
+ - try { 
+ - MessagingService . instance ( ) . shutdown ( ) ; 
+ - } catch ( IOError ioe ) { 
+ - logger . info ( " failed to shutdown message service : { } " , ioe ) ; 
+ - } 
+ - StageManager . shutdownNow ( ) ; 
+ - SystemKeyspace . setBootstrapState ( SystemKeyspace . BootstrapState . DECOMMISSIONED ) ; 
+ - setMode ( Mode . DECOMMISSIONED , true ) ; 
+ - / / let op be responsible for killing the process 
+ + if ( tokenMetadata . getPendingRanges ( keyspaceName , FBUtilities . getBroadcastAddress ( ) ) . size ( ) > 0 ) 
+ + throw new UnsupportedOperationException ( " data is currently moving to this node ; unable to leave the ring " ) ; 
+ } 
+ - } ; 
+ - unbootstrap ( finishLeaving ) ; 
+ + 
+ + startLeaving ( ) ; 
+ + long timeout = Math . max ( RING _ DELAY , BatchlogManager . instance . getBatchlogTimeout ( ) ) ; 
+ + setMode ( Mode . LEAVING , " sleeping " + timeout + " ms for batch processing and pending range setup " , true ) ; 
+ + Thread . sleep ( timeout ) ; 
+ + 
+ + Runnable finishLeaving = new Runnable ( ) 
+ + { 
+ + public void run ( ) 
+ + { 
+ + shutdownClientServers ( ) ; 
+ + Gossiper . instance . stop ( ) ; 
+ + try 
+ + { 
+ + MessagingService . instance ( ) . shutdown ( ) ; 
+ + } 
+ + catch ( IOError ioe ) 
+ + { 
+ + logger . info ( " failed to shutdown message service : { } " , ioe ) ; 
+ + } 
+ + StageManager . shutdownNow ( ) ; 
+ + SystemKeyspace . setBootstrapState ( SystemKeyspace . BootstrapState . DECOMMISSIONED ) ; 
+ + setMode ( Mode . DECOMMISSIONED , true ) ; 
+ + / / let op be responsible for killing the process 
+ + } 
+ + } ; 
+ + unbootstrap ( finishLeaving ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + throw new RuntimeException ( " Node interrupted while decommissioning " ) ; 
+ + } 
+ + catch ( ExecutionException e ) 
+ + { 
+ + logger . error ( " Error while decommissioning node " , e . getCause ( ) ) ; 
+ + throw new RuntimeException ( " Error while decommissioning node : " + e . getCause ( ) . getMessage ( ) ) ; 
+ + } 
+ + finally 
+ + { 
+ + isDecommissioning . set ( false ) ; 
+ + } 
+ } 
+ 
+ private void leaveRing ( ) 
+ @ @ - 3714 , 7 + 3737 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ Uninterruptibles . sleepUninterruptibly ( delay , TimeUnit . MILLISECONDS ) ; 
+ } 
+ 
+ - private void unbootstrap ( Runnable onFinish ) 
+ + private void unbootstrap ( Runnable onFinish ) throws ExecutionException , InterruptedException 
+ { 
+ Map < String , Multimap < Range < Token > , InetAddress > > rangesToStream = new HashMap < > ( ) ; 
+ 
+ @ @ - 3736 , 14 + 3759 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ 
+ / / Wait for batch log to complete before streaming hints . 
+ logger . debug ( " waiting for batch log processing . " ) ; 
+ - try 
+ - { 
+ - batchlogReplay . get ( ) ; 
+ - } 
+ - catch ( ExecutionException | InterruptedException e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ + batchlogReplay . get ( ) ; 
+ 
+ setMode ( Mode . LEAVING , " streaming hints to other nodes " , true ) ; 
+ 
+ @ @ - 3751 , 15 + 3767 , 8 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ 
+ / / wait for the transfer runnables to signal the latch . 
+ logger . debug ( " waiting for stream acks . " ) ; 
+ - try 
+ - { 
+ - streamSuccess . get ( ) ; 
+ - hintsSuccess . get ( ) ; 
+ - } 
+ - catch ( ExecutionException | InterruptedException e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ + streamSuccess . get ( ) ; 
+ + hintsSuccess . get ( ) ; 
+ logger . debug ( " stream acks all received . " ) ; 
+ leaveRing ( ) ; 
+ onFinish . run ( ) ; 
+ @ @ - 4541 , 6 + 4550 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ { 
+ / / First , we build a list of ranges to stream to each host , per table 
+ Map < String , Map < InetAddress , List < Range < Token > > > > sessionsToStreamByKeyspace = new HashMap < > ( ) ; 
+ + 
+ for ( Map . Entry < String , Multimap < Range < Token > , InetAddress > > entry : rangesToStreamByKeyspace . entrySet ( ) ) 
+ { 
+ String keyspace = entry . getKey ( ) ; 
+ @ @ - 4549 , 12 + 4559 , 22 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ if ( rangesWithEndpoints . isEmpty ( ) ) 
+ continue ; 
+ 
+ + Map < InetAddress , Set < Range < Token > > > transferredRangePerKeyspace = SystemKeyspace . getTransferredRanges ( " Unbootstrap " , 
+ + keyspace , 
+ + StorageService . instance . getTokenMetadata ( ) . partitioner ) ; 
+ Map < InetAddress , List < Range < Token > > > rangesPerEndpoint = new HashMap < > ( ) ; 
+ for ( Map . Entry < Range < Token > , InetAddress > endPointEntry : rangesWithEndpoints . entries ( ) ) 
+ { 
+ Range < Token > range = endPointEntry . getKey ( ) ; 
+ InetAddress endpoint = endPointEntry . getValue ( ) ; 
+ 
+ + Set < Range < Token > > transferredRanges = transferredRangePerKeyspace . get ( endpoint ) ; 
+ + if ( transferredRanges ! = null & & transferredRanges . contains ( range ) ) 
+ + { 
+ + logger . debug ( " Skipping transferred range { } of keyspace { } , endpoint { } " , range , keyspace , endpoint ) ; 
+ + continue ; 
+ + } 
+ + 
+ List < Range < Token > > curRanges = rangesPerEndpoint . get ( endpoint ) ; 
+ if ( curRanges = = null ) 
+ { 
+ @ @ - 4568 , 6 + 4588 , 10 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ } 
+ 
+ StreamPlan streamPlan = new StreamPlan ( " Unbootstrap " ) ; 
+ + 
+ + / / Vinculate StreamStateStore to current StreamPlan to update transferred ranges per StreamSession 
+ + streamPlan . listeners ( streamStateStore ) ; 
+ + 
+ for ( Map . Entry < String , Map < InetAddress , List < Range < Token > > > > entry : sessionsToStreamByKeyspace . entrySet ( ) ) 
+ { 
+ String keyspaceName = entry . getKey ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamEvent . java b / src / java / org / apache / cassandra / streaming / StreamEvent . java 
+ index de3db9c . . 49172fb 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamEvent . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamEvent . java 
+ @ @ - 18 , 11 + 18 , 16 @ @ 
+ package org . apache . cassandra . streaming ; 
+ 
+ import java . net . InetAddress ; 
+ + import java . util . Collections ; 
+ + import java . util . Map ; 
+ import java . util . Set ; 
+ import java . util . UUID ; 
+ 
+ import com . google . common . collect . ImmutableSet ; 
+ 
+ + import org . apache . cassandra . dht . Range ; 
+ + import org . apache . cassandra . dht . Token ; 
+ + 
+ public abstract class StreamEvent 
+ { 
+ public static enum Type 
+ @ @ - 47 , 6 + 52 , 8 @ @ public abstract class StreamEvent 
+ public final boolean success ; 
+ public final int sessionIndex ; 
+ public final Set < StreamRequest > requests ; 
+ + public final String description ; 
+ + public final Map < String , Set < Range < Token > > > transferredRangesPerKeyspace ; 
+ 
+ public SessionCompleteEvent ( StreamSession session ) 
+ { 
+ @ @ - 55 , 6 + 62 , 8 @ @ public abstract class StreamEvent 
+ this . success = session . isSuccess ( ) ; 
+ this . sessionIndex = session . sessionIndex ( ) ; 
+ this . requests = ImmutableSet . copyOf ( session . requests ) ; 
+ + this . description = session . description ( ) ; 
+ + this . transferredRangesPerKeyspace = Collections . unmodifiableMap ( session . transferredRangesPerKeyspace ) ; 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamSession . java b / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ index 11b0847 . . 3af31f8 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ @ @ - 142 , 6 + 142 , 8 @ @ public class StreamSession implements IEndpointStateChangeSubscriber 
+ / * can be null when session is created in remote * / 
+ private final StreamConnectionFactory factory ; 
+ 
+ + public final Map < String , Set < Range < Token > > > transferredRangesPerKeyspace = new HashMap < > ( ) ; 
+ + 
+ public final ConnectionHandler handler ; 
+ 
+ private AtomicBoolean isAborted = new AtomicBoolean ( false ) ; 
+ @ @ - 289 , 6 + 291 , 13 @ @ public class StreamSession implements IEndpointStateChangeSubscriber 
+ try 
+ { 
+ addTransferFiles ( sections ) ; 
+ + Set < Range < Token > > toBeUpdated = transferredRangesPerKeyspace . get ( keyspace ) ; 
+ + if ( toBeUpdated = = null ) 
+ + { 
+ + toBeUpdated = new HashSet < > ( ) ; 
+ + } 
+ + toBeUpdated . addAll ( ranges ) ; 
+ + transferredRangesPerKeyspace . put ( keyspace , toBeUpdated ) ; 
+ } 
+ finally 
+ {
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java b / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java 
+ index 1095a72 . . c0568b9 100644 
+ - - - a / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java 
+ + + + b / src / java / org / apache / cassandra / cql / CreateColumnFamilyStatement . java 
+ @ @ - 37 , 6 + 37 , 7 @ @ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . config . ColumnDefinition ; 
+ import org . apache . cassandra . config . ConfigurationException ; 
+ import org . apache . cassandra . db . ColumnFamilyType ; 
+ + import org . apache . cassandra . db . compaction . AbstractCompactionStrategy ; 
+ import org . apache . cassandra . db . marshal . AbstractType ; 
+ import org . apache . cassandra . db . marshal . TypeParser ; 
+ import org . apache . cassandra . thrift . InvalidRequestException ; 
+ @ @ - 114 , 6 + 115 , 7 @ @ public class CreateColumnFamilyStatement 
+ private final Map < String , String > properties = new HashMap < String , String > ( ) ; 
+ private List < String > keyValidator = new ArrayList < String > ( ) ; 
+ private ByteBuffer keyAlias = null ; 
+ + private Class < ? extends AbstractCompactionStrategy > compactionStrategyClass ; 
+ private final Map < String , String > compactionStrategyOptions = new HashMap < String , String > ( ) ; 
+ private final Map < String , String > compressionParameters = new HashMap < String , String > ( ) ; 
+ 
+ @ @ - 125 , 6 + 127 , 17 @ @ public class CreateColumnFamilyStatement 
+ / * * Perform validation of parsed params * / 
+ private void validate ( ) throws InvalidRequestException 
+ { 
+ + String compStrategy = getPropertyString ( KW _ COMPACTION _ STRATEGY _ CLASS , CFMetaData . DEFAULT _ COMPACTION _ STRATEGY _ CLASS ) ; 
+ + 
+ + try 
+ + { 
+ + compactionStrategyClass = CFMetaData . createCompactionStrategy ( compStrategy ) ; 
+ + } 
+ + catch ( ConfigurationException e ) 
+ + { 
+ + throw new InvalidRequestException ( e . getMessage ( ) ) ; 
+ + } 
+ + 
+ / / we need to remove parent : key = value pairs from the main properties 
+ Set < String > propsToRemove = new HashSet < String > ( ) ; 
+ 
+ @ @ - 338 , 6 + 351 , 7 @ @ public class CreateColumnFamilyStatement 
+ . keyValidator ( TypeParser . parse ( comparators . get ( getKeyType ( ) ) ) ) 
+ . rowCacheProvider ( FBUtilities . newCacheProvider ( getPropertyString ( KW _ ROW _ CACHE _ PROVIDER , CFMetaData . DEFAULT _ ROW _ CACHE _ PROVIDER . getClass ( ) . getName ( ) ) ) ) 
+ . keyAlias ( keyAlias ) 
+ + . compactionStrategyClass ( compactionStrategyClass ) 
+ . compactionStrategyOptions ( compactionStrategyOptions ) 
+ . compressionParameters ( CompressionParameters . create ( compressionParameters ) ) 
+ . validate ( ) ;

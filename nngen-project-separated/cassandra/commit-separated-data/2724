@@ -1,0 +1,247 @@
+BLEU SCORE: 0.016932492841722675
+
+TEST MSG: Split out outgoing stream throughput within a DC and inter - DC
+GENERATED MSG: Test fixes for 1 . 0 message serialization format
+
+TEST DIFF (one line): diff - - git a / conf / cassandra . yaml b / conf / cassandra . yaml <nl> index 8538920 . . 2666316 100644 <nl> - - - a / conf / cassandra . yaml <nl> + + + b / conf / cassandra . yaml <nl> @ @ - 518 , 6 + 518 , 12 @ @ compaction _ preheat _ key _ cache : true <nl> # When unset , the default is 200 Mbps or 25 MB / s . <nl> # stream _ throughput _ outbound _ megabits _ per _ sec : 200 <nl> <nl> + # Throttles all streaming file transfer between the datacenters , <nl> + # this setting allows users to throttle inter dc stream throughput in addition <nl> + # to throttling all network stream traffic as configured with <nl> + # stream _ throughput _ outbound _ megabits _ per _ sec <nl> + # inter _ dc _ stream _ throughput _ outbound _ megabits _ per _ sec : <nl> + <nl> # How long the coordinator should wait for read operations to complete <nl> read _ request _ timeout _ in _ ms : 5000 <nl> # How long the coordinator should wait for seq or index scans to complete <nl> diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java <nl> index 1f47171 . . d5108e3 100644 <nl> - - - a / src / java / org / apache / cassandra / config / Config . java <nl> + + + b / src / java / org / apache / cassandra / config / Config . java <nl> @ @ - 124 , 6 + 124 , 7 @ @ public class Config <nl> public Integer max _ streaming _ retries = 3 ; <nl> <nl> public volatile Integer stream _ throughput _ outbound _ megabits _ per _ sec = 200 ; <nl> + public volatile Integer inter _ dc _ stream _ throughput _ outbound _ megabits _ per _ sec = 0 ; <nl> <nl> public String [ ] data _ file _ directories ; <nl> public String flush _ directory ; <nl> diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> index 29dece6 . . 73a03eb 100644 <nl> - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> @ @ - 930 , 6 + 930 , 16 @ @ public class DatabaseDescriptor <nl> conf . stream _ throughput _ outbound _ megabits _ per _ sec = value ; <nl> } <nl> <nl> + public static int getInterDCStreamThroughputOutboundMegabitsPerSec ( ) <nl> + { <nl> + return conf . inter _ dc _ stream _ throughput _ outbound _ megabits _ per _ sec ; <nl> + } <nl> + <nl> + public static void setInterDCStreamThroughputOutboundMegabitsPerSec ( int value ) <nl> + { <nl> + conf . inter _ dc _ stream _ throughput _ outbound _ megabits _ per _ sec = value ; <nl> + } <nl> + <nl> public static String [ ] getAllDataFileLocations ( ) <nl> { <nl> return conf . data _ file _ directories ; <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamManager . java b / src / java / org / apache / cassandra / streaming / StreamManager . java <nl> index ccd0053 . . c82e45c 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamManager . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamManager . java <nl> @ @ - 17 , 6 + 17 , 7 @ @ <nl> * / <nl> package org . apache . cassandra . streaming ; <nl> <nl> + import java . net . InetAddress ; <nl> import java . util . Map ; <nl> import java . util . Set ; <nl> import java . util . UUID ; <nl> @ @ - 32 , 8 + 33 , 8 @ @ import com . google . common . collect . Iterables ; <nl> import com . google . common . collect . Sets ; <nl> import com . google . common . util . concurrent . MoreExecutors ; <nl> import com . google . common . util . concurrent . RateLimiter ; <nl> - import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; <nl> <nl> + import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . streaming . management . StreamEventJMXNotifier ; <nl> import org . apache . cassandra . streaming . management . StreamStateCompositeData ; <nl> @ @ - 47 , 25 + 48 , 53 @ @ public class StreamManager implements StreamManagerMBean <nl> { <nl> public static final StreamManager instance = new StreamManager ( ) ; <nl> <nl> - private static final RateLimiter limiter = RateLimiter . create ( Double . MAX _ VALUE ) ; <nl> - <nl> / * * <nl> * Gets streaming rate limiter . <nl> * When stream _ throughput _ outbound _ megabits _ per _ sec is 0 , this returns rate limiter <nl> * with the rate of Double . MAX _ VALUE bytes per second . <nl> * Rate unit is bytes per sec . <nl> * <nl> - * @ return RateLimiter with rate limit set <nl> + * @ return StreamRateLimiter with rate limit set based on peer location . <nl> * / <nl> - public static RateLimiter getRateLimiter ( ) <nl> + public static StreamRateLimiter getRateLimiter ( InetAddress peer ) <nl> { <nl> - double currentThroughput = ( ( double ) DatabaseDescriptor . getStreamThroughputOutboundMegabitsPerSec ( ) ) * 1024 * 1024 ; <nl> - / / if throughput is set to 0 , throttling is disabled <nl> - if ( currentThroughput = = 0 ) <nl> - currentThroughput = Double . MAX _ VALUE ; <nl> - if ( limiter . getRate ( ) ! = currentThroughput ) <nl> - limiter . setRate ( currentThroughput ) ; <nl> - return limiter ; <nl> + return new StreamRateLimiter ( peer ) ; <nl> + } <nl> + <nl> + public static class StreamRateLimiter <nl> + { <nl> + private static final double ONE _ MEGA _ BITS = 1024 * 1024 * 8 ; <nl> + private static final RateLimiter limiter = RateLimiter . create ( Double . MAX _ VALUE ) ; <nl> + private static final RateLimiter interDCLimiter = RateLimiter . create ( Double . MAX _ VALUE ) ; <nl> + private final boolean isLocalDC ; <nl> + <nl> + public StreamRateLimiter ( InetAddress peer ) <nl> + { <nl> + double throughput = ( ( double ) DatabaseDescriptor . getStreamThroughputOutboundMegabitsPerSec ( ) ) * ONE _ MEGA _ BITS ; <nl> + mayUpdateThroughput ( throughput , limiter ) ; <nl> + <nl> + double interDCThroughput = ( ( double ) DatabaseDescriptor . getInterDCStreamThroughputOutboundMegabitsPerSec ( ) ) * ONE _ MEGA _ BITS ; <nl> + mayUpdateThroughput ( interDCThroughput , interDCLimiter ) ; <nl> + <nl> + isLocalDC = DatabaseDescriptor . getLocalDataCenter ( ) . equals ( <nl> + DatabaseDescriptor . getEndpointSnitch ( ) . getDatacenter ( peer ) ) ; <nl> + } <nl> + <nl> + private void mayUpdateThroughput ( double limit , RateLimiter rateLimiter ) <nl> + { <nl> + / / if throughput is set to 0 , throttling is disabled <nl> + if ( limit = = 0 ) <nl> + limit = Double . MAX _ VALUE ; <nl> + if ( rateLimiter . getRate ( ) ! = limit ) <nl> + rateLimiter . setRate ( limit ) ; <nl> + } <nl> + <nl> + public void acquire ( int toTransfer ) <nl> + { <nl> + limiter . acquire ( toTransfer ) ; <nl> + if ( ! isLocalDC ) <nl> + interDCLimiter . acquire ( toTransfer ) ; <nl> + } <nl> } <nl> <nl> private final StreamEventJMXNotifier notifier = new StreamEventJMXNotifier ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamWriter . java b / src / java / org / apache / cassandra / streaming / StreamWriter . java <nl> index 04301ba . . a84d2f4 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamWriter . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamWriter . java <nl> @ @ - 24 , 7 + 24 , 6 @ @ import java . nio . channels . Channels ; <nl> import java . nio . channels . WritableByteChannel ; <nl> import java . util . Collection ; <nl> <nl> - import com . google . common . util . concurrent . RateLimiter ; <nl> import com . ning . compress . lzf . LZFOutputStream ; <nl> <nl> import org . apache . cassandra . io . sstable . Component ; <nl> @ @ - 33 , 6 + 32 , 7 @ @ import org . apache . cassandra . io . util . DataIntegrityMetadata ; <nl> import org . apache . cassandra . io . util . DataIntegrityMetadata . ChecksumValidator ; <nl> import org . apache . cassandra . io . util . FileUtils ; <nl> import org . apache . cassandra . io . util . RandomAccessReader ; <nl> + import org . apache . cassandra . streaming . StreamManager . StreamRateLimiter ; <nl> import org . apache . cassandra . utils . Pair ; <nl> <nl> / * * <nl> @ @ - 44 , 7 + 44 , 7 @ @ public class StreamWriter <nl> <nl> protected final SSTableReader sstable ; <nl> protected final Collection < Pair < Long , Long > > sections ; <nl> - protected final RateLimiter limiter = StreamManager . getRateLimiter ( ) ; <nl> + protected final StreamRateLimiter limiter ; <nl> protected final StreamSession session ; <nl> <nl> private OutputStream compressedOutput ; <nl> @ @ - 57 , 6 + 57 , 7 @ @ public class StreamWriter <nl> this . session = session ; <nl> this . sstable = sstable ; <nl> this . sections = sections ; <nl> + this . limiter = StreamManager . getRateLimiter ( session . peer ) ; <nl> } <nl> <nl> / * *
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index 66e28f4 . . 5920c36 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 1639 , 6 + 1639 , 11 @ @ public class StorageService implements IEndpointStateChangeSubscriber , StorageSe <nl> return FBUtilities . getReleaseVersionString ( ) ; <nl> } <nl> <nl> + public String getSchemaVersion ( ) <nl> + { <nl> + return Schema . instance . getVersion ( ) . toString ( ) ; <nl> + } <nl> + <nl> public List < String > getLeavingNodes ( ) <nl> { <nl> return stringify ( tokenMetadata _ . getLeavingEndpoints ( ) ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageServiceMBean . java b / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> index 184a935 . . 404c794 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> @ @ - 84 , 6 + 84 , 13 @ @ public interface StorageServiceMBean <nl> public String getReleaseVersion ( ) ; <nl> <nl> / * * <nl> + * Fetch a string representation of the current Schema version . <nl> + * @ return A string representation of the Schema version . <nl> + * / <nl> + public String getSchemaVersion ( ) ; <nl> + <nl> + <nl> + / * * <nl> * Get the list of all data file locations from conf <nl> * @ return String array of all locations <nl> * / <nl> diff - - git a / src / java / org / apache / cassandra / tools / NodeCmd . java b / src / java / org / apache / cassandra / tools / NodeCmd . java <nl> index 46b369b . . 8540deb 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / NodeCmd . java <nl> + + + b / src / java / org / apache / cassandra / tools / NodeCmd . java <nl> @ @ - 837 , 6 + 837 , 7 @ @ public class NodeCmd <nl> <nl> private void printDescribeRing ( String keyspaceName , PrintStream out ) <nl> { <nl> + out . println ( " Schema Version : " + probe . getSchemaVersion ( ) ) ; <nl> out . println ( " TokenRange : " ) ; <nl> try <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> index 2c51990 . . cea2fc6 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> @ @ - 648 , 6 + 648 , 11 @ @ public class NodeProbe <nl> ssProxy . setStreamThroughputMbPerSec ( value ) ; <nl> } <nl> <nl> + public String getSchemaVersion ( ) <nl> + { <nl> + return ssProxy . getSchemaVersion ( ) ; <nl> + } <nl> + <nl> public List < String > describeRing ( String keyspaceName ) throws InvalidRequestException <nl> { <nl> return ssProxy . describeRingJMX ( keyspaceName ) ;
+
+TEST DIFF:
+diff - - git a / conf / cassandra . yaml b / conf / cassandra . yaml 
+ index 8538920 . . 2666316 100644 
+ - - - a / conf / cassandra . yaml 
+ + + + b / conf / cassandra . yaml 
+ @ @ - 518 , 6 + 518 , 12 @ @ compaction _ preheat _ key _ cache : true 
+ # When unset , the default is 200 Mbps or 25 MB / s . 
+ # stream _ throughput _ outbound _ megabits _ per _ sec : 200 
+ 
+ + # Throttles all streaming file transfer between the datacenters , 
+ + # this setting allows users to throttle inter dc stream throughput in addition 
+ + # to throttling all network stream traffic as configured with 
+ + # stream _ throughput _ outbound _ megabits _ per _ sec 
+ + # inter _ dc _ stream _ throughput _ outbound _ megabits _ per _ sec : 
+ + 
+ # How long the coordinator should wait for read operations to complete 
+ read _ request _ timeout _ in _ ms : 5000 
+ # How long the coordinator should wait for seq or index scans to complete 
+ diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java 
+ index 1f47171 . . d5108e3 100644 
+ - - - a / src / java / org / apache / cassandra / config / Config . java 
+ + + + b / src / java / org / apache / cassandra / config / Config . java 
+ @ @ - 124 , 6 + 124 , 7 @ @ public class Config 
+ public Integer max _ streaming _ retries = 3 ; 
+ 
+ public volatile Integer stream _ throughput _ outbound _ megabits _ per _ sec = 200 ; 
+ + public volatile Integer inter _ dc _ stream _ throughput _ outbound _ megabits _ per _ sec = 0 ; 
+ 
+ public String [ ] data _ file _ directories ; 
+ public String flush _ directory ; 
+ diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ index 29dece6 . . 73a03eb 100644 
+ - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ @ @ - 930 , 6 + 930 , 16 @ @ public class DatabaseDescriptor 
+ conf . stream _ throughput _ outbound _ megabits _ per _ sec = value ; 
+ } 
+ 
+ + public static int getInterDCStreamThroughputOutboundMegabitsPerSec ( ) 
+ + { 
+ + return conf . inter _ dc _ stream _ throughput _ outbound _ megabits _ per _ sec ; 
+ + } 
+ + 
+ + public static void setInterDCStreamThroughputOutboundMegabitsPerSec ( int value ) 
+ + { 
+ + conf . inter _ dc _ stream _ throughput _ outbound _ megabits _ per _ sec = value ; 
+ + } 
+ + 
+ public static String [ ] getAllDataFileLocations ( ) 
+ { 
+ return conf . data _ file _ directories ; 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamManager . java b / src / java / org / apache / cassandra / streaming / StreamManager . java 
+ index ccd0053 . . c82e45c 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamManager . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamManager . java 
+ @ @ - 17 , 6 + 17 , 7 @ @ 
+ * / 
+ package org . apache . cassandra . streaming ; 
+ 
+ + import java . net . InetAddress ; 
+ import java . util . Map ; 
+ import java . util . Set ; 
+ import java . util . UUID ; 
+ @ @ - 32 , 8 + 33 , 8 @ @ import com . google . common . collect . Iterables ; 
+ import com . google . common . collect . Sets ; 
+ import com . google . common . util . concurrent . MoreExecutors ; 
+ import com . google . common . util . concurrent . RateLimiter ; 
+ - import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; 
+ 
+ + import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . streaming . management . StreamEventJMXNotifier ; 
+ import org . apache . cassandra . streaming . management . StreamStateCompositeData ; 
+ @ @ - 47 , 25 + 48 , 53 @ @ public class StreamManager implements StreamManagerMBean 
+ { 
+ public static final StreamManager instance = new StreamManager ( ) ; 
+ 
+ - private static final RateLimiter limiter = RateLimiter . create ( Double . MAX _ VALUE ) ; 
+ - 
+ / * * 
+ * Gets streaming rate limiter . 
+ * When stream _ throughput _ outbound _ megabits _ per _ sec is 0 , this returns rate limiter 
+ * with the rate of Double . MAX _ VALUE bytes per second . 
+ * Rate unit is bytes per sec . 
+ * 
+ - * @ return RateLimiter with rate limit set 
+ + * @ return StreamRateLimiter with rate limit set based on peer location . 
+ * / 
+ - public static RateLimiter getRateLimiter ( ) 
+ + public static StreamRateLimiter getRateLimiter ( InetAddress peer ) 
+ { 
+ - double currentThroughput = ( ( double ) DatabaseDescriptor . getStreamThroughputOutboundMegabitsPerSec ( ) ) * 1024 * 1024 ; 
+ - / / if throughput is set to 0 , throttling is disabled 
+ - if ( currentThroughput = = 0 ) 
+ - currentThroughput = Double . MAX _ VALUE ; 
+ - if ( limiter . getRate ( ) ! = currentThroughput ) 
+ - limiter . setRate ( currentThroughput ) ; 
+ - return limiter ; 
+ + return new StreamRateLimiter ( peer ) ; 
+ + } 
+ + 
+ + public static class StreamRateLimiter 
+ + { 
+ + private static final double ONE _ MEGA _ BITS = 1024 * 1024 * 8 ; 
+ + private static final RateLimiter limiter = RateLimiter . create ( Double . MAX _ VALUE ) ; 
+ + private static final RateLimiter interDCLimiter = RateLimiter . create ( Double . MAX _ VALUE ) ; 
+ + private final boolean isLocalDC ; 
+ + 
+ + public StreamRateLimiter ( InetAddress peer ) 
+ + { 
+ + double throughput = ( ( double ) DatabaseDescriptor . getStreamThroughputOutboundMegabitsPerSec ( ) ) * ONE _ MEGA _ BITS ; 
+ + mayUpdateThroughput ( throughput , limiter ) ; 
+ + 
+ + double interDCThroughput = ( ( double ) DatabaseDescriptor . getInterDCStreamThroughputOutboundMegabitsPerSec ( ) ) * ONE _ MEGA _ BITS ; 
+ + mayUpdateThroughput ( interDCThroughput , interDCLimiter ) ; 
+ + 
+ + isLocalDC = DatabaseDescriptor . getLocalDataCenter ( ) . equals ( 
+ + DatabaseDescriptor . getEndpointSnitch ( ) . getDatacenter ( peer ) ) ; 
+ + } 
+ + 
+ + private void mayUpdateThroughput ( double limit , RateLimiter rateLimiter ) 
+ + { 
+ + / / if throughput is set to 0 , throttling is disabled 
+ + if ( limit = = 0 ) 
+ + limit = Double . MAX _ VALUE ; 
+ + if ( rateLimiter . getRate ( ) ! = limit ) 
+ + rateLimiter . setRate ( limit ) ; 
+ + } 
+ + 
+ + public void acquire ( int toTransfer ) 
+ + { 
+ + limiter . acquire ( toTransfer ) ; 
+ + if ( ! isLocalDC ) 
+ + interDCLimiter . acquire ( toTransfer ) ; 
+ + } 
+ } 
+ 
+ private final StreamEventJMXNotifier notifier = new StreamEventJMXNotifier ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamWriter . java b / src / java / org / apache / cassandra / streaming / StreamWriter . java 
+ index 04301ba . . a84d2f4 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamWriter . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamWriter . java 
+ @ @ - 24 , 7 + 24 , 6 @ @ import java . nio . channels . Channels ; 
+ import java . nio . channels . WritableByteChannel ; 
+ import java . util . Collection ; 
+ 
+ - import com . google . common . util . concurrent . RateLimiter ; 
+ import com . ning . compress . lzf . LZFOutputStream ; 
+ 
+ import org . apache . cassandra . io . sstable . Component ; 
+ @ @ - 33 , 6 + 32 , 7 @ @ import org . apache . cassandra . io . util . DataIntegrityMetadata ; 
+ import org . apache . cassandra . io . util . DataIntegrityMetadata . ChecksumValidator ; 
+ import org . apache . cassandra . io . util . FileUtils ; 
+ import org . apache . cassandra . io . util . RandomAccessReader ; 
+ + import org . apache . cassandra . streaming . StreamManager . StreamRateLimiter ; 
+ import org . apache . cassandra . utils . Pair ; 
+ 
+ / * * 
+ @ @ - 44 , 7 + 44 , 7 @ @ public class StreamWriter 
+ 
+ protected final SSTableReader sstable ; 
+ protected final Collection < Pair < Long , Long > > sections ; 
+ - protected final RateLimiter limiter = StreamManager . getRateLimiter ( ) ; 
+ + protected final StreamRateLimiter limiter ; 
+ protected final StreamSession session ; 
+ 
+ private OutputStream compressedOutput ; 
+ @ @ - 57 , 6 + 57 , 7 @ @ public class StreamWriter 
+ this . session = session ; 
+ this . sstable = sstable ; 
+ this . sections = sections ; 
+ + this . limiter = StreamManager . getRateLimiter ( session . peer ) ; 
+ } 
+ 
+ / * *
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index 66e28f4 . . 5920c36 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 1639 , 6 + 1639 , 11 @ @ public class StorageService implements IEndpointStateChangeSubscriber , StorageSe 
+ return FBUtilities . getReleaseVersionString ( ) ; 
+ } 
+ 
+ + public String getSchemaVersion ( ) 
+ + { 
+ + return Schema . instance . getVersion ( ) . toString ( ) ; 
+ + } 
+ + 
+ public List < String > getLeavingNodes ( ) 
+ { 
+ return stringify ( tokenMetadata _ . getLeavingEndpoints ( ) ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageServiceMBean . java b / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ index 184a935 . . 404c794 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ @ @ - 84 , 6 + 84 , 13 @ @ public interface StorageServiceMBean 
+ public String getReleaseVersion ( ) ; 
+ 
+ / * * 
+ + * Fetch a string representation of the current Schema version . 
+ + * @ return A string representation of the Schema version . 
+ + * / 
+ + public String getSchemaVersion ( ) ; 
+ + 
+ + 
+ + / * * 
+ * Get the list of all data file locations from conf 
+ * @ return String array of all locations 
+ * / 
+ diff - - git a / src / java / org / apache / cassandra / tools / NodeCmd . java b / src / java / org / apache / cassandra / tools / NodeCmd . java 
+ index 46b369b . . 8540deb 100644 
+ - - - a / src / java / org / apache / cassandra / tools / NodeCmd . java 
+ + + + b / src / java / org / apache / cassandra / tools / NodeCmd . java 
+ @ @ - 837 , 6 + 837 , 7 @ @ public class NodeCmd 
+ 
+ private void printDescribeRing ( String keyspaceName , PrintStream out ) 
+ { 
+ + out . println ( " Schema Version : " + probe . getSchemaVersion ( ) ) ; 
+ out . println ( " TokenRange : " ) ; 
+ try 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ index 2c51990 . . cea2fc6 100644 
+ - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ @ @ - 648 , 6 + 648 , 11 @ @ public class NodeProbe 
+ ssProxy . setStreamThroughputMbPerSec ( value ) ; 
+ } 
+ 
+ + public String getSchemaVersion ( ) 
+ + { 
+ + return ssProxy . getSchemaVersion ( ) ; 
+ + } 
+ + 
+ public List < String > describeRing ( String keyspaceName ) throws InvalidRequestException 
+ { 
+ return ssProxy . describeRingJMX ( keyspaceName ) ;

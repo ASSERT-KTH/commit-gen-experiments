@@ -1,0 +1,160 @@
+BLEU SCORE: 0.2136435031981171
+
+TEST MSG: Fix growing pending background compaction
+GENERATED MSG: Periodically submit background compaction tasks
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index bd1db92 . . 40bf463 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 5 + 1 , 6 @ @ <nl> 2 . 0 . 18 <nl> - * Scrub ( recover ) sstables even when - Index . db is missing , ( CASSANDRA - 9591 ) <nl> + * Scrub ( recover ) sstables even when - Index . db is missing , ( CASSANDRA - 9591 ) <nl> + * Fix growing pending background compaction ( CASSANDRA - 9662 ) <nl> <nl> <nl> 2 . 0 . 17 <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index bf1e779 . . 00b2eb8 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 180 , 20 + 180 , 9 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> { <nl> public void run ( ) <nl> { <nl> - List < ColumnFamilyStore > submitted = new ArrayList < > ( ) ; <nl> for ( Keyspace keyspace : Keyspace . all ( ) ) <nl> for ( ColumnFamilyStore cfs : keyspace . getColumnFamilyStores ( ) ) <nl> - if ( ! CompactionManager . instance . submitBackground ( cfs , false ) . isEmpty ( ) ) <nl> - submitted . add ( cfs ) ; <nl> - <nl> - while ( ! submitted . isEmpty ( ) & & CompactionManager . instance . getActiveCompactions ( ) < CompactionManager . instance . getMaximumCompactorThreads ( ) ) <nl> - { <nl> - List < ColumnFamilyStore > submitMore = ImmutableList . copyOf ( submitted ) ; <nl> - submitted . clear ( ) ; <nl> - for ( ColumnFamilyStore cfs : submitMore ) <nl> - if ( ! CompactionManager . instance . submitBackground ( cfs , false ) . isEmpty ( ) ) <nl> - submitted . add ( cfs ) ; <nl> - } <nl> + CompactionManager . instance . submitBackground ( cfs ) ; <nl> } <nl> } ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> index c66eeb6 . . 5b5b39e 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> @ @ - 128 , 11 + 128 , 6 @ @ public class CompactionManager implements CompactionManagerMBean <nl> * / <nl> public List < Future < ? > > submitBackground ( final ColumnFamilyStore cfs ) <nl> { <nl> - return submitBackground ( cfs , true ) ; <nl> - } <nl> - <nl> - public List < Future < ? > > submitBackground ( final ColumnFamilyStore cfs , boolean autoFill ) <nl> - { <nl> if ( cfs . isAutoCompactionDisabled ( ) ) <nl> { <nl> logger . debug ( " Autocompaction is disabled " ) ; <nl> @ @ - 151 , 14 + 146 , 11 @ @ public class CompactionManager implements CompactionManagerMBean <nl> cfs . keyspace . getName ( ) , <nl> cfs . name , <nl> cfs . getCompactionStrategy ( ) . getClass ( ) . getSimpleName ( ) ) ; <nl> - List < Future < ? > > futures = new ArrayList < Future < ? > > ( ) ; <nl> + List < Future < ? > > futures = new ArrayList < > ( ) ; <nl> <nl> / / we must schedule it at least once , otherwise compaction will stop for a CF until next flush <nl> - do { <nl> - compactingCF . add ( cfs ) ; <nl> - futures . add ( executor . submit ( new BackgroundCompactionTask ( cfs ) ) ) ; <nl> - / / if we have room for more compactions , then fill up executor <nl> - } while ( autoFill & & executor . getActiveCount ( ) + futures . size ( ) < executor . getMaximumPoolSize ( ) ) ; <nl> + compactingCF . add ( cfs ) ; <nl> + futures . add ( executor . submit ( new BackgroundCompactionCandidate ( cfs ) ) ) ; <nl> <nl> return futures ; <nl> } <nl> @ @ - 173 , 11 + 165 , 11 @ @ public class CompactionManager implements CompactionManagerMBean <nl> <nl> / / the actual sstables to compact are not determined until we run the BCT ; that way , if new sstables <nl> / / are created between task submission and execution , we execute against the most up - to - date information <nl> - class BackgroundCompactionTask implements Runnable <nl> + class BackgroundCompactionCandidate implements Runnable <nl> { <nl> private final ColumnFamilyStore cfs ; <nl> <nl> - BackgroundCompactionTask ( ColumnFamilyStore cfs ) <nl> + BackgroundCompactionCandidate ( ColumnFamilyStore cfs ) <nl> { <nl> this . cfs = cfs ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / metrics / CompactionMetrics . java b / src / java / org / apache / cassandra / metrics / CompactionMetrics . java <nl> index b015130 . . f7a99e1 100644 <nl> - - - a / src / java / org / apache / cassandra / metrics / CompactionMetrics . java <nl> + + + b / src / java / org / apache / cassandra / metrics / CompactionMetrics . java <nl> @ @ - 58 , 14 + 58 , 14 @ @ public class CompactionMetrics implements CompactionManager . CompactionExecutorSt <nl> public Integer value ( ) <nl> { <nl> int n = 0 ; <nl> + / / add estimate number of compactions need to be done <nl> for ( String keyspaceName : Schema . instance . getKeyspaces ( ) ) <nl> { <nl> for ( ColumnFamilyStore cfs : Keyspace . open ( keyspaceName ) . getColumnFamilyStores ( ) ) <nl> n + = cfs . getCompactionStrategy ( ) . getEstimatedRemainingTasks ( ) ; <nl> } <nl> - for ( ThreadPoolExecutor collector : collectors ) <nl> - n + = collector . getTaskCount ( ) - collector . getCompletedTaskCount ( ) ; <nl> - return n ; <nl> + / / add number of currently running compactions <nl> + return n + compactions . size ( ) ; <nl> } <nl> } ) ; <nl> completedTasks = Metrics . newGauge ( factory . createMetricName ( " CompletedTasks " ) , new Gauge < Long > ( ) <nl> diff - - git a / test / unit / org / apache / cassandra / db / compaction / CompactionsTest . java b / test / unit / org / apache / cassandra / db / compaction / CompactionsTest . java <nl> index 1879838 . . 7da8d92 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / compaction / CompactionsTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / compaction / CompactionsTest . java <nl> @ @ - 82 , 8 + 82 , 10 @ @ public class CompactionsTest extends SchemaLoader <nl> / / enable compaction , submit background and wait for it to complete <nl> store . enableAutoCompaction ( ) ; <nl> FBUtilities . waitOnFutures ( CompactionManager . instance . submitBackground ( store ) ) ; <nl> - while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) <nl> + do <nl> + { <nl> TimeUnit . SECONDS . sleep ( 1 ) ; <nl> + } while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) ; <nl> <nl> / / and sstable with ttl should be compacted <nl> assertEquals ( 1 , store . getSSTables ( ) . size ( ) ) ; <nl> @ @ - 202 , 8 + 204 , 10 @ @ public class CompactionsTest extends SchemaLoader <nl> / / enable compaction , submit background and wait for it to complete <nl> store . enableAutoCompaction ( ) ; <nl> FBUtilities . waitOnFutures ( CompactionManager . instance . submitBackground ( store ) ) ; <nl> - while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) <nl> + do <nl> + { <nl> TimeUnit . SECONDS . sleep ( 1 ) ; <nl> + } while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) ; <nl> <nl> / / even though both sstables were candidate for tombstone compaction <nl> / / it was not executed because they have an overlapping token range <nl> @ @ - 222 , 8 + 226 , 10 @ @ public class CompactionsTest extends SchemaLoader <nl> <nl> / / submit background task again and wait for it to complete <nl> FBUtilities . waitOnFutures ( CompactionManager . instance . submitBackground ( store ) ) ; <nl> - while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) <nl> + do <nl> + { <nl> TimeUnit . SECONDS . sleep ( 1 ) ; <nl> + } while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) ; <nl> <nl> / / we still have 2 sstables , since they were not compacted against each other <nl> assertEquals ( 2 , store . getSSTables ( ) . size ( ) ) ;
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index bd1db92 . . 40bf463 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 5 + 1 , 6 @ @ 
+ 2 . 0 . 18 
+ - * Scrub ( recover ) sstables even when - Index . db is missing , ( CASSANDRA - 9591 ) 
+ + * Scrub ( recover ) sstables even when - Index . db is missing , ( CASSANDRA - 9591 ) 
+ + * Fix growing pending background compaction ( CASSANDRA - 9662 ) 
+ 
+ 
+ 2 . 0 . 17 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index bf1e779 . . 00b2eb8 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 180 , 20 + 180 , 9 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ { 
+ public void run ( ) 
+ { 
+ - List < ColumnFamilyStore > submitted = new ArrayList < > ( ) ; 
+ for ( Keyspace keyspace : Keyspace . all ( ) ) 
+ for ( ColumnFamilyStore cfs : keyspace . getColumnFamilyStores ( ) ) 
+ - if ( ! CompactionManager . instance . submitBackground ( cfs , false ) . isEmpty ( ) ) 
+ - submitted . add ( cfs ) ; 
+ - 
+ - while ( ! submitted . isEmpty ( ) & & CompactionManager . instance . getActiveCompactions ( ) < CompactionManager . instance . getMaximumCompactorThreads ( ) ) 
+ - { 
+ - List < ColumnFamilyStore > submitMore = ImmutableList . copyOf ( submitted ) ; 
+ - submitted . clear ( ) ; 
+ - for ( ColumnFamilyStore cfs : submitMore ) 
+ - if ( ! CompactionManager . instance . submitBackground ( cfs , false ) . isEmpty ( ) ) 
+ - submitted . add ( cfs ) ; 
+ - } 
+ + CompactionManager . instance . submitBackground ( cfs ) ; 
+ } 
+ } ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ index c66eeb6 . . 5b5b39e 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ @ @ - 128 , 11 + 128 , 6 @ @ public class CompactionManager implements CompactionManagerMBean 
+ * / 
+ public List < Future < ? > > submitBackground ( final ColumnFamilyStore cfs ) 
+ { 
+ - return submitBackground ( cfs , true ) ; 
+ - } 
+ - 
+ - public List < Future < ? > > submitBackground ( final ColumnFamilyStore cfs , boolean autoFill ) 
+ - { 
+ if ( cfs . isAutoCompactionDisabled ( ) ) 
+ { 
+ logger . debug ( " Autocompaction is disabled " ) ; 
+ @ @ - 151 , 14 + 146 , 11 @ @ public class CompactionManager implements CompactionManagerMBean 
+ cfs . keyspace . getName ( ) , 
+ cfs . name , 
+ cfs . getCompactionStrategy ( ) . getClass ( ) . getSimpleName ( ) ) ; 
+ - List < Future < ? > > futures = new ArrayList < Future < ? > > ( ) ; 
+ + List < Future < ? > > futures = new ArrayList < > ( ) ; 
+ 
+ / / we must schedule it at least once , otherwise compaction will stop for a CF until next flush 
+ - do { 
+ - compactingCF . add ( cfs ) ; 
+ - futures . add ( executor . submit ( new BackgroundCompactionTask ( cfs ) ) ) ; 
+ - / / if we have room for more compactions , then fill up executor 
+ - } while ( autoFill & & executor . getActiveCount ( ) + futures . size ( ) < executor . getMaximumPoolSize ( ) ) ; 
+ + compactingCF . add ( cfs ) ; 
+ + futures . add ( executor . submit ( new BackgroundCompactionCandidate ( cfs ) ) ) ; 
+ 
+ return futures ; 
+ } 
+ @ @ - 173 , 11 + 165 , 11 @ @ public class CompactionManager implements CompactionManagerMBean 
+ 
+ / / the actual sstables to compact are not determined until we run the BCT ; that way , if new sstables 
+ / / are created between task submission and execution , we execute against the most up - to - date information 
+ - class BackgroundCompactionTask implements Runnable 
+ + class BackgroundCompactionCandidate implements Runnable 
+ { 
+ private final ColumnFamilyStore cfs ; 
+ 
+ - BackgroundCompactionTask ( ColumnFamilyStore cfs ) 
+ + BackgroundCompactionCandidate ( ColumnFamilyStore cfs ) 
+ { 
+ this . cfs = cfs ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / metrics / CompactionMetrics . java b / src / java / org / apache / cassandra / metrics / CompactionMetrics . java 
+ index b015130 . . f7a99e1 100644 
+ - - - a / src / java / org / apache / cassandra / metrics / CompactionMetrics . java 
+ + + + b / src / java / org / apache / cassandra / metrics / CompactionMetrics . java 
+ @ @ - 58 , 14 + 58 , 14 @ @ public class CompactionMetrics implements CompactionManager . CompactionExecutorSt 
+ public Integer value ( ) 
+ { 
+ int n = 0 ; 
+ + / / add estimate number of compactions need to be done 
+ for ( String keyspaceName : Schema . instance . getKeyspaces ( ) ) 
+ { 
+ for ( ColumnFamilyStore cfs : Keyspace . open ( keyspaceName ) . getColumnFamilyStores ( ) ) 
+ n + = cfs . getCompactionStrategy ( ) . getEstimatedRemainingTasks ( ) ; 
+ } 
+ - for ( ThreadPoolExecutor collector : collectors ) 
+ - n + = collector . getTaskCount ( ) - collector . getCompletedTaskCount ( ) ; 
+ - return n ; 
+ + / / add number of currently running compactions 
+ + return n + compactions . size ( ) ; 
+ } 
+ } ) ; 
+ completedTasks = Metrics . newGauge ( factory . createMetricName ( " CompletedTasks " ) , new Gauge < Long > ( ) 
+ diff - - git a / test / unit / org / apache / cassandra / db / compaction / CompactionsTest . java b / test / unit / org / apache / cassandra / db / compaction / CompactionsTest . java 
+ index 1879838 . . 7da8d92 100644 
+ - - - a / test / unit / org / apache / cassandra / db / compaction / CompactionsTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / compaction / CompactionsTest . java 
+ @ @ - 82 , 8 + 82 , 10 @ @ public class CompactionsTest extends SchemaLoader 
+ / / enable compaction , submit background and wait for it to complete 
+ store . enableAutoCompaction ( ) ; 
+ FBUtilities . waitOnFutures ( CompactionManager . instance . submitBackground ( store ) ) ; 
+ - while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) 
+ + do 
+ + { 
+ TimeUnit . SECONDS . sleep ( 1 ) ; 
+ + } while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) ; 
+ 
+ / / and sstable with ttl should be compacted 
+ assertEquals ( 1 , store . getSSTables ( ) . size ( ) ) ; 
+ @ @ - 202 , 8 + 204 , 10 @ @ public class CompactionsTest extends SchemaLoader 
+ / / enable compaction , submit background and wait for it to complete 
+ store . enableAutoCompaction ( ) ; 
+ FBUtilities . waitOnFutures ( CompactionManager . instance . submitBackground ( store ) ) ; 
+ - while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) 
+ + do 
+ + { 
+ TimeUnit . SECONDS . sleep ( 1 ) ; 
+ + } while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) ; 
+ 
+ / / even though both sstables were candidate for tombstone compaction 
+ / / it was not executed because they have an overlapping token range 
+ @ @ - 222 , 8 + 226 , 10 @ @ public class CompactionsTest extends SchemaLoader 
+ 
+ / / submit background task again and wait for it to complete 
+ FBUtilities . waitOnFutures ( CompactionManager . instance . submitBackground ( store ) ) ; 
+ - while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) 
+ + do 
+ + { 
+ TimeUnit . SECONDS . sleep ( 1 ) ; 
+ + } while ( CompactionManager . instance . getPendingTasks ( ) > 0 | | CompactionManager . instance . getActiveCompactions ( ) > 0 ) ; 
+ 
+ / / we still have 2 sstables , since they were not compacted against each other 
+ assertEquals ( 2 , store . getSSTables ( ) . size ( ) ) ;
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

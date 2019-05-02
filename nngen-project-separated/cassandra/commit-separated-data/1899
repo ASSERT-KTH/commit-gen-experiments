@@ -1,0 +1,815 @@
+BLEU SCORE: 0.009055098589312643
+
+TEST MSG: Don ' t allow starting several repairs on the same sstables
+GENERATED MSG: make estimation of pendingtasks for CompactionManager sane . patch by jbellis ; reviewed by eevans for CASSANDRA - 599
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 296aa66 . . ea2ecc0 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 3 <nl> + * Don ' t allow starting multiple inc repairs on the same sstables ( CASSANDRA - 8316 ) <nl> * Invalidate prepared BATCH statements when related tables <nl> or keyspaces are dropped ( CASSANDRA - 8652 ) <nl> * Fix missing results in secondary index queries on collections <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> index eb7c0ee . . 02f5e81 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> @ @ - 21 , 6 + 21 , 7 @ @ import java . io . File ; <nl> import java . io . IOException ; <nl> import java . lang . management . ManagementFactory ; <nl> import java . util . ArrayList ; <nl> + import java . util . Arrays ; <nl> import java . util . Collection ; <nl> import java . util . Collections ; <nl> import java . util . HashSet ; <nl> @ @ - 369 , 15 + 370 , 32 @ @ public class CompactionManager implements CompactionManagerMBean <nl> <nl> public Future < ? > submitAntiCompaction ( final ColumnFamilyStore cfs , <nl> final Collection < Range < Token > > ranges , <nl> - final Collection < SSTableReader > validatedForRepair , <nl> + final Collection < SSTableReader > sstables , <nl> final long repairedAt ) <nl> { <nl> Runnable runnable = new WrappedRunnable ( ) { <nl> - <nl> @ Override <nl> public void runMayThrow ( ) throws Exception <nl> { <nl> - performAnticompaction ( cfs , ranges , validatedForRepair , repairedAt ) ; <nl> + boolean success = false ; <nl> + while ( ! success ) <nl> + { <nl> + for ( SSTableReader compactingSSTable : cfs . getDataTracker ( ) . getCompacting ( ) ) <nl> + { <nl> + if ( sstables . remove ( compactingSSTable ) ) <nl> + SSTableReader . releaseReferences ( Arrays . asList ( compactingSSTable ) ) ; <nl> + } <nl> + Set < SSTableReader > compactedSSTables = new HashSet < > ( ) ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + { <nl> + if ( sstable . isMarkedCompacted ( ) ) <nl> + compactedSSTables . add ( sstable ) ; <nl> + } <nl> + sstables . removeAll ( compactedSSTables ) ; <nl> + SSTableReader . releaseReferences ( compactedSSTables ) ; <nl> + success = sstables . isEmpty ( ) | | cfs . getDataTracker ( ) . markCompacting ( sstables ) ; <nl> + } <nl> + performAnticompaction ( cfs , ranges , sstables , repairedAt ) ; <nl> } <nl> } ; <nl> return executor . submit ( runnable ) ; <nl> @ @ - 398 , 7 + 416 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> Collection < SSTableReader > validatedForRepair , <nl> long repairedAt ) throws InterruptedException , ExecutionException , IOException <nl> { <nl> - logger . info ( " Starting anticompaction " ) ; <nl> + logger . info ( " Starting anticompaction for { } . { } on { } / { } sstables " , cfs . keyspace . getName ( ) , cfs . getColumnFamilyName ( ) , validatedForRepair . size ( ) , cfs . getSSTables ( ) . size ( ) ) ; <nl> logger . debug ( " Starting anticompaction for ranges { } " , ranges ) ; <nl> Set < SSTableReader > sstables = new HashSet < > ( validatedForRepair ) ; <nl> Set < SSTableReader > mutatedRepairStatuses = new HashSet < > ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java <nl> index 141e4c7 . . c7cf4c8 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java <nl> + + + b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java <nl> @ @ - 57 , 78 + 57 , 88 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > <nl> { <nl> / / TODO add cancel / interrupt message <nl> RepairJobDesc desc = message . payload . desc ; <nl> - switch ( message . payload . messageType ) <nl> + try <nl> { <nl> - case PREPARE _ MESSAGE : <nl> - PrepareMessage prepareMessage = ( PrepareMessage ) message . payload ; <nl> - List < ColumnFamilyStore > columnFamilyStores = new ArrayList < > ( prepareMessage . cfIds . size ( ) ) ; <nl> - for ( UUID cfId : prepareMessage . cfIds ) <nl> - { <nl> - Pair < String , String > kscf = Schema . instance . getCF ( cfId ) ; <nl> - ColumnFamilyStore columnFamilyStore = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; <nl> - columnFamilyStores . add ( columnFamilyStore ) ; <nl> - } <nl> - ActiveRepairService . instance . registerParentRepairSession ( prepareMessage . parentRepairSession , <nl> - columnFamilyStores , <nl> - prepareMessage . ranges ) ; <nl> - MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; <nl> - break ; <nl> - <nl> - case SNAPSHOT : <nl> - ColumnFamilyStore cfs = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; <nl> - final Range < Token > repairingRange = desc . range ; <nl> - cfs . snapshot ( desc . sessionId . toString ( ) , new Predicate < SSTableReader > ( ) <nl> - { <nl> - public boolean apply ( SSTableReader sstable ) <nl> + switch ( message . payload . messageType ) <nl> + { <nl> + case PREPARE _ MESSAGE : <nl> + PrepareMessage prepareMessage = ( PrepareMessage ) message . payload ; <nl> + List < ColumnFamilyStore > columnFamilyStores = new ArrayList < > ( prepareMessage . cfIds . size ( ) ) ; <nl> + for ( UUID cfId : prepareMessage . cfIds ) <nl> { <nl> - return sstable ! = null & & <nl> - ! ( sstable . partitioner instanceof LocalPartitioner ) & & / / exclude SSTables from 2i <nl> - new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Collections . singleton ( repairingRange ) ) ; <nl> + Pair < String , String > kscf = Schema . instance . getCF ( cfId ) ; <nl> + ColumnFamilyStore columnFamilyStore = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; <nl> + columnFamilyStores . add ( columnFamilyStore ) ; <nl> } <nl> - } ) ; <nl> + ActiveRepairService . instance . registerParentRepairSession ( prepareMessage . parentRepairSession , <nl> + columnFamilyStores , <nl> + prepareMessage . ranges ) ; <nl> + MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; <nl> + break ; <nl> <nl> - logger . debug ( " Enqueuing response to snapshot request { } to { } " , desc . sessionId , message . from ) ; <nl> - MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; <nl> - break ; <nl> + case SNAPSHOT : <nl> + ColumnFamilyStore cfs = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; <nl> + final Range < Token > repairingRange = desc . range ; <nl> + cfs . snapshot ( desc . sessionId . toString ( ) , new Predicate < SSTableReader > ( ) <nl> + { <nl> + public boolean apply ( SSTableReader sstable ) <nl> + { <nl> + return sstable ! = null & & <nl> + ! ( sstable . partitioner instanceof LocalPartitioner ) & & / / exclude SSTables from 2i <nl> + new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Collections . singleton ( repairingRange ) ) ; <nl> + } <nl> + } ) ; <nl> <nl> - case VALIDATION _ REQUEST : <nl> - ValidationRequest validationRequest = ( ValidationRequest ) message . payload ; <nl> - / / trigger read - only compaction <nl> - ColumnFamilyStore store = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; <nl> + logger . debug ( " Enqueuing response to snapshot request { } to { } " , desc . sessionId , message . from ) ; <nl> + MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; <nl> + break ; <nl> <nl> - Validator validator = new Validator ( desc , message . from , validationRequest . gcBefore ) ; <nl> - CompactionManager . instance . submitValidation ( store , validator ) ; <nl> - break ; <nl> + case VALIDATION _ REQUEST : <nl> + ValidationRequest validationRequest = ( ValidationRequest ) message . payload ; <nl> + / / trigger read - only compaction <nl> + ColumnFamilyStore store = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; <nl> <nl> - case SYNC _ REQUEST : <nl> - / / forwarded sync request <nl> - SyncRequest request = ( SyncRequest ) message . payload ; <nl> - StreamingRepairTask task = new StreamingRepairTask ( desc , request ) ; <nl> - task . run ( ) ; <nl> - break ; <nl> + Validator validator = new Validator ( desc , message . from , validationRequest . gcBefore ) ; <nl> + CompactionManager . instance . submitValidation ( store , validator ) ; <nl> + break ; <nl> <nl> - case ANTICOMPACTION _ REQUEST : <nl> - logger . debug ( " Got anticompaction request " ) ; <nl> - AnticompactionRequest anticompactionRequest = ( AnticompactionRequest ) message . payload ; <nl> - try <nl> - { <nl> - List < Future < ? > > futures = ActiveRepairService . instance . doAntiCompaction ( anticompactionRequest . parentRepairSession ) ; <nl> - FBUtilities . waitOnFutures ( futures ) ; <nl> - } <nl> - catch ( Exception e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> - finally <nl> - { <nl> - ActiveRepairService . instance . removeParentRepairSession ( anticompactionRequest . parentRepairSession ) ; <nl> - } <nl> + case SYNC _ REQUEST : <nl> + / / forwarded sync request <nl> + SyncRequest request = ( SyncRequest ) message . payload ; <nl> + StreamingRepairTask task = new StreamingRepairTask ( desc , request ) ; <nl> + task . run ( ) ; <nl> + break ; <nl> <nl> - break ; <nl> + case ANTICOMPACTION _ REQUEST : <nl> + logger . debug ( " Got anticompaction request " ) ; <nl> + AnticompactionRequest anticompactionRequest = ( AnticompactionRequest ) message . payload ; <nl> + try <nl> + { <nl> + List < Future < ? > > futures = ActiveRepairService . instance . doAntiCompaction ( anticompactionRequest . parentRepairSession ) ; <nl> + FBUtilities . waitOnFutures ( futures ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + finally <nl> + { <nl> + ActiveRepairService . instance . removeParentRepairSession ( anticompactionRequest . parentRepairSession ) ; <nl> + } <nl> + <nl> + break ; <nl> <nl> - default : <nl> - ActiveRepairService . instance . handleMessage ( message . from , message . payload ) ; <nl> - break ; <nl> + default : <nl> + ActiveRepairService . instance . handleMessage ( message . from , message . payload ) ; <nl> + break ; <nl> + } <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + logger . error ( " Got error , removing parent repair session " ) ; <nl> + if ( desc ! = null & & desc . parentSessionId ! = null ) <nl> + ActiveRepairService . instance . removeParentRepairSession ( desc . parentSessionId ) ; <nl> + throw new RuntimeException ( e ) ; <nl> } <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / ActiveRepairService . java b / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> index 17cf6ef . . 36f7c5c 100644 <nl> - - - a / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> + + + b / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> @ @ - 139 , 7 + 139 , 7 @ @ public class ActiveRepairService <nl> sessions . remove ( session . getId ( ) ) ; <nl> } <nl> <nl> - public void terminateSessions ( ) <nl> + public synchronized void terminateSessions ( ) <nl> { <nl> for ( RepairSession session : sessions . values ( ) ) <nl> { <nl> @ @ - 241 , 7 + 241 , 7 @ @ public class ActiveRepairService <nl> return neighbors ; <nl> } <nl> <nl> - public UUID prepareForRepair ( Set < InetAddress > endpoints , Collection < Range < Token > > ranges , List < ColumnFamilyStore > columnFamilyStores ) <nl> + public synchronized UUID prepareForRepair ( Set < InetAddress > endpoints , Collection < Range < Token > > ranges , List < ColumnFamilyStore > columnFamilyStores ) <nl> { <nl> UUID parentRepairSession = UUIDGen . getTimeUUID ( ) ; <nl> registerParentRepairSession ( parentRepairSession , columnFamilyStores , ranges ) ; <nl> @ @ - 297 , 18 + 297 , 24 @ @ public class ActiveRepairService <nl> return parentRepairSession ; <nl> } <nl> <nl> - public void registerParentRepairSession ( UUID parentRepairSession , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges ) <nl> + public synchronized void registerParentRepairSession ( UUID parentRepairSession , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges ) <nl> { <nl> Map < UUID , Set < SSTableReader > > sstablesToRepair = new HashMap < > ( ) ; <nl> for ( ColumnFamilyStore cfs : columnFamilyStores ) <nl> { <nl> Set < SSTableReader > sstables = new HashSet < > ( ) ; <nl> + Set < SSTableReader > currentlyRepairing = currentlyRepairing ( cfs . metadata . cfId ) ; <nl> for ( SSTableReader sstable : cfs . getSSTables ( ) ) <nl> { <nl> if ( new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( ranges ) ) <nl> { <nl> if ( ! sstable . isRepaired ( ) ) <nl> { <nl> + if ( currentlyRepairing . contains ( sstable ) ) <nl> + { <nl> + logger . error ( " Already repairing " + sstable + " , can not continue . " ) ; <nl> + throw new RuntimeException ( " Already repairing " + sstable + " , can not continue . " ) ; <nl> + } <nl> sstables . add ( sstable ) ; <nl> } <nl> } <nl> @ @ - 318 , 7 + 324 , 19 @ @ public class ActiveRepairService <nl> parentRepairSessions . put ( parentRepairSession , new ParentRepairSession ( columnFamilyStores , ranges , sstablesToRepair , System . currentTimeMillis ( ) ) ) ; <nl> } <nl> <nl> - public void finishParentSession ( UUID parentSession , Set < InetAddress > neighbors , boolean doAntiCompaction ) throws InterruptedException , ExecutionException , IOException <nl> + private Set < SSTableReader > currentlyRepairing ( UUID cfId ) <nl> + { <nl> + Set < SSTableReader > repairing = new HashSet < > ( ) ; <nl> + for ( Map . Entry < UUID , ParentRepairSession > entry : parentRepairSessions . entrySet ( ) ) <nl> + { <nl> + Collection < SSTableReader > sstables = entry . getValue ( ) . sstableMap . get ( cfId ) ; <nl> + if ( sstables ! = null ) <nl> + repairing . addAll ( sstables ) ; <nl> + } <nl> + return repairing ; <nl> + } <nl> + <nl> + public synchronized void finishParentSession ( UUID parentSession , Set < InetAddress > neighbors , boolean doAntiCompaction ) throws InterruptedException , ExecutionException , IOException <nl> { <nl> try <nl> { <nl> @ @ - 345 , 7 + 363 , 7 @ @ public class ActiveRepairService <nl> return parentRepairSessions . get ( parentSessionId ) ; <nl> } <nl> <nl> - public ParentRepairSession removeParentRepairSession ( UUID parentSessionId ) <nl> + public synchronized ParentRepairSession removeParentRepairSession ( UUID parentSessionId ) <nl> { <nl> return parentRepairSessions . remove ( parentSessionId ) ; <nl> } <nl> @ @ - 358 , 20 + 376 , 8 @ @ public class ActiveRepairService <nl> List < Future < ? > > futures = new ArrayList < > ( ) ; <nl> for ( Map . Entry < UUID , ColumnFamilyStore > columnFamilyStoreEntry : prs . columnFamilyStores . entrySet ( ) ) <nl> { <nl> - <nl> Collection < SSTableReader > sstables = new HashSet < > ( prs . getAndReferenceSSTables ( columnFamilyStoreEntry . getKey ( ) ) ) ; <nl> ColumnFamilyStore cfs = columnFamilyStoreEntry . getValue ( ) ; <nl> - boolean success = false ; <nl> - while ( ! success ) <nl> - { <nl> - for ( SSTableReader compactingSSTable : cfs . getDataTracker ( ) . getCompacting ( ) ) <nl> - { <nl> - if ( sstables . remove ( compactingSSTable ) ) <nl> - SSTableReader . releaseReferences ( Arrays . asList ( compactingSSTable ) ) ; <nl> - } <nl> - success = sstables . isEmpty ( ) | | cfs . getDataTracker ( ) . markCompacting ( sstables ) ; <nl> - } <nl> - <nl> futures . add ( CompactionManager . instance . submitAntiCompaction ( cfs , prs . ranges , sstables , prs . repairedAt ) ) ; <nl> } <nl> <nl> @ @ - 435 , 5 + 441 , 16 @ @ public class ActiveRepairService <nl> } <nl> return sstables ; <nl> } <nl> + <nl> + @ Override <nl> + public String toString ( ) <nl> + { <nl> + return " ParentRepairSession { " + <nl> + " columnFamilyStores = " + columnFamilyStores + <nl> + " , ranges = " + ranges + <nl> + " , sstableMap = " + sstableMap + <nl> + " , repairedAt = " + repairedAt + <nl> + ' } ' ; <nl> + } <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamSession . java b / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> index b03d28a . . 5617b04 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> @ @ - 300 , 7 + 300 , 6 @ @ public class StreamSession implements IEndpointStateChangeSubscriber <nl> ColumnFamilyStore . ViewFragment view = cfStore . selectAndReference ( cfStore . viewFilter ( rowBoundsList ) ) ; <nl> sstables . addAll ( view . sstables ) ; <nl> } <nl> - <nl> List < SSTableStreamingSections > sections = new ArrayList < > ( sstables . size ( ) ) ; <nl> for ( SSTableReader sstable : sstables ) <nl> {
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 06b6ca7 . . 30fdbf7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 559 , 7 + 559 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> public void addSSTable ( SSTableReader sstable ) <nl> { <nl> ssTables _ . add ( sstable ) ; <nl> - CompactionManager . instance . submitMinor ( this ) ; <nl> + CompactionManager . instance . submitMinorIfNeeded ( this ) ; <nl> } <nl> <nl> / * <nl> diff - - git a / src / java / org / apache / cassandra / db / CompactionManager . java b / src / java / org / apache / cassandra / db / CompactionManager . java <nl> index 7584e96 . . 9f71364 100644 <nl> - - - a / src / java / org / apache / cassandra / db / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / CompactionManager . java <nl> @ @ - 23 , 13 + 23 , 12 @ @ import java . io . File ; <nl> import java . lang . management . ManagementFactory ; <nl> import java . util . * ; <nl> import java . util . concurrent . Callable ; <nl> - import java . util . concurrent . ExecutorService ; <nl> import java . util . concurrent . Future ; <nl> import javax . management . * ; <nl> <nl> import org . apache . log4j . Logger ; <nl> <nl> - import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutor ; <nl> + import org . apache . cassandra . concurrent . DebuggableThreadPoolExecutor ; <nl> import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . io . * ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> @ @ - 37 , 6 + 36 , 7 @ @ import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . service . AntiEntropyService ; <nl> import org . apache . cassandra . utils . FileUtils ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; <nl> <nl> import java . net . InetAddress ; <nl> <nl> @ @ - 68 , 44 + 68 , 56 @ @ public class CompactionManager implements CompactionManagerMBean <nl> } <nl> } <nl> <nl> - private ExecutorService compactor _ = new JMXEnabledThreadPoolExecutor ( " COMPACTION - POOL " ) ; <nl> + private CompactionExecutor executor = new CompactionExecutor ( ) ; <nl> + private Map < ColumnFamilyStore , Integer > estimatedCompactions = new NonBlockingHashMap < ColumnFamilyStore , Integer > ( ) ; <nl> <nl> / * * <nl> * Call this whenever a compaction might be needed on the given columnfamily . <nl> * It ' s okay to over - call ( within reason ) since the compactions are single - threaded , <nl> * and if a call is unnecessary , it will just be no - oped in the bucketing phase . <nl> * / <nl> - public Future < Integer > submitMinor ( final ColumnFamilyStore cfs ) <nl> + public Future < Integer > submitMinorIfNeeded ( final ColumnFamilyStore cfs ) <nl> { <nl> Callable < Integer > callable = new Callable < Integer > ( ) <nl> { <nl> public Integer call ( ) throws IOException <nl> { <nl> - int filesCompacted = 0 ; <nl> - if ( minimumCompactionThreshold > 0 & & maximumCompactionThreshold > 0 ) <nl> + if ( minimumCompactionThreshold < = 0 | | maximumCompactionThreshold < = 0 ) <nl> { <nl> - logger . debug ( " Checking to see if compaction of " + cfs . columnFamily _ + " would be useful " ) ; <nl> - for ( List < SSTableReader > sstables : getCompactionBuckets ( cfs . getSSTables ( ) , 50L * 1024L * 1024L ) ) <nl> + logger . debug ( " Compaction is currently disabled . " ) ; <nl> + return 0 ; <nl> + } <nl> + logger . debug ( " Checking to see if compaction of " + cfs . columnFamily _ + " would be useful " ) ; <nl> + Set < List < SSTableReader > > buckets = getCompactionBuckets ( cfs . getSSTables ( ) , 50L * 1024L * 1024L ) ; <nl> + updateEstimateFor ( cfs , buckets ) ; <nl> + <nl> + for ( List < SSTableReader > sstables : buckets ) <nl> + { <nl> + if ( sstables . size ( ) > = minimumCompactionThreshold ) <nl> { <nl> - if ( sstables . size ( ) < minimumCompactionThreshold ) <nl> - { <nl> - continue ; <nl> - } <nl> / / if we have too many to compact all at once , compact older ones first - - this avoids <nl> / / re - compacting files we just created . <nl> Collections . sort ( sstables ) ; <nl> - filesCompacted + = doCompaction ( cfs , sstables . subList ( 0 , Math . min ( sstables . size ( ) , maximumCompactionThreshold ) ) , getDefaultGCBefore ( ) ) ; <nl> + return doCompaction ( cfs , sstables . subList ( 0 , Math . min ( sstables . size ( ) , maximumCompactionThreshold ) ) , getDefaultGCBefore ( ) ) ; <nl> } <nl> - logger . debug ( filesCompacted + " files compacted " ) ; <nl> } <nl> - else <nl> - { <nl> - logger . debug ( " Compaction is currently disabled . " ) ; <nl> - } <nl> - return filesCompacted ; <nl> + return 0 ; <nl> } <nl> } ; <nl> - return compactor _ . submit ( callable ) ; <nl> + return executor . submit ( callable ) ; <nl> + } <nl> + <nl> + private void updateEstimateFor ( ColumnFamilyStore cfs , Set < List < SSTableReader > > buckets ) <nl> + { <nl> + int n = 0 ; <nl> + for ( List < SSTableReader > sstables : buckets ) <nl> + { <nl> + if ( sstables . size ( ) > = minimumCompactionThreshold ) <nl> + { <nl> + n + = 1 + sstables . size ( ) / ( maximumCompactionThreshold - minimumCompactionThreshold ) ; <nl> + } <nl> + } <nl> + estimatedCompactions . put ( cfs , n ) ; <nl> } <nl> <nl> public Future < Object > submitCleanup ( final ColumnFamilyStore cfStore ) <nl> @ @ - 118 , 7 + 130 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> return this ; <nl> } <nl> } ; <nl> - return compactor _ . submit ( runnable ) ; <nl> + return executor . submit ( runnable ) ; <nl> } <nl> <nl> public Future < List < SSTableReader > > submitAnticompaction ( final ColumnFamilyStore cfStore , final Collection < Range > ranges , final InetAddress target ) <nl> @ @ - 130 , 7 + 142 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> return doAntiCompaction ( cfStore , cfStore . getSSTables ( ) , ranges , target ) ; <nl> } <nl> } ; <nl> - return compactor _ . submit ( callable ) ; <nl> + return executor . submit ( callable ) ; <nl> } <nl> <nl> public Future submitMajor ( final ColumnFamilyStore cfStore ) <nl> @ @ - 165 , 7 + 177 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> return this ; <nl> } <nl> } ; <nl> - return compactor _ . submit ( callable ) ; <nl> + return executor . submit ( callable ) ; <nl> } <nl> <nl> public Future submitReadonly ( final ColumnFamilyStore cfStore , final InetAddress initiator ) <nl> @ @ - 178 , 7 + 190 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> return this ; <nl> } <nl> } ; <nl> - return compactor _ . submit ( callable ) ; <nl> + return executor . submit ( callable ) ; <nl> } <nl> <nl> / * * <nl> @ @ - 258 , 6 + 270 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> SSTableWriter writer ; <nl> CompactionIterator ci = new CompactionIterator ( sstables , gcBefore , major ) ; / / retain a handle so we can call close ( ) <nl> Iterator < CompactionIterator . CompactedRow > nni = new FilterIterator ( ci , PredicateUtils . notNullPredicate ( ) ) ; <nl> + executor . beginCompaction ( cfs , ci ) ; <nl> <nl> try <nl> { <nl> @ @ - 293 , 7 + 306 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> SSTableReader ssTable = writer . closeAndOpenReader ( DatabaseDescriptor . getKeysCachedFraction ( table . name ) ) ; <nl> cfs . replaceCompactedSSTables ( sstables , Arrays . asList ( ssTable ) ) ; <nl> gcAfterRpcTimeout ( ) ; <nl> - instance . submitMinor ( cfs ) ; <nl> + submitMinorIfNeeded ( cfs ) ; <nl> <nl> String format = " Compacted to % s . % d / % d bytes for % d keys . Time : % dms . " ; <nl> long dTime = System . currentTimeMillis ( ) - startTime ; <nl> @ @ - 341 , 6 + 354 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> SSTableWriter writer = null ; <nl> CompactionIterator ci = new AntiCompactionIterator ( sstables , ranges , getDefaultGCBefore ( ) , cfs . isCompleteSSTables ( sstables ) ) ; <nl> Iterator < CompactionIterator . CompactedRow > nni = new FilterIterator ( ci , PredicateUtils . notNullPredicate ( ) ) ; <nl> + executor . beginCompaction ( cfs , ci ) ; <nl> <nl> try <nl> { <nl> @ @ - 403 , 6 + 417 , 7 @ @ public class CompactionManager implements CompactionManagerMBean <nl> { <nl> Collection < SSTableReader > sstables = cfs . getSSTables ( ) ; <nl> CompactionIterator ci = new CompactionIterator ( sstables , getDefaultGCBefore ( ) , true ) ; <nl> + executor . beginCompaction ( cfs , ci ) ; <nl> try <nl> { <nl> Iterator < CompactionIterator . CompactedRow > nni = new FilterIterator ( ci , PredicateUtils . notNullPredicate ( ) ) ; <nl> @ @ - 528 , 21 + 543 , 99 @ @ public class CompactionManager implements CompactionManagerMBean <nl> } <nl> } <nl> <nl> - public void checkAllColumnFamilies ( ) <nl> + public void checkAllColumnFamilies ( ) throws IOException <nl> { <nl> + / / perform estimates <nl> for ( String tableName : DatabaseDescriptor . getTables ( ) ) <nl> { <nl> - try <nl> + for ( final ColumnFamilyStore cfs : Table . open ( tableName ) . getColumnFamilyStores ( ) . values ( ) ) <nl> { <nl> - for ( ColumnFamilyStore cfs : Table . open ( tableName ) . getColumnFamilyStores ( ) . values ( ) ) <nl> + Runnable runnable = new Runnable ( ) <nl> { <nl> - submitMinor ( cfs ) ; <nl> - } <nl> + public void run ( ) <nl> + { <nl> + logger . debug ( " Estimating compactions for " + cfs . columnFamily _ ) ; <nl> + final Set < List < SSTableReader > > buckets = getCompactionBuckets ( cfs . getSSTables ( ) , 50L * 1024L * 1024L ) ; <nl> + updateEstimateFor ( cfs , buckets ) ; <nl> + } <nl> + } ; <nl> + executor . submit ( runnable ) ; <nl> } <nl> - catch ( IOException e ) <nl> + } <nl> + <nl> + / / actually schedule compactions . done in a second pass so all the estimates occur before we <nl> + / / bog down the executor in actual compactions . <nl> + for ( String tableName : DatabaseDescriptor . getTables ( ) ) <nl> + { <nl> + for ( final ColumnFamilyStore cfs : Table . open ( tableName ) . getColumnFamilyStores ( ) . values ( ) ) <nl> { <nl> - throw new RuntimeException ( e ) ; <nl> + submitMinorIfNeeded ( cfs ) ; <nl> } <nl> } <nl> } <nl> + <nl> + private class CompactionExecutor extends DebuggableThreadPoolExecutor <nl> + { <nl> + private volatile ColumnFamilyStore cfs ; <nl> + private volatile CompactionIterator ci ; <nl> + <nl> + public CompactionExecutor ( ) <nl> + { <nl> + super ( " COMPACTION - POOL " ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void afterExecute ( Runnable r , Throwable t ) <nl> + { <nl> + super . afterExecute ( r , t ) ; <nl> + cfs = null ; <nl> + ci = null ; <nl> + } <nl> + <nl> + void beginCompaction ( ColumnFamilyStore cfs , CompactionIterator ci ) <nl> + { <nl> + this . cfs = cfs ; <nl> + this . ci = ci ; <nl> + } <nl> + <nl> + public String getColumnFamilyName ( ) <nl> + { <nl> + return cfs = = null ? null : cfs . getColumnFamilyName ( ) ; <nl> + } <nl> + <nl> + public Long getBytesTotal ( ) <nl> + { <nl> + return ci = = null ? null : ci . getTotalBytes ( ) ; <nl> + } <nl> + <nl> + public Long getBytesCompleted ( ) <nl> + { <nl> + return ci = = null ? null : ci . getBytesRead ( ) ; <nl> + } <nl> + } <nl> + <nl> + public String getColumnFamilyInProgress ( ) <nl> + { <nl> + return executor . getColumnFamilyName ( ) ; <nl> + } <nl> + <nl> + public Long getBytesTotalInProgress ( ) <nl> + { <nl> + return executor . getBytesTotal ( ) ; <nl> + } <nl> + <nl> + public Long getBytesCompacted ( ) <nl> + { <nl> + return executor . getBytesCompleted ( ) ; <nl> + } <nl> + <nl> + public int getPendingTasks ( ) <nl> + { <nl> + int n = 0 ; <nl> + for ( Integer i : estimatedCompactions . values ( ) ) <nl> + { <nl> + n + = i ; <nl> + } <nl> + return n ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / CompactionManagerMBean . java b / src / java / org / apache / cassandra / db / CompactionManagerMBean . java <nl> index e11b09f . . 0bb7c3f 100644 <nl> - - - a / src / java / org / apache / cassandra / db / CompactionManagerMBean . java <nl> + + + b / src / java / org / apache / cassandra / db / CompactionManagerMBean . java <nl> @ @ - 39 , 4 + 39 , 24 @ @ public interface CompactionManagerMBean <nl> * Sets the maximum number of sstables in queue before compaction kicks off <nl> * / <nl> public void setMaximumCompactionThreshold ( int threshold ) ; <nl> + <nl> + / * * <nl> + * @ return the columnfamily currently being compacted ; null if none <nl> + * / <nl> + public String getColumnFamilyInProgress ( ) ; <nl> + <nl> + / * * <nl> + * @ return the total ( data , not including index and filter ) bytes being compacted ; null if none <nl> + * / <nl> + public Long getBytesTotalInProgress ( ) ; <nl> + <nl> + / * * <nl> + * @ return the progress on the current compaction ; null if none <nl> + * / <nl> + public Long getBytesCompacted ( ) ; <nl> + <nl> + / * * <nl> + * @ return estimated number of compactions remaining to perform <nl> + * / <nl> + public int getPendingTasks ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / CompactionIterator . java b / src / java / org / apache / cassandra / io / CompactionIterator . java <nl> index c085b63 . . 20dfe55 100644 <nl> - - - a / src / java / org / apache / cassandra / io / CompactionIterator . java <nl> + + + b / src / java / org / apache / cassandra / io / CompactionIterator . java <nl> @ @ - 45 , 10 + 45 , 15 @ @ public class CompactionIterator extends ReducingIterator < IteratingRow , Compactio <nl> <nl> private final List < IteratingRow > rows = new ArrayList < IteratingRow > ( ) ; <nl> private final int gcBefore ; <nl> - private boolean major ; <nl> + private final boolean major ; <nl> + <nl> + private long totalBytes ; <nl> + private long bytesRead ; <nl> + private long row ; <nl> <nl> public CompactionIterator ( Iterable < SSTableReader > sstables , int gcBefore , boolean major ) throws IOException <nl> { <nl> + < < < < < < < HEAD <nl> this ( getCollatingIterator ( sstables ) , gcBefore , major ) ; <nl> } <nl> <nl> @ @ - 56 , 6 + 61 , 15 @ @ public class CompactionIterator extends ReducingIterator < IteratingRow , Compactio <nl> protected CompactionIterator ( Iterator iter , int gcBefore , boolean major ) <nl> { <nl> super ( iter ) ; <nl> + = = = = = = = <nl> + super ( getCollatingIterator ( sstables ) ) ; <nl> + row = 0 ; <nl> + totalBytes = bytesRead = 0 ; <nl> + for ( SSTableScanner iter : ( List < SSTableScanner > ) ( ( CollatingIterator ) source ) . getIterators ( ) ) <nl> + { <nl> + totalBytes + = iter . getFileLength ( ) ; <nl> + } <nl> + > > > > > > > make estimation of pendingtasks for CompactionManager sane <nl> this . gcBefore = gcBefore ; <nl> this . major = major ; <nl> } <nl> @ @ - 135 , 6 + 149 , 14 @ @ public class CompactionIterator extends ReducingIterator < IteratingRow , Compactio <nl> finally <nl> { <nl> rows . clear ( ) ; <nl> + if ( ( row + + % 1000 ) = = 0 ) <nl> + { <nl> + bytesRead = 0 ; <nl> + for ( SSTableScanner iter : ( List < SSTableScanner > ) ( ( CollatingIterator ) source ) . getIterators ( ) ) <nl> + { <nl> + bytesRead + = iter . getFilePointer ( ) ; <nl> + } <nl> + } <nl> } <nl> return new CompactedRow ( key , buffer ) ; <nl> } <nl> @ @ - 147 , 6 + 169 , 16 @ @ public class CompactionIterator extends ReducingIterator < IteratingRow , Compactio <nl> } <nl> } <nl> <nl> + public long getTotalBytes ( ) <nl> + { <nl> + return totalBytes ; <nl> + } <nl> + <nl> + public long getBytesRead ( ) <nl> + { <nl> + return bytesRead ; <nl> + } <nl> + <nl> public static class CompactedRow <nl> { <nl> public final DecoratedKey key ; <nl> diff - - git a / src / java / org / apache / cassandra / io / SSTable . java b / src / java / org / apache / cassandra / io / SSTable . java <nl> index 2c137ef . . e5b0690 100644 <nl> - - - a / src / java / org / apache / cassandra / io / SSTable . java <nl> + + + b / src / java / org / apache / cassandra / io / SSTable . java <nl> @ @ - 198 , 11 + 198 , 6 @ @ public abstract class SSTable <nl> } <nl> } <nl> <nl> - public long dataBytesOnDisk ( ) <nl> - { <nl> - return new File ( path ) . length ( ) ; <nl> - } <nl> - <nl> public long bytesOnDisk ( ) <nl> { <nl> long bytes = 0 ; <nl> diff - - git a / src / java / org / apache / cassandra / io / SSTableScanner . java b / src / java / org / apache / cassandra / io / SSTableScanner . java <nl> index 9bc1c70 . . 8a99337 100644 <nl> - - - a / src / java / org / apache / cassandra / io / SSTableScanner . java <nl> + + + b / src / java / org / apache / cassandra / io / SSTableScanner . java <nl> @ @ - 20 , 6 + 20 , 7 @ @ package org . apache . cassandra . io ; <nl> <nl> import java . io . IOException ; <nl> import java . io . Closeable ; <nl> + import java . io . IOError ; <nl> import java . util . Iterator ; <nl> import java . util . Arrays ; <nl> <nl> @ @ - 72 , 6 + 73 , 23 @ @ public class SSTableScanner implements Iterator < IteratingRow > , Closeable <nl> } <nl> } <nl> <nl> + public long getFileLength ( ) <nl> + { <nl> + try <nl> + { <nl> + return file . length ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + } <nl> + <nl> + public long getFilePointer ( ) <nl> + { <nl> + return file . getFilePointer ( ) ; <nl> + } <nl> + <nl> public boolean hasNext ( ) <nl> { <nl> if ( iterator = = null ) <nl> diff - - git a / test / unit / org / apache / cassandra / db / CompactionsTest . java b / test / unit / org / apache / cassandra / db / CompactionsTest . java <nl> index 1fa6b30 . . 52aa04b 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / CompactionsTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / CompactionsTest . java <nl> @ @ - 66 , 7 + 66 , 7 @ @ public class CompactionsTest extends CleanupHelper <nl> } <nl> while ( true ) <nl> { <nl> - Future < Integer > ft = CompactionManager . instance . submitMinor ( store ) ; <nl> + Future < Integer > ft = CompactionManager . instance . submitMinorIfNeeded ( store ) ; <nl> if ( ft . get ( ) = = 0 ) <nl> break ; <nl> }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 296aa66 . . ea2ecc0 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 3 
+ + * Don ' t allow starting multiple inc repairs on the same sstables ( CASSANDRA - 8316 ) 
+ * Invalidate prepared BATCH statements when related tables 
+ or keyspaces are dropped ( CASSANDRA - 8652 ) 
+ * Fix missing results in secondary index queries on collections 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ index eb7c0ee . . 02f5e81 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ @ @ - 21 , 6 + 21 , 7 @ @ import java . io . File ; 
+ import java . io . IOException ; 
+ import java . lang . management . ManagementFactory ; 
+ import java . util . ArrayList ; 
+ + import java . util . Arrays ; 
+ import java . util . Collection ; 
+ import java . util . Collections ; 
+ import java . util . HashSet ; 
+ @ @ - 369 , 15 + 370 , 32 @ @ public class CompactionManager implements CompactionManagerMBean 
+ 
+ public Future < ? > submitAntiCompaction ( final ColumnFamilyStore cfs , 
+ final Collection < Range < Token > > ranges , 
+ - final Collection < SSTableReader > validatedForRepair , 
+ + final Collection < SSTableReader > sstables , 
+ final long repairedAt ) 
+ { 
+ Runnable runnable = new WrappedRunnable ( ) { 
+ - 
+ @ Override 
+ public void runMayThrow ( ) throws Exception 
+ { 
+ - performAnticompaction ( cfs , ranges , validatedForRepair , repairedAt ) ; 
+ + boolean success = false ; 
+ + while ( ! success ) 
+ + { 
+ + for ( SSTableReader compactingSSTable : cfs . getDataTracker ( ) . getCompacting ( ) ) 
+ + { 
+ + if ( sstables . remove ( compactingSSTable ) ) 
+ + SSTableReader . releaseReferences ( Arrays . asList ( compactingSSTable ) ) ; 
+ + } 
+ + Set < SSTableReader > compactedSSTables = new HashSet < > ( ) ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + { 
+ + if ( sstable . isMarkedCompacted ( ) ) 
+ + compactedSSTables . add ( sstable ) ; 
+ + } 
+ + sstables . removeAll ( compactedSSTables ) ; 
+ + SSTableReader . releaseReferences ( compactedSSTables ) ; 
+ + success = sstables . isEmpty ( ) | | cfs . getDataTracker ( ) . markCompacting ( sstables ) ; 
+ + } 
+ + performAnticompaction ( cfs , ranges , sstables , repairedAt ) ; 
+ } 
+ } ; 
+ return executor . submit ( runnable ) ; 
+ @ @ - 398 , 7 + 416 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ Collection < SSTableReader > validatedForRepair , 
+ long repairedAt ) throws InterruptedException , ExecutionException , IOException 
+ { 
+ - logger . info ( " Starting anticompaction " ) ; 
+ + logger . info ( " Starting anticompaction for { } . { } on { } / { } sstables " , cfs . keyspace . getName ( ) , cfs . getColumnFamilyName ( ) , validatedForRepair . size ( ) , cfs . getSSTables ( ) . size ( ) ) ; 
+ logger . debug ( " Starting anticompaction for ranges { } " , ranges ) ; 
+ Set < SSTableReader > sstables = new HashSet < > ( validatedForRepair ) ; 
+ Set < SSTableReader > mutatedRepairStatuses = new HashSet < > ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java 
+ index 141e4c7 . . c7cf4c8 100644 
+ - - - a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java 
+ + + + b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java 
+ @ @ - 57 , 78 + 57 , 88 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > 
+ { 
+ / / TODO add cancel / interrupt message 
+ RepairJobDesc desc = message . payload . desc ; 
+ - switch ( message . payload . messageType ) 
+ + try 
+ { 
+ - case PREPARE _ MESSAGE : 
+ - PrepareMessage prepareMessage = ( PrepareMessage ) message . payload ; 
+ - List < ColumnFamilyStore > columnFamilyStores = new ArrayList < > ( prepareMessage . cfIds . size ( ) ) ; 
+ - for ( UUID cfId : prepareMessage . cfIds ) 
+ - { 
+ - Pair < String , String > kscf = Schema . instance . getCF ( cfId ) ; 
+ - ColumnFamilyStore columnFamilyStore = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; 
+ - columnFamilyStores . add ( columnFamilyStore ) ; 
+ - } 
+ - ActiveRepairService . instance . registerParentRepairSession ( prepareMessage . parentRepairSession , 
+ - columnFamilyStores , 
+ - prepareMessage . ranges ) ; 
+ - MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; 
+ - break ; 
+ - 
+ - case SNAPSHOT : 
+ - ColumnFamilyStore cfs = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; 
+ - final Range < Token > repairingRange = desc . range ; 
+ - cfs . snapshot ( desc . sessionId . toString ( ) , new Predicate < SSTableReader > ( ) 
+ - { 
+ - public boolean apply ( SSTableReader sstable ) 
+ + switch ( message . payload . messageType ) 
+ + { 
+ + case PREPARE _ MESSAGE : 
+ + PrepareMessage prepareMessage = ( PrepareMessage ) message . payload ; 
+ + List < ColumnFamilyStore > columnFamilyStores = new ArrayList < > ( prepareMessage . cfIds . size ( ) ) ; 
+ + for ( UUID cfId : prepareMessage . cfIds ) 
+ { 
+ - return sstable ! = null & & 
+ - ! ( sstable . partitioner instanceof LocalPartitioner ) & & / / exclude SSTables from 2i 
+ - new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Collections . singleton ( repairingRange ) ) ; 
+ + Pair < String , String > kscf = Schema . instance . getCF ( cfId ) ; 
+ + ColumnFamilyStore columnFamilyStore = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; 
+ + columnFamilyStores . add ( columnFamilyStore ) ; 
+ } 
+ - } ) ; 
+ + ActiveRepairService . instance . registerParentRepairSession ( prepareMessage . parentRepairSession , 
+ + columnFamilyStores , 
+ + prepareMessage . ranges ) ; 
+ + MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; 
+ + break ; 
+ 
+ - logger . debug ( " Enqueuing response to snapshot request { } to { } " , desc . sessionId , message . from ) ; 
+ - MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; 
+ - break ; 
+ + case SNAPSHOT : 
+ + ColumnFamilyStore cfs = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; 
+ + final Range < Token > repairingRange = desc . range ; 
+ + cfs . snapshot ( desc . sessionId . toString ( ) , new Predicate < SSTableReader > ( ) 
+ + { 
+ + public boolean apply ( SSTableReader sstable ) 
+ + { 
+ + return sstable ! = null & & 
+ + ! ( sstable . partitioner instanceof LocalPartitioner ) & & / / exclude SSTables from 2i 
+ + new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Collections . singleton ( repairingRange ) ) ; 
+ + } 
+ + } ) ; 
+ 
+ - case VALIDATION _ REQUEST : 
+ - ValidationRequest validationRequest = ( ValidationRequest ) message . payload ; 
+ - / / trigger read - only compaction 
+ - ColumnFamilyStore store = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; 
+ + logger . debug ( " Enqueuing response to snapshot request { } to { } " , desc . sessionId , message . from ) ; 
+ + MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; 
+ + break ; 
+ 
+ - Validator validator = new Validator ( desc , message . from , validationRequest . gcBefore ) ; 
+ - CompactionManager . instance . submitValidation ( store , validator ) ; 
+ - break ; 
+ + case VALIDATION _ REQUEST : 
+ + ValidationRequest validationRequest = ( ValidationRequest ) message . payload ; 
+ + / / trigger read - only compaction 
+ + ColumnFamilyStore store = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; 
+ 
+ - case SYNC _ REQUEST : 
+ - / / forwarded sync request 
+ - SyncRequest request = ( SyncRequest ) message . payload ; 
+ - StreamingRepairTask task = new StreamingRepairTask ( desc , request ) ; 
+ - task . run ( ) ; 
+ - break ; 
+ + Validator validator = new Validator ( desc , message . from , validationRequest . gcBefore ) ; 
+ + CompactionManager . instance . submitValidation ( store , validator ) ; 
+ + break ; 
+ 
+ - case ANTICOMPACTION _ REQUEST : 
+ - logger . debug ( " Got anticompaction request " ) ; 
+ - AnticompactionRequest anticompactionRequest = ( AnticompactionRequest ) message . payload ; 
+ - try 
+ - { 
+ - List < Future < ? > > futures = ActiveRepairService . instance . doAntiCompaction ( anticompactionRequest . parentRepairSession ) ; 
+ - FBUtilities . waitOnFutures ( futures ) ; 
+ - } 
+ - catch ( Exception e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ - finally 
+ - { 
+ - ActiveRepairService . instance . removeParentRepairSession ( anticompactionRequest . parentRepairSession ) ; 
+ - } 
+ + case SYNC _ REQUEST : 
+ + / / forwarded sync request 
+ + SyncRequest request = ( SyncRequest ) message . payload ; 
+ + StreamingRepairTask task = new StreamingRepairTask ( desc , request ) ; 
+ + task . run ( ) ; 
+ + break ; 
+ 
+ - break ; 
+ + case ANTICOMPACTION _ REQUEST : 
+ + logger . debug ( " Got anticompaction request " ) ; 
+ + AnticompactionRequest anticompactionRequest = ( AnticompactionRequest ) message . payload ; 
+ + try 
+ + { 
+ + List < Future < ? > > futures = ActiveRepairService . instance . doAntiCompaction ( anticompactionRequest . parentRepairSession ) ; 
+ + FBUtilities . waitOnFutures ( futures ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + finally 
+ + { 
+ + ActiveRepairService . instance . removeParentRepairSession ( anticompactionRequest . parentRepairSession ) ; 
+ + } 
+ + 
+ + break ; 
+ 
+ - default : 
+ - ActiveRepairService . instance . handleMessage ( message . from , message . payload ) ; 
+ - break ; 
+ + default : 
+ + ActiveRepairService . instance . handleMessage ( message . from , message . payload ) ; 
+ + break ; 
+ + } 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + logger . error ( " Got error , removing parent repair session " ) ; 
+ + if ( desc ! = null & & desc . parentSessionId ! = null ) 
+ + ActiveRepairService . instance . removeParentRepairSession ( desc . parentSessionId ) ; 
+ + throw new RuntimeException ( e ) ; 
+ } 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / ActiveRepairService . java b / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ index 17cf6ef . . 36f7c5c 100644 
+ - - - a / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ + + + b / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ @ @ - 139 , 7 + 139 , 7 @ @ public class ActiveRepairService 
+ sessions . remove ( session . getId ( ) ) ; 
+ } 
+ 
+ - public void terminateSessions ( ) 
+ + public synchronized void terminateSessions ( ) 
+ { 
+ for ( RepairSession session : sessions . values ( ) ) 
+ { 
+ @ @ - 241 , 7 + 241 , 7 @ @ public class ActiveRepairService 
+ return neighbors ; 
+ } 
+ 
+ - public UUID prepareForRepair ( Set < InetAddress > endpoints , Collection < Range < Token > > ranges , List < ColumnFamilyStore > columnFamilyStores ) 
+ + public synchronized UUID prepareForRepair ( Set < InetAddress > endpoints , Collection < Range < Token > > ranges , List < ColumnFamilyStore > columnFamilyStores ) 
+ { 
+ UUID parentRepairSession = UUIDGen . getTimeUUID ( ) ; 
+ registerParentRepairSession ( parentRepairSession , columnFamilyStores , ranges ) ; 
+ @ @ - 297 , 18 + 297 , 24 @ @ public class ActiveRepairService 
+ return parentRepairSession ; 
+ } 
+ 
+ - public void registerParentRepairSession ( UUID parentRepairSession , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges ) 
+ + public synchronized void registerParentRepairSession ( UUID parentRepairSession , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges ) 
+ { 
+ Map < UUID , Set < SSTableReader > > sstablesToRepair = new HashMap < > ( ) ; 
+ for ( ColumnFamilyStore cfs : columnFamilyStores ) 
+ { 
+ Set < SSTableReader > sstables = new HashSet < > ( ) ; 
+ + Set < SSTableReader > currentlyRepairing = currentlyRepairing ( cfs . metadata . cfId ) ; 
+ for ( SSTableReader sstable : cfs . getSSTables ( ) ) 
+ { 
+ if ( new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( ranges ) ) 
+ { 
+ if ( ! sstable . isRepaired ( ) ) 
+ { 
+ + if ( currentlyRepairing . contains ( sstable ) ) 
+ + { 
+ + logger . error ( " Already repairing " + sstable + " , can not continue . " ) ; 
+ + throw new RuntimeException ( " Already repairing " + sstable + " , can not continue . " ) ; 
+ + } 
+ sstables . add ( sstable ) ; 
+ } 
+ } 
+ @ @ - 318 , 7 + 324 , 19 @ @ public class ActiveRepairService 
+ parentRepairSessions . put ( parentRepairSession , new ParentRepairSession ( columnFamilyStores , ranges , sstablesToRepair , System . currentTimeMillis ( ) ) ) ; 
+ } 
+ 
+ - public void finishParentSession ( UUID parentSession , Set < InetAddress > neighbors , boolean doAntiCompaction ) throws InterruptedException , ExecutionException , IOException 
+ + private Set < SSTableReader > currentlyRepairing ( UUID cfId ) 
+ + { 
+ + Set < SSTableReader > repairing = new HashSet < > ( ) ; 
+ + for ( Map . Entry < UUID , ParentRepairSession > entry : parentRepairSessions . entrySet ( ) ) 
+ + { 
+ + Collection < SSTableReader > sstables = entry . getValue ( ) . sstableMap . get ( cfId ) ; 
+ + if ( sstables ! = null ) 
+ + repairing . addAll ( sstables ) ; 
+ + } 
+ + return repairing ; 
+ + } 
+ + 
+ + public synchronized void finishParentSession ( UUID parentSession , Set < InetAddress > neighbors , boolean doAntiCompaction ) throws InterruptedException , ExecutionException , IOException 
+ { 
+ try 
+ { 
+ @ @ - 345 , 7 + 363 , 7 @ @ public class ActiveRepairService 
+ return parentRepairSessions . get ( parentSessionId ) ; 
+ } 
+ 
+ - public ParentRepairSession removeParentRepairSession ( UUID parentSessionId ) 
+ + public synchronized ParentRepairSession removeParentRepairSession ( UUID parentSessionId ) 
+ { 
+ return parentRepairSessions . remove ( parentSessionId ) ; 
+ } 
+ @ @ - 358 , 20 + 376 , 8 @ @ public class ActiveRepairService 
+ List < Future < ? > > futures = new ArrayList < > ( ) ; 
+ for ( Map . Entry < UUID , ColumnFamilyStore > columnFamilyStoreEntry : prs . columnFamilyStores . entrySet ( ) ) 
+ { 
+ - 
+ Collection < SSTableReader > sstables = new HashSet < > ( prs . getAndReferenceSSTables ( columnFamilyStoreEntry . getKey ( ) ) ) ; 
+ ColumnFamilyStore cfs = columnFamilyStoreEntry . getValue ( ) ; 
+ - boolean success = false ; 
+ - while ( ! success ) 
+ - { 
+ - for ( SSTableReader compactingSSTable : cfs . getDataTracker ( ) . getCompacting ( ) ) 
+ - { 
+ - if ( sstables . remove ( compactingSSTable ) ) 
+ - SSTableReader . releaseReferences ( Arrays . asList ( compactingSSTable ) ) ; 
+ - } 
+ - success = sstables . isEmpty ( ) | | cfs . getDataTracker ( ) . markCompacting ( sstables ) ; 
+ - } 
+ - 
+ futures . add ( CompactionManager . instance . submitAntiCompaction ( cfs , prs . ranges , sstables , prs . repairedAt ) ) ; 
+ } 
+ 
+ @ @ - 435 , 5 + 441 , 16 @ @ public class ActiveRepairService 
+ } 
+ return sstables ; 
+ } 
+ + 
+ + @ Override 
+ + public String toString ( ) 
+ + { 
+ + return " ParentRepairSession { " + 
+ + " columnFamilyStores = " + columnFamilyStores + 
+ + " , ranges = " + ranges + 
+ + " , sstableMap = " + sstableMap + 
+ + " , repairedAt = " + repairedAt + 
+ + ' } ' ; 
+ + } 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamSession . java b / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ index b03d28a . . 5617b04 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ @ @ - 300 , 7 + 300 , 6 @ @ public class StreamSession implements IEndpointStateChangeSubscriber 
+ ColumnFamilyStore . ViewFragment view = cfStore . selectAndReference ( cfStore . viewFilter ( rowBoundsList ) ) ; 
+ sstables . addAll ( view . sstables ) ; 
+ } 
+ - 
+ List < SSTableStreamingSections > sections = new ArrayList < > ( sstables . size ( ) ) ; 
+ for ( SSTableReader sstable : sstables ) 
+ {
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 06b6ca7 . . 30fdbf7 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 559 , 7 + 559 , 7 @ @ public final class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ public void addSSTable ( SSTableReader sstable ) 
+ { 
+ ssTables _ . add ( sstable ) ; 
+ - CompactionManager . instance . submitMinor ( this ) ; 
+ + CompactionManager . instance . submitMinorIfNeeded ( this ) ; 
+ } 
+ 
+ / * 
+ diff - - git a / src / java / org / apache / cassandra / db / CompactionManager . java b / src / java / org / apache / cassandra / db / CompactionManager . java 
+ index 7584e96 . . 9f71364 100644 
+ - - - a / src / java / org / apache / cassandra / db / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / CompactionManager . java 
+ @ @ - 23 , 13 + 23 , 12 @ @ import java . io . File ; 
+ import java . lang . management . ManagementFactory ; 
+ import java . util . * ; 
+ import java . util . concurrent . Callable ; 
+ - import java . util . concurrent . ExecutorService ; 
+ import java . util . concurrent . Future ; 
+ import javax . management . * ; 
+ 
+ import org . apache . log4j . Logger ; 
+ 
+ - import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutor ; 
+ + import org . apache . cassandra . concurrent . DebuggableThreadPoolExecutor ; 
+ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . io . * ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ @ @ - 37 , 6 + 36 , 7 @ @ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . service . AntiEntropyService ; 
+ import org . apache . cassandra . utils . FileUtils ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; 
+ 
+ import java . net . InetAddress ; 
+ 
+ @ @ - 68 , 44 + 68 , 56 @ @ public class CompactionManager implements CompactionManagerMBean 
+ } 
+ } 
+ 
+ - private ExecutorService compactor _ = new JMXEnabledThreadPoolExecutor ( " COMPACTION - POOL " ) ; 
+ + private CompactionExecutor executor = new CompactionExecutor ( ) ; 
+ + private Map < ColumnFamilyStore , Integer > estimatedCompactions = new NonBlockingHashMap < ColumnFamilyStore , Integer > ( ) ; 
+ 
+ / * * 
+ * Call this whenever a compaction might be needed on the given columnfamily . 
+ * It ' s okay to over - call ( within reason ) since the compactions are single - threaded , 
+ * and if a call is unnecessary , it will just be no - oped in the bucketing phase . 
+ * / 
+ - public Future < Integer > submitMinor ( final ColumnFamilyStore cfs ) 
+ + public Future < Integer > submitMinorIfNeeded ( final ColumnFamilyStore cfs ) 
+ { 
+ Callable < Integer > callable = new Callable < Integer > ( ) 
+ { 
+ public Integer call ( ) throws IOException 
+ { 
+ - int filesCompacted = 0 ; 
+ - if ( minimumCompactionThreshold > 0 & & maximumCompactionThreshold > 0 ) 
+ + if ( minimumCompactionThreshold < = 0 | | maximumCompactionThreshold < = 0 ) 
+ { 
+ - logger . debug ( " Checking to see if compaction of " + cfs . columnFamily _ + " would be useful " ) ; 
+ - for ( List < SSTableReader > sstables : getCompactionBuckets ( cfs . getSSTables ( ) , 50L * 1024L * 1024L ) ) 
+ + logger . debug ( " Compaction is currently disabled . " ) ; 
+ + return 0 ; 
+ + } 
+ + logger . debug ( " Checking to see if compaction of " + cfs . columnFamily _ + " would be useful " ) ; 
+ + Set < List < SSTableReader > > buckets = getCompactionBuckets ( cfs . getSSTables ( ) , 50L * 1024L * 1024L ) ; 
+ + updateEstimateFor ( cfs , buckets ) ; 
+ + 
+ + for ( List < SSTableReader > sstables : buckets ) 
+ + { 
+ + if ( sstables . size ( ) > = minimumCompactionThreshold ) 
+ { 
+ - if ( sstables . size ( ) < minimumCompactionThreshold ) 
+ - { 
+ - continue ; 
+ - } 
+ / / if we have too many to compact all at once , compact older ones first - - this avoids 
+ / / re - compacting files we just created . 
+ Collections . sort ( sstables ) ; 
+ - filesCompacted + = doCompaction ( cfs , sstables . subList ( 0 , Math . min ( sstables . size ( ) , maximumCompactionThreshold ) ) , getDefaultGCBefore ( ) ) ; 
+ + return doCompaction ( cfs , sstables . subList ( 0 , Math . min ( sstables . size ( ) , maximumCompactionThreshold ) ) , getDefaultGCBefore ( ) ) ; 
+ } 
+ - logger . debug ( filesCompacted + " files compacted " ) ; 
+ } 
+ - else 
+ - { 
+ - logger . debug ( " Compaction is currently disabled . " ) ; 
+ - } 
+ - return filesCompacted ; 
+ + return 0 ; 
+ } 
+ } ; 
+ - return compactor _ . submit ( callable ) ; 
+ + return executor . submit ( callable ) ; 
+ + } 
+ + 
+ + private void updateEstimateFor ( ColumnFamilyStore cfs , Set < List < SSTableReader > > buckets ) 
+ + { 
+ + int n = 0 ; 
+ + for ( List < SSTableReader > sstables : buckets ) 
+ + { 
+ + if ( sstables . size ( ) > = minimumCompactionThreshold ) 
+ + { 
+ + n + = 1 + sstables . size ( ) / ( maximumCompactionThreshold - minimumCompactionThreshold ) ; 
+ + } 
+ + } 
+ + estimatedCompactions . put ( cfs , n ) ; 
+ } 
+ 
+ public Future < Object > submitCleanup ( final ColumnFamilyStore cfStore ) 
+ @ @ - 118 , 7 + 130 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ return this ; 
+ } 
+ } ; 
+ - return compactor _ . submit ( runnable ) ; 
+ + return executor . submit ( runnable ) ; 
+ } 
+ 
+ public Future < List < SSTableReader > > submitAnticompaction ( final ColumnFamilyStore cfStore , final Collection < Range > ranges , final InetAddress target ) 
+ @ @ - 130 , 7 + 142 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ return doAntiCompaction ( cfStore , cfStore . getSSTables ( ) , ranges , target ) ; 
+ } 
+ } ; 
+ - return compactor _ . submit ( callable ) ; 
+ + return executor . submit ( callable ) ; 
+ } 
+ 
+ public Future submitMajor ( final ColumnFamilyStore cfStore ) 
+ @ @ - 165 , 7 + 177 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ return this ; 
+ } 
+ } ; 
+ - return compactor _ . submit ( callable ) ; 
+ + return executor . submit ( callable ) ; 
+ } 
+ 
+ public Future submitReadonly ( final ColumnFamilyStore cfStore , final InetAddress initiator ) 
+ @ @ - 178 , 7 + 190 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ return this ; 
+ } 
+ } ; 
+ - return compactor _ . submit ( callable ) ; 
+ + return executor . submit ( callable ) ; 
+ } 
+ 
+ / * * 
+ @ @ - 258 , 6 + 270 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ SSTableWriter writer ; 
+ CompactionIterator ci = new CompactionIterator ( sstables , gcBefore , major ) ; / / retain a handle so we can call close ( ) 
+ Iterator < CompactionIterator . CompactedRow > nni = new FilterIterator ( ci , PredicateUtils . notNullPredicate ( ) ) ; 
+ + executor . beginCompaction ( cfs , ci ) ; 
+ 
+ try 
+ { 
+ @ @ - 293 , 7 + 306 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ SSTableReader ssTable = writer . closeAndOpenReader ( DatabaseDescriptor . getKeysCachedFraction ( table . name ) ) ; 
+ cfs . replaceCompactedSSTables ( sstables , Arrays . asList ( ssTable ) ) ; 
+ gcAfterRpcTimeout ( ) ; 
+ - instance . submitMinor ( cfs ) ; 
+ + submitMinorIfNeeded ( cfs ) ; 
+ 
+ String format = " Compacted to % s . % d / % d bytes for % d keys . Time : % dms . " ; 
+ long dTime = System . currentTimeMillis ( ) - startTime ; 
+ @ @ - 341 , 6 + 354 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ SSTableWriter writer = null ; 
+ CompactionIterator ci = new AntiCompactionIterator ( sstables , ranges , getDefaultGCBefore ( ) , cfs . isCompleteSSTables ( sstables ) ) ; 
+ Iterator < CompactionIterator . CompactedRow > nni = new FilterIterator ( ci , PredicateUtils . notNullPredicate ( ) ) ; 
+ + executor . beginCompaction ( cfs , ci ) ; 
+ 
+ try 
+ { 
+ @ @ - 403 , 6 + 417 , 7 @ @ public class CompactionManager implements CompactionManagerMBean 
+ { 
+ Collection < SSTableReader > sstables = cfs . getSSTables ( ) ; 
+ CompactionIterator ci = new CompactionIterator ( sstables , getDefaultGCBefore ( ) , true ) ; 
+ + executor . beginCompaction ( cfs , ci ) ; 
+ try 
+ { 
+ Iterator < CompactionIterator . CompactedRow > nni = new FilterIterator ( ci , PredicateUtils . notNullPredicate ( ) ) ; 
+ @ @ - 528 , 21 + 543 , 99 @ @ public class CompactionManager implements CompactionManagerMBean 
+ } 
+ } 
+ 
+ - public void checkAllColumnFamilies ( ) 
+ + public void checkAllColumnFamilies ( ) throws IOException 
+ { 
+ + / / perform estimates 
+ for ( String tableName : DatabaseDescriptor . getTables ( ) ) 
+ { 
+ - try 
+ + for ( final ColumnFamilyStore cfs : Table . open ( tableName ) . getColumnFamilyStores ( ) . values ( ) ) 
+ { 
+ - for ( ColumnFamilyStore cfs : Table . open ( tableName ) . getColumnFamilyStores ( ) . values ( ) ) 
+ + Runnable runnable = new Runnable ( ) 
+ { 
+ - submitMinor ( cfs ) ; 
+ - } 
+ + public void run ( ) 
+ + { 
+ + logger . debug ( " Estimating compactions for " + cfs . columnFamily _ ) ; 
+ + final Set < List < SSTableReader > > buckets = getCompactionBuckets ( cfs . getSSTables ( ) , 50L * 1024L * 1024L ) ; 
+ + updateEstimateFor ( cfs , buckets ) ; 
+ + } 
+ + } ; 
+ + executor . submit ( runnable ) ; 
+ } 
+ - catch ( IOException e ) 
+ + } 
+ + 
+ + / / actually schedule compactions . done in a second pass so all the estimates occur before we 
+ + / / bog down the executor in actual compactions . 
+ + for ( String tableName : DatabaseDescriptor . getTables ( ) ) 
+ + { 
+ + for ( final ColumnFamilyStore cfs : Table . open ( tableName ) . getColumnFamilyStores ( ) . values ( ) ) 
+ { 
+ - throw new RuntimeException ( e ) ; 
+ + submitMinorIfNeeded ( cfs ) ; 
+ } 
+ } 
+ } 
+ + 
+ + private class CompactionExecutor extends DebuggableThreadPoolExecutor 
+ + { 
+ + private volatile ColumnFamilyStore cfs ; 
+ + private volatile CompactionIterator ci ; 
+ + 
+ + public CompactionExecutor ( ) 
+ + { 
+ + super ( " COMPACTION - POOL " ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void afterExecute ( Runnable r , Throwable t ) 
+ + { 
+ + super . afterExecute ( r , t ) ; 
+ + cfs = null ; 
+ + ci = null ; 
+ + } 
+ + 
+ + void beginCompaction ( ColumnFamilyStore cfs , CompactionIterator ci ) 
+ + { 
+ + this . cfs = cfs ; 
+ + this . ci = ci ; 
+ + } 
+ + 
+ + public String getColumnFamilyName ( ) 
+ + { 
+ + return cfs = = null ? null : cfs . getColumnFamilyName ( ) ; 
+ + } 
+ + 
+ + public Long getBytesTotal ( ) 
+ + { 
+ + return ci = = null ? null : ci . getTotalBytes ( ) ; 
+ + } 
+ + 
+ + public Long getBytesCompleted ( ) 
+ + { 
+ + return ci = = null ? null : ci . getBytesRead ( ) ; 
+ + } 
+ + } 
+ + 
+ + public String getColumnFamilyInProgress ( ) 
+ + { 
+ + return executor . getColumnFamilyName ( ) ; 
+ + } 
+ + 
+ + public Long getBytesTotalInProgress ( ) 
+ + { 
+ + return executor . getBytesTotal ( ) ; 
+ + } 
+ + 
+ + public Long getBytesCompacted ( ) 
+ + { 
+ + return executor . getBytesCompleted ( ) ; 
+ + } 
+ + 
+ + public int getPendingTasks ( ) 
+ + { 
+ + int n = 0 ; 
+ + for ( Integer i : estimatedCompactions . values ( ) ) 
+ + { 
+ + n + = i ; 
+ + } 
+ + return n ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / CompactionManagerMBean . java b / src / java / org / apache / cassandra / db / CompactionManagerMBean . java 
+ index e11b09f . . 0bb7c3f 100644 
+ - - - a / src / java / org / apache / cassandra / db / CompactionManagerMBean . java 
+ + + + b / src / java / org / apache / cassandra / db / CompactionManagerMBean . java 
+ @ @ - 39 , 4 + 39 , 24 @ @ public interface CompactionManagerMBean 
+ * Sets the maximum number of sstables in queue before compaction kicks off 
+ * / 
+ public void setMaximumCompactionThreshold ( int threshold ) ; 
+ + 
+ + / * * 
+ + * @ return the columnfamily currently being compacted ; null if none 
+ + * / 
+ + public String getColumnFamilyInProgress ( ) ; 
+ + 
+ + / * * 
+ + * @ return the total ( data , not including index and filter ) bytes being compacted ; null if none 
+ + * / 
+ + public Long getBytesTotalInProgress ( ) ; 
+ + 
+ + / * * 
+ + * @ return the progress on the current compaction ; null if none 
+ + * / 
+ + public Long getBytesCompacted ( ) ; 
+ + 
+ + / * * 
+ + * @ return estimated number of compactions remaining to perform 
+ + * / 
+ + public int getPendingTasks ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / CompactionIterator . java b / src / java / org / apache / cassandra / io / CompactionIterator . java 
+ index c085b63 . . 20dfe55 100644 
+ - - - a / src / java / org / apache / cassandra / io / CompactionIterator . java 
+ + + + b / src / java / org / apache / cassandra / io / CompactionIterator . java 
+ @ @ - 45 , 10 + 45 , 15 @ @ public class CompactionIterator extends ReducingIterator < IteratingRow , Compactio 
+ 
+ private final List < IteratingRow > rows = new ArrayList < IteratingRow > ( ) ; 
+ private final int gcBefore ; 
+ - private boolean major ; 
+ + private final boolean major ; 
+ + 
+ + private long totalBytes ; 
+ + private long bytesRead ; 
+ + private long row ; 
+ 
+ public CompactionIterator ( Iterable < SSTableReader > sstables , int gcBefore , boolean major ) throws IOException 
+ { 
+ + < < < < < < < HEAD 
+ this ( getCollatingIterator ( sstables ) , gcBefore , major ) ; 
+ } 
+ 
+ @ @ - 56 , 6 + 61 , 15 @ @ public class CompactionIterator extends ReducingIterator < IteratingRow , Compactio 
+ protected CompactionIterator ( Iterator iter , int gcBefore , boolean major ) 
+ { 
+ super ( iter ) ; 
+ + = = = = = = = 
+ + super ( getCollatingIterator ( sstables ) ) ; 
+ + row = 0 ; 
+ + totalBytes = bytesRead = 0 ; 
+ + for ( SSTableScanner iter : ( List < SSTableScanner > ) ( ( CollatingIterator ) source ) . getIterators ( ) ) 
+ + { 
+ + totalBytes + = iter . getFileLength ( ) ; 
+ + } 
+ + > > > > > > > make estimation of pendingtasks for CompactionManager sane 
+ this . gcBefore = gcBefore ; 
+ this . major = major ; 
+ } 
+ @ @ - 135 , 6 + 149 , 14 @ @ public class CompactionIterator extends ReducingIterator < IteratingRow , Compactio 
+ finally 
+ { 
+ rows . clear ( ) ; 
+ + if ( ( row + + % 1000 ) = = 0 ) 
+ + { 
+ + bytesRead = 0 ; 
+ + for ( SSTableScanner iter : ( List < SSTableScanner > ) ( ( CollatingIterator ) source ) . getIterators ( ) ) 
+ + { 
+ + bytesRead + = iter . getFilePointer ( ) ; 
+ + } 
+ + } 
+ } 
+ return new CompactedRow ( key , buffer ) ; 
+ } 
+ @ @ - 147 , 6 + 169 , 16 @ @ public class CompactionIterator extends ReducingIterator < IteratingRow , Compactio 
+ } 
+ } 
+ 
+ + public long getTotalBytes ( ) 
+ + { 
+ + return totalBytes ; 
+ + } 
+ + 
+ + public long getBytesRead ( ) 
+ + { 
+ + return bytesRead ; 
+ + } 
+ + 
+ public static class CompactedRow 
+ { 
+ public final DecoratedKey key ; 
+ diff - - git a / src / java / org / apache / cassandra / io / SSTable . java b / src / java / org / apache / cassandra / io / SSTable . java 
+ index 2c137ef . . e5b0690 100644 
+ - - - a / src / java / org / apache / cassandra / io / SSTable . java 
+ + + + b / src / java / org / apache / cassandra / io / SSTable . java 
+ @ @ - 198 , 11 + 198 , 6 @ @ public abstract class SSTable 
+ } 
+ } 
+ 
+ - public long dataBytesOnDisk ( ) 
+ - { 
+ - return new File ( path ) . length ( ) ; 
+ - } 
+ - 
+ public long bytesOnDisk ( ) 
+ { 
+ long bytes = 0 ; 
+ diff - - git a / src / java / org / apache / cassandra / io / SSTableScanner . java b / src / java / org / apache / cassandra / io / SSTableScanner . java 
+ index 9bc1c70 . . 8a99337 100644 
+ - - - a / src / java / org / apache / cassandra / io / SSTableScanner . java 
+ + + + b / src / java / org / apache / cassandra / io / SSTableScanner . java 
+ @ @ - 20 , 6 + 20 , 7 @ @ package org . apache . cassandra . io ; 
+ 
+ import java . io . IOException ; 
+ import java . io . Closeable ; 
+ + import java . io . IOError ; 
+ import java . util . Iterator ; 
+ import java . util . Arrays ; 
+ 
+ @ @ - 72 , 6 + 73 , 23 @ @ public class SSTableScanner implements Iterator < IteratingRow > , Closeable 
+ } 
+ } 
+ 
+ + public long getFileLength ( ) 
+ + { 
+ + try 
+ + { 
+ + return file . length ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + } 
+ + 
+ + public long getFilePointer ( ) 
+ + { 
+ + return file . getFilePointer ( ) ; 
+ + } 
+ + 
+ public boolean hasNext ( ) 
+ { 
+ if ( iterator = = null ) 
+ diff - - git a / test / unit / org / apache / cassandra / db / CompactionsTest . java b / test / unit / org / apache / cassandra / db / CompactionsTest . java 
+ index 1fa6b30 . . 52aa04b 100644 
+ - - - a / test / unit / org / apache / cassandra / db / CompactionsTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / CompactionsTest . java 
+ @ @ - 66 , 7 + 66 , 7 @ @ public class CompactionsTest extends CleanupHelper 
+ } 
+ while ( true ) 
+ { 
+ - Future < Integer > ft = CompactionManager . instance . submitMinor ( store ) ; 
+ + Future < Integer > ft = CompactionManager . instance . submitMinorIfNeeded ( store ) ; 
+ if ( ft . get ( ) = = 0 ) 
+ break ; 
+ }

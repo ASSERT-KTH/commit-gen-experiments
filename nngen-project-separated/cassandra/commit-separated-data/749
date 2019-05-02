@@ -1,0 +1,375 @@
+BLEU SCORE: 0.033864985683445356
+
+TEST MSG: Fix problem with undeleteable rows on upgrade to new sstable format .
+GENERATED MSG: Avoid writing range tombstones after END _ OF _ ROW marker .
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 59f0a5f . . f205e0b 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 9 <nl> + * Fix problem with undeleteable rows on upgrade to new sstable format ( CASSANDRA - 12144 ) <nl> * Fix paging logic for deleted partitions with static columns ( CASSANDRA - 12107 ) <nl> * Wait until the message is being send to decide which serializer must be used ( CASSANDRA - 11393 ) <nl> * Fix migration of static thrift column names with non - text comparators ( CASSANDRA - 12147 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / LegacyLayout . java b / src / java / org / apache / cassandra / db / LegacyLayout . java <nl> index 495a12a . . 3feb1f4 100644 <nl> - - - a / src / java / org / apache / cassandra / db / LegacyLayout . java <nl> + + + b / src / java / org / apache / cassandra / db / LegacyLayout . java <nl> @ @ - 1205 , 9 + 1205 , 26 @ @ public abstract class LegacyLayout <nl> { <nl> if ( tombstone . isRowDeletion ( metadata ) ) <nl> { <nl> - / / If we ' re already within a row , it can ' t be the same one <nl> if ( clustering ! = null ) <nl> + { <nl> + / / If we ' re already in the row , there might be a chance that there were two range tombstones <nl> + / / written , as 2 . x storage format does not guarantee just one range tombstone , unlike 3 . x . <nl> + / / We have to make sure that clustering matches , which would mean that tombstone is for the <nl> + / / same row . <nl> + if ( rowDeletion ! = null & & clustering . equals ( tombstone . start . getAsClustering ( metadata ) ) ) <nl> + { <nl> + / / If the tombstone superceeds the previous delete , we discard the previous one <nl> + if ( tombstone . deletionTime . supersedes ( rowDeletion . deletionTime ) ) <nl> + { <nl> + builder . addRowDeletion ( Row . Deletion . regular ( tombstone . deletionTime ) ) ; <nl> + rowDeletion = tombstone ; <nl> + } <nl> + return true ; <nl> + } <nl> + <nl> + / / If we ' re already within a row and there was no delete written before that one , it can ' t be the same one <nl> return false ; <nl> + } <nl> <nl> clustering = tombstone . start . getAsClustering ( metadata ) ; <nl> builder . newRow ( clustering ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / Scrubber . java b / src / java / org / apache / cassandra / db / compaction / Scrubber . java <nl> index d824d04 . . 539c4c7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / Scrubber . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / Scrubber . java <nl> @ @ - 34 , 10 + 34 , 7 @ @ import org . apache . cassandra . io . sstable . format . SSTableWriter ; <nl> import org . apache . cassandra . io . util . FileUtils ; <nl> import org . apache . cassandra . io . util . RandomAccessReader ; <nl> import org . apache . cassandra . service . ActiveRepairService ; <nl> - import org . apache . cassandra . utils . ByteBufferUtil ; <nl> - import org . apache . cassandra . utils . JVMStabilityInspector ; <nl> - import org . apache . cassandra . utils . OutputHandler ; <nl> - import org . apache . cassandra . utils . UUIDGen ; <nl> + import org . apache . cassandra . utils . * ; <nl> <nl> public class Scrubber implements Closeable <nl> { <nl> @ @ - 216 , 7 + 213 , 7 @ @ public class Scrubber implements Closeable <nl> if ( indexFile ! = null & & dataStart ! = dataStartFromIndex ) <nl> outputHandler . warn ( String . format ( " Data file row position % d differs from index file row position % d " , dataStart , dataStartFromIndex ) ) ; <nl> <nl> - try ( UnfilteredRowIterator iterator = withValidation ( new SSTableIdentityIterator ( sstable , dataFile , key ) , dataFile . getPath ( ) ) ) <nl> + try ( UnfilteredRowIterator iterator = withValidation ( new RowMergingSSTableIterator ( sstable , dataFile , key ) , dataFile . getPath ( ) ) ) <nl> { <nl> if ( prevKey ! = null & & prevKey . compareTo ( key ) > 0 ) <nl> { <nl> @ @ - 470 , 4 + 467 , 46 @ @ public class Scrubber implements Closeable <nl> this . emptyRows = scrubber . emptyRows ; <nl> } <nl> } <nl> + <nl> + / * * <nl> + * During 2 . x migration , under some circumstances rows might have gotten duplicated . <nl> + * Merging iterator merges rows with same clustering . <nl> + * <nl> + * For more details , refer to CASSANDRA - 12144 . <nl> + * / <nl> + private static class RowMergingSSTableIterator extends SSTableIdentityIterator <nl> + { <nl> + RowMergingSSTableIterator ( SSTableReader sstable , RandomAccessReader file , DecoratedKey key ) <nl> + { <nl> + super ( sstable , file , key ) ; <nl> + } <nl> + <nl> + @ Override <nl> + protected Unfiltered doCompute ( ) <nl> + { <nl> + if ( ! iterator . hasNext ( ) ) <nl> + return endOfData ( ) ; <nl> + <nl> + Unfiltered next = iterator . next ( ) ; <nl> + if ( ! next . isRow ( ) ) <nl> + return next ; <nl> + <nl> + while ( iterator . hasNext ( ) ) <nl> + { <nl> + Unfiltered peek = iterator . peek ( ) ; <nl> + / / If there was a duplicate row , merge it . <nl> + if ( next . clustering ( ) . equals ( peek . clustering ( ) ) & & peek . isRow ( ) ) <nl> + { <nl> + iterator . next ( ) ; / / Make sure that the peeked item was consumed . <nl> + next = Rows . merge ( ( Row ) next , ( Row ) peek , FBUtilities . nowInSeconds ( ) ) ; <nl> + } <nl> + else <nl> + { <nl> + break ; <nl> + } <nl> + } <nl> + <nl> + return next ; <nl> + } <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableIdentityIterator . java b / src / java / org / apache / cassandra / io / sstable / SSTableIdentityIterator . java <nl> index 6fbc690 . . a5af334 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableIdentityIterator . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableIdentityIterator . java <nl> @ @ - 34 , 7 + 34 , 7 @ @ public class SSTableIdentityIterator extends AbstractIterator < Unfiltered > implem <nl> private final DeletionTime partitionLevelDeletion ; <nl> private final String filename ; <nl> <nl> - private final SSTableSimpleIterator iterator ; <nl> + protected final SSTableSimpleIterator iterator ; <nl> private final Row staticRow ; <nl> <nl> / * * <nl> @ @ - 97 , 7 + 97 , 7 @ @ public class SSTableIdentityIterator extends AbstractIterator < Unfiltered > implem <nl> { <nl> try <nl> { <nl> - return iterator . hasNext ( ) ? iterator . next ( ) : endOfData ( ) ; <nl> + return doCompute ( ) ; <nl> } <nl> catch ( IndexOutOfBoundsException e ) <nl> { <nl> @ @ - 118 , 6 + 118 , 11 @ @ public class SSTableIdentityIterator extends AbstractIterator < Unfiltered > implem <nl> } <nl> } <nl> <nl> + protected Unfiltered doCompute ( ) <nl> + { <nl> + return iterator . hasNext ( ) ? iterator . next ( ) : endOfData ( ) ; <nl> + } <nl> + <nl> public void close ( ) <nl> { <nl> / / creator is responsible for closing file when finished <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - CompressionInfo . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - CompressionInfo . db <nl> new file mode 100644 <nl> index 0000000 . . 307eeb3 <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - CompressionInfo . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Data . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Data . db <nl> new file mode 100644 <nl> index 0000000 . . 175a5b6 <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Data . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Digest . adler32 b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Digest . adler32 <nl> new file mode 100644 <nl> index 0000000 . . ad624d2 <nl> - - - / dev / null <nl> + + + b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Digest . adler32 <nl> @ @ - 0 , 0 + 1 @ @ <nl> + 408097082 <nl> \ No newline at end of file <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Filter . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Filter . db <nl> new file mode 100644 <nl> index 0000000 . . 00a88b4 <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Filter . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Index . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Index . db <nl> new file mode 100644 <nl> index 0000000 . . c3b42d8 <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Index . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Statistics . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Statistics . db <nl> new file mode 100644 <nl> index 0000000 . . 056cf17 <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Statistics . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Summary . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Summary . db <nl> new file mode 100644 <nl> index 0000000 . . 453753f <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Summary . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - TOC . txt b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - TOC . txt <nl> new file mode 100644 <nl> index 0000000 . . ceb1dab <nl> - - - / dev / null <nl> + + + b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - TOC . txt <nl> @ @ - 0 , 0 + 1 , 8 @ @ <nl> + CompressionInfo . db <nl> + Digest . adler32 <nl> + TOC . txt <nl> + Filter . db <nl> + Data . db <nl> + Index . db <nl> + Statistics . db <nl> + Summary . db <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - CompressionInfo . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - CompressionInfo . db <nl> new file mode 100644 <nl> index 0000000 . . 3c39b5d <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - CompressionInfo . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Data . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Data . db <nl> new file mode 100644 <nl> index 0000000 . . 1f90815 <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Data . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Digest . crc32 b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Digest . crc32 <nl> new file mode 100644 <nl> index 0000000 . . eeb8a5f <nl> - - - / dev / null <nl> + + + b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Digest . crc32 <nl> @ @ - 0 , 0 + 1 @ @ <nl> + 3332428483 <nl> \ No newline at end of file <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Filter . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Filter . db <nl> new file mode 100644 <nl> index 0000000 . . f9c2d6e <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Filter . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Index . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Index . db <nl> new file mode 100644 <nl> index 0000000 . . b077026 <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Index . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Statistics . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Statistics . db <nl> new file mode 100644 <nl> index 0000000 . . 0b49b88 <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Statistics . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Summary . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Summary . db <nl> new file mode 100644 <nl> index 0000000 . . 4547a94 <nl> Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Summary . db differ <nl> diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - TOC . txt b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - TOC . txt <nl> new file mode 100644 <nl> index 0000000 . . 9a29338 <nl> - - - / dev / null <nl> + + + b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - TOC . txt <nl> @ @ - 0 , 0 + 1 , 8 @ @ <nl> + Statistics . db <nl> + Digest . crc32 <nl> + Summary . db <nl> + Index . db <nl> + TOC . txt <nl> + CompressionInfo . db <nl> + Filter . db <nl> + Data . db <nl> diff - - git a / test / unit / org / apache / cassandra / db / ScrubTest . java b / test / unit / org / apache / cassandra / db / ScrubTest . java <nl> index 936ccd8 . . f97d9a9 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / ScrubTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / ScrubTest . java <nl> @ @ - 20 , 6 + 20 , 9 @ @ package org . apache . cassandra . db ; <nl> <nl> import java . io . * ; <nl> import java . nio . ByteBuffer ; <nl> + import java . nio . file . Files ; <nl> + import java . nio . file . Path ; <nl> + import java . nio . file . Paths ; <nl> import java . util . * ; <nl> import java . util . concurrent . ExecutionException ; <nl> <nl> @ @ - 43 , 14 + 46 , 12 @ @ import org . apache . cassandra . db . marshal . UUIDType ; <nl> import org . apache . cassandra . db . partitions . Partition ; <nl> import org . apache . cassandra . db . partitions . PartitionUpdate ; <nl> import org . apache . cassandra . db . rows . EncodingStats ; <nl> - import org . apache . cassandra . dht . ByteOrderedPartitioner ; <nl> - import org . apache . cassandra . dht . IPartitioner ; <nl> + import org . apache . cassandra . dht . * ; <nl> import org . apache . cassandra . exceptions . ConfigurationException ; <nl> import org . apache . cassandra . exceptions . RequestExecutionException ; <nl> import org . apache . cassandra . exceptions . WriteTimeoutException ; <nl> import org . apache . cassandra . io . compress . CompressionMetadata ; <nl> import org . apache . cassandra . io . sstable . * ; <nl> - import org . apache . cassandra . io . sstable . format . SSTableFormat ; <nl> import org . apache . cassandra . io . sstable . format . SSTableReader ; <nl> import org . apache . cassandra . io . sstable . format . SSTableWriter ; <nl> import org . apache . cassandra . io . sstable . format . big . BigTableWriter ; <nl> @ @ - 68 , 6 + 69 , 8 @ @ import static org . junit . Assume . assumeTrue ; <nl> @ RunWith ( OrderedJUnit4ClassRunner . class ) <nl> public class ScrubTest <nl> { <nl> + public static final String INVALID _ LEGACY _ SSTABLE _ ROOT _ PROP = " invalid - legacy - sstable - root " ; <nl> + <nl> public static final String KEYSPACE = " Keyspace1 " ; <nl> public static final String CF = " Standard1 " ; <nl> public static final String CF2 = " Standard2 " ; <nl> @ @ - 661 , 4 + 664 , 83 @ @ public class ScrubTest <nl> return dataFile . position ( ) ; <nl> } <nl> } <nl> + <nl> + / * * <nl> + * Tests with invalid sstables ( containing duplicate entries in 2 . 0 and 3 . 0 storage format ) , <nl> + * that were caused by upgrading from 2 . x with duplicate range tombstones . <nl> + * <nl> + * See CASSANDRA - 12144 for details . <nl> + * / <nl> + @ Test <nl> + public void testFilterOutDuplicates ( ) throws Exception <nl> + { <nl> + DatabaseDescriptor . setPartitionerUnsafe ( Murmur3Partitioner . instance ) ; <nl> + QueryProcessor . process ( String . format ( " CREATE TABLE \ " % s \ " . cf _ with _ duplicates _ 3 _ 0 ( a int , b int , c int , PRIMARY KEY ( a , b ) ) " , KEYSPACE ) , ConsistencyLevel . ONE ) ; <nl> + <nl> + Keyspace keyspace = Keyspace . open ( KEYSPACE ) ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( " cf _ with _ duplicates _ 3 _ 0 " ) ; <nl> + <nl> + Path legacySSTableRoot = Paths . get ( System . getProperty ( INVALID _ LEGACY _ SSTABLE _ ROOT _ PROP ) , <nl> + " Keyspace1 " , <nl> + " cf _ with _ duplicates _ 3 _ 0 " ) ; <nl> + <nl> + for ( String filename : new String [ ] { " mb - 3 - big - CompressionInfo . db " , <nl> + " mb - 3 - big - Digest . crc32 " , <nl> + " mb - 3 - big - Index . db " , <nl> + " mb - 3 - big - Summary . db " , <nl> + " mb - 3 - big - Data . db " , <nl> + " mb - 3 - big - Filter . db " , <nl> + " mb - 3 - big - Statistics . db " , <nl> + " mb - 3 - big - TOC . txt " } ) <nl> + { <nl> + Files . copy ( Paths . get ( legacySSTableRoot . toString ( ) , filename ) , cfs . getDirectories ( ) . getDirectoryForNewSSTables ( ) . toPath ( ) . resolve ( filename ) ) ; <nl> + } <nl> + <nl> + cfs . loadNewSSTables ( ) ; <nl> + <nl> + cfs . scrub ( true , true , true , 1 ) ; <nl> + <nl> + UntypedResultSet rs = QueryProcessor . executeInternal ( String . format ( " SELECT * FROM \ " % s \ " . cf _ with _ duplicates _ 3 _ 0 " , KEYSPACE ) ) ; <nl> + assertEquals ( 1 , rs . size ( ) ) ; <nl> + QueryProcessor . executeInternal ( String . format ( " DELETE FROM \ " % s \ " . cf _ with _ duplicates _ 3 _ 0 WHERE a = 1 AND b = 2 " , KEYSPACE ) ) ; <nl> + rs = QueryProcessor . executeInternal ( String . format ( " SELECT * FROM \ " % s \ " . cf _ with _ duplicates _ 3 _ 0 " , KEYSPACE ) ) ; <nl> + assertEquals ( 0 , rs . size ( ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testUpgradeSstablesWithDuplicates ( ) throws Exception <nl> + { <nl> + DatabaseDescriptor . setPartitionerUnsafe ( Murmur3Partitioner . instance ) ; <nl> + String cf = " cf _ with _ duplicates _ 2 _ 0 " ; <nl> + QueryProcessor . process ( String . format ( " CREATE TABLE \ " % s \ " . % s ( a int , b int , c int , PRIMARY KEY ( a , b ) ) " , KEYSPACE , cf ) , ConsistencyLevel . ONE ) ; <nl> + <nl> + Keyspace keyspace = Keyspace . open ( KEYSPACE ) ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cf ) ; <nl> + <nl> + Path legacySSTableRoot = Paths . get ( System . getProperty ( INVALID _ LEGACY _ SSTABLE _ ROOT _ PROP ) , <nl> + " Keyspace1 " , <nl> + cf ) ; <nl> + <nl> + for ( String filename : new String [ ] { " lb - 1 - big - CompressionInfo . db " , <nl> + " lb - 1 - big - Data . db " , <nl> + " lb - 1 - big - Digest . adler32 " , <nl> + " lb - 1 - big - Filter . db " , <nl> + " lb - 1 - big - Index . db " , <nl> + " lb - 1 - big - Statistics . db " , <nl> + " lb - 1 - big - Summary . db " , <nl> + " lb - 1 - big - TOC . txt " } ) <nl> + { <nl> + Files . copy ( Paths . get ( legacySSTableRoot . toString ( ) , filename ) , cfs . getDirectories ( ) . getDirectoryForNewSSTables ( ) . toPath ( ) . resolve ( filename ) ) ; <nl> + } <nl> + <nl> + cfs . loadNewSSTables ( ) ; <nl> + <nl> + cfs . sstablesRewrite ( true , 1 ) ; <nl> + <nl> + UntypedResultSet rs = QueryProcessor . executeInternal ( String . format ( " SELECT * FROM \ " % s \ " . % s " , KEYSPACE , cf ) ) ; <nl> + assertEquals ( 1 , rs . size ( ) ) ; <nl> + QueryProcessor . executeInternal ( String . format ( " DELETE FROM \ " % s \ " . % s WHERE a = 1 AND b = 2 " , KEYSPACE , cf ) ) ; <nl> + rs = QueryProcessor . executeInternal ( String . format ( " SELECT * FROM \ " % s \ " . % s " , KEYSPACE , cf ) ) ; <nl> + assertEquals ( 0 , rs . size ( ) ) ; <nl> + } <nl> }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 59f0a5f . . f205e0b 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 9 
+ + * Fix problem with undeleteable rows on upgrade to new sstable format ( CASSANDRA - 12144 ) 
+ * Fix paging logic for deleted partitions with static columns ( CASSANDRA - 12107 ) 
+ * Wait until the message is being send to decide which serializer must be used ( CASSANDRA - 11393 ) 
+ * Fix migration of static thrift column names with non - text comparators ( CASSANDRA - 12147 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / LegacyLayout . java b / src / java / org / apache / cassandra / db / LegacyLayout . java 
+ index 495a12a . . 3feb1f4 100644 
+ - - - a / src / java / org / apache / cassandra / db / LegacyLayout . java 
+ + + + b / src / java / org / apache / cassandra / db / LegacyLayout . java 
+ @ @ - 1205 , 9 + 1205 , 26 @ @ public abstract class LegacyLayout 
+ { 
+ if ( tombstone . isRowDeletion ( metadata ) ) 
+ { 
+ - / / If we ' re already within a row , it can ' t be the same one 
+ if ( clustering ! = null ) 
+ + { 
+ + / / If we ' re already in the row , there might be a chance that there were two range tombstones 
+ + / / written , as 2 . x storage format does not guarantee just one range tombstone , unlike 3 . x . 
+ + / / We have to make sure that clustering matches , which would mean that tombstone is for the 
+ + / / same row . 
+ + if ( rowDeletion ! = null & & clustering . equals ( tombstone . start . getAsClustering ( metadata ) ) ) 
+ + { 
+ + / / If the tombstone superceeds the previous delete , we discard the previous one 
+ + if ( tombstone . deletionTime . supersedes ( rowDeletion . deletionTime ) ) 
+ + { 
+ + builder . addRowDeletion ( Row . Deletion . regular ( tombstone . deletionTime ) ) ; 
+ + rowDeletion = tombstone ; 
+ + } 
+ + return true ; 
+ + } 
+ + 
+ + / / If we ' re already within a row and there was no delete written before that one , it can ' t be the same one 
+ return false ; 
+ + } 
+ 
+ clustering = tombstone . start . getAsClustering ( metadata ) ; 
+ builder . newRow ( clustering ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / Scrubber . java b / src / java / org / apache / cassandra / db / compaction / Scrubber . java 
+ index d824d04 . . 539c4c7 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / Scrubber . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / Scrubber . java 
+ @ @ - 34 , 10 + 34 , 7 @ @ import org . apache . cassandra . io . sstable . format . SSTableWriter ; 
+ import org . apache . cassandra . io . util . FileUtils ; 
+ import org . apache . cassandra . io . util . RandomAccessReader ; 
+ import org . apache . cassandra . service . ActiveRepairService ; 
+ - import org . apache . cassandra . utils . ByteBufferUtil ; 
+ - import org . apache . cassandra . utils . JVMStabilityInspector ; 
+ - import org . apache . cassandra . utils . OutputHandler ; 
+ - import org . apache . cassandra . utils . UUIDGen ; 
+ + import org . apache . cassandra . utils . * ; 
+ 
+ public class Scrubber implements Closeable 
+ { 
+ @ @ - 216 , 7 + 213 , 7 @ @ public class Scrubber implements Closeable 
+ if ( indexFile ! = null & & dataStart ! = dataStartFromIndex ) 
+ outputHandler . warn ( String . format ( " Data file row position % d differs from index file row position % d " , dataStart , dataStartFromIndex ) ) ; 
+ 
+ - try ( UnfilteredRowIterator iterator = withValidation ( new SSTableIdentityIterator ( sstable , dataFile , key ) , dataFile . getPath ( ) ) ) 
+ + try ( UnfilteredRowIterator iterator = withValidation ( new RowMergingSSTableIterator ( sstable , dataFile , key ) , dataFile . getPath ( ) ) ) 
+ { 
+ if ( prevKey ! = null & & prevKey . compareTo ( key ) > 0 ) 
+ { 
+ @ @ - 470 , 4 + 467 , 46 @ @ public class Scrubber implements Closeable 
+ this . emptyRows = scrubber . emptyRows ; 
+ } 
+ } 
+ + 
+ + / * * 
+ + * During 2 . x migration , under some circumstances rows might have gotten duplicated . 
+ + * Merging iterator merges rows with same clustering . 
+ + * 
+ + * For more details , refer to CASSANDRA - 12144 . 
+ + * / 
+ + private static class RowMergingSSTableIterator extends SSTableIdentityIterator 
+ + { 
+ + RowMergingSSTableIterator ( SSTableReader sstable , RandomAccessReader file , DecoratedKey key ) 
+ + { 
+ + super ( sstable , file , key ) ; 
+ + } 
+ + 
+ + @ Override 
+ + protected Unfiltered doCompute ( ) 
+ + { 
+ + if ( ! iterator . hasNext ( ) ) 
+ + return endOfData ( ) ; 
+ + 
+ + Unfiltered next = iterator . next ( ) ; 
+ + if ( ! next . isRow ( ) ) 
+ + return next ; 
+ + 
+ + while ( iterator . hasNext ( ) ) 
+ + { 
+ + Unfiltered peek = iterator . peek ( ) ; 
+ + / / If there was a duplicate row , merge it . 
+ + if ( next . clustering ( ) . equals ( peek . clustering ( ) ) & & peek . isRow ( ) ) 
+ + { 
+ + iterator . next ( ) ; / / Make sure that the peeked item was consumed . 
+ + next = Rows . merge ( ( Row ) next , ( Row ) peek , FBUtilities . nowInSeconds ( ) ) ; 
+ + } 
+ + else 
+ + { 
+ + break ; 
+ + } 
+ + } 
+ + 
+ + return next ; 
+ + } 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableIdentityIterator . java b / src / java / org / apache / cassandra / io / sstable / SSTableIdentityIterator . java 
+ index 6fbc690 . . a5af334 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableIdentityIterator . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableIdentityIterator . java 
+ @ @ - 34 , 7 + 34 , 7 @ @ public class SSTableIdentityIterator extends AbstractIterator < Unfiltered > implem 
+ private final DeletionTime partitionLevelDeletion ; 
+ private final String filename ; 
+ 
+ - private final SSTableSimpleIterator iterator ; 
+ + protected final SSTableSimpleIterator iterator ; 
+ private final Row staticRow ; 
+ 
+ / * * 
+ @ @ - 97 , 7 + 97 , 7 @ @ public class SSTableIdentityIterator extends AbstractIterator < Unfiltered > implem 
+ { 
+ try 
+ { 
+ - return iterator . hasNext ( ) ? iterator . next ( ) : endOfData ( ) ; 
+ + return doCompute ( ) ; 
+ } 
+ catch ( IndexOutOfBoundsException e ) 
+ { 
+ @ @ - 118 , 6 + 118 , 11 @ @ public class SSTableIdentityIterator extends AbstractIterator < Unfiltered > implem 
+ } 
+ } 
+ 
+ + protected Unfiltered doCompute ( ) 
+ + { 
+ + return iterator . hasNext ( ) ? iterator . next ( ) : endOfData ( ) ; 
+ + } 
+ + 
+ public void close ( ) 
+ { 
+ / / creator is responsible for closing file when finished 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - CompressionInfo . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - CompressionInfo . db 
+ new file mode 100644 
+ index 0000000 . . 307eeb3 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - CompressionInfo . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Data . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Data . db 
+ new file mode 100644 
+ index 0000000 . . 175a5b6 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Data . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Digest . adler32 b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Digest . adler32 
+ new file mode 100644 
+ index 0000000 . . ad624d2 
+ - - - / dev / null 
+ + + + b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Digest . adler32 
+ @ @ - 0 , 0 + 1 @ @ 
+ + 408097082 
+ \ No newline at end of file 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Filter . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Filter . db 
+ new file mode 100644 
+ index 0000000 . . 00a88b4 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Filter . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Index . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Index . db 
+ new file mode 100644 
+ index 0000000 . . c3b42d8 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Index . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Statistics . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Statistics . db 
+ new file mode 100644 
+ index 0000000 . . 056cf17 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Statistics . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Summary . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Summary . db 
+ new file mode 100644 
+ index 0000000 . . 453753f 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - Summary . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - TOC . txt b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - TOC . txt 
+ new file mode 100644 
+ index 0000000 . . ceb1dab 
+ - - - / dev / null 
+ + + + b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 2 _ 0 / lb - 1 - big - TOC . txt 
+ @ @ - 0 , 0 + 1 , 8 @ @ 
+ + CompressionInfo . db 
+ + Digest . adler32 
+ + TOC . txt 
+ + Filter . db 
+ + Data . db 
+ + Index . db 
+ + Statistics . db 
+ + Summary . db 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - CompressionInfo . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - CompressionInfo . db 
+ new file mode 100644 
+ index 0000000 . . 3c39b5d 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - CompressionInfo . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Data . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Data . db 
+ new file mode 100644 
+ index 0000000 . . 1f90815 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Data . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Digest . crc32 b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Digest . crc32 
+ new file mode 100644 
+ index 0000000 . . eeb8a5f 
+ - - - / dev / null 
+ + + + b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Digest . crc32 
+ @ @ - 0 , 0 + 1 @ @ 
+ + 3332428483 
+ \ No newline at end of file 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Filter . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Filter . db 
+ new file mode 100644 
+ index 0000000 . . f9c2d6e 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Filter . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Index . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Index . db 
+ new file mode 100644 
+ index 0000000 . . b077026 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Index . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Statistics . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Statistics . db 
+ new file mode 100644 
+ index 0000000 . . 0b49b88 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Statistics . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Summary . db b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Summary . db 
+ new file mode 100644 
+ index 0000000 . . 4547a94 
+ Binary files / dev / null and b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - Summary . db differ 
+ diff - - git a / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - TOC . txt b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - TOC . txt 
+ new file mode 100644 
+ index 0000000 . . 9a29338 
+ - - - / dev / null 
+ + + + b / test / data / invalid - legacy - sstables / Keyspace1 / cf _ with _ duplicates _ 3 _ 0 / mb - 3 - big - TOC . txt 
+ @ @ - 0 , 0 + 1 , 8 @ @ 
+ + Statistics . db 
+ + Digest . crc32 
+ + Summary . db 
+ + Index . db 
+ + TOC . txt 
+ + CompressionInfo . db 
+ + Filter . db 
+ + Data . db 
+ diff - - git a / test / unit / org / apache / cassandra / db / ScrubTest . java b / test / unit / org / apache / cassandra / db / ScrubTest . java 
+ index 936ccd8 . . f97d9a9 100644 
+ - - - a / test / unit / org / apache / cassandra / db / ScrubTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / ScrubTest . java 
+ @ @ - 20 , 6 + 20 , 9 @ @ package org . apache . cassandra . db ; 
+ 
+ import java . io . * ; 
+ import java . nio . ByteBuffer ; 
+ + import java . nio . file . Files ; 
+ + import java . nio . file . Path ; 
+ + import java . nio . file . Paths ; 
+ import java . util . * ; 
+ import java . util . concurrent . ExecutionException ; 
+ 
+ @ @ - 43 , 14 + 46 , 12 @ @ import org . apache . cassandra . db . marshal . UUIDType ; 
+ import org . apache . cassandra . db . partitions . Partition ; 
+ import org . apache . cassandra . db . partitions . PartitionUpdate ; 
+ import org . apache . cassandra . db . rows . EncodingStats ; 
+ - import org . apache . cassandra . dht . ByteOrderedPartitioner ; 
+ - import org . apache . cassandra . dht . IPartitioner ; 
+ + import org . apache . cassandra . dht . * ; 
+ import org . apache . cassandra . exceptions . ConfigurationException ; 
+ import org . apache . cassandra . exceptions . RequestExecutionException ; 
+ import org . apache . cassandra . exceptions . WriteTimeoutException ; 
+ import org . apache . cassandra . io . compress . CompressionMetadata ; 
+ import org . apache . cassandra . io . sstable . * ; 
+ - import org . apache . cassandra . io . sstable . format . SSTableFormat ; 
+ import org . apache . cassandra . io . sstable . format . SSTableReader ; 
+ import org . apache . cassandra . io . sstable . format . SSTableWriter ; 
+ import org . apache . cassandra . io . sstable . format . big . BigTableWriter ; 
+ @ @ - 68 , 6 + 69 , 8 @ @ import static org . junit . Assume . assumeTrue ; 
+ @ RunWith ( OrderedJUnit4ClassRunner . class ) 
+ public class ScrubTest 
+ { 
+ + public static final String INVALID _ LEGACY _ SSTABLE _ ROOT _ PROP = " invalid - legacy - sstable - root " ; 
+ + 
+ public static final String KEYSPACE = " Keyspace1 " ; 
+ public static final String CF = " Standard1 " ; 
+ public static final String CF2 = " Standard2 " ; 
+ @ @ - 661 , 4 + 664 , 83 @ @ public class ScrubTest 
+ return dataFile . position ( ) ; 
+ } 
+ } 
+ + 
+ + / * * 
+ + * Tests with invalid sstables ( containing duplicate entries in 2 . 0 and 3 . 0 storage format ) , 
+ + * that were caused by upgrading from 2 . x with duplicate range tombstones . 
+ + * 
+ + * See CASSANDRA - 12144 for details . 
+ + * / 
+ + @ Test 
+ + public void testFilterOutDuplicates ( ) throws Exception 
+ + { 
+ + DatabaseDescriptor . setPartitionerUnsafe ( Murmur3Partitioner . instance ) ; 
+ + QueryProcessor . process ( String . format ( " CREATE TABLE \ " % s \ " . cf _ with _ duplicates _ 3 _ 0 ( a int , b int , c int , PRIMARY KEY ( a , b ) ) " , KEYSPACE ) , ConsistencyLevel . ONE ) ; 
+ + 
+ + Keyspace keyspace = Keyspace . open ( KEYSPACE ) ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( " cf _ with _ duplicates _ 3 _ 0 " ) ; 
+ + 
+ + Path legacySSTableRoot = Paths . get ( System . getProperty ( INVALID _ LEGACY _ SSTABLE _ ROOT _ PROP ) , 
+ + " Keyspace1 " , 
+ + " cf _ with _ duplicates _ 3 _ 0 " ) ; 
+ + 
+ + for ( String filename : new String [ ] { " mb - 3 - big - CompressionInfo . db " , 
+ + " mb - 3 - big - Digest . crc32 " , 
+ + " mb - 3 - big - Index . db " , 
+ + " mb - 3 - big - Summary . db " , 
+ + " mb - 3 - big - Data . db " , 
+ + " mb - 3 - big - Filter . db " , 
+ + " mb - 3 - big - Statistics . db " , 
+ + " mb - 3 - big - TOC . txt " } ) 
+ + { 
+ + Files . copy ( Paths . get ( legacySSTableRoot . toString ( ) , filename ) , cfs . getDirectories ( ) . getDirectoryForNewSSTables ( ) . toPath ( ) . resolve ( filename ) ) ; 
+ + } 
+ + 
+ + cfs . loadNewSSTables ( ) ; 
+ + 
+ + cfs . scrub ( true , true , true , 1 ) ; 
+ + 
+ + UntypedResultSet rs = QueryProcessor . executeInternal ( String . format ( " SELECT * FROM \ " % s \ " . cf _ with _ duplicates _ 3 _ 0 " , KEYSPACE ) ) ; 
+ + assertEquals ( 1 , rs . size ( ) ) ; 
+ + QueryProcessor . executeInternal ( String . format ( " DELETE FROM \ " % s \ " . cf _ with _ duplicates _ 3 _ 0 WHERE a = 1 AND b = 2 " , KEYSPACE ) ) ; 
+ + rs = QueryProcessor . executeInternal ( String . format ( " SELECT * FROM \ " % s \ " . cf _ with _ duplicates _ 3 _ 0 " , KEYSPACE ) ) ; 
+ + assertEquals ( 0 , rs . size ( ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testUpgradeSstablesWithDuplicates ( ) throws Exception 
+ + { 
+ + DatabaseDescriptor . setPartitionerUnsafe ( Murmur3Partitioner . instance ) ; 
+ + String cf = " cf _ with _ duplicates _ 2 _ 0 " ; 
+ + QueryProcessor . process ( String . format ( " CREATE TABLE \ " % s \ " . % s ( a int , b int , c int , PRIMARY KEY ( a , b ) ) " , KEYSPACE , cf ) , ConsistencyLevel . ONE ) ; 
+ + 
+ + Keyspace keyspace = Keyspace . open ( KEYSPACE ) ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cf ) ; 
+ + 
+ + Path legacySSTableRoot = Paths . get ( System . getProperty ( INVALID _ LEGACY _ SSTABLE _ ROOT _ PROP ) , 
+ + " Keyspace1 " , 
+ + cf ) ; 
+ + 
+ + for ( String filename : new String [ ] { " lb - 1 - big - CompressionInfo . db " , 
+ + " lb - 1 - big - Data . db " , 
+ + " lb - 1 - big - Digest . adler32 " , 
+ + " lb - 1 - big - Filter . db " , 
+ + " lb - 1 - big - Index . db " , 
+ + " lb - 1 - big - Statistics . db " , 
+ + " lb - 1 - big - Summary . db " , 
+ + " lb - 1 - big - TOC . txt " } ) 
+ + { 
+ + Files . copy ( Paths . get ( legacySSTableRoot . toString ( ) , filename ) , cfs . getDirectories ( ) . getDirectoryForNewSSTables ( ) . toPath ( ) . resolve ( filename ) ) ; 
+ + } 
+ + 
+ + cfs . loadNewSSTables ( ) ; 
+ + 
+ + cfs . sstablesRewrite ( true , 1 ) ; 
+ + 
+ + UntypedResultSet rs = QueryProcessor . executeInternal ( String . format ( " SELECT * FROM \ " % s \ " . % s " , KEYSPACE , cf ) ) ; 
+ + assertEquals ( 1 , rs . size ( ) ) ; 
+ + QueryProcessor . executeInternal ( String . format ( " DELETE FROM \ " % s \ " . % s WHERE a = 1 AND b = 2 " , KEYSPACE , cf ) ) ; 
+ + rs = QueryProcessor . executeInternal ( String . format ( " SELECT * FROM \ " % s \ " . % s " , KEYSPACE , cf ) ) ; 
+ + assertEquals ( 0 , rs . size ( ) ) ; 
+ + } 
+ }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

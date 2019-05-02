@@ -1,0 +1,654 @@
+BLEU SCORE: 0.015445276590783498
+
+TEST MSG: GCInspector more closely tracks GC ; cassandra - stress and nodetool report it
+GENERATED MSG: Add sstable bulk loading utility
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 6e029ab . . 4c39f5c 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 1 <nl> + * GCInspector more closely tracks GC ; cassandra - stress and nodetool report it <nl> * nodetool won ' t output bogus ownership info without a keyspace ( CASSANDRA - 7173 ) <nl> * Add human readable option to nodetool commands ( CASSANDRA - 5433 ) <nl> * Don ' t try to set repairedAt on old sstables ( CASSANDRA - 7913 ) <nl> diff - - git a / src / java / org / apache / cassandra / service / GCInspector . java b / src / java / org / apache / cassandra / service / GCInspector . java <nl> index d04b250 . . c4bffac 100644 <nl> - - - a / src / java / org / apache / cassandra / service / GCInspector . java <nl> + + + b / src / java / org / apache / cassandra / service / GCInspector . java <nl> @ @ - 22 , 6 + 22 , 8 @ @ import java . lang . management . MemoryUsage ; <nl> import java . util . ArrayList ; <nl> import java . util . Collections ; <nl> import java . util . List ; <nl> + import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . atomic . AtomicReference ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . Notification ; <nl> import javax . management . NotificationListener ; <nl> @ @ - 35 , 11 + 37 , 55 @ @ import com . sun . management . GarbageCollectionNotificationInfo ; <nl> import org . apache . cassandra . io . sstable . SSTableDeletingTask ; <nl> import org . apache . cassandra . utils . StatusLogger ; <nl> <nl> - public class GCInspector implements NotificationListener <nl> + public class GCInspector implements NotificationListener , GCInspectorMXBean <nl> { <nl> + public static final String MBEAN _ NAME = " org . apache . cassandra . service : type = GCInspector " ; <nl> private static final Logger logger = LoggerFactory . getLogger ( GCInspector . class ) ; <nl> - final static long MIN _ DURATION = 200 ; <nl> - final static long MIN _ DURATION _ TPSTATS = 1000 ; <nl> + final static long MIN _ LOG _ DURATION = 200 ; <nl> + final static long MIN _ LOG _ DURATION _ TPSTATS = 1000 ; <nl> + <nl> + static final class State <nl> + { <nl> + final double maxRealTimeElapsed ; <nl> + final double totalRealTimeElapsed ; <nl> + final double sumSquaresRealTimeElapsed ; <nl> + final double totalBytesReclaimed ; <nl> + final double count ; <nl> + final long startNanos ; <nl> + <nl> + State ( double extraElapsed , double extraBytes , State prev ) <nl> + { <nl> + this . totalRealTimeElapsed = prev . totalRealTimeElapsed + extraElapsed ; <nl> + this . totalBytesReclaimed = prev . totalBytesReclaimed + extraBytes ; <nl> + this . sumSquaresRealTimeElapsed = prev . sumSquaresRealTimeElapsed + ( extraElapsed * extraElapsed ) ; <nl> + this . startNanos = prev . startNanos ; <nl> + this . count = prev . count + 1 ; <nl> + this . maxRealTimeElapsed = Math . max ( prev . maxRealTimeElapsed , extraElapsed ) ; <nl> + } <nl> + <nl> + State ( ) <nl> + { <nl> + count = maxRealTimeElapsed = sumSquaresRealTimeElapsed = totalRealTimeElapsed = totalBytesReclaimed = 0 ; <nl> + startNanos = System . nanoTime ( ) ; <nl> + } <nl> + } <nl> + <nl> + final AtomicReference < State > state = new AtomicReference < > ( new State ( ) ) ; <nl> + <nl> + public GCInspector ( ) <nl> + { <nl> + MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; <nl> + <nl> + try <nl> + { <nl> + mbs . registerMBean ( this , new ObjectName ( MBEAN _ NAME ) ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + <nl> + } <nl> <nl> public static void register ( ) throws Exception <nl> { <nl> @ @ - 66 , 6 + 112 , 7 @ @ public class GCInspector implements NotificationListener <nl> StringBuilder sb = new StringBuilder ( ) ; <nl> sb . append ( info . getGcName ( ) ) . append ( " GC in " ) . append ( duration ) . append ( " ms . " ) ; <nl> <nl> + long bytes = 0 ; <nl> List < String > keys = new ArrayList < > ( info . getGcInfo ( ) . getMemoryUsageBeforeGc ( ) . keySet ( ) ) ; <nl> Collections . sort ( keys ) ; <nl> for ( String key : keys ) <nl> @ @ - 79 , 16 + 126 , 24 @ @ public class GCInspector implements NotificationListener <nl> sb . append ( after . getUsed ( ) ) ; <nl> if ( ! key . equals ( keys . get ( keys . size ( ) - 1 ) ) ) <nl> sb . append ( " ; " ) ; <nl> + bytes + = before . getUsed ( ) - after . getUsed ( ) ; <nl> } <nl> } <nl> <nl> + while ( true ) <nl> + { <nl> + State prev = state . get ( ) ; <nl> + if ( state . compareAndSet ( prev , new State ( duration , bytes , prev ) ) ) <nl> + break ; <nl> + } <nl> + <nl> String st = sb . toString ( ) ; <nl> - if ( duration > MIN _ DURATION ) <nl> + if ( duration > MIN _ LOG _ DURATION ) <nl> logger . info ( st ) ; <nl> else if ( logger . isDebugEnabled ( ) ) <nl> logger . debug ( st ) ; <nl> <nl> - if ( duration > MIN _ DURATION _ TPSTATS ) <nl> + if ( duration > MIN _ LOG _ DURATION _ TPSTATS ) <nl> StatusLogger . log ( ) ; <nl> <nl> / / if we just finished a full collection and we ' re still using a lot of memory , try to reduce the pressure <nl> @ @ - 96 , 4 + 151 , 22 @ @ public class GCInspector implements NotificationListener <nl> SSTableDeletingTask . rescheduleFailedTasks ( ) ; <nl> } <nl> } <nl> + <nl> + public State getTotalSinceLastCheck ( ) <nl> + { <nl> + return state . getAndSet ( new State ( ) ) ; <nl> + } <nl> + <nl> + public double [ ] getAndResetStats ( ) <nl> + { <nl> + State state = getTotalSinceLastCheck ( ) ; <nl> + double [ ] r = new double [ 6 ] ; <nl> + r [ 0 ] = TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - state . startNanos ) ; <nl> + r [ 1 ] = state . maxRealTimeElapsed ; <nl> + r [ 2 ] = state . totalRealTimeElapsed ; <nl> + r [ 3 ] = state . sumSquaresRealTimeElapsed ; <nl> + r [ 4 ] = state . totalBytesReclaimed ; <nl> + r [ 5 ] = state . count ; <nl> + return r ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / GCInspectorMXBean . java b / src / java / org / apache / cassandra / service / GCInspectorMXBean . java <nl> new file mode 100644 <nl> index 0000000 . . c26a67c <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / service / GCInspectorMXBean . java <nl> @ @ - 0 , 0 + 1 , 25 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + package org . apache . cassandra . service ; <nl> + <nl> + public interface GCInspectorMXBean <nl> + { <nl> + / / returns { interval ( ms ) , max ( gc real time ( ms ) ) , sum ( gc real time ( ms ) ) , sum ( ( gc real time ( ms ) ) ^ 2 ) , sum ( gc bytes ) , count ( gc ) } <nl> + public double [ ] getAndResetStats ( ) ; <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> index 3f3073d . . 203730a 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> @ @ - 79 , 6 + 79 , 7 @ @ public class NodeProbe implements AutoCloseable <nl> private CompactionManagerMBean compactionProxy ; <nl> private StorageServiceMBean ssProxy ; <nl> private MemoryMXBean memProxy ; <nl> + private GCInspectorMXBean gcProxy ; <nl> private RuntimeMXBean runtimeProxy ; <nl> private StreamManagerMBean streamProxy ; <nl> public MessagingServiceMBean msProxy ; <nl> @ @ - 169 , 7 + 170 , 10 @ @ public class NodeProbe implements AutoCloseable <nl> spProxy = JMX . newMBeanProxy ( mbeanServerConn , name , StorageProxyMBean . class ) ; <nl> name = new ObjectName ( HintedHandOffManager . MBEAN _ NAME ) ; <nl> hhProxy = JMX . newMBeanProxy ( mbeanServerConn , name , HintedHandOffManagerMBean . class ) ; <nl> - } catch ( MalformedObjectNameException e ) <nl> + name = new ObjectName ( GCInspector . MBEAN _ NAME ) ; <nl> + gcProxy = JMX . newMBeanProxy ( mbeanServerConn , name , GCInspectorMXBean . class ) ; <nl> + } <nl> + catch ( MalformedObjectNameException e ) <nl> { <nl> throw new RuntimeException ( <nl> " Invalid ObjectName ? Please report this as a bug . " , e ) ; <nl> @ @ - 374 , 6 + 378 , 11 @ @ public class NodeProbe implements AutoCloseable <nl> } <nl> } <nl> <nl> + public double [ ] getAndResetGCStats ( ) <nl> + { <nl> + return gcProxy . getAndResetStats ( ) ; <nl> + } <nl> + <nl> public Iterator < Map . Entry < String , ColumnFamilyStoreMBean > > getColumnFamilyStoreMBeanProxies ( ) <nl> { <nl> try <nl> diff - - git a / src / java / org / apache / cassandra / tools / NodeTool . java b / src / java / org / apache / cassandra / tools / NodeTool . java <nl> index e7d1404 . . 731afcc 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / NodeTool . java <nl> + + + b / src / java / org / apache / cassandra / tools / NodeTool . java <nl> @ @ - 96 , 6 + 96 , 7 @ @ public class NodeTool <nl> DisableGossip . class , <nl> EnableHandoff . class , <nl> EnableThrift . class , <nl> + GcStats . class , <nl> GetCompactionThreshold . class , <nl> GetCompactionThroughput . class , <nl> GetStreamThroughput . class , <nl> @ @ - 2361 , 6 + 2362 , 20 @ @ public class NodeTool <nl> } <nl> } <nl> <nl> + @ Command ( name = " gcstats " , description = " Print GC Statistics " ) <nl> + public static class GcStats extends NodeTool . NodeToolCmd <nl> + { <nl> + @ Override <nl> + public void execute ( NodeProbe probe ) <nl> + { <nl> + double [ ] stats = probe . getAndResetGCStats ( ) ; <nl> + double mean = stats [ 2 ] / stats [ 5 ] ; <nl> + double stdev = Math . sqrt ( ( stats [ 3 ] / stats [ 5 ] ) - ( mean * mean ) ) ; <nl> + System . out . printf ( " % 20s % 20s % 20s % 20s % 20s % n " , " Interval ( ms ) " , " Max GC Elapsed ( ms ) " , " Total GC Elapsed ( ms ) " , " Stdev GC Elapsed ( ms ) " , " GC Reclaimed ( MB ) " , " Collections " ) ; <nl> + System . out . printf ( " % 20 . 0d % 20 . 0d % 20 . 0d % 20 . 0d % 20 . 0d % n " , stats [ 0 ] , stats [ 1 ] , stats [ 2 ] , stdev , stats [ 4 ] , stats [ 5 ] ) ; <nl> + } <nl> + } <nl> + <nl> @ Command ( name = " truncatehints " , description = " Truncate all hints on the local node , or truncate hints for the endpoint ( s ) specified . " ) <nl> public static class TruncateHints extends NodeToolCmd <nl> { <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / StressAction . java b / tools / stress / src / org / apache / cassandra / stress / StressAction . java <nl> index f697dd9 . . da32284 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / StressAction . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / StressAction . java <nl> @ @ - 182 , 7 + 182 , 7 @ @ public class StressAction implements Runnable <nl> if ( settings . rate . opRateTargetPerSecond > 0 ) <nl> rateLimiter = RateLimiter . create ( settings . rate . opRateTargetPerSecond ) ; <nl> <nl> - final StressMetrics metrics = new StressMetrics ( output , settings . log . intervalMillis ) ; <nl> + final StressMetrics metrics = new StressMetrics ( output , settings . log . intervalMillis , settings ) ; <nl> <nl> final CountDownLatch done = new CountDownLatch ( threadCount ) ; <nl> final Consumer [ ] consumers = new Consumer [ threadCount ] ; <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / StressMetrics . java b / tools / stress / src / org / apache / cassandra / stress / StressMetrics . java <nl> index dd3b867 . . 9e8e961 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / StressMetrics . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / StressMetrics . java <nl> @ @ - 23 , 12 + 23 , 16 @ @ package org . apache . cassandra . stress ; <nl> <nl> import java . io . PrintStream ; <nl> import java . util . List ; <nl> + import java . util . concurrent . Callable ; <nl> import java . util . concurrent . CountDownLatch ; <nl> import java . util . concurrent . ThreadFactory ; <nl> + import java . util . concurrent . TimeUnit ; <nl> <nl> import org . apache . commons . lang3 . time . DurationFormatUtils ; <nl> <nl> import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> + import org . apache . cassandra . stress . settings . StressSettings ; <nl> + import org . apache . cassandra . stress . util . JmxCollector ; <nl> import org . apache . cassandra . stress . util . Timing ; <nl> import org . apache . cassandra . stress . util . TimingInterval ; <nl> import org . apache . cassandra . stress . util . Uncertainty ; <nl> @ @ - 45 , 10 + 49 , 33 @ @ public class StressMetrics <nl> private final Uncertainty rowRateUncertainty = new Uncertainty ( ) ; <nl> private final CountDownLatch stopped = new CountDownLatch ( 1 ) ; <nl> private final Timing timing = new Timing ( ) ; <nl> + private final Callable < JmxCollector . GcStats > gcStatsCollector ; <nl> + private volatile JmxCollector . GcStats totalGcStats ; <nl> <nl> - public StressMetrics ( PrintStream output , final long logIntervalMillis ) <nl> + public StressMetrics ( PrintStream output , final long logIntervalMillis , StressSettings settings ) <nl> { <nl> this . output = output ; <nl> + Callable < JmxCollector . GcStats > gcStatsCollector ; <nl> + try <nl> + { <nl> + gcStatsCollector = new JmxCollector ( settings . node . nodes , settings . port . jmxPort ) ; <nl> + totalGcStats = new JmxCollector . GcStats ( 0 ) ; <nl> + } <nl> + catch ( Throwable t ) <nl> + { <nl> + t . printStackTrace ( ) ; <nl> + System . err . println ( " Failed to connect over JMX ; not collecting these stats " ) ; <nl> + totalGcStats = new JmxCollector . GcStats ( Double . POSITIVE _ INFINITY ) ; <nl> + gcStatsCollector = new Callable < JmxCollector . GcStats > ( ) <nl> + { <nl> + public JmxCollector . GcStats call ( ) throws Exception <nl> + { <nl> + return totalGcStats ; <nl> + } <nl> + } ; <nl> + } <nl> + this . gcStatsCollector = gcStatsCollector ; <nl> + <nl> printHeader ( " " , output ) ; <nl> thread = tf . newThread ( new Runnable ( ) <nl> { <nl> @ @ - 121 , 10 + 148 , 10 @ @ public class StressMetrics <nl> <nl> private void update ( ) throws InterruptedException <nl> { <nl> - TimingInterval interval = timing . snapInterval ( ) ; <nl> - if ( interval . partitionCount ! = 0 ) <nl> - printRow ( " " , interval , timing . getHistory ( ) , rowRateUncertainty , output ) ; <nl> - rowRateUncertainty . update ( interval . adjustedRowRate ( ) ) ; <nl> + Timing . TimingResult < JmxCollector . GcStats > result = timing . snap ( gcStatsCollector ) ; <nl> + if ( result . timing . partitionCount ! = 0 ) <nl> + printRow ( " " , result . timing , timing . getHistory ( ) , result . extra , rowRateUncertainty , output ) ; <nl> + rowRateUncertainty . update ( result . timing . adjustedRowRate ( ) ) ; <nl> if ( timing . done ( ) ) <nl> stop = true ; <nl> } <nl> @ @ - 132 , 15 + 159 , 15 @ @ public class StressMetrics <nl> <nl> / / PRINT FORMATTING <nl> <nl> - public static final String HEADFORMAT = " % - 10s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 7s , % 9s " ; <nl> - public static final String ROWFORMAT = " % - 10d , % 8 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 7 . 1f , % 9 . 5f " ; <nl> + public static final String HEADFORMAT = " % - 10s , % 10s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 7s , % 9s , % 7s , % 8s , % 8s , % 8s , % 8s " ; <nl> + public static final String ROWFORMAT = " % - 10d , % 10 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 7 . 1f , % 9 . 5f , % 7 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 0f " ; <nl> <nl> private static void printHeader ( String prefix , PrintStream output ) <nl> { <nl> - output . println ( prefix + String . format ( HEADFORMAT , " total ops " , " adj row / s " , " op / s " , " pk / s " , " row / s " , " mean " , " med " , " . 95 " , " . 99 " , " . 999 " , " max " , " time " , " stderr " ) ) ; <nl> + output . println ( prefix + String . format ( HEADFORMAT , " total ops " , " adj row / s " , " op / s " , " pk / s " , " row / s " , " mean " , " med " , " . 95 " , " . 99 " , " . 999 " , " max " , " time " , " stderr " , " gc : # " , " max ms " , " sum ms " , " sdv ms " , " mb " ) ) ; <nl> } <nl> <nl> - private static void printRow ( String prefix , TimingInterval interval , TimingInterval total , Uncertainty opRateUncertainty , PrintStream output ) <nl> + private static void printRow ( String prefix , TimingInterval interval , TimingInterval total , JmxCollector . GcStats gcStats , Uncertainty opRateUncertainty , PrintStream output ) <nl> { <nl> output . println ( prefix + String . format ( ROWFORMAT , <nl> total . operationCount , <nl> @ @ - 155 , 7 + 182 , 13 @ @ public class StressMetrics <nl> interval . rankLatency ( 0 . 999f ) , <nl> interval . maxLatency ( ) , <nl> total . runTime ( ) / 1000f , <nl> - opRateUncertainty . getUncertainty ( ) ) ) ; <nl> + opRateUncertainty . getUncertainty ( ) , <nl> + gcStats . count , <nl> + gcStats . maxms , <nl> + gcStats . summs , <nl> + gcStats . sdvms , <nl> + gcStats . bytes / ( 1 < < 20 ) <nl> + ) ) ; <nl> } <nl> <nl> public void summarise ( ) <nl> @ @ - 172 , 11 + 205 , 16 @ @ public class StressMetrics <nl> output . println ( String . format ( " latency 99th percentile : % . 1f " , history . rankLatency ( 0 . 99f ) ) ) ; <nl> output . println ( String . format ( " latency 99 . 9th percentile : % . 1f " , history . rankLatency ( 0 . 999f ) ) ) ; <nl> output . println ( String . format ( " latency max : % . 1f " , history . maxLatency ( ) ) ) ; <nl> + output . println ( String . format ( " total gc count : % . 0f " , totalGcStats . count ) ) ; <nl> + output . println ( String . format ( " total gc mb : % . 0f " , totalGcStats . bytes / ( 1 < < 20 ) ) ) ; <nl> + output . println ( String . format ( " total gc time ( s ) : % . 0f " , totalGcStats . summs / 1000 ) ) ; <nl> + output . println ( String . format ( " avg gc time ( ms ) : % . 0f " , totalGcStats . summs / totalGcStats . count ) ) ; <nl> + output . println ( String . format ( " stdev gc time ( ms ) : % . 0f " , totalGcStats . sdvms ) ) ; <nl> output . println ( " Total operation time : " + DurationFormatUtils . formatDuration ( <nl> history . runTime ( ) , " HH : mm : ss " , true ) ) ; <nl> } <nl> <nl> - public static final void summarise ( List < String > ids , List < StressMetrics > summarise , PrintStream out ) <nl> + public static void summarise ( List < String > ids , List < StressMetrics > summarise , PrintStream out ) <nl> { <nl> int idLen = 0 ; <nl> for ( String id : ids ) <nl> @ @ - 187 , 6 + 225 , 7 @ @ public class StressMetrics <nl> printRow ( String . format ( formatstr , ids . get ( i ) ) , <nl> summarise . get ( i ) . timing . getHistory ( ) , <nl> summarise . get ( i ) . timing . getHistory ( ) , <nl> + summarise . get ( i ) . totalGcStats , <nl> summarise . get ( i ) . rowRateUncertainty , <nl> out <nl> ) ; <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / settings / SettingsPort . java b / tools / stress / src / org / apache / cassandra / stress / settings / SettingsPort . java <nl> index 6f12f99 . . 1e10e37 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / settings / SettingsPort . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / settings / SettingsPort . java <nl> @ @ - 31 , 11 + 31 , 13 @ @ public class SettingsPort implements Serializable <nl> <nl> public final int nativePort ; <nl> public final int thriftPort ; <nl> + public final int jmxPort ; <nl> <nl> public SettingsPort ( PortOptions options ) <nl> { <nl> nativePort = Integer . parseInt ( options . nativePort . value ( ) ) ; <nl> thriftPort = Integer . parseInt ( options . thriftPort . value ( ) ) ; <nl> + jmxPort = Integer . parseInt ( options . jmxPort . value ( ) ) ; <nl> } <nl> <nl> / / Option Declarations <nl> @ @ - 44 , 6 + 46 , 7 @ @ public class SettingsPort implements Serializable <nl> { <nl> final OptionSimple nativePort = new OptionSimple ( " native = " , " [ 0 - 9 ] + " , " 9042 " , " Use this port for the Cassandra native protocol " , false ) ; <nl> final OptionSimple thriftPort = new OptionSimple ( " thrift = " , " [ 0 - 9 ] + " , " 9160 " , " Use this port for the thrift protocol " , false ) ; <nl> + final OptionSimple jmxPort = new OptionSimple ( " jmx = " , " [ 0 - 9 ] + " , " 7199 " , " Use this port for retrieving statistics over jmx " , false ) ; <nl> <nl> @ Override <nl> public List < ? extends Option > options ( ) <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / util / JmxCollector . java b / tools / stress / src / org / apache / cassandra / stress / util / JmxCollector . java <nl> new file mode 100644 <nl> index 0000000 . . 9611b2a <nl> - - - / dev / null <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / util / JmxCollector . java <nl> @ @ - 0 , 0 + 1 , 119 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + package org . apache . cassandra . stress . util ; <nl> + <nl> + import java . io . IOException ; <nl> + import java . util . ArrayList ; <nl> + import java . util . List ; <nl> + import java . util . concurrent . Callable ; <nl> + import java . util . concurrent . ExecutorService ; <nl> + import java . util . concurrent . Executors ; <nl> + import java . util . concurrent . Future ; <nl> + <nl> + import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> + import org . apache . cassandra . tools . NodeProbe ; <nl> + <nl> + public class JmxCollector implements Callable < JmxCollector . GcStats > <nl> + { <nl> + <nl> + public static class GcStats <nl> + { <nl> + public final double count ; <nl> + public final double bytes ; <nl> + public final double maxms ; <nl> + public final double summs ; <nl> + public final double sumsqms ; <nl> + public final double sdvms ; <nl> + public GcStats ( double count , double bytes , double maxms , double summs , double sumsqms ) <nl> + { <nl> + this . count = count ; <nl> + this . bytes = bytes ; <nl> + this . maxms = maxms ; <nl> + this . summs = summs ; <nl> + this . sumsqms = sumsqms ; <nl> + double mean = summs / count ; <nl> + double stdev = Math . sqrt ( ( sumsqms / count ) - ( mean * mean ) ) ; <nl> + if ( Double . isNaN ( stdev ) ) <nl> + stdev = 0 ; <nl> + this . sdvms = stdev ; <nl> + } <nl> + public GcStats ( double fill ) <nl> + { <nl> + this ( fill , fill , fill , fill , fill ) ; <nl> + } <nl> + public static GcStats aggregate ( List < GcStats > stats ) <nl> + { <nl> + double count = 0 , bytes = 0 , maxms = 0 , summs = 0 , sumsqms = 0 ; <nl> + for ( GcStats stat : stats ) <nl> + { <nl> + count + = stat . count ; <nl> + bytes + = stat . bytes ; <nl> + maxms + = stat . maxms ; <nl> + summs + = stat . summs ; <nl> + sumsqms + = stat . sumsqms ; <nl> + } <nl> + return new GcStats ( count , bytes , maxms , summs , sumsqms ) ; <nl> + } <nl> + } <nl> + <nl> + final NodeProbe [ ] probes ; <nl> + <nl> + / / TODO : should expand to whole cluster <nl> + public JmxCollector ( List < String > hosts , int port ) <nl> + { <nl> + probes = new NodeProbe [ hosts . size ( ) ] ; <nl> + for ( int i = 0 ; i < hosts . size ( ) ; i + + ) <nl> + probes [ i ] = connect ( hosts . get ( i ) , port ) ; <nl> + } <nl> + <nl> + private static NodeProbe connect ( String host , int port ) <nl> + { <nl> + try <nl> + { <nl> + return new NodeProbe ( host , port ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + public GcStats call ( ) throws Exception <nl> + { <nl> + final List < Future < GcStats > > futures = new ArrayList < > ( ) ; <nl> + for ( final NodeProbe probe : probes ) <nl> + { <nl> + futures . add ( TPE . submit ( new Callable < GcStats > ( ) <nl> + { <nl> + public GcStats call ( ) throws Exception <nl> + { <nl> + final double [ ] stats = probe . getAndResetGCStats ( ) ; <nl> + return new GcStats ( stats [ 5 ] , stats [ 4 ] , stats [ 1 ] , stats [ 2 ] , stats [ 3 ] ) ; <nl> + } <nl> + } ) ) ; <nl> + } <nl> + <nl> + List < GcStats > results = new ArrayList < > ( ) ; <nl> + for ( Future < GcStats > future : futures ) <nl> + results . add ( future . get ( ) ) ; <nl> + return GcStats . aggregate ( results ) ; <nl> + } <nl> + <nl> + private static final ExecutorService TPE = Executors . newFixedThreadPool ( Runtime . getRuntime ( ) . availableProcessors ( ) , new NamedThreadFactory ( " JmxCollector " ) ) ; <nl> + } <nl> diff - - git a / tools / stress / src / org / apache / cassandra / stress / util / Timing . java b / tools / stress / src / org / apache / cassandra / stress / util / Timing . java <nl> index b6d4e52 . . f64a40b 100644 <nl> - - - a / tools / stress / src / org / apache / cassandra / stress / util / Timing . java <nl> + + + b / tools / stress / src / org / apache / cassandra / stress / util / Timing . java <nl> @ @ - 25 , 6 + 25 , 7 @ @ import java . util . ArrayList ; <nl> import java . util . Arrays ; <nl> import java . util . List ; <nl> import java . util . Random ; <nl> + import java . util . concurrent . Callable ; <nl> import java . util . concurrent . CopyOnWriteArrayList ; <nl> import java . util . concurrent . CountDownLatch ; <nl> import java . util . concurrent . TimeUnit ; <nl> @ @ - 44 , 7 + 45 , 18 @ @ public class Timing <nl> <nl> / / TIMING <nl> <nl> - private TimingInterval snapInterval ( Random rnd ) throws InterruptedException <nl> + public static class TimingResult < E > <nl> + { <nl> + public final E extra ; <nl> + public final TimingInterval timing ; <nl> + public TimingResult ( E extra , TimingInterval timing ) <nl> + { <nl> + this . extra = extra ; <nl> + this . timing = timing ; <nl> + } <nl> + } <nl> + <nl> + private < E > TimingResult < E > snap ( Random rnd , Callable < E > call ) throws InterruptedException <nl> { <nl> final Timer [ ] timers = this . timers . toArray ( new Timer [ 0 ] ) ; <nl> final CountDownLatch ready = new CountDownLatch ( timers . length ) ; <nl> @ @ - 54 , 8 + 66 , 18 @ @ public class Timing <nl> timer . requestReport ( ready ) ; <nl> } <nl> <nl> + E extra ; <nl> + try <nl> + { <nl> + extra = call . call ( ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + <nl> / / TODO fail gracefully after timeout if a thread is stuck <nl> - if ( ! ready . await ( 2L , TimeUnit . MINUTES ) ) <nl> + if ( ! ready . await ( 5L , TimeUnit . MINUTES ) ) <nl> throw new RuntimeException ( " Timed out waiting for a timer thread - seems one got stuck " ) ; <nl> <nl> boolean done = true ; <nl> @ @ - 68 , 7 + 90 , 7 @ @ public class Timing <nl> } <nl> <nl> this . done = done ; <nl> - return TimingInterval . merge ( rnd , intervals , Integer . MAX _ VALUE , history . endNanos ( ) ) ; <nl> + return new TimingResult < > ( extra , TimingInterval . merge ( rnd , intervals , Integer . MAX _ VALUE , history . endNanos ( ) ) ) ; <nl> } <nl> <nl> / / build a new timer and add it to the set of running timers <nl> @ @ - 89 , 11 + 111 , 11 @ @ public class Timing <nl> return done ; <nl> } <nl> <nl> - public TimingInterval snapInterval ( ) throws InterruptedException <nl> + public < E > TimingResult < E > snap ( Callable < E > call ) throws InterruptedException <nl> { <nl> - final TimingInterval interval = snapInterval ( rnd ) ; <nl> - history = TimingInterval . merge ( rnd , Arrays . asList ( interval , history ) , 200000 , history . startNanos ( ) ) ; <nl> - return interval ; <nl> + final TimingResult < E > result = snap ( rnd , call ) ; <nl> + history = TimingInterval . merge ( rnd , Arrays . asList ( result . timing , history ) , 200000 , history . startNanos ( ) ) ; <nl> + return result ; <nl> } <nl> <nl> public TimingInterval getHistory ( )
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java b / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java <nl> index 6077e38 . . 84b91e9 100644 <nl> - - - a / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java <nl> + + + b / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java <nl> @ @ - 62 , 7 + 62 , 7 @ @ public class RangeSliceResponseResolver implements IResponseResolver < Iterable < Ro <nl> return reply . rows ; <nl> } <nl> <nl> - / / Note : this deserializes the response a 2nd time if getData was called first <nl> + / / Note : this would deserialize the response a 2nd time if getData was called first . <nl> / / ( this is not currently an issue since we don ' t do read repair for range queries . ) <nl> public Iterable < Row > resolve ( ) throws IOException <nl> { <nl> @ @ - 73 , 7 + 73 , 7 @ @ public class RangeSliceResponseResolver implements IResponseResolver < Iterable < Ro <nl> return o1 . left . key . compareTo ( o2 . left . key ) ; <nl> } <nl> } ) ; <nl> - <nl> + <nl> int n = 0 ; <nl> for ( Message response : responses ) <nl> { <nl> @ @ - 83 , 7 + 83 , 6 @ @ public class RangeSliceResponseResolver implements IResponseResolver < Iterable < Ro <nl> } <nl> <nl> / / for each row , compute the combination of all different versions seen , and repair incomplete versions <nl> - <nl> return new ReducingIterator < Pair < Row , InetAddress > , Row > ( collator ) <nl> { <nl> List < ColumnFamily > versions = new ArrayList < ColumnFamily > ( sources . size ( ) ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 6e029ab . . 4c39f5c 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 1 
+ + * GCInspector more closely tracks GC ; cassandra - stress and nodetool report it 
+ * nodetool won ' t output bogus ownership info without a keyspace ( CASSANDRA - 7173 ) 
+ * Add human readable option to nodetool commands ( CASSANDRA - 5433 ) 
+ * Don ' t try to set repairedAt on old sstables ( CASSANDRA - 7913 ) 
+ diff - - git a / src / java / org / apache / cassandra / service / GCInspector . java b / src / java / org / apache / cassandra / service / GCInspector . java 
+ index d04b250 . . c4bffac 100644 
+ - - - a / src / java / org / apache / cassandra / service / GCInspector . java 
+ + + + b / src / java / org / apache / cassandra / service / GCInspector . java 
+ @ @ - 22 , 6 + 22 , 8 @ @ import java . lang . management . MemoryUsage ; 
+ import java . util . ArrayList ; 
+ import java . util . Collections ; 
+ import java . util . List ; 
+ + import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . atomic . AtomicReference ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . Notification ; 
+ import javax . management . NotificationListener ; 
+ @ @ - 35 , 11 + 37 , 55 @ @ import com . sun . management . GarbageCollectionNotificationInfo ; 
+ import org . apache . cassandra . io . sstable . SSTableDeletingTask ; 
+ import org . apache . cassandra . utils . StatusLogger ; 
+ 
+ - public class GCInspector implements NotificationListener 
+ + public class GCInspector implements NotificationListener , GCInspectorMXBean 
+ { 
+ + public static final String MBEAN _ NAME = " org . apache . cassandra . service : type = GCInspector " ; 
+ private static final Logger logger = LoggerFactory . getLogger ( GCInspector . class ) ; 
+ - final static long MIN _ DURATION = 200 ; 
+ - final static long MIN _ DURATION _ TPSTATS = 1000 ; 
+ + final static long MIN _ LOG _ DURATION = 200 ; 
+ + final static long MIN _ LOG _ DURATION _ TPSTATS = 1000 ; 
+ + 
+ + static final class State 
+ + { 
+ + final double maxRealTimeElapsed ; 
+ + final double totalRealTimeElapsed ; 
+ + final double sumSquaresRealTimeElapsed ; 
+ + final double totalBytesReclaimed ; 
+ + final double count ; 
+ + final long startNanos ; 
+ + 
+ + State ( double extraElapsed , double extraBytes , State prev ) 
+ + { 
+ + this . totalRealTimeElapsed = prev . totalRealTimeElapsed + extraElapsed ; 
+ + this . totalBytesReclaimed = prev . totalBytesReclaimed + extraBytes ; 
+ + this . sumSquaresRealTimeElapsed = prev . sumSquaresRealTimeElapsed + ( extraElapsed * extraElapsed ) ; 
+ + this . startNanos = prev . startNanos ; 
+ + this . count = prev . count + 1 ; 
+ + this . maxRealTimeElapsed = Math . max ( prev . maxRealTimeElapsed , extraElapsed ) ; 
+ + } 
+ + 
+ + State ( ) 
+ + { 
+ + count = maxRealTimeElapsed = sumSquaresRealTimeElapsed = totalRealTimeElapsed = totalBytesReclaimed = 0 ; 
+ + startNanos = System . nanoTime ( ) ; 
+ + } 
+ + } 
+ + 
+ + final AtomicReference < State > state = new AtomicReference < > ( new State ( ) ) ; 
+ + 
+ + public GCInspector ( ) 
+ + { 
+ + MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; 
+ + 
+ + try 
+ + { 
+ + mbs . registerMBean ( this , new ObjectName ( MBEAN _ NAME ) ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + 
+ + } 
+ 
+ public static void register ( ) throws Exception 
+ { 
+ @ @ - 66 , 6 + 112 , 7 @ @ public class GCInspector implements NotificationListener 
+ StringBuilder sb = new StringBuilder ( ) ; 
+ sb . append ( info . getGcName ( ) ) . append ( " GC in " ) . append ( duration ) . append ( " ms . " ) ; 
+ 
+ + long bytes = 0 ; 
+ List < String > keys = new ArrayList < > ( info . getGcInfo ( ) . getMemoryUsageBeforeGc ( ) . keySet ( ) ) ; 
+ Collections . sort ( keys ) ; 
+ for ( String key : keys ) 
+ @ @ - 79 , 16 + 126 , 24 @ @ public class GCInspector implements NotificationListener 
+ sb . append ( after . getUsed ( ) ) ; 
+ if ( ! key . equals ( keys . get ( keys . size ( ) - 1 ) ) ) 
+ sb . append ( " ; " ) ; 
+ + bytes + = before . getUsed ( ) - after . getUsed ( ) ; 
+ } 
+ } 
+ 
+ + while ( true ) 
+ + { 
+ + State prev = state . get ( ) ; 
+ + if ( state . compareAndSet ( prev , new State ( duration , bytes , prev ) ) ) 
+ + break ; 
+ + } 
+ + 
+ String st = sb . toString ( ) ; 
+ - if ( duration > MIN _ DURATION ) 
+ + if ( duration > MIN _ LOG _ DURATION ) 
+ logger . info ( st ) ; 
+ else if ( logger . isDebugEnabled ( ) ) 
+ logger . debug ( st ) ; 
+ 
+ - if ( duration > MIN _ DURATION _ TPSTATS ) 
+ + if ( duration > MIN _ LOG _ DURATION _ TPSTATS ) 
+ StatusLogger . log ( ) ; 
+ 
+ / / if we just finished a full collection and we ' re still using a lot of memory , try to reduce the pressure 
+ @ @ - 96 , 4 + 151 , 22 @ @ public class GCInspector implements NotificationListener 
+ SSTableDeletingTask . rescheduleFailedTasks ( ) ; 
+ } 
+ } 
+ + 
+ + public State getTotalSinceLastCheck ( ) 
+ + { 
+ + return state . getAndSet ( new State ( ) ) ; 
+ + } 
+ + 
+ + public double [ ] getAndResetStats ( ) 
+ + { 
+ + State state = getTotalSinceLastCheck ( ) ; 
+ + double [ ] r = new double [ 6 ] ; 
+ + r [ 0 ] = TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - state . startNanos ) ; 
+ + r [ 1 ] = state . maxRealTimeElapsed ; 
+ + r [ 2 ] = state . totalRealTimeElapsed ; 
+ + r [ 3 ] = state . sumSquaresRealTimeElapsed ; 
+ + r [ 4 ] = state . totalBytesReclaimed ; 
+ + r [ 5 ] = state . count ; 
+ + return r ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / GCInspectorMXBean . java b / src / java / org / apache / cassandra / service / GCInspectorMXBean . java 
+ new file mode 100644 
+ index 0000000 . . c26a67c 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / service / GCInspectorMXBean . java 
+ @ @ - 0 , 0 + 1 , 25 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + package org . apache . cassandra . service ; 
+ + 
+ + public interface GCInspectorMXBean 
+ + { 
+ + / / returns { interval ( ms ) , max ( gc real time ( ms ) ) , sum ( gc real time ( ms ) ) , sum ( ( gc real time ( ms ) ) ^ 2 ) , sum ( gc bytes ) , count ( gc ) } 
+ + public double [ ] getAndResetStats ( ) ; 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ index 3f3073d . . 203730a 100644 
+ - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ @ @ - 79 , 6 + 79 , 7 @ @ public class NodeProbe implements AutoCloseable 
+ private CompactionManagerMBean compactionProxy ; 
+ private StorageServiceMBean ssProxy ; 
+ private MemoryMXBean memProxy ; 
+ + private GCInspectorMXBean gcProxy ; 
+ private RuntimeMXBean runtimeProxy ; 
+ private StreamManagerMBean streamProxy ; 
+ public MessagingServiceMBean msProxy ; 
+ @ @ - 169 , 7 + 170 , 10 @ @ public class NodeProbe implements AutoCloseable 
+ spProxy = JMX . newMBeanProxy ( mbeanServerConn , name , StorageProxyMBean . class ) ; 
+ name = new ObjectName ( HintedHandOffManager . MBEAN _ NAME ) ; 
+ hhProxy = JMX . newMBeanProxy ( mbeanServerConn , name , HintedHandOffManagerMBean . class ) ; 
+ - } catch ( MalformedObjectNameException e ) 
+ + name = new ObjectName ( GCInspector . MBEAN _ NAME ) ; 
+ + gcProxy = JMX . newMBeanProxy ( mbeanServerConn , name , GCInspectorMXBean . class ) ; 
+ + } 
+ + catch ( MalformedObjectNameException e ) 
+ { 
+ throw new RuntimeException ( 
+ " Invalid ObjectName ? Please report this as a bug . " , e ) ; 
+ @ @ - 374 , 6 + 378 , 11 @ @ public class NodeProbe implements AutoCloseable 
+ } 
+ } 
+ 
+ + public double [ ] getAndResetGCStats ( ) 
+ + { 
+ + return gcProxy . getAndResetStats ( ) ; 
+ + } 
+ + 
+ public Iterator < Map . Entry < String , ColumnFamilyStoreMBean > > getColumnFamilyStoreMBeanProxies ( ) 
+ { 
+ try 
+ diff - - git a / src / java / org / apache / cassandra / tools / NodeTool . java b / src / java / org / apache / cassandra / tools / NodeTool . java 
+ index e7d1404 . . 731afcc 100644 
+ - - - a / src / java / org / apache / cassandra / tools / NodeTool . java 
+ + + + b / src / java / org / apache / cassandra / tools / NodeTool . java 
+ @ @ - 96 , 6 + 96 , 7 @ @ public class NodeTool 
+ DisableGossip . class , 
+ EnableHandoff . class , 
+ EnableThrift . class , 
+ + GcStats . class , 
+ GetCompactionThreshold . class , 
+ GetCompactionThroughput . class , 
+ GetStreamThroughput . class , 
+ @ @ - 2361 , 6 + 2362 , 20 @ @ public class NodeTool 
+ } 
+ } 
+ 
+ + @ Command ( name = " gcstats " , description = " Print GC Statistics " ) 
+ + public static class GcStats extends NodeTool . NodeToolCmd 
+ + { 
+ + @ Override 
+ + public void execute ( NodeProbe probe ) 
+ + { 
+ + double [ ] stats = probe . getAndResetGCStats ( ) ; 
+ + double mean = stats [ 2 ] / stats [ 5 ] ; 
+ + double stdev = Math . sqrt ( ( stats [ 3 ] / stats [ 5 ] ) - ( mean * mean ) ) ; 
+ + System . out . printf ( " % 20s % 20s % 20s % 20s % 20s % n " , " Interval ( ms ) " , " Max GC Elapsed ( ms ) " , " Total GC Elapsed ( ms ) " , " Stdev GC Elapsed ( ms ) " , " GC Reclaimed ( MB ) " , " Collections " ) ; 
+ + System . out . printf ( " % 20 . 0d % 20 . 0d % 20 . 0d % 20 . 0d % 20 . 0d % n " , stats [ 0 ] , stats [ 1 ] , stats [ 2 ] , stdev , stats [ 4 ] , stats [ 5 ] ) ; 
+ + } 
+ + } 
+ + 
+ @ Command ( name = " truncatehints " , description = " Truncate all hints on the local node , or truncate hints for the endpoint ( s ) specified . " ) 
+ public static class TruncateHints extends NodeToolCmd 
+ { 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / StressAction . java b / tools / stress / src / org / apache / cassandra / stress / StressAction . java 
+ index f697dd9 . . da32284 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / StressAction . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / StressAction . java 
+ @ @ - 182 , 7 + 182 , 7 @ @ public class StressAction implements Runnable 
+ if ( settings . rate . opRateTargetPerSecond > 0 ) 
+ rateLimiter = RateLimiter . create ( settings . rate . opRateTargetPerSecond ) ; 
+ 
+ - final StressMetrics metrics = new StressMetrics ( output , settings . log . intervalMillis ) ; 
+ + final StressMetrics metrics = new StressMetrics ( output , settings . log . intervalMillis , settings ) ; 
+ 
+ final CountDownLatch done = new CountDownLatch ( threadCount ) ; 
+ final Consumer [ ] consumers = new Consumer [ threadCount ] ; 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / StressMetrics . java b / tools / stress / src / org / apache / cassandra / stress / StressMetrics . java 
+ index dd3b867 . . 9e8e961 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / StressMetrics . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / StressMetrics . java 
+ @ @ - 23 , 12 + 23 , 16 @ @ package org . apache . cassandra . stress ; 
+ 
+ import java . io . PrintStream ; 
+ import java . util . List ; 
+ + import java . util . concurrent . Callable ; 
+ import java . util . concurrent . CountDownLatch ; 
+ import java . util . concurrent . ThreadFactory ; 
+ + import java . util . concurrent . TimeUnit ; 
+ 
+ import org . apache . commons . lang3 . time . DurationFormatUtils ; 
+ 
+ import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ + import org . apache . cassandra . stress . settings . StressSettings ; 
+ + import org . apache . cassandra . stress . util . JmxCollector ; 
+ import org . apache . cassandra . stress . util . Timing ; 
+ import org . apache . cassandra . stress . util . TimingInterval ; 
+ import org . apache . cassandra . stress . util . Uncertainty ; 
+ @ @ - 45 , 10 + 49 , 33 @ @ public class StressMetrics 
+ private final Uncertainty rowRateUncertainty = new Uncertainty ( ) ; 
+ private final CountDownLatch stopped = new CountDownLatch ( 1 ) ; 
+ private final Timing timing = new Timing ( ) ; 
+ + private final Callable < JmxCollector . GcStats > gcStatsCollector ; 
+ + private volatile JmxCollector . GcStats totalGcStats ; 
+ 
+ - public StressMetrics ( PrintStream output , final long logIntervalMillis ) 
+ + public StressMetrics ( PrintStream output , final long logIntervalMillis , StressSettings settings ) 
+ { 
+ this . output = output ; 
+ + Callable < JmxCollector . GcStats > gcStatsCollector ; 
+ + try 
+ + { 
+ + gcStatsCollector = new JmxCollector ( settings . node . nodes , settings . port . jmxPort ) ; 
+ + totalGcStats = new JmxCollector . GcStats ( 0 ) ; 
+ + } 
+ + catch ( Throwable t ) 
+ + { 
+ + t . printStackTrace ( ) ; 
+ + System . err . println ( " Failed to connect over JMX ; not collecting these stats " ) ; 
+ + totalGcStats = new JmxCollector . GcStats ( Double . POSITIVE _ INFINITY ) ; 
+ + gcStatsCollector = new Callable < JmxCollector . GcStats > ( ) 
+ + { 
+ + public JmxCollector . GcStats call ( ) throws Exception 
+ + { 
+ + return totalGcStats ; 
+ + } 
+ + } ; 
+ + } 
+ + this . gcStatsCollector = gcStatsCollector ; 
+ + 
+ printHeader ( " " , output ) ; 
+ thread = tf . newThread ( new Runnable ( ) 
+ { 
+ @ @ - 121 , 10 + 148 , 10 @ @ public class StressMetrics 
+ 
+ private void update ( ) throws InterruptedException 
+ { 
+ - TimingInterval interval = timing . snapInterval ( ) ; 
+ - if ( interval . partitionCount ! = 0 ) 
+ - printRow ( " " , interval , timing . getHistory ( ) , rowRateUncertainty , output ) ; 
+ - rowRateUncertainty . update ( interval . adjustedRowRate ( ) ) ; 
+ + Timing . TimingResult < JmxCollector . GcStats > result = timing . snap ( gcStatsCollector ) ; 
+ + if ( result . timing . partitionCount ! = 0 ) 
+ + printRow ( " " , result . timing , timing . getHistory ( ) , result . extra , rowRateUncertainty , output ) ; 
+ + rowRateUncertainty . update ( result . timing . adjustedRowRate ( ) ) ; 
+ if ( timing . done ( ) ) 
+ stop = true ; 
+ } 
+ @ @ - 132 , 15 + 159 , 15 @ @ public class StressMetrics 
+ 
+ / / PRINT FORMATTING 
+ 
+ - public static final String HEADFORMAT = " % - 10s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 7s , % 9s " ; 
+ - public static final String ROWFORMAT = " % - 10d , % 8 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 7 . 1f , % 9 . 5f " ; 
+ + public static final String HEADFORMAT = " % - 10s , % 10s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 8s , % 7s , % 9s , % 7s , % 8s , % 8s , % 8s , % 8s " ; 
+ + public static final String ROWFORMAT = " % - 10d , % 10 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 8 . 1f , % 7 . 1f , % 9 . 5f , % 7 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 0f , % 8 . 0f " ; 
+ 
+ private static void printHeader ( String prefix , PrintStream output ) 
+ { 
+ - output . println ( prefix + String . format ( HEADFORMAT , " total ops " , " adj row / s " , " op / s " , " pk / s " , " row / s " , " mean " , " med " , " . 95 " , " . 99 " , " . 999 " , " max " , " time " , " stderr " ) ) ; 
+ + output . println ( prefix + String . format ( HEADFORMAT , " total ops " , " adj row / s " , " op / s " , " pk / s " , " row / s " , " mean " , " med " , " . 95 " , " . 99 " , " . 999 " , " max " , " time " , " stderr " , " gc : # " , " max ms " , " sum ms " , " sdv ms " , " mb " ) ) ; 
+ } 
+ 
+ - private static void printRow ( String prefix , TimingInterval interval , TimingInterval total , Uncertainty opRateUncertainty , PrintStream output ) 
+ + private static void printRow ( String prefix , TimingInterval interval , TimingInterval total , JmxCollector . GcStats gcStats , Uncertainty opRateUncertainty , PrintStream output ) 
+ { 
+ output . println ( prefix + String . format ( ROWFORMAT , 
+ total . operationCount , 
+ @ @ - 155 , 7 + 182 , 13 @ @ public class StressMetrics 
+ interval . rankLatency ( 0 . 999f ) , 
+ interval . maxLatency ( ) , 
+ total . runTime ( ) / 1000f , 
+ - opRateUncertainty . getUncertainty ( ) ) ) ; 
+ + opRateUncertainty . getUncertainty ( ) , 
+ + gcStats . count , 
+ + gcStats . maxms , 
+ + gcStats . summs , 
+ + gcStats . sdvms , 
+ + gcStats . bytes / ( 1 < < 20 ) 
+ + ) ) ; 
+ } 
+ 
+ public void summarise ( ) 
+ @ @ - 172 , 11 + 205 , 16 @ @ public class StressMetrics 
+ output . println ( String . format ( " latency 99th percentile : % . 1f " , history . rankLatency ( 0 . 99f ) ) ) ; 
+ output . println ( String . format ( " latency 99 . 9th percentile : % . 1f " , history . rankLatency ( 0 . 999f ) ) ) ; 
+ output . println ( String . format ( " latency max : % . 1f " , history . maxLatency ( ) ) ) ; 
+ + output . println ( String . format ( " total gc count : % . 0f " , totalGcStats . count ) ) ; 
+ + output . println ( String . format ( " total gc mb : % . 0f " , totalGcStats . bytes / ( 1 < < 20 ) ) ) ; 
+ + output . println ( String . format ( " total gc time ( s ) : % . 0f " , totalGcStats . summs / 1000 ) ) ; 
+ + output . println ( String . format ( " avg gc time ( ms ) : % . 0f " , totalGcStats . summs / totalGcStats . count ) ) ; 
+ + output . println ( String . format ( " stdev gc time ( ms ) : % . 0f " , totalGcStats . sdvms ) ) ; 
+ output . println ( " Total operation time : " + DurationFormatUtils . formatDuration ( 
+ history . runTime ( ) , " HH : mm : ss " , true ) ) ; 
+ } 
+ 
+ - public static final void summarise ( List < String > ids , List < StressMetrics > summarise , PrintStream out ) 
+ + public static void summarise ( List < String > ids , List < StressMetrics > summarise , PrintStream out ) 
+ { 
+ int idLen = 0 ; 
+ for ( String id : ids ) 
+ @ @ - 187 , 6 + 225 , 7 @ @ public class StressMetrics 
+ printRow ( String . format ( formatstr , ids . get ( i ) ) , 
+ summarise . get ( i ) . timing . getHistory ( ) , 
+ summarise . get ( i ) . timing . getHistory ( ) , 
+ + summarise . get ( i ) . totalGcStats , 
+ summarise . get ( i ) . rowRateUncertainty , 
+ out 
+ ) ; 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / settings / SettingsPort . java b / tools / stress / src / org / apache / cassandra / stress / settings / SettingsPort . java 
+ index 6f12f99 . . 1e10e37 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / settings / SettingsPort . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / settings / SettingsPort . java 
+ @ @ - 31 , 11 + 31 , 13 @ @ public class SettingsPort implements Serializable 
+ 
+ public final int nativePort ; 
+ public final int thriftPort ; 
+ + public final int jmxPort ; 
+ 
+ public SettingsPort ( PortOptions options ) 
+ { 
+ nativePort = Integer . parseInt ( options . nativePort . value ( ) ) ; 
+ thriftPort = Integer . parseInt ( options . thriftPort . value ( ) ) ; 
+ + jmxPort = Integer . parseInt ( options . jmxPort . value ( ) ) ; 
+ } 
+ 
+ / / Option Declarations 
+ @ @ - 44 , 6 + 46 , 7 @ @ public class SettingsPort implements Serializable 
+ { 
+ final OptionSimple nativePort = new OptionSimple ( " native = " , " [ 0 - 9 ] + " , " 9042 " , " Use this port for the Cassandra native protocol " , false ) ; 
+ final OptionSimple thriftPort = new OptionSimple ( " thrift = " , " [ 0 - 9 ] + " , " 9160 " , " Use this port for the thrift protocol " , false ) ; 
+ + final OptionSimple jmxPort = new OptionSimple ( " jmx = " , " [ 0 - 9 ] + " , " 7199 " , " Use this port for retrieving statistics over jmx " , false ) ; 
+ 
+ @ Override 
+ public List < ? extends Option > options ( ) 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / util / JmxCollector . java b / tools / stress / src / org / apache / cassandra / stress / util / JmxCollector . java 
+ new file mode 100644 
+ index 0000000 . . 9611b2a 
+ - - - / dev / null 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / util / JmxCollector . java 
+ @ @ - 0 , 0 + 1 , 119 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + package org . apache . cassandra . stress . util ; 
+ + 
+ + import java . io . IOException ; 
+ + import java . util . ArrayList ; 
+ + import java . util . List ; 
+ + import java . util . concurrent . Callable ; 
+ + import java . util . concurrent . ExecutorService ; 
+ + import java . util . concurrent . Executors ; 
+ + import java . util . concurrent . Future ; 
+ + 
+ + import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ + import org . apache . cassandra . tools . NodeProbe ; 
+ + 
+ + public class JmxCollector implements Callable < JmxCollector . GcStats > 
+ + { 
+ + 
+ + public static class GcStats 
+ + { 
+ + public final double count ; 
+ + public final double bytes ; 
+ + public final double maxms ; 
+ + public final double summs ; 
+ + public final double sumsqms ; 
+ + public final double sdvms ; 
+ + public GcStats ( double count , double bytes , double maxms , double summs , double sumsqms ) 
+ + { 
+ + this . count = count ; 
+ + this . bytes = bytes ; 
+ + this . maxms = maxms ; 
+ + this . summs = summs ; 
+ + this . sumsqms = sumsqms ; 
+ + double mean = summs / count ; 
+ + double stdev = Math . sqrt ( ( sumsqms / count ) - ( mean * mean ) ) ; 
+ + if ( Double . isNaN ( stdev ) ) 
+ + stdev = 0 ; 
+ + this . sdvms = stdev ; 
+ + } 
+ + public GcStats ( double fill ) 
+ + { 
+ + this ( fill , fill , fill , fill , fill ) ; 
+ + } 
+ + public static GcStats aggregate ( List < GcStats > stats ) 
+ + { 
+ + double count = 0 , bytes = 0 , maxms = 0 , summs = 0 , sumsqms = 0 ; 
+ + for ( GcStats stat : stats ) 
+ + { 
+ + count + = stat . count ; 
+ + bytes + = stat . bytes ; 
+ + maxms + = stat . maxms ; 
+ + summs + = stat . summs ; 
+ + sumsqms + = stat . sumsqms ; 
+ + } 
+ + return new GcStats ( count , bytes , maxms , summs , sumsqms ) ; 
+ + } 
+ + } 
+ + 
+ + final NodeProbe [ ] probes ; 
+ + 
+ + / / TODO : should expand to whole cluster 
+ + public JmxCollector ( List < String > hosts , int port ) 
+ + { 
+ + probes = new NodeProbe [ hosts . size ( ) ] ; 
+ + for ( int i = 0 ; i < hosts . size ( ) ; i + + ) 
+ + probes [ i ] = connect ( hosts . get ( i ) , port ) ; 
+ + } 
+ + 
+ + private static NodeProbe connect ( String host , int port ) 
+ + { 
+ + try 
+ + { 
+ + return new NodeProbe ( host , port ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + public GcStats call ( ) throws Exception 
+ + { 
+ + final List < Future < GcStats > > futures = new ArrayList < > ( ) ; 
+ + for ( final NodeProbe probe : probes ) 
+ + { 
+ + futures . add ( TPE . submit ( new Callable < GcStats > ( ) 
+ + { 
+ + public GcStats call ( ) throws Exception 
+ + { 
+ + final double [ ] stats = probe . getAndResetGCStats ( ) ; 
+ + return new GcStats ( stats [ 5 ] , stats [ 4 ] , stats [ 1 ] , stats [ 2 ] , stats [ 3 ] ) ; 
+ + } 
+ + } ) ) ; 
+ + } 
+ + 
+ + List < GcStats > results = new ArrayList < > ( ) ; 
+ + for ( Future < GcStats > future : futures ) 
+ + results . add ( future . get ( ) ) ; 
+ + return GcStats . aggregate ( results ) ; 
+ + } 
+ + 
+ + private static final ExecutorService TPE = Executors . newFixedThreadPool ( Runtime . getRuntime ( ) . availableProcessors ( ) , new NamedThreadFactory ( " JmxCollector " ) ) ; 
+ + } 
+ diff - - git a / tools / stress / src / org / apache / cassandra / stress / util / Timing . java b / tools / stress / src / org / apache / cassandra / stress / util / Timing . java 
+ index b6d4e52 . . f64a40b 100644 
+ - - - a / tools / stress / src / org / apache / cassandra / stress / util / Timing . java 
+ + + + b / tools / stress / src / org / apache / cassandra / stress / util / Timing . java 
+ @ @ - 25 , 6 + 25 , 7 @ @ import java . util . ArrayList ; 
+ import java . util . Arrays ; 
+ import java . util . List ; 
+ import java . util . Random ; 
+ + import java . util . concurrent . Callable ; 
+ import java . util . concurrent . CopyOnWriteArrayList ; 
+ import java . util . concurrent . CountDownLatch ; 
+ import java . util . concurrent . TimeUnit ; 
+ @ @ - 44 , 7 + 45 , 18 @ @ public class Timing 
+ 
+ / / TIMING 
+ 
+ - private TimingInterval snapInterval ( Random rnd ) throws InterruptedException 
+ + public static class TimingResult < E > 
+ + { 
+ + public final E extra ; 
+ + public final TimingInterval timing ; 
+ + public TimingResult ( E extra , TimingInterval timing ) 
+ + { 
+ + this . extra = extra ; 
+ + this . timing = timing ; 
+ + } 
+ + } 
+ + 
+ + private < E > TimingResult < E > snap ( Random rnd , Callable < E > call ) throws InterruptedException 
+ { 
+ final Timer [ ] timers = this . timers . toArray ( new Timer [ 0 ] ) ; 
+ final CountDownLatch ready = new CountDownLatch ( timers . length ) ; 
+ @ @ - 54 , 8 + 66 , 18 @ @ public class Timing 
+ timer . requestReport ( ready ) ; 
+ } 
+ 
+ + E extra ; 
+ + try 
+ + { 
+ + extra = call . call ( ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + 
+ / / TODO fail gracefully after timeout if a thread is stuck 
+ - if ( ! ready . await ( 2L , TimeUnit . MINUTES ) ) 
+ + if ( ! ready . await ( 5L , TimeUnit . MINUTES ) ) 
+ throw new RuntimeException ( " Timed out waiting for a timer thread - seems one got stuck " ) ; 
+ 
+ boolean done = true ; 
+ @ @ - 68 , 7 + 90 , 7 @ @ public class Timing 
+ } 
+ 
+ this . done = done ; 
+ - return TimingInterval . merge ( rnd , intervals , Integer . MAX _ VALUE , history . endNanos ( ) ) ; 
+ + return new TimingResult < > ( extra , TimingInterval . merge ( rnd , intervals , Integer . MAX _ VALUE , history . endNanos ( ) ) ) ; 
+ } 
+ 
+ / / build a new timer and add it to the set of running timers 
+ @ @ - 89 , 11 + 111 , 11 @ @ public class Timing 
+ return done ; 
+ } 
+ 
+ - public TimingInterval snapInterval ( ) throws InterruptedException 
+ + public < E > TimingResult < E > snap ( Callable < E > call ) throws InterruptedException 
+ { 
+ - final TimingInterval interval = snapInterval ( rnd ) ; 
+ - history = TimingInterval . merge ( rnd , Arrays . asList ( interval , history ) , 200000 , history . startNanos ( ) ) ; 
+ - return interval ; 
+ + final TimingResult < E > result = snap ( rnd , call ) ; 
+ + history = TimingInterval . merge ( rnd , Arrays . asList ( result . timing , history ) , 200000 , history . startNanos ( ) ) ; 
+ + return result ; 
+ } 
+ 
+ public TimingInterval getHistory ( )
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java b / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java 
+ index 6077e38 . . 84b91e9 100644 
+ - - - a / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java 
+ + + + b / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java 
+ @ @ - 62 , 7 + 62 , 7 @ @ public class RangeSliceResponseResolver implements IResponseResolver < Iterable < Ro 
+ return reply . rows ; 
+ } 
+ 
+ - / / Note : this deserializes the response a 2nd time if getData was called first 
+ + / / Note : this would deserialize the response a 2nd time if getData was called first . 
+ / / ( this is not currently an issue since we don ' t do read repair for range queries . ) 
+ public Iterable < Row > resolve ( ) throws IOException 
+ { 
+ @ @ - 73 , 7 + 73 , 7 @ @ public class RangeSliceResponseResolver implements IResponseResolver < Iterable < Ro 
+ return o1 . left . key . compareTo ( o2 . left . key ) ; 
+ } 
+ } ) ; 
+ - 
+ + 
+ int n = 0 ; 
+ for ( Message response : responses ) 
+ { 
+ @ @ - 83 , 7 + 83 , 6 @ @ public class RangeSliceResponseResolver implements IResponseResolver < Iterable < Ro 
+ } 
+ 
+ / / for each row , compute the combination of all different versions seen , and repair incomplete versions 
+ - 
+ return new ReducingIterator < Pair < Row , InetAddress > , Row > ( collator ) 
+ { 
+ List < ColumnFamily > versions = new ArrayList < ColumnFamily > ( sources . size ( ) ) ;

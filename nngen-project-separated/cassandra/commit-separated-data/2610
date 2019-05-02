@@ -1,0 +1,622 @@
+BLEU SCORE: 0.02133165846478451
+
+TEST MSG: Improve MeteredFlusher handling of MF - unaffected column families
+GENERATED MSG: Tuning knobs for dealing with large blobs and many CFs
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 373544c . . 00b98fa 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 29 , 6 + 29 , 8 @ @ <nl> * Static columns with IF NOT EXISTS don ' t always work as expected ( CASSANDRA - 6873 ) <nl> * Fix paging with SELECT DISTINCT ( CASSANDRA - 6857 ) <nl> * Fix UnsupportedOperationException on CAS timeout ( CASSANDRA - 6923 ) <nl> + * Improve MeteredFlusher handling of MF - unaffected column families <nl> + ( CASSANDRA - 6867 ) <nl> Merged from 1 . 2 : <nl> * Add UNLOGGED , COUNTER options to BATCH documentation ( CASSANDRA - 6816 ) <nl> * add extra SSL cipher suites ( CASSANDRA - 6613 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / MeteredFlusher . java b / src / java / org / apache / cassandra / db / MeteredFlusher . java <nl> index 5c71fc6 . . 4f06bc6 100644 <nl> - - - a / src / java / org / apache / cassandra / db / MeteredFlusher . java <nl> + + + b / src / java / org / apache / cassandra / db / MeteredFlusher . java <nl> @ @ - 22 , 7 + 22 , 6 @ @ import java . util . Collections ; <nl> import java . util . Comparator ; <nl> import java . util . List ; <nl> <nl> - import com . google . common . collect . Iterables ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 34 , 97 + 33 , 102 @ @ public class MeteredFlusher implements Runnable <nl> <nl> public void run ( ) <nl> { <nl> - long totalMemtableBytesAllowed = DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L ; <nl> - <nl> - / / first , find how much memory non - active memtables are using <nl> - ColumnFamilyStore measuredCfs = Memtable . activelyMeasuring ; <nl> - long flushingBytes = measuredCfs = = null ? 0 : measuredCfs . getMemtableThreadSafe ( ) . getLiveSize ( ) ; <nl> - flushingBytes + = countFlushingBytes ( ) ; <nl> - if ( flushingBytes > 0 ) <nl> - logger . debug ( " Currently flushing { } bytes of { } max " , flushingBytes , totalMemtableBytesAllowed ) ; <nl> - <nl> - / / next , flush CFs using more than 1 / ( maximum number of memtables it could have in the pipeline ) <nl> - / / of the total size allotted . Then , flush other CFs in order of size if necessary . <nl> - long liveBytes = 0 ; <nl> - try <nl> - { <nl> - long totalMemtableBytesUnused = totalMemtableBytesAllowed - flushingBytes ; <nl> - for ( ColumnFamilyStore cfs : ColumnFamilyStore . all ( ) ) <nl> - { <nl> - long size = cfs . getTotalMemtableLiveSize ( ) ; <nl> - int maxInFlight = ( int ) Math . ceil ( ( double ) ( 1 / / live memtable <nl> - + 1 / / potentially a flushed memtable being counted by jamm <nl> - + DatabaseDescriptor . getFlushWriters ( ) <nl> - + DatabaseDescriptor . getFlushQueueSize ( ) ) <nl> - / ( 1 + cfs . indexManager . getIndexesBackedByCfs ( ) . size ( ) ) ) ; <nl> - if ( cfs . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) & & totalMemtableBytesUnused > 0 & & size > totalMemtableBytesUnused / maxInFlight ) <nl> - { <nl> - logger . info ( " flushing high - traffic column family { } ( estimated { } bytes ) " , cfs , size ) ; <nl> - cfs . forceFlush ( ) ; <nl> - } <nl> - else <nl> - { <nl> - liveBytes + = size ; <nl> - } <nl> - } <nl> + long allowedSize = calculateAllowedSize ( ) ; <nl> <nl> - if ( flushingBytes + liveBytes < = totalMemtableBytesAllowed ) <nl> - return ; <nl> + / / find how much memory non - active memtables are using <nl> + long flushingSize = calculateFlushingSize ( ) ; <nl> + if ( flushingSize > 0 ) <nl> + logger . debug ( " Currently flushing { } bytes of { } max " , flushingSize , allowedSize ) ; <nl> <nl> - logger . info ( " estimated { } live and { } flushing bytes used by all memtables " , liveBytes , flushingBytes ) ; <nl> + List < ColumnFamilyStore > affectedCFs = affectedColumnFamilies ( ) ; <nl> + long liveSize = 0 ; <nl> <nl> - / / sort memtables by size <nl> - List < ColumnFamilyStore > sorted = new ArrayList < ColumnFamilyStore > ( ) ; <nl> - Iterables . addAll ( sorted , ColumnFamilyStore . all ( ) ) ; <nl> - Collections . sort ( sorted , new Comparator < ColumnFamilyStore > ( ) <nl> + / / flush CFs using more than 1 / ( maximum number of memtables it could have in the pipeline ) <nl> + / / of the total size allotted . Then , flush other CFs in order of size if necessary . <nl> + for ( ColumnFamilyStore cfs : affectedCFs ) <nl> + { <nl> + int maxInFlight = ( int ) Math . ceil ( ( double ) ( 1 / / live memtable <nl> + + 1 / / potentially a flushed memtable being counted by jamm <nl> + + DatabaseDescriptor . getFlushWriters ( ) <nl> + + DatabaseDescriptor . getFlushQueueSize ( ) ) <nl> + / ( 1 + cfs . indexManager . getIndexesBackedByCfs ( ) . size ( ) ) ) ; <nl> + long size = cfs . getTotalMemtableLiveSize ( ) ; <nl> + if ( allowedSize > flushingSize & & size > ( allowedSize - flushingSize ) / maxInFlight ) <nl> { <nl> - public int compare ( ColumnFamilyStore o1 , ColumnFamilyStore o2 ) <nl> - { <nl> - long size1 = o1 . getTotalMemtableLiveSize ( ) ; <nl> - long size2 = o2 . getTotalMemtableLiveSize ( ) ; <nl> - if ( size1 < size2 ) <nl> - return - 1 ; <nl> - if ( size1 > size2 ) <nl> - return 1 ; <nl> - return 0 ; <nl> - } <nl> - } ) ; <nl> - <nl> - / / flush largest first until we get below our threshold . <nl> - / / although it looks like liveBytes + flushingBytes will stay a constant , it will not if flushes finish <nl> - / / while we loop , which is especially likely to happen if the flush queue fills up ( so further forceFlush calls block ) <nl> - while ( ! sorted . isEmpty ( ) ) <nl> + logger . info ( " flushing high - traffic column family { } ( estimated { } bytes ) " , cfs , size ) ; <nl> + cfs . forceFlush ( ) ; <nl> + } <nl> + else <nl> { <nl> - flushingBytes = countFlushingBytes ( ) ; <nl> - if ( liveBytes + flushingBytes < = totalMemtableBytesAllowed ) <nl> - break ; <nl> - <nl> - ColumnFamilyStore cfs = sorted . remove ( sorted . size ( ) - 1 ) ; <nl> - if ( cfs . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) ) <nl> - { <nl> - long size = cfs . getTotalMemtableLiveSize ( ) ; <nl> - if ( size = = 0 ) <nl> - break ; <nl> - logger . info ( " flushing { } to free up { } bytes " , cfs , size ) ; <nl> - liveBytes - = size ; <nl> - cfs . forceFlush ( ) ; <nl> - } <nl> + liveSize + = size ; <nl> } <nl> } <nl> - finally <nl> + <nl> + if ( liveSize + flushingSize < = allowedSize ) <nl> + return ; <nl> + logger . info ( " estimated { } live and { } flushing bytes used by all memtables " , liveSize , flushingSize ) ; <nl> + <nl> + Collections . sort ( affectedCFs , new Comparator < ColumnFamilyStore > ( ) <nl> { <nl> - logger . trace ( " memtable memory usage is { } bytes with { } live " , liveBytes + flushingBytes , liveBytes ) ; <nl> + public int compare ( ColumnFamilyStore lhs , ColumnFamilyStore rhs ) <nl> + { <nl> + return Long . compare ( lhs . getTotalMemtableLiveSize ( ) , rhs . getTotalMemtableLiveSize ( ) ) ; <nl> + } <nl> + } ) ; <nl> + <nl> + / / flush largest first until we get below our threshold . <nl> + / / although it looks like liveSize + flushingSize will stay a constant , it will not if flushes finish <nl> + / / while we loop , which is especially likely to happen if the flush queue fills up ( so further forceFlush calls block ) <nl> + while ( ! affectedCFs . isEmpty ( ) ) <nl> + { <nl> + flushingSize = calculateFlushingSize ( ) ; <nl> + if ( liveSize + flushingSize < = allowedSize ) <nl> + break ; <nl> + <nl> + ColumnFamilyStore cfs = affectedCFs . remove ( affectedCFs . size ( ) - 1 ) ; <nl> + long size = cfs . getTotalMemtableLiveSize ( ) ; <nl> + if ( size > 0 ) <nl> + { <nl> + logger . info ( " flushing { } to free up { } bytes " , cfs , size ) ; <nl> + liveSize - = size ; <nl> + cfs . forceFlush ( ) ; <nl> + } <nl> } <nl> + <nl> + logger . trace ( " memtable memory usage is { } bytes with { } live " , liveSize + flushingSize , liveSize ) ; <nl> } <nl> <nl> - private long countFlushingBytes ( ) <nl> + private static List < ColumnFamilyStore > affectedColumnFamilies ( ) <nl> { <nl> - long flushingBytes = 0 ; <nl> + List < ColumnFamilyStore > affected = new ArrayList < > ( ) ; <nl> + / / filter out column families that aren ' t affected by MeteredFlusher <nl> for ( ColumnFamilyStore cfs : ColumnFamilyStore . all ( ) ) <nl> - { <nl> - for ( Memtable memtable : cfs . getMemtablesPendingFlush ( ) ) <nl> - flushingBytes + = memtable . getLiveSize ( ) ; <nl> - } <nl> - return flushingBytes ; <nl> + if ( cfs . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) ) <nl> + affected . add ( cfs ) ; <nl> + return affected ; <nl> + } <nl> + <nl> + private static long calculateAllowedSize ( ) <nl> + { <nl> + long allowed = DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L ; <nl> + / / deduct the combined memory limit of the tables unaffected by the metered flusher ( we don ' t flush them , we <nl> + / / should not count their limits to the total limit either ) . <nl> + for ( ColumnFamilyStore cfs : ColumnFamilyStore . all ( ) ) <nl> + if ( ! cfs . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) ) <nl> + allowed - = cfs . getCompactionStrategy ( ) . getMemtableReservedSize ( ) ; <nl> + return allowed ; <nl> + } <nl> + <nl> + private static long calculateFlushingSize ( ) <nl> + { <nl> + ColumnFamilyStore measuredCFS = Memtable . activelyMeasuring ; <nl> + long flushing = measuredCFS ! = null & & measuredCFS . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) <nl> + ? measuredCFS . getMemtableThreadSafe ( ) . getLiveSize ( ) <nl> + : 0 ; <nl> + for ( ColumnFamilyStore cfs : ColumnFamilyStore . all ( ) ) <nl> + if ( cfs . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) ) <nl> + for ( Memtable memtable : cfs . getMemtablesPendingFlush ( ) ) <nl> + flushing + = memtable . getLiveSize ( ) ; <nl> + return flushing ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / AbstractCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / AbstractCompactionStrategy . java <nl> index 164cfda . . 5425683 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / AbstractCompactionStrategy . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / AbstractCompactionStrategy . java <nl> @ @ - 201 , 6 + 201 , 16 @ @ public abstract class AbstractCompactionStrategy <nl> } <nl> <nl> / * * <nl> + * If not affected by MeteredFlusher ( and handling flushing on its own ) , override to tell MF how much <nl> + * space to reserve for this CF , i . e . , how much space to subtract from ` memtable _ total _ space _ in _ mb ` when deciding <nl> + * if other memtables should be flushed or not . <nl> + * / <nl> + public long getMemtableReservedSize ( ) <nl> + { <nl> + return 0 ; <nl> + } <nl> + <nl> + / * * <nl> * Handle a flushed memtable . <nl> * <nl> * @ param memtable the flushed memtable
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index f48fb5c . . 2192fe9 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 20 , 7 + 20 , 8 @ @ <nl> * Fix potential AssertionError during tracing ( CASSANDRA - 6041 ) <nl> * Fix NPE in sstablesplit ( CASSANDRA - 6027 ) <nl> Merged from 1 . 2 : <nl> - 1 . 2 . 10 <nl> + * Tuning knobs for dealing with large blobs and many CFs ( CASSANDRA - 5982 ) <nl> + * ( Hadoop ) Fix CQLRW for thrift tables ( CASSANDRA - 6002 ) <nl> * Fix possible divide - by - zero in HHOM ( CASSANDRA - 5990 ) <nl> * Allow local batchlog writes for CL . ANY ( CASSANDRA - 5967 ) <nl> * Optimize name query performance in wide rows ( CASSANDRA - 5966 ) <nl> diff - - git a / conf / cassandra . yaml b / conf / cassandra . yaml <nl> index aef3e60 . . 4decf6c 100644 <nl> - - - a / conf / cassandra . yaml <nl> + + + b / conf / cassandra . yaml <nl> @ @ - 194 , 9 + 194 , 13 @ @ saved _ caches _ directory : / var / lib / cassandra / saved _ caches <nl> # <nl> # the other option is " periodic " where writes may be acked immediately <nl> # and the CommitLog is simply synced every commitlog _ sync _ period _ in _ ms <nl> - # milliseconds . <nl> + # milliseconds . By default this allows 1024 * ( CPU cores ) pending <nl> + # entries on the commitlog queue . If you are writing very large blobs , <nl> + # you should reduce that ; 16 * cores works reasonably well for 1MB blobs . <nl> + # It should be at least as large as the concurrent _ writes setting . <nl> commitlog _ sync : periodic <nl> commitlog _ sync _ period _ in _ ms : 10000 <nl> + # commitlog _ periodic _ queue _ size : <nl> <nl> # The size of the individual commitlog file segments . A commitlog <nl> # segment may be archived , deleted , or recycled once all the data <nl> diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java <nl> index 99fd833 . . dd0728c 100644 <nl> - - - a / src / java / org / apache / cassandra / config / Config . java <nl> + + + b / src / java / org / apache / cassandra / config / Config . java <nl> @ @ - 126 , 6 + 126 , 7 @ @ public class Config <nl> public Double commitlog _ sync _ batch _ window _ in _ ms ; <nl> public Integer commitlog _ sync _ period _ in _ ms ; <nl> public int commitlog _ segment _ size _ in _ mb = 32 ; <nl> + public int commitlog _ periodic _ queue _ size = 1024 * FBUtilities . getAvailableProcessors ( ) ; <nl> <nl> public String endpoint _ snitch ; <nl> public Boolean dynamic _ snitch = true ; <nl> diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> index 1e1b9a2 . . c2f3fa6 100644 <nl> - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> @ @ - 989 , 10 + 989 , 16 @ @ public class DatabaseDescriptor <nl> return conf . commitlog _ sync _ batch _ window _ in _ ms ; <nl> } <nl> <nl> - public static int getCommitLogSyncPeriod ( ) { <nl> + public static int getCommitLogSyncPeriod ( ) <nl> + { <nl> return conf . commitlog _ sync _ period _ in _ ms ; <nl> } <nl> <nl> + public static int getCommitLogPeriodicQueueSize ( ) <nl> + { <nl> + return conf . commitlog _ periodic _ queue _ size ; <nl> + } <nl> + <nl> public static Config . CommitLogSync getCommitLogSync ( ) <nl> { <nl> return conf . commitlog _ sync ; <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 93b8905 . . 4c9f72d 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 108 , 7 + 108 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> public final Directories directories ; <nl> <nl> / * * ratio of in - memory memtable size , to serialized size * / <nl> - volatile double liveRatio = 1 . 0 ; <nl> + volatile double liveRatio = 10 . 0 ; / / reasonable default until we compute what it is based on actual data <nl> / * * ops count last time we computed liveRatio * / <nl> private final AtomicLong liveRatioComputedAt = new AtomicLong ( 32 ) ; <nl> <nl> @ @ - 1103 , 7 + 1103 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> return ( int ) metric . memtableSwitchCount . count ( ) ; <nl> } <nl> <nl> - private Memtable getMemtableThreadSafe ( ) <nl> + Memtable getMemtableThreadSafe ( ) <nl> { <nl> return data . getMemtable ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java <nl> index 2b3ca1e . . 4cca602 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Memtable . java <nl> + + + b / src / java / org / apache / cassandra / db / Memtable . java <nl> @ @ - 28 , 7 + 28 , 6 @ @ import org . cliffc . high _ scale _ lib . NonBlockingHashSet ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> - import org . apache . cassandra . concurrent . DebuggableThreadPoolExecutor ; <nl> import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutor ; <nl> import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> import org . apache . cassandra . concurrent . StageManager ; <nl> @ @ - 78 , 24 + 77 , 15 @ @ public class Memtable <nl> / / outstanding / running meterings to a maximum of one per CFS using this set ; the executor ' s queue is unbounded but <nl> / / will implicitly be bounded by the number of CFS : s . <nl> private static final Set < ColumnFamilyStore > meteringInProgress = new NonBlockingHashSet < ColumnFamilyStore > ( ) ; <nl> - private static final ExecutorService meterExecutor = new DebuggableThreadPoolExecutor ( 1 , <nl> - 1 , <nl> + private static final ExecutorService meterExecutor = new JMXEnabledThreadPoolExecutor ( 1 , <nl> Integer . MAX _ VALUE , <nl> TimeUnit . MILLISECONDS , <nl> new LinkedBlockingQueue < Runnable > ( ) , <nl> - new NamedThreadFactory ( " MemoryMeter " ) ) <nl> - { <nl> - @ Override <nl> - protected void afterExecute ( Runnable r , Throwable t ) <nl> - { <nl> - super . afterExecute ( r , t ) ; <nl> - DebuggableThreadPoolExecutor . logExceptionsAfterExecute ( r , t ) ; <nl> - } <nl> - } ; <nl> - <nl> + new NamedThreadFactory ( " MemoryMeter " ) , <nl> + " internal " ) ; <nl> private final MemoryMeter meter ; <nl> <nl> - volatile static Memtable activelyMeasuring ; <nl> + volatile static ColumnFamilyStore activelyMeasuring ; <nl> <nl> private final AtomicLong currentSize = new AtomicLong ( 0 ) ; <nl> private final AtomicLong currentOperations = new AtomicLong ( 0 ) ; <nl> @ @ - 175 , 8 + 165 , 9 @ @ public class Memtable <nl> if ( ! MemoryMeter . isInitialized ( ) ) <nl> { <nl> / / hack for openjdk . we log a warning about this in the startup script too . <nl> - logger . warn ( " MemoryMeter uninitialized ( jamm not specified as java agent ) ; assuming liveRatio of 10 . 0 . Usually this means cassandra - env . sh disabled jamm because you are using a buggy JRE ; upgrade to the Sun JRE instead " ) ; <nl> - cfs . liveRatio = 10 . 0 ; <nl> + logger . warn ( " MemoryMeter uninitialized ( jamm not specified as java agent ) ; assuming liveRatio of { } . " <nl> + + " Usually this means cassandra - env . sh disabled jamm because you are using a buggy JRE ; " <nl> + + " upgrade to the Sun JRE instead " , cfs . liveRatio ) ; <nl> return ; <nl> } <nl> <nl> @ @ - 186 , 56 + 177 , 7 @ @ public class Memtable <nl> return ; <nl> } <nl> <nl> - Runnable runnable = new Runnable ( ) <nl> - { <nl> - public void run ( ) <nl> - { <nl> - try <nl> - { <nl> - activelyMeasuring = Memtable . this ; <nl> - <nl> - long start = System . nanoTime ( ) ; <nl> - / / ConcurrentSkipListMap has cycles , so measureDeep will have to track a reference to EACH object it visits . <nl> - / / So to reduce the memory overhead of doing a measurement , we break it up to row - at - a - time . <nl> - long deepSize = meter . measure ( rows ) ; <nl> - int objects = 0 ; <nl> - for ( Map . Entry < RowPosition , AtomicSortedColumns > entry : rows . entrySet ( ) ) <nl> - { <nl> - deepSize + = meter . measureDeep ( entry . getKey ( ) ) + meter . measureDeep ( entry . getValue ( ) ) ; <nl> - objects + = entry . getValue ( ) . getColumnCount ( ) ; <nl> - } <nl> - double newRatio = ( double ) deepSize / currentSize . get ( ) ; <nl> - <nl> - if ( newRatio < MIN _ SANE _ LIVE _ RATIO ) <nl> - { <nl> - logger . warn ( " setting live ratio to minimum of { } instead of { } " , MIN _ SANE _ LIVE _ RATIO , newRatio ) ; <nl> - newRatio = MIN _ SANE _ LIVE _ RATIO ; <nl> - } <nl> - if ( newRatio > MAX _ SANE _ LIVE _ RATIO ) <nl> - { <nl> - logger . warn ( " setting live ratio to maximum of { } instead of { } " , MAX _ SANE _ LIVE _ RATIO , newRatio ) ; <nl> - newRatio = MAX _ SANE _ LIVE _ RATIO ; <nl> - } <nl> - <nl> - / / we want to be very conservative about our estimate , since the penalty for guessing low is OOM <nl> - / / death . thus , higher estimates are believed immediately ; lower ones are averaged w / the old <nl> - if ( newRatio > cfs . liveRatio ) <nl> - cfs . liveRatio = newRatio ; <nl> - else <nl> - cfs . liveRatio = ( cfs . liveRatio + newRatio ) / 2 . 0 ; <nl> - <nl> - logger . info ( " { } liveRatio is { } ( just - counted was { } ) . calculation took { } ms for { } columns " , <nl> - cfs , cfs . liveRatio , newRatio , TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) , objects ) ; <nl> - activelyMeasuring = null ; <nl> - } <nl> - finally <nl> - { <nl> - meteringInProgress . remove ( cfs ) ; <nl> - } <nl> - } <nl> - } ; <nl> - <nl> - meterExecutor . submit ( runnable ) ; <nl> + meterExecutor . submit ( new MeteringRunnable ( cfs ) ) ; <nl> } <nl> <nl> private void resolve ( DecoratedKey key , ColumnFamily cf , SecondaryIndexManager . Updater indexer ) <nl> @ @ - 448 , 4 + 390 , 63 @ @ public class Memtable <nl> sstableMetadataCollector ) ; <nl> } <nl> } <nl> + <nl> + private static class MeteringRunnable implements Runnable <nl> + { <nl> + / / we might need to wait in the meter queue for a while . measure whichever memtable is active at that point , <nl> + / / rather than keeping the original memtable referenced ( and thus un - freeable ) until this runs . <nl> + private final ColumnFamilyStore cfs ; <nl> + <nl> + public MeteringRunnable ( ColumnFamilyStore cfs ) <nl> + { <nl> + this . cfs = cfs ; <nl> + } <nl> + <nl> + public void run ( ) <nl> + { <nl> + try <nl> + { <nl> + activelyMeasuring = cfs ; <nl> + Memtable memtable = cfs . getMemtableThreadSafe ( ) ; <nl> + <nl> + long start = System . nanoTime ( ) ; <nl> + / / ConcurrentSkipListMap has cycles , so measureDeep will have to track a reference to EACH object it visits . <nl> + / / So to reduce the memory overhead of doing a measurement , we break it up to row - at - a - time . <nl> + long deepSize = memtable . meter . measure ( memtable . rows ) ; <nl> + int objects = 0 ; <nl> + for ( Map . Entry < RowPosition , AtomicSortedColumns > entry : memtable . rows . entrySet ( ) ) <nl> + { <nl> + deepSize + = memtable . meter . measureDeep ( entry . getKey ( ) ) + memtable . meter . measureDeep ( entry . getValue ( ) ) ; <nl> + objects + = entry . getValue ( ) . getColumnCount ( ) ; <nl> + } <nl> + double newRatio = ( double ) deepSize / memtable . currentSize . get ( ) ; <nl> + <nl> + if ( newRatio < MIN _ SANE _ LIVE _ RATIO ) <nl> + { <nl> + logger . warn ( " setting live ratio to minimum of { } instead of { } " , MIN _ SANE _ LIVE _ RATIO , newRatio ) ; <nl> + newRatio = MIN _ SANE _ LIVE _ RATIO ; <nl> + } <nl> + if ( newRatio > MAX _ SANE _ LIVE _ RATIO ) <nl> + { <nl> + logger . warn ( " setting live ratio to maximum of { } instead of { } " , MAX _ SANE _ LIVE _ RATIO , newRatio ) ; <nl> + newRatio = MAX _ SANE _ LIVE _ RATIO ; <nl> + } <nl> + <nl> + / / we want to be very conservative about our estimate , since the penalty for guessing low is OOM <nl> + / / death . thus , higher estimates are believed immediately ; lower ones are averaged w / the old <nl> + if ( newRatio > cfs . liveRatio ) <nl> + cfs . liveRatio = newRatio ; <nl> + else <nl> + cfs . liveRatio = ( cfs . liveRatio + newRatio ) / 2 . 0 ; <nl> + <nl> + logger . info ( " { } liveRatio is { } ( just - counted was { } ) . calculation took { } ms for { } columns " , <nl> + cfs , cfs . liveRatio , newRatio , TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) , objects ) ; <nl> + } <nl> + finally <nl> + { <nl> + activelyMeasuring = null ; <nl> + meteringInProgress . remove ( cfs ) ; <nl> + } <nl> + } <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / MeteredFlusher . java b / src / java / org / apache / cassandra / db / MeteredFlusher . java <nl> index 408727c . . f16b8a0 100644 <nl> - - - a / src / java / org / apache / cassandra / db / MeteredFlusher . java <nl> + + + b / src / java / org / apache / cassandra / db / MeteredFlusher . java <nl> @ @ - 35 , 16 + 35 , 22 @ @ public class MeteredFlusher implements Runnable <nl> <nl> public void run ( ) <nl> { <nl> + long totalMemtableBytesAllowed = DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L ; <nl> + <nl> / / first , find how much memory non - active memtables are using <nl> - Memtable activelyMeasuring = Memtable . activelyMeasuring ; <nl> - long flushingBytes = activelyMeasuring = = null ? 0 : activelyMeasuring . getLiveSize ( ) ; <nl> + long flushingBytes = Memtable . activelyMeasuring = = null <nl> + ? 0 <nl> + : Memtable . activelyMeasuring . getMemtableThreadSafe ( ) . getLiveSize ( ) ; <nl> flushingBytes + = countFlushingBytes ( ) ; <nl> + if ( flushingBytes > 0 ) <nl> + logger . debug ( " Currently flushing { } bytes of { } max " , flushingBytes , totalMemtableBytesAllowed ) ; <nl> <nl> / / next , flush CFs using more than 1 / ( maximum number of memtables it could have in the pipeline ) <nl> / / of the total size allotted . Then , flush other CFs in order of size if necessary . <nl> long liveBytes = 0 ; <nl> try <nl> { <nl> + long totalMemtableBytesUnused = totalMemtableBytesAllowed - flushingBytes ; <nl> for ( ColumnFamilyStore cfs : ColumnFamilyStore . all ( ) ) <nl> { <nl> long size = cfs . getTotalMemtableLiveSize ( ) ; <nl> @ @ - 53 , 7 + 59 , 7 @ @ public class MeteredFlusher implements Runnable <nl> + DatabaseDescriptor . getFlushWriters ( ) <nl> + DatabaseDescriptor . getFlushQueueSize ( ) ) <nl> / ( 1 + cfs . indexManager . getIndexesBackedByCfs ( ) . size ( ) ) ) ; <nl> - if ( size > ( DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L - flushingBytes ) / maxInFlight ) <nl> + if ( totalMemtableBytesUnused > 0 & & size > totalMemtableBytesUnused / maxInFlight ) <nl> { <nl> logger . info ( " flushing high - traffic column family { } ( estimated { } bytes ) " , cfs , size ) ; <nl> cfs . forceFlush ( ) ; <nl> @ @ - 64 , 10 + 70 , 10 @ @ public class MeteredFlusher implements Runnable <nl> } <nl> } <nl> <nl> - if ( flushingBytes + liveBytes < = DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L ) <nl> + if ( flushingBytes + liveBytes < = totalMemtableBytesAllowed ) <nl> return ; <nl> <nl> - logger . info ( " estimated { } bytes used by all memtables pre - flush " , liveBytes ) ; <nl> + logger . info ( " estimated { } live and { } flushing bytes used by all memtables " , liveBytes , flushingBytes ) ; <nl> <nl> / / sort memtables by size <nl> List < ColumnFamilyStore > sorted = new ArrayList < ColumnFamilyStore > ( ) ; <nl> @ @ - 89 , 14 + 95 , 16 @ @ public class MeteredFlusher implements Runnable <nl> / / flush largest first until we get below our threshold . <nl> / / although it looks like liveBytes + flushingBytes will stay a constant , it will not if flushes finish <nl> / / while we loop , which is especially likely to happen if the flush queue fills up ( so further forceFlush calls block ) <nl> - while ( true ) <nl> + while ( ! sorted . isEmpty ( ) ) <nl> { <nl> flushingBytes = countFlushingBytes ( ) ; <nl> - if ( liveBytes + flushingBytes < = DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L | | sorted . isEmpty ( ) ) <nl> + if ( liveBytes + flushingBytes < = totalMemtableBytesAllowed ) <nl> break ; <nl> <nl> ColumnFamilyStore cfs = sorted . remove ( sorted . size ( ) - 1 ) ; <nl> long size = cfs . getTotalMemtableLiveSize ( ) ; <nl> + if ( size = = 0 ) <nl> + break ; <nl> logger . info ( " flushing { } to free up { } bytes " , cfs , size ) ; <nl> liveBytes - = size ; <nl> cfs . forceFlush ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / PeriodicCommitLogExecutorService . java b / src / java / org / apache / cassandra / db / commitlog / PeriodicCommitLogExecutorService . java <nl> index 7a0a761 . . 30f33b6 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / PeriodicCommitLogExecutorService . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / PeriodicCommitLogExecutorService . java <nl> @ @ - 35 , 7 + 35 , 7 @ @ class PeriodicCommitLogExecutorService implements ICommitLogExecutorService <nl> <nl> public PeriodicCommitLogExecutorService ( final CommitLog commitLog ) <nl> { <nl> - queue = new LinkedBlockingQueue < Runnable > ( 1024 * FBUtilities . getAvailableProcessors ( ) ) ; <nl> + queue = new LinkedBlockingQueue < Runnable > ( DatabaseDescriptor . getCommitLogPeriodicQueueSize ( ) ) ; <nl> Runnable runnable = new WrappedRunnable ( ) <nl> { <nl> public void runMayThrow ( ) throws Exception <nl> diff - - git a / src / java / org / apache / cassandra / utils / StatusLogger . java b / src / java / org / apache / cassandra / utils / StatusLogger . java <nl> index 2b9627f . . 939c81f 100644 <nl> - - - a / src / java / org / apache / cassandra / utils / StatusLogger . java <nl> + + + b / src / java / org / apache / cassandra / utils / StatusLogger . java <nl> @ @ - 19 , 6 + 19 , 8 @ @ package org . apache . cassandra . utils ; <nl> <nl> import java . lang . management . ManagementFactory ; <nl> import java . util . Set ; <nl> + import java . util . concurrent . ExecutorService ; <nl> + import java . util . concurrent . ThreadPoolExecutor ; <nl> import javax . management . JMX ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . MalformedObjectNameException ; <nl> @ @ - 34 , 7 + 36 , 9 @ @ import org . slf4j . LoggerFactory ; <nl> import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutorMBean ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> + import org . apache . cassandra . db . Memtable ; <nl> import org . apache . cassandra . db . RowIndexEntry ; <nl> + import org . apache . cassandra . db . commitlog . CommitLog ; <nl> import org . apache . cassandra . db . compaction . CompactionManager ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> import org . apache . cassandra . service . CacheService ; <nl> @ @ - 72 , 9 + 76 , 10 @ @ public class StatusLogger <nl> threadPoolProxy . getTotalBlockedTasks ( ) ) ) ; <nl> } <nl> / / one offs <nl> - CompactionManager cm = CompactionManager . instance ; <nl> logger . info ( String . format ( " % - 25s % 10s % 10s " , <nl> - " CompactionManager " , cm . getActiveCompactions ( ) , cm . getPendingTasks ( ) ) ) ; <nl> + " CompactionManager " , CompactionManager . instance . getActiveCompactions ( ) , CompactionManager . instance . getPendingTasks ( ) ) ) ; <nl> + logger . info ( String . format ( " % - 25s % 10s % 10s " , <nl> + " Commitlog " , " n / a " , CommitLog . instance . getPendingTasks ( ) ) ) ; <nl> int pendingCommands = 0 ; <nl> for ( int n : MessagingService . instance ( ) . getCommandPendingTasks ( ) . values ( ) ) <nl> {
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 373544c . . 00b98fa 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 29 , 6 + 29 , 8 @ @ 
+ * Static columns with IF NOT EXISTS don ' t always work as expected ( CASSANDRA - 6873 ) 
+ * Fix paging with SELECT DISTINCT ( CASSANDRA - 6857 ) 
+ * Fix UnsupportedOperationException on CAS timeout ( CASSANDRA - 6923 ) 
+ + * Improve MeteredFlusher handling of MF - unaffected column families 
+ + ( CASSANDRA - 6867 ) 
+ Merged from 1 . 2 : 
+ * Add UNLOGGED , COUNTER options to BATCH documentation ( CASSANDRA - 6816 ) 
+ * add extra SSL cipher suites ( CASSANDRA - 6613 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / MeteredFlusher . java b / src / java / org / apache / cassandra / db / MeteredFlusher . java 
+ index 5c71fc6 . . 4f06bc6 100644 
+ - - - a / src / java / org / apache / cassandra / db / MeteredFlusher . java 
+ + + + b / src / java / org / apache / cassandra / db / MeteredFlusher . java 
+ @ @ - 22 , 7 + 22 , 6 @ @ import java . util . Collections ; 
+ import java . util . Comparator ; 
+ import java . util . List ; 
+ 
+ - import com . google . common . collect . Iterables ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 34 , 97 + 33 , 102 @ @ public class MeteredFlusher implements Runnable 
+ 
+ public void run ( ) 
+ { 
+ - long totalMemtableBytesAllowed = DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L ; 
+ - 
+ - / / first , find how much memory non - active memtables are using 
+ - ColumnFamilyStore measuredCfs = Memtable . activelyMeasuring ; 
+ - long flushingBytes = measuredCfs = = null ? 0 : measuredCfs . getMemtableThreadSafe ( ) . getLiveSize ( ) ; 
+ - flushingBytes + = countFlushingBytes ( ) ; 
+ - if ( flushingBytes > 0 ) 
+ - logger . debug ( " Currently flushing { } bytes of { } max " , flushingBytes , totalMemtableBytesAllowed ) ; 
+ - 
+ - / / next , flush CFs using more than 1 / ( maximum number of memtables it could have in the pipeline ) 
+ - / / of the total size allotted . Then , flush other CFs in order of size if necessary . 
+ - long liveBytes = 0 ; 
+ - try 
+ - { 
+ - long totalMemtableBytesUnused = totalMemtableBytesAllowed - flushingBytes ; 
+ - for ( ColumnFamilyStore cfs : ColumnFamilyStore . all ( ) ) 
+ - { 
+ - long size = cfs . getTotalMemtableLiveSize ( ) ; 
+ - int maxInFlight = ( int ) Math . ceil ( ( double ) ( 1 / / live memtable 
+ - + 1 / / potentially a flushed memtable being counted by jamm 
+ - + DatabaseDescriptor . getFlushWriters ( ) 
+ - + DatabaseDescriptor . getFlushQueueSize ( ) ) 
+ - / ( 1 + cfs . indexManager . getIndexesBackedByCfs ( ) . size ( ) ) ) ; 
+ - if ( cfs . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) & & totalMemtableBytesUnused > 0 & & size > totalMemtableBytesUnused / maxInFlight ) 
+ - { 
+ - logger . info ( " flushing high - traffic column family { } ( estimated { } bytes ) " , cfs , size ) ; 
+ - cfs . forceFlush ( ) ; 
+ - } 
+ - else 
+ - { 
+ - liveBytes + = size ; 
+ - } 
+ - } 
+ + long allowedSize = calculateAllowedSize ( ) ; 
+ 
+ - if ( flushingBytes + liveBytes < = totalMemtableBytesAllowed ) 
+ - return ; 
+ + / / find how much memory non - active memtables are using 
+ + long flushingSize = calculateFlushingSize ( ) ; 
+ + if ( flushingSize > 0 ) 
+ + logger . debug ( " Currently flushing { } bytes of { } max " , flushingSize , allowedSize ) ; 
+ 
+ - logger . info ( " estimated { } live and { } flushing bytes used by all memtables " , liveBytes , flushingBytes ) ; 
+ + List < ColumnFamilyStore > affectedCFs = affectedColumnFamilies ( ) ; 
+ + long liveSize = 0 ; 
+ 
+ - / / sort memtables by size 
+ - List < ColumnFamilyStore > sorted = new ArrayList < ColumnFamilyStore > ( ) ; 
+ - Iterables . addAll ( sorted , ColumnFamilyStore . all ( ) ) ; 
+ - Collections . sort ( sorted , new Comparator < ColumnFamilyStore > ( ) 
+ + / / flush CFs using more than 1 / ( maximum number of memtables it could have in the pipeline ) 
+ + / / of the total size allotted . Then , flush other CFs in order of size if necessary . 
+ + for ( ColumnFamilyStore cfs : affectedCFs ) 
+ + { 
+ + int maxInFlight = ( int ) Math . ceil ( ( double ) ( 1 / / live memtable 
+ + + 1 / / potentially a flushed memtable being counted by jamm 
+ + + DatabaseDescriptor . getFlushWriters ( ) 
+ + + DatabaseDescriptor . getFlushQueueSize ( ) ) 
+ + / ( 1 + cfs . indexManager . getIndexesBackedByCfs ( ) . size ( ) ) ) ; 
+ + long size = cfs . getTotalMemtableLiveSize ( ) ; 
+ + if ( allowedSize > flushingSize & & size > ( allowedSize - flushingSize ) / maxInFlight ) 
+ { 
+ - public int compare ( ColumnFamilyStore o1 , ColumnFamilyStore o2 ) 
+ - { 
+ - long size1 = o1 . getTotalMemtableLiveSize ( ) ; 
+ - long size2 = o2 . getTotalMemtableLiveSize ( ) ; 
+ - if ( size1 < size2 ) 
+ - return - 1 ; 
+ - if ( size1 > size2 ) 
+ - return 1 ; 
+ - return 0 ; 
+ - } 
+ - } ) ; 
+ - 
+ - / / flush largest first until we get below our threshold . 
+ - / / although it looks like liveBytes + flushingBytes will stay a constant , it will not if flushes finish 
+ - / / while we loop , which is especially likely to happen if the flush queue fills up ( so further forceFlush calls block ) 
+ - while ( ! sorted . isEmpty ( ) ) 
+ + logger . info ( " flushing high - traffic column family { } ( estimated { } bytes ) " , cfs , size ) ; 
+ + cfs . forceFlush ( ) ; 
+ + } 
+ + else 
+ { 
+ - flushingBytes = countFlushingBytes ( ) ; 
+ - if ( liveBytes + flushingBytes < = totalMemtableBytesAllowed ) 
+ - break ; 
+ - 
+ - ColumnFamilyStore cfs = sorted . remove ( sorted . size ( ) - 1 ) ; 
+ - if ( cfs . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) ) 
+ - { 
+ - long size = cfs . getTotalMemtableLiveSize ( ) ; 
+ - if ( size = = 0 ) 
+ - break ; 
+ - logger . info ( " flushing { } to free up { } bytes " , cfs , size ) ; 
+ - liveBytes - = size ; 
+ - cfs . forceFlush ( ) ; 
+ - } 
+ + liveSize + = size ; 
+ } 
+ } 
+ - finally 
+ + 
+ + if ( liveSize + flushingSize < = allowedSize ) 
+ + return ; 
+ + logger . info ( " estimated { } live and { } flushing bytes used by all memtables " , liveSize , flushingSize ) ; 
+ + 
+ + Collections . sort ( affectedCFs , new Comparator < ColumnFamilyStore > ( ) 
+ { 
+ - logger . trace ( " memtable memory usage is { } bytes with { } live " , liveBytes + flushingBytes , liveBytes ) ; 
+ + public int compare ( ColumnFamilyStore lhs , ColumnFamilyStore rhs ) 
+ + { 
+ + return Long . compare ( lhs . getTotalMemtableLiveSize ( ) , rhs . getTotalMemtableLiveSize ( ) ) ; 
+ + } 
+ + } ) ; 
+ + 
+ + / / flush largest first until we get below our threshold . 
+ + / / although it looks like liveSize + flushingSize will stay a constant , it will not if flushes finish 
+ + / / while we loop , which is especially likely to happen if the flush queue fills up ( so further forceFlush calls block ) 
+ + while ( ! affectedCFs . isEmpty ( ) ) 
+ + { 
+ + flushingSize = calculateFlushingSize ( ) ; 
+ + if ( liveSize + flushingSize < = allowedSize ) 
+ + break ; 
+ + 
+ + ColumnFamilyStore cfs = affectedCFs . remove ( affectedCFs . size ( ) - 1 ) ; 
+ + long size = cfs . getTotalMemtableLiveSize ( ) ; 
+ + if ( size > 0 ) 
+ + { 
+ + logger . info ( " flushing { } to free up { } bytes " , cfs , size ) ; 
+ + liveSize - = size ; 
+ + cfs . forceFlush ( ) ; 
+ + } 
+ } 
+ + 
+ + logger . trace ( " memtable memory usage is { } bytes with { } live " , liveSize + flushingSize , liveSize ) ; 
+ } 
+ 
+ - private long countFlushingBytes ( ) 
+ + private static List < ColumnFamilyStore > affectedColumnFamilies ( ) 
+ { 
+ - long flushingBytes = 0 ; 
+ + List < ColumnFamilyStore > affected = new ArrayList < > ( ) ; 
+ + / / filter out column families that aren ' t affected by MeteredFlusher 
+ for ( ColumnFamilyStore cfs : ColumnFamilyStore . all ( ) ) 
+ - { 
+ - for ( Memtable memtable : cfs . getMemtablesPendingFlush ( ) ) 
+ - flushingBytes + = memtable . getLiveSize ( ) ; 
+ - } 
+ - return flushingBytes ; 
+ + if ( cfs . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) ) 
+ + affected . add ( cfs ) ; 
+ + return affected ; 
+ + } 
+ + 
+ + private static long calculateAllowedSize ( ) 
+ + { 
+ + long allowed = DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L ; 
+ + / / deduct the combined memory limit of the tables unaffected by the metered flusher ( we don ' t flush them , we 
+ + / / should not count their limits to the total limit either ) . 
+ + for ( ColumnFamilyStore cfs : ColumnFamilyStore . all ( ) ) 
+ + if ( ! cfs . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) ) 
+ + allowed - = cfs . getCompactionStrategy ( ) . getMemtableReservedSize ( ) ; 
+ + return allowed ; 
+ + } 
+ + 
+ + private static long calculateFlushingSize ( ) 
+ + { 
+ + ColumnFamilyStore measuredCFS = Memtable . activelyMeasuring ; 
+ + long flushing = measuredCFS ! = null & & measuredCFS . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) 
+ + ? measuredCFS . getMemtableThreadSafe ( ) . getLiveSize ( ) 
+ + : 0 ; 
+ + for ( ColumnFamilyStore cfs : ColumnFamilyStore . all ( ) ) 
+ + if ( cfs . getCompactionStrategy ( ) . isAffectedByMeteredFlusher ( ) ) 
+ + for ( Memtable memtable : cfs . getMemtablesPendingFlush ( ) ) 
+ + flushing + = memtable . getLiveSize ( ) ; 
+ + return flushing ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / AbstractCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / AbstractCompactionStrategy . java 
+ index 164cfda . . 5425683 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / AbstractCompactionStrategy . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / AbstractCompactionStrategy . java 
+ @ @ - 201 , 6 + 201 , 16 @ @ public abstract class AbstractCompactionStrategy 
+ } 
+ 
+ / * * 
+ + * If not affected by MeteredFlusher ( and handling flushing on its own ) , override to tell MF how much 
+ + * space to reserve for this CF , i . e . , how much space to subtract from ` memtable _ total _ space _ in _ mb ` when deciding 
+ + * if other memtables should be flushed or not . 
+ + * / 
+ + public long getMemtableReservedSize ( ) 
+ + { 
+ + return 0 ; 
+ + } 
+ + 
+ + / * * 
+ * Handle a flushed memtable . 
+ * 
+ * @ param memtable the flushed memtable
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index f48fb5c . . 2192fe9 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 20 , 7 + 20 , 8 @ @ 
+ * Fix potential AssertionError during tracing ( CASSANDRA - 6041 ) 
+ * Fix NPE in sstablesplit ( CASSANDRA - 6027 ) 
+ Merged from 1 . 2 : 
+ - 1 . 2 . 10 
+ + * Tuning knobs for dealing with large blobs and many CFs ( CASSANDRA - 5982 ) 
+ + * ( Hadoop ) Fix CQLRW for thrift tables ( CASSANDRA - 6002 ) 
+ * Fix possible divide - by - zero in HHOM ( CASSANDRA - 5990 ) 
+ * Allow local batchlog writes for CL . ANY ( CASSANDRA - 5967 ) 
+ * Optimize name query performance in wide rows ( CASSANDRA - 5966 ) 
+ diff - - git a / conf / cassandra . yaml b / conf / cassandra . yaml 
+ index aef3e60 . . 4decf6c 100644 
+ - - - a / conf / cassandra . yaml 
+ + + + b / conf / cassandra . yaml 
+ @ @ - 194 , 9 + 194 , 13 @ @ saved _ caches _ directory : / var / lib / cassandra / saved _ caches 
+ # 
+ # the other option is " periodic " where writes may be acked immediately 
+ # and the CommitLog is simply synced every commitlog _ sync _ period _ in _ ms 
+ - # milliseconds . 
+ + # milliseconds . By default this allows 1024 * ( CPU cores ) pending 
+ + # entries on the commitlog queue . If you are writing very large blobs , 
+ + # you should reduce that ; 16 * cores works reasonably well for 1MB blobs . 
+ + # It should be at least as large as the concurrent _ writes setting . 
+ commitlog _ sync : periodic 
+ commitlog _ sync _ period _ in _ ms : 10000 
+ + # commitlog _ periodic _ queue _ size : 
+ 
+ # The size of the individual commitlog file segments . A commitlog 
+ # segment may be archived , deleted , or recycled once all the data 
+ diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java 
+ index 99fd833 . . dd0728c 100644 
+ - - - a / src / java / org / apache / cassandra / config / Config . java 
+ + + + b / src / java / org / apache / cassandra / config / Config . java 
+ @ @ - 126 , 6 + 126 , 7 @ @ public class Config 
+ public Double commitlog _ sync _ batch _ window _ in _ ms ; 
+ public Integer commitlog _ sync _ period _ in _ ms ; 
+ public int commitlog _ segment _ size _ in _ mb = 32 ; 
+ + public int commitlog _ periodic _ queue _ size = 1024 * FBUtilities . getAvailableProcessors ( ) ; 
+ 
+ public String endpoint _ snitch ; 
+ public Boolean dynamic _ snitch = true ; 
+ diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ index 1e1b9a2 . . c2f3fa6 100644 
+ - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ @ @ - 989 , 10 + 989 , 16 @ @ public class DatabaseDescriptor 
+ return conf . commitlog _ sync _ batch _ window _ in _ ms ; 
+ } 
+ 
+ - public static int getCommitLogSyncPeriod ( ) { 
+ + public static int getCommitLogSyncPeriod ( ) 
+ + { 
+ return conf . commitlog _ sync _ period _ in _ ms ; 
+ } 
+ 
+ + public static int getCommitLogPeriodicQueueSize ( ) 
+ + { 
+ + return conf . commitlog _ periodic _ queue _ size ; 
+ + } 
+ + 
+ public static Config . CommitLogSync getCommitLogSync ( ) 
+ { 
+ return conf . commitlog _ sync ; 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 93b8905 . . 4c9f72d 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 108 , 7 + 108 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ public final Directories directories ; 
+ 
+ / * * ratio of in - memory memtable size , to serialized size * / 
+ - volatile double liveRatio = 1 . 0 ; 
+ + volatile double liveRatio = 10 . 0 ; / / reasonable default until we compute what it is based on actual data 
+ / * * ops count last time we computed liveRatio * / 
+ private final AtomicLong liveRatioComputedAt = new AtomicLong ( 32 ) ; 
+ 
+ @ @ - 1103 , 7 + 1103 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ return ( int ) metric . memtableSwitchCount . count ( ) ; 
+ } 
+ 
+ - private Memtable getMemtableThreadSafe ( ) 
+ + Memtable getMemtableThreadSafe ( ) 
+ { 
+ return data . getMemtable ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / Memtable . java b / src / java / org / apache / cassandra / db / Memtable . java 
+ index 2b3ca1e . . 4cca602 100644 
+ - - - a / src / java / org / apache / cassandra / db / Memtable . java 
+ + + + b / src / java / org / apache / cassandra / db / Memtable . java 
+ @ @ - 28 , 7 + 28 , 6 @ @ import org . cliffc . high _ scale _ lib . NonBlockingHashSet ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ - import org . apache . cassandra . concurrent . DebuggableThreadPoolExecutor ; 
+ import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutor ; 
+ import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ import org . apache . cassandra . concurrent . StageManager ; 
+ @ @ - 78 , 24 + 77 , 15 @ @ public class Memtable 
+ / / outstanding / running meterings to a maximum of one per CFS using this set ; the executor ' s queue is unbounded but 
+ / / will implicitly be bounded by the number of CFS : s . 
+ private static final Set < ColumnFamilyStore > meteringInProgress = new NonBlockingHashSet < ColumnFamilyStore > ( ) ; 
+ - private static final ExecutorService meterExecutor = new DebuggableThreadPoolExecutor ( 1 , 
+ - 1 , 
+ + private static final ExecutorService meterExecutor = new JMXEnabledThreadPoolExecutor ( 1 , 
+ Integer . MAX _ VALUE , 
+ TimeUnit . MILLISECONDS , 
+ new LinkedBlockingQueue < Runnable > ( ) , 
+ - new NamedThreadFactory ( " MemoryMeter " ) ) 
+ - { 
+ - @ Override 
+ - protected void afterExecute ( Runnable r , Throwable t ) 
+ - { 
+ - super . afterExecute ( r , t ) ; 
+ - DebuggableThreadPoolExecutor . logExceptionsAfterExecute ( r , t ) ; 
+ - } 
+ - } ; 
+ - 
+ + new NamedThreadFactory ( " MemoryMeter " ) , 
+ + " internal " ) ; 
+ private final MemoryMeter meter ; 
+ 
+ - volatile static Memtable activelyMeasuring ; 
+ + volatile static ColumnFamilyStore activelyMeasuring ; 
+ 
+ private final AtomicLong currentSize = new AtomicLong ( 0 ) ; 
+ private final AtomicLong currentOperations = new AtomicLong ( 0 ) ; 
+ @ @ - 175 , 8 + 165 , 9 @ @ public class Memtable 
+ if ( ! MemoryMeter . isInitialized ( ) ) 
+ { 
+ / / hack for openjdk . we log a warning about this in the startup script too . 
+ - logger . warn ( " MemoryMeter uninitialized ( jamm not specified as java agent ) ; assuming liveRatio of 10 . 0 . Usually this means cassandra - env . sh disabled jamm because you are using a buggy JRE ; upgrade to the Sun JRE instead " ) ; 
+ - cfs . liveRatio = 10 . 0 ; 
+ + logger . warn ( " MemoryMeter uninitialized ( jamm not specified as java agent ) ; assuming liveRatio of { } . " 
+ + + " Usually this means cassandra - env . sh disabled jamm because you are using a buggy JRE ; " 
+ + + " upgrade to the Sun JRE instead " , cfs . liveRatio ) ; 
+ return ; 
+ } 
+ 
+ @ @ - 186 , 56 + 177 , 7 @ @ public class Memtable 
+ return ; 
+ } 
+ 
+ - Runnable runnable = new Runnable ( ) 
+ - { 
+ - public void run ( ) 
+ - { 
+ - try 
+ - { 
+ - activelyMeasuring = Memtable . this ; 
+ - 
+ - long start = System . nanoTime ( ) ; 
+ - / / ConcurrentSkipListMap has cycles , so measureDeep will have to track a reference to EACH object it visits . 
+ - / / So to reduce the memory overhead of doing a measurement , we break it up to row - at - a - time . 
+ - long deepSize = meter . measure ( rows ) ; 
+ - int objects = 0 ; 
+ - for ( Map . Entry < RowPosition , AtomicSortedColumns > entry : rows . entrySet ( ) ) 
+ - { 
+ - deepSize + = meter . measureDeep ( entry . getKey ( ) ) + meter . measureDeep ( entry . getValue ( ) ) ; 
+ - objects + = entry . getValue ( ) . getColumnCount ( ) ; 
+ - } 
+ - double newRatio = ( double ) deepSize / currentSize . get ( ) ; 
+ - 
+ - if ( newRatio < MIN _ SANE _ LIVE _ RATIO ) 
+ - { 
+ - logger . warn ( " setting live ratio to minimum of { } instead of { } " , MIN _ SANE _ LIVE _ RATIO , newRatio ) ; 
+ - newRatio = MIN _ SANE _ LIVE _ RATIO ; 
+ - } 
+ - if ( newRatio > MAX _ SANE _ LIVE _ RATIO ) 
+ - { 
+ - logger . warn ( " setting live ratio to maximum of { } instead of { } " , MAX _ SANE _ LIVE _ RATIO , newRatio ) ; 
+ - newRatio = MAX _ SANE _ LIVE _ RATIO ; 
+ - } 
+ - 
+ - / / we want to be very conservative about our estimate , since the penalty for guessing low is OOM 
+ - / / death . thus , higher estimates are believed immediately ; lower ones are averaged w / the old 
+ - if ( newRatio > cfs . liveRatio ) 
+ - cfs . liveRatio = newRatio ; 
+ - else 
+ - cfs . liveRatio = ( cfs . liveRatio + newRatio ) / 2 . 0 ; 
+ - 
+ - logger . info ( " { } liveRatio is { } ( just - counted was { } ) . calculation took { } ms for { } columns " , 
+ - cfs , cfs . liveRatio , newRatio , TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) , objects ) ; 
+ - activelyMeasuring = null ; 
+ - } 
+ - finally 
+ - { 
+ - meteringInProgress . remove ( cfs ) ; 
+ - } 
+ - } 
+ - } ; 
+ - 
+ - meterExecutor . submit ( runnable ) ; 
+ + meterExecutor . submit ( new MeteringRunnable ( cfs ) ) ; 
+ } 
+ 
+ private void resolve ( DecoratedKey key , ColumnFamily cf , SecondaryIndexManager . Updater indexer ) 
+ @ @ - 448 , 4 + 390 , 63 @ @ public class Memtable 
+ sstableMetadataCollector ) ; 
+ } 
+ } 
+ + 
+ + private static class MeteringRunnable implements Runnable 
+ + { 
+ + / / we might need to wait in the meter queue for a while . measure whichever memtable is active at that point , 
+ + / / rather than keeping the original memtable referenced ( and thus un - freeable ) until this runs . 
+ + private final ColumnFamilyStore cfs ; 
+ + 
+ + public MeteringRunnable ( ColumnFamilyStore cfs ) 
+ + { 
+ + this . cfs = cfs ; 
+ + } 
+ + 
+ + public void run ( ) 
+ + { 
+ + try 
+ + { 
+ + activelyMeasuring = cfs ; 
+ + Memtable memtable = cfs . getMemtableThreadSafe ( ) ; 
+ + 
+ + long start = System . nanoTime ( ) ; 
+ + / / ConcurrentSkipListMap has cycles , so measureDeep will have to track a reference to EACH object it visits . 
+ + / / So to reduce the memory overhead of doing a measurement , we break it up to row - at - a - time . 
+ + long deepSize = memtable . meter . measure ( memtable . rows ) ; 
+ + int objects = 0 ; 
+ + for ( Map . Entry < RowPosition , AtomicSortedColumns > entry : memtable . rows . entrySet ( ) ) 
+ + { 
+ + deepSize + = memtable . meter . measureDeep ( entry . getKey ( ) ) + memtable . meter . measureDeep ( entry . getValue ( ) ) ; 
+ + objects + = entry . getValue ( ) . getColumnCount ( ) ; 
+ + } 
+ + double newRatio = ( double ) deepSize / memtable . currentSize . get ( ) ; 
+ + 
+ + if ( newRatio < MIN _ SANE _ LIVE _ RATIO ) 
+ + { 
+ + logger . warn ( " setting live ratio to minimum of { } instead of { } " , MIN _ SANE _ LIVE _ RATIO , newRatio ) ; 
+ + newRatio = MIN _ SANE _ LIVE _ RATIO ; 
+ + } 
+ + if ( newRatio > MAX _ SANE _ LIVE _ RATIO ) 
+ + { 
+ + logger . warn ( " setting live ratio to maximum of { } instead of { } " , MAX _ SANE _ LIVE _ RATIO , newRatio ) ; 
+ + newRatio = MAX _ SANE _ LIVE _ RATIO ; 
+ + } 
+ + 
+ + / / we want to be very conservative about our estimate , since the penalty for guessing low is OOM 
+ + / / death . thus , higher estimates are believed immediately ; lower ones are averaged w / the old 
+ + if ( newRatio > cfs . liveRatio ) 
+ + cfs . liveRatio = newRatio ; 
+ + else 
+ + cfs . liveRatio = ( cfs . liveRatio + newRatio ) / 2 . 0 ; 
+ + 
+ + logger . info ( " { } liveRatio is { } ( just - counted was { } ) . calculation took { } ms for { } columns " , 
+ + cfs , cfs . liveRatio , newRatio , TimeUnit . NANOSECONDS . toMillis ( System . nanoTime ( ) - start ) , objects ) ; 
+ + } 
+ + finally 
+ + { 
+ + activelyMeasuring = null ; 
+ + meteringInProgress . remove ( cfs ) ; 
+ + } 
+ + } 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / MeteredFlusher . java b / src / java / org / apache / cassandra / db / MeteredFlusher . java 
+ index 408727c . . f16b8a0 100644 
+ - - - a / src / java / org / apache / cassandra / db / MeteredFlusher . java 
+ + + + b / src / java / org / apache / cassandra / db / MeteredFlusher . java 
+ @ @ - 35 , 16 + 35 , 22 @ @ public class MeteredFlusher implements Runnable 
+ 
+ public void run ( ) 
+ { 
+ + long totalMemtableBytesAllowed = DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L ; 
+ + 
+ / / first , find how much memory non - active memtables are using 
+ - Memtable activelyMeasuring = Memtable . activelyMeasuring ; 
+ - long flushingBytes = activelyMeasuring = = null ? 0 : activelyMeasuring . getLiveSize ( ) ; 
+ + long flushingBytes = Memtable . activelyMeasuring = = null 
+ + ? 0 
+ + : Memtable . activelyMeasuring . getMemtableThreadSafe ( ) . getLiveSize ( ) ; 
+ flushingBytes + = countFlushingBytes ( ) ; 
+ + if ( flushingBytes > 0 ) 
+ + logger . debug ( " Currently flushing { } bytes of { } max " , flushingBytes , totalMemtableBytesAllowed ) ; 
+ 
+ / / next , flush CFs using more than 1 / ( maximum number of memtables it could have in the pipeline ) 
+ / / of the total size allotted . Then , flush other CFs in order of size if necessary . 
+ long liveBytes = 0 ; 
+ try 
+ { 
+ + long totalMemtableBytesUnused = totalMemtableBytesAllowed - flushingBytes ; 
+ for ( ColumnFamilyStore cfs : ColumnFamilyStore . all ( ) ) 
+ { 
+ long size = cfs . getTotalMemtableLiveSize ( ) ; 
+ @ @ - 53 , 7 + 59 , 7 @ @ public class MeteredFlusher implements Runnable 
+ + DatabaseDescriptor . getFlushWriters ( ) 
+ + DatabaseDescriptor . getFlushQueueSize ( ) ) 
+ / ( 1 + cfs . indexManager . getIndexesBackedByCfs ( ) . size ( ) ) ) ; 
+ - if ( size > ( DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L - flushingBytes ) / maxInFlight ) 
+ + if ( totalMemtableBytesUnused > 0 & & size > totalMemtableBytesUnused / maxInFlight ) 
+ { 
+ logger . info ( " flushing high - traffic column family { } ( estimated { } bytes ) " , cfs , size ) ; 
+ cfs . forceFlush ( ) ; 
+ @ @ - 64 , 10 + 70 , 10 @ @ public class MeteredFlusher implements Runnable 
+ } 
+ } 
+ 
+ - if ( flushingBytes + liveBytes < = DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L ) 
+ + if ( flushingBytes + liveBytes < = totalMemtableBytesAllowed ) 
+ return ; 
+ 
+ - logger . info ( " estimated { } bytes used by all memtables pre - flush " , liveBytes ) ; 
+ + logger . info ( " estimated { } live and { } flushing bytes used by all memtables " , liveBytes , flushingBytes ) ; 
+ 
+ / / sort memtables by size 
+ List < ColumnFamilyStore > sorted = new ArrayList < ColumnFamilyStore > ( ) ; 
+ @ @ - 89 , 14 + 95 , 16 @ @ public class MeteredFlusher implements Runnable 
+ / / flush largest first until we get below our threshold . 
+ / / although it looks like liveBytes + flushingBytes will stay a constant , it will not if flushes finish 
+ / / while we loop , which is especially likely to happen if the flush queue fills up ( so further forceFlush calls block ) 
+ - while ( true ) 
+ + while ( ! sorted . isEmpty ( ) ) 
+ { 
+ flushingBytes = countFlushingBytes ( ) ; 
+ - if ( liveBytes + flushingBytes < = DatabaseDescriptor . getTotalMemtableSpaceInMB ( ) * 1048576L | | sorted . isEmpty ( ) ) 
+ + if ( liveBytes + flushingBytes < = totalMemtableBytesAllowed ) 
+ break ; 
+ 
+ ColumnFamilyStore cfs = sorted . remove ( sorted . size ( ) - 1 ) ; 
+ long size = cfs . getTotalMemtableLiveSize ( ) ; 
+ + if ( size = = 0 ) 
+ + break ; 
+ logger . info ( " flushing { } to free up { } bytes " , cfs , size ) ; 
+ liveBytes - = size ; 
+ cfs . forceFlush ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / PeriodicCommitLogExecutorService . java b / src / java / org / apache / cassandra / db / commitlog / PeriodicCommitLogExecutorService . java 
+ index 7a0a761 . . 30f33b6 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / PeriodicCommitLogExecutorService . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / PeriodicCommitLogExecutorService . java 
+ @ @ - 35 , 7 + 35 , 7 @ @ class PeriodicCommitLogExecutorService implements ICommitLogExecutorService 
+ 
+ public PeriodicCommitLogExecutorService ( final CommitLog commitLog ) 
+ { 
+ - queue = new LinkedBlockingQueue < Runnable > ( 1024 * FBUtilities . getAvailableProcessors ( ) ) ; 
+ + queue = new LinkedBlockingQueue < Runnable > ( DatabaseDescriptor . getCommitLogPeriodicQueueSize ( ) ) ; 
+ Runnable runnable = new WrappedRunnable ( ) 
+ { 
+ public void runMayThrow ( ) throws Exception 
+ diff - - git a / src / java / org / apache / cassandra / utils / StatusLogger . java b / src / java / org / apache / cassandra / utils / StatusLogger . java 
+ index 2b9627f . . 939c81f 100644 
+ - - - a / src / java / org / apache / cassandra / utils / StatusLogger . java 
+ + + + b / src / java / org / apache / cassandra / utils / StatusLogger . java 
+ @ @ - 19 , 6 + 19 , 8 @ @ package org . apache . cassandra . utils ; 
+ 
+ import java . lang . management . ManagementFactory ; 
+ import java . util . Set ; 
+ + import java . util . concurrent . ExecutorService ; 
+ + import java . util . concurrent . ThreadPoolExecutor ; 
+ import javax . management . JMX ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . MalformedObjectNameException ; 
+ @ @ - 34 , 7 + 36 , 9 @ @ import org . slf4j . LoggerFactory ; 
+ import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutorMBean ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ + import org . apache . cassandra . db . Memtable ; 
+ import org . apache . cassandra . db . RowIndexEntry ; 
+ + import org . apache . cassandra . db . commitlog . CommitLog ; 
+ import org . apache . cassandra . db . compaction . CompactionManager ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ import org . apache . cassandra . service . CacheService ; 
+ @ @ - 72 , 9 + 76 , 10 @ @ public class StatusLogger 
+ threadPoolProxy . getTotalBlockedTasks ( ) ) ) ; 
+ } 
+ / / one offs 
+ - CompactionManager cm = CompactionManager . instance ; 
+ logger . info ( String . format ( " % - 25s % 10s % 10s " , 
+ - " CompactionManager " , cm . getActiveCompactions ( ) , cm . getPendingTasks ( ) ) ) ; 
+ + " CompactionManager " , CompactionManager . instance . getActiveCompactions ( ) , CompactionManager . instance . getPendingTasks ( ) ) ) ; 
+ + logger . info ( String . format ( " % - 25s % 10s % 10s " , 
+ + " Commitlog " , " n / a " , CommitLog . instance . getPendingTasks ( ) ) ) ; 
+ int pendingCommands = 0 ; 
+ for ( int n : MessagingService . instance ( ) . getCommandPendingTasks ( ) . values ( ) ) 
+ {

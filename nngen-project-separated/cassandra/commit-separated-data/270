@@ -1,0 +1,319 @@
+BLEU SCORE: 0.039297526283216276
+
+TEST MSG: AssertionError prepending to a list
+GENERATED MSG: Throttle base partitions during MV repair streaming to prevent OOM
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 7745e8c . . a1f49cd 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 15 <nl> + * AssertionError prepending to a list ( CASSANDRA - 13149 ) <nl> * Fix support for SuperColumn tables ( CASSANDRA - 12373 ) <nl> * Handle limit correctly on tables with strict liveness ( CASSANDRA - 13883 ) <nl> * Fix missing original update in TriggerExecutor ( CASSANDRA - 13894 ) <nl> diff - - git a / src / java / org / apache / cassandra / cql3 / Lists . java b / src / java / org / apache / cassandra / cql3 / Lists . java <nl> index 559cf3f . . 065f74a 100644 <nl> - - - a / src / java / org / apache / cassandra / cql3 / Lists . java <nl> + + + b / src / java / org / apache / cassandra / cql3 / Lists . java <nl> @ @ - 25 , 6 + 25 , 8 @ @ import java . util . List ; <nl> import java . util . concurrent . atomic . AtomicReference ; <nl> import java . util . stream . Collectors ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> + <nl> import org . apache . cassandra . config . ColumnDefinition ; <nl> import org . apache . cassandra . cql3 . functions . Function ; <nl> import org . apache . cassandra . db . * ; <nl> @ @ - 243 , 18 + 245 , 17 @ @ public abstract class Lists <nl> } <nl> } <nl> <nl> - / * <nl> + / * * <nl> * For prepend , we need to be able to generate unique but decreasing time <nl> - * UUID , which is a bit challenging . To do that , given a time in milliseconds , <nl> - * we adds a number representing the 100 - nanoseconds precision and make sure <nl> - * that within the same millisecond , that number is always decreasing . We <nl> - * do rely on the fact that the user will only provide decreasing <nl> - * milliseconds timestamp for that purpose . <nl> + * UUIDs , which is a bit challenging . To do that , given a time in milliseconds , <nl> + * we add a number representing the 100 - nanoseconds precision and make sure <nl> + * that within the same millisecond , that number is always decreasing . <nl> * / <nl> - private static class PrecisionTime <nl> + static class PrecisionTime <nl> { <nl> / / Our reference time ( 1 jan 2010 , 00 : 00 : 00 ) in milliseconds . <nl> private static final long REFERENCE _ TIME = 1262304000000L ; <nl> + static final int MAX _ NANOS = 9999 ; <nl> private static final AtomicReference < PrecisionTime > last = new AtomicReference < > ( new PrecisionTime ( Long . MAX _ VALUE , 0 ) ) ; <nl> <nl> public final long millis ; <nl> @ @ - 266 , 21 + 267 , 52 @ @ public abstract class Lists <nl> this . nanos = nanos ; <nl> } <nl> <nl> - static PrecisionTime getNext ( long millis ) <nl> + static PrecisionTime getNext ( long millis , int count ) <nl> { <nl> + if ( count = = 0 ) <nl> + return last . get ( ) ; <nl> + <nl> while ( true ) <nl> { <nl> PrecisionTime current = last . get ( ) ; <nl> <nl> - assert millis < = current . millis ; <nl> - PrecisionTime next = millis < current . millis <nl> - ? new PrecisionTime ( millis , 9999 ) <nl> - : new PrecisionTime ( millis , Math . max ( 0 , current . nanos - 1 ) ) ; <nl> + final PrecisionTime next ; <nl> + if ( millis < current . millis ) <nl> + { <nl> + next = new PrecisionTime ( millis , MAX _ NANOS - count ) ; <nl> + } <nl> + else <nl> + { <nl> + / / in addition to being at the same millisecond , we handle the unexpected case of the millis parameter <nl> + / / being in the past . That could happen if the System . currentTimeMillis ( ) not operating montonically <nl> + / / or if one thread is just a really big loser in the compareAndSet game of life . <nl> + long millisToUse = millis < = current . millis ? millis : current . millis ; <nl> + <nl> + / / if we will go below zero on the nanos , decrement the millis by one <nl> + final int nanosToUse ; <nl> + if ( current . nanos - count > = 0 ) <nl> + { <nl> + nanosToUse = current . nanos - count ; <nl> + } <nl> + else <nl> + { <nl> + nanosToUse = MAX _ NANOS - count ; <nl> + millisToUse - = 1 ; <nl> + } <nl> + <nl> + next = new PrecisionTime ( millisToUse , nanosToUse ) ; <nl> + } <nl> <nl> if ( last . compareAndSet ( current , next ) ) <nl> return next ; <nl> } <nl> } <nl> + <nl> + @ VisibleForTesting <nl> + static void set ( long millis , int nanos ) <nl> + { <nl> + last . set ( new PrecisionTime ( millis , nanos ) ) ; <nl> + } <nl> } <nl> <nl> public static class Setter extends Operation <nl> @ @ - 422 , 13 + 454 , 23 @ @ public abstract class Lists <nl> if ( value = = null | | value = = UNSET _ VALUE ) <nl> return ; <nl> <nl> - long time = PrecisionTime . REFERENCE _ TIME - ( System . currentTimeMillis ( ) - PrecisionTime . REFERENCE _ TIME ) ; <nl> - <nl> List < ByteBuffer > toAdd = ( ( Value ) value ) . elements ; <nl> - for ( int i = toAdd . size ( ) - 1 ; i > = 0 ; i - - ) <nl> + final int totalCount = toAdd . size ( ) ; <nl> + <nl> + / / we have to obey MAX _ NANOS per batch - in the unlikely event a client has decided to prepend a list with <nl> + / / an insane number of entries . <nl> + PrecisionTime pt = null ; <nl> + int remainingInBatch = 0 ; <nl> + for ( int i = totalCount - 1 ; i > = 0 ; i - - ) <nl> { <nl> - PrecisionTime pt = PrecisionTime . getNext ( time ) ; <nl> - ByteBuffer uuid = ByteBuffer . wrap ( UUIDGen . getTimeUUIDBytes ( pt . millis , pt . nanos ) ) ; <nl> + if ( remainingInBatch = = 0 ) <nl> + { <nl> + long time = PrecisionTime . REFERENCE _ TIME - ( System . currentTimeMillis ( ) - PrecisionTime . REFERENCE _ TIME ) ; <nl> + remainingInBatch = Math . min ( PrecisionTime . MAX _ NANOS , i ) + 1 ; <nl> + pt = PrecisionTime . getNext ( time , remainingInBatch ) ; <nl> + } <nl> + <nl> + ByteBuffer uuid = ByteBuffer . wrap ( UUIDGen . getTimeUUIDBytes ( pt . millis , ( pt . nanos + remainingInBatch - - ) ) ) ; <nl> params . addCell ( column , CellPath . create ( uuid ) , toAdd . get ( i ) ) ; <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / cql3 / ListsTest . java b / test / unit / org / apache / cassandra / cql3 / ListsTest . java <nl> new file mode 100644 <nl> index 0000000 . . 9ca0010 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / cql3 / ListsTest . java <nl> @ @ - 0 , 0 + 1 , 166 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + <nl> + package org . apache . cassandra . cql3 ; <nl> + <nl> + import java . nio . ByteBuffer ; <nl> + import java . util . ArrayList ; <nl> + import java . util . Collections ; <nl> + import java . util . List ; <nl> + import java . util . UUID ; <nl> + <nl> + import com . google . common . collect . Iterators ; <nl> + import org . junit . Assert ; <nl> + import org . junit . Test ; <nl> + <nl> + import org . apache . cassandra . config . CFMetaData ; <nl> + import org . apache . cassandra . config . ColumnDefinition ; <nl> + import org . apache . cassandra . cql3 . Lists . PrecisionTime ; <nl> + import org . apache . cassandra . db . Clustering ; <nl> + import org . apache . cassandra . db . DecoratedKey ; <nl> + import org . apache . cassandra . db . rows . Cell ; <nl> + import org . apache . cassandra . db . rows . Row ; <nl> + import org . apache . cassandra . dht . Murmur3Partitioner ; <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> + import org . apache . cassandra . utils . UUIDGen ; <nl> + <nl> + public class ListsTest extends CQLTester <nl> + { <nl> + private static final long DEFAULT _ MILLIS = 424242424242L ; <nl> + private static final int DEFAULT _ NANOS = PrecisionTime . MAX _ NANOS ; <nl> + <nl> + @ Test <nl> + public void testPrecisionTime _ getNext _ simple ( ) <nl> + { <nl> + PrecisionTime . set ( DEFAULT _ MILLIS , DEFAULT _ NANOS ) ; <nl> + <nl> + long millis = DEFAULT _ MILLIS - 100 ; <nl> + int count = 1 ; <nl> + PrecisionTime next = PrecisionTime . getNext ( millis , count ) ; <nl> + Assert . assertEquals ( millis , next . millis ) ; <nl> + Assert . assertEquals ( DEFAULT _ NANOS - count , next . nanos ) ; <nl> + <nl> + next = PrecisionTime . getNext ( millis , count ) ; <nl> + Assert . assertEquals ( millis , next . millis ) ; <nl> + Assert . assertEquals ( DEFAULT _ NANOS - ( count * 2 ) , next . nanos ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testPrecisionTime _ getNext _ Mulitple ( ) <nl> + { <nl> + PrecisionTime . set ( DEFAULT _ MILLIS , DEFAULT _ NANOS ) ; <nl> + <nl> + long millis = DEFAULT _ MILLIS - 100 ; <nl> + int count = DEFAULT _ NANOS / 2 ; <nl> + PrecisionTime next = PrecisionTime . getNext ( millis , count ) ; <nl> + Assert . assertEquals ( millis , next . millis ) ; <nl> + Assert . assertEquals ( DEFAULT _ NANOS - count , next . nanos ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testPrecisionTime _ getNext _ RollOverNanos ( ) <nl> + { <nl> + final int remainingNanos = 0 ; <nl> + PrecisionTime . set ( DEFAULT _ MILLIS , remainingNanos ) ; <nl> + <nl> + long millis = DEFAULT _ MILLIS ; <nl> + int count = 1 ; <nl> + PrecisionTime next = PrecisionTime . getNext ( millis , count ) ; <nl> + Assert . assertEquals ( millis - 1 , next . millis ) ; <nl> + Assert . assertEquals ( DEFAULT _ NANOS - count , next . nanos ) ; <nl> + <nl> + next = PrecisionTime . getNext ( millis , count ) ; <nl> + Assert . assertEquals ( millis - 1 , next . millis ) ; <nl> + Assert . assertEquals ( DEFAULT _ NANOS - ( count * 2 ) , next . nanos ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testPrecisionTime _ getNext _ BorkedClock ( ) <nl> + { <nl> + final int remainingNanos = 1 ; <nl> + PrecisionTime . set ( DEFAULT _ MILLIS , remainingNanos ) ; <nl> + <nl> + long millis = DEFAULT _ MILLIS + 100 ; <nl> + int count = 1 ; <nl> + PrecisionTime next = PrecisionTime . getNext ( millis , count ) ; <nl> + Assert . assertEquals ( DEFAULT _ MILLIS , next . millis ) ; <nl> + Assert . assertEquals ( remainingNanos - count , next . nanos ) ; <nl> + <nl> + / / this should roll the clock <nl> + next = PrecisionTime . getNext ( millis , count ) ; <nl> + Assert . assertEquals ( DEFAULT _ MILLIS - 1 , next . millis ) ; <nl> + Assert . assertEquals ( DEFAULT _ NANOS - count , next . nanos ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testPrepender _ SmallList ( ) <nl> + { <nl> + List < ByteBuffer > terms = new ArrayList < > ( ) ; <nl> + terms . add ( ByteBufferUtil . bytes ( 1 ) ) ; <nl> + terms . add ( ByteBufferUtil . bytes ( 2 ) ) ; <nl> + terms . add ( ByteBufferUtil . bytes ( 3 ) ) ; <nl> + terms . add ( ByteBufferUtil . bytes ( 4 ) ) ; <nl> + terms . add ( ByteBufferUtil . bytes ( 5 ) ) ; <nl> + testPrepender _ execute ( terms ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testPrepender _ HugeList ( ) <nl> + { <nl> + List < ByteBuffer > terms = new ArrayList < > ( ) ; <nl> + / / create a large enough array , then remove some off the end , just to make it an odd size <nl> + for ( int i = 0 ; i < PrecisionTime . MAX _ NANOS * 4 - 287 ; i + + ) <nl> + terms . add ( ByteBufferUtil . bytes ( i ) ) ; <nl> + testPrepender _ execute ( terms ) ; <nl> + } <nl> + <nl> + private void testPrepender _ execute ( List < ByteBuffer > terms ) <nl> + { <nl> + createTable ( " CREATE TABLE % s ( k int PRIMARY KEY , l list < text > ) " ) ; <nl> + CFMetaData metaData = currentTableMetadata ( ) ; <nl> + <nl> + ColumnDefinition columnDefinition = metaData . getColumnDefinition ( ByteBufferUtil . bytes ( " l " ) ) ; <nl> + Term term = new Lists . Value ( terms ) ; <nl> + Lists . Prepender prepender = new Lists . Prepender ( columnDefinition , term ) ; <nl> + <nl> + ByteBuffer keyBuf = ByteBufferUtil . bytes ( " key " ) ; <nl> + DecoratedKey key = Murmur3Partitioner . instance . decorateKey ( keyBuf ) ; <nl> + UpdateParameters parameters = new UpdateParameters ( metaData , null , null , System . currentTimeMillis ( ) , 1000 , Collections . emptyMap ( ) ) ; <nl> + Clustering clustering = new Clustering ( ByteBufferUtil . bytes ( 1 ) ) ; <nl> + parameters . newRow ( clustering ) ; <nl> + prepender . execute ( key , parameters ) ; <nl> + <nl> + Row row = parameters . buildRow ( ) ; <nl> + Assert . assertEquals ( terms . size ( ) , Iterators . size ( row . cells ( ) . iterator ( ) ) ) ; <nl> + <nl> + int idx = 0 ; <nl> + UUID last = null ; <nl> + for ( Cell cell : row . cells ( ) ) <nl> + { <nl> + UUID uuid = UUIDGen . getUUID ( cell . path ( ) . get ( 0 ) ) ; <nl> + <nl> + if ( last ! = null ) <nl> + Assert . assertTrue ( last . compareTo ( uuid ) < 0 ) ; <nl> + last = uuid ; <nl> + <nl> + Assert . assertEquals ( String . format ( " different values found : expected : ' % d ' , found ' % d ' " , ByteBufferUtil . toInt ( terms . get ( idx ) ) , ByteBufferUtil . toInt ( cell . value ( ) ) ) , <nl> + terms . get ( idx ) , cell . value ( ) ) ; <nl> + idx + + ; <nl> + } <nl> + } <nl> + }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 7745e8c . . a1f49cd 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 15 
+ + * AssertionError prepending to a list ( CASSANDRA - 13149 ) 
+ * Fix support for SuperColumn tables ( CASSANDRA - 12373 ) 
+ * Handle limit correctly on tables with strict liveness ( CASSANDRA - 13883 ) 
+ * Fix missing original update in TriggerExecutor ( CASSANDRA - 13894 ) 
+ diff - - git a / src / java / org / apache / cassandra / cql3 / Lists . java b / src / java / org / apache / cassandra / cql3 / Lists . java 
+ index 559cf3f . . 065f74a 100644 
+ - - - a / src / java / org / apache / cassandra / cql3 / Lists . java 
+ + + + b / src / java / org / apache / cassandra / cql3 / Lists . java 
+ @ @ - 25 , 6 + 25 , 8 @ @ import java . util . List ; 
+ import java . util . concurrent . atomic . AtomicReference ; 
+ import java . util . stream . Collectors ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ + 
+ import org . apache . cassandra . config . ColumnDefinition ; 
+ import org . apache . cassandra . cql3 . functions . Function ; 
+ import org . apache . cassandra . db . * ; 
+ @ @ - 243 , 18 + 245 , 17 @ @ public abstract class Lists 
+ } 
+ } 
+ 
+ - / * 
+ + / * * 
+ * For prepend , we need to be able to generate unique but decreasing time 
+ - * UUID , which is a bit challenging . To do that , given a time in milliseconds , 
+ - * we adds a number representing the 100 - nanoseconds precision and make sure 
+ - * that within the same millisecond , that number is always decreasing . We 
+ - * do rely on the fact that the user will only provide decreasing 
+ - * milliseconds timestamp for that purpose . 
+ + * UUIDs , which is a bit challenging . To do that , given a time in milliseconds , 
+ + * we add a number representing the 100 - nanoseconds precision and make sure 
+ + * that within the same millisecond , that number is always decreasing . 
+ * / 
+ - private static class PrecisionTime 
+ + static class PrecisionTime 
+ { 
+ / / Our reference time ( 1 jan 2010 , 00 : 00 : 00 ) in milliseconds . 
+ private static final long REFERENCE _ TIME = 1262304000000L ; 
+ + static final int MAX _ NANOS = 9999 ; 
+ private static final AtomicReference < PrecisionTime > last = new AtomicReference < > ( new PrecisionTime ( Long . MAX _ VALUE , 0 ) ) ; 
+ 
+ public final long millis ; 
+ @ @ - 266 , 21 + 267 , 52 @ @ public abstract class Lists 
+ this . nanos = nanos ; 
+ } 
+ 
+ - static PrecisionTime getNext ( long millis ) 
+ + static PrecisionTime getNext ( long millis , int count ) 
+ { 
+ + if ( count = = 0 ) 
+ + return last . get ( ) ; 
+ + 
+ while ( true ) 
+ { 
+ PrecisionTime current = last . get ( ) ; 
+ 
+ - assert millis < = current . millis ; 
+ - PrecisionTime next = millis < current . millis 
+ - ? new PrecisionTime ( millis , 9999 ) 
+ - : new PrecisionTime ( millis , Math . max ( 0 , current . nanos - 1 ) ) ; 
+ + final PrecisionTime next ; 
+ + if ( millis < current . millis ) 
+ + { 
+ + next = new PrecisionTime ( millis , MAX _ NANOS - count ) ; 
+ + } 
+ + else 
+ + { 
+ + / / in addition to being at the same millisecond , we handle the unexpected case of the millis parameter 
+ + / / being in the past . That could happen if the System . currentTimeMillis ( ) not operating montonically 
+ + / / or if one thread is just a really big loser in the compareAndSet game of life . 
+ + long millisToUse = millis < = current . millis ? millis : current . millis ; 
+ + 
+ + / / if we will go below zero on the nanos , decrement the millis by one 
+ + final int nanosToUse ; 
+ + if ( current . nanos - count > = 0 ) 
+ + { 
+ + nanosToUse = current . nanos - count ; 
+ + } 
+ + else 
+ + { 
+ + nanosToUse = MAX _ NANOS - count ; 
+ + millisToUse - = 1 ; 
+ + } 
+ + 
+ + next = new PrecisionTime ( millisToUse , nanosToUse ) ; 
+ + } 
+ 
+ if ( last . compareAndSet ( current , next ) ) 
+ return next ; 
+ } 
+ } 
+ + 
+ + @ VisibleForTesting 
+ + static void set ( long millis , int nanos ) 
+ + { 
+ + last . set ( new PrecisionTime ( millis , nanos ) ) ; 
+ + } 
+ } 
+ 
+ public static class Setter extends Operation 
+ @ @ - 422 , 13 + 454 , 23 @ @ public abstract class Lists 
+ if ( value = = null | | value = = UNSET _ VALUE ) 
+ return ; 
+ 
+ - long time = PrecisionTime . REFERENCE _ TIME - ( System . currentTimeMillis ( ) - PrecisionTime . REFERENCE _ TIME ) ; 
+ - 
+ List < ByteBuffer > toAdd = ( ( Value ) value ) . elements ; 
+ - for ( int i = toAdd . size ( ) - 1 ; i > = 0 ; i - - ) 
+ + final int totalCount = toAdd . size ( ) ; 
+ + 
+ + / / we have to obey MAX _ NANOS per batch - in the unlikely event a client has decided to prepend a list with 
+ + / / an insane number of entries . 
+ + PrecisionTime pt = null ; 
+ + int remainingInBatch = 0 ; 
+ + for ( int i = totalCount - 1 ; i > = 0 ; i - - ) 
+ { 
+ - PrecisionTime pt = PrecisionTime . getNext ( time ) ; 
+ - ByteBuffer uuid = ByteBuffer . wrap ( UUIDGen . getTimeUUIDBytes ( pt . millis , pt . nanos ) ) ; 
+ + if ( remainingInBatch = = 0 ) 
+ + { 
+ + long time = PrecisionTime . REFERENCE _ TIME - ( System . currentTimeMillis ( ) - PrecisionTime . REFERENCE _ TIME ) ; 
+ + remainingInBatch = Math . min ( PrecisionTime . MAX _ NANOS , i ) + 1 ; 
+ + pt = PrecisionTime . getNext ( time , remainingInBatch ) ; 
+ + } 
+ + 
+ + ByteBuffer uuid = ByteBuffer . wrap ( UUIDGen . getTimeUUIDBytes ( pt . millis , ( pt . nanos + remainingInBatch - - ) ) ) ; 
+ params . addCell ( column , CellPath . create ( uuid ) , toAdd . get ( i ) ) ; 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / cql3 / ListsTest . java b / test / unit / org / apache / cassandra / cql3 / ListsTest . java 
+ new file mode 100644 
+ index 0000000 . . 9ca0010 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / cql3 / ListsTest . java 
+ @ @ - 0 , 0 + 1 , 166 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + 
+ + package org . apache . cassandra . cql3 ; 
+ + 
+ + import java . nio . ByteBuffer ; 
+ + import java . util . ArrayList ; 
+ + import java . util . Collections ; 
+ + import java . util . List ; 
+ + import java . util . UUID ; 
+ + 
+ + import com . google . common . collect . Iterators ; 
+ + import org . junit . Assert ; 
+ + import org . junit . Test ; 
+ + 
+ + import org . apache . cassandra . config . CFMetaData ; 
+ + import org . apache . cassandra . config . ColumnDefinition ; 
+ + import org . apache . cassandra . cql3 . Lists . PrecisionTime ; 
+ + import org . apache . cassandra . db . Clustering ; 
+ + import org . apache . cassandra . db . DecoratedKey ; 
+ + import org . apache . cassandra . db . rows . Cell ; 
+ + import org . apache . cassandra . db . rows . Row ; 
+ + import org . apache . cassandra . dht . Murmur3Partitioner ; 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ + import org . apache . cassandra . utils . UUIDGen ; 
+ + 
+ + public class ListsTest extends CQLTester 
+ + { 
+ + private static final long DEFAULT _ MILLIS = 424242424242L ; 
+ + private static final int DEFAULT _ NANOS = PrecisionTime . MAX _ NANOS ; 
+ + 
+ + @ Test 
+ + public void testPrecisionTime _ getNext _ simple ( ) 
+ + { 
+ + PrecisionTime . set ( DEFAULT _ MILLIS , DEFAULT _ NANOS ) ; 
+ + 
+ + long millis = DEFAULT _ MILLIS - 100 ; 
+ + int count = 1 ; 
+ + PrecisionTime next = PrecisionTime . getNext ( millis , count ) ; 
+ + Assert . assertEquals ( millis , next . millis ) ; 
+ + Assert . assertEquals ( DEFAULT _ NANOS - count , next . nanos ) ; 
+ + 
+ + next = PrecisionTime . getNext ( millis , count ) ; 
+ + Assert . assertEquals ( millis , next . millis ) ; 
+ + Assert . assertEquals ( DEFAULT _ NANOS - ( count * 2 ) , next . nanos ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testPrecisionTime _ getNext _ Mulitple ( ) 
+ + { 
+ + PrecisionTime . set ( DEFAULT _ MILLIS , DEFAULT _ NANOS ) ; 
+ + 
+ + long millis = DEFAULT _ MILLIS - 100 ; 
+ + int count = DEFAULT _ NANOS / 2 ; 
+ + PrecisionTime next = PrecisionTime . getNext ( millis , count ) ; 
+ + Assert . assertEquals ( millis , next . millis ) ; 
+ + Assert . assertEquals ( DEFAULT _ NANOS - count , next . nanos ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testPrecisionTime _ getNext _ RollOverNanos ( ) 
+ + { 
+ + final int remainingNanos = 0 ; 
+ + PrecisionTime . set ( DEFAULT _ MILLIS , remainingNanos ) ; 
+ + 
+ + long millis = DEFAULT _ MILLIS ; 
+ + int count = 1 ; 
+ + PrecisionTime next = PrecisionTime . getNext ( millis , count ) ; 
+ + Assert . assertEquals ( millis - 1 , next . millis ) ; 
+ + Assert . assertEquals ( DEFAULT _ NANOS - count , next . nanos ) ; 
+ + 
+ + next = PrecisionTime . getNext ( millis , count ) ; 
+ + Assert . assertEquals ( millis - 1 , next . millis ) ; 
+ + Assert . assertEquals ( DEFAULT _ NANOS - ( count * 2 ) , next . nanos ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testPrecisionTime _ getNext _ BorkedClock ( ) 
+ + { 
+ + final int remainingNanos = 1 ; 
+ + PrecisionTime . set ( DEFAULT _ MILLIS , remainingNanos ) ; 
+ + 
+ + long millis = DEFAULT _ MILLIS + 100 ; 
+ + int count = 1 ; 
+ + PrecisionTime next = PrecisionTime . getNext ( millis , count ) ; 
+ + Assert . assertEquals ( DEFAULT _ MILLIS , next . millis ) ; 
+ + Assert . assertEquals ( remainingNanos - count , next . nanos ) ; 
+ + 
+ + / / this should roll the clock 
+ + next = PrecisionTime . getNext ( millis , count ) ; 
+ + Assert . assertEquals ( DEFAULT _ MILLIS - 1 , next . millis ) ; 
+ + Assert . assertEquals ( DEFAULT _ NANOS - count , next . nanos ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testPrepender _ SmallList ( ) 
+ + { 
+ + List < ByteBuffer > terms = new ArrayList < > ( ) ; 
+ + terms . add ( ByteBufferUtil . bytes ( 1 ) ) ; 
+ + terms . add ( ByteBufferUtil . bytes ( 2 ) ) ; 
+ + terms . add ( ByteBufferUtil . bytes ( 3 ) ) ; 
+ + terms . add ( ByteBufferUtil . bytes ( 4 ) ) ; 
+ + terms . add ( ByteBufferUtil . bytes ( 5 ) ) ; 
+ + testPrepender _ execute ( terms ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testPrepender _ HugeList ( ) 
+ + { 
+ + List < ByteBuffer > terms = new ArrayList < > ( ) ; 
+ + / / create a large enough array , then remove some off the end , just to make it an odd size 
+ + for ( int i = 0 ; i < PrecisionTime . MAX _ NANOS * 4 - 287 ; i + + ) 
+ + terms . add ( ByteBufferUtil . bytes ( i ) ) ; 
+ + testPrepender _ execute ( terms ) ; 
+ + } 
+ + 
+ + private void testPrepender _ execute ( List < ByteBuffer > terms ) 
+ + { 
+ + createTable ( " CREATE TABLE % s ( k int PRIMARY KEY , l list < text > ) " ) ; 
+ + CFMetaData metaData = currentTableMetadata ( ) ; 
+ + 
+ + ColumnDefinition columnDefinition = metaData . getColumnDefinition ( ByteBufferUtil . bytes ( " l " ) ) ; 
+ + Term term = new Lists . Value ( terms ) ; 
+ + Lists . Prepender prepender = new Lists . Prepender ( columnDefinition , term ) ; 
+ + 
+ + ByteBuffer keyBuf = ByteBufferUtil . bytes ( " key " ) ; 
+ + DecoratedKey key = Murmur3Partitioner . instance . decorateKey ( keyBuf ) ; 
+ + UpdateParameters parameters = new UpdateParameters ( metaData , null , null , System . currentTimeMillis ( ) , 1000 , Collections . emptyMap ( ) ) ; 
+ + Clustering clustering = new Clustering ( ByteBufferUtil . bytes ( 1 ) ) ; 
+ + parameters . newRow ( clustering ) ; 
+ + prepender . execute ( key , parameters ) ; 
+ + 
+ + Row row = parameters . buildRow ( ) ; 
+ + Assert . assertEquals ( terms . size ( ) , Iterators . size ( row . cells ( ) . iterator ( ) ) ) ; 
+ + 
+ + int idx = 0 ; 
+ + UUID last = null ; 
+ + for ( Cell cell : row . cells ( ) ) 
+ + { 
+ + UUID uuid = UUIDGen . getUUID ( cell . path ( ) . get ( 0 ) ) ; 
+ + 
+ + if ( last ! = null ) 
+ + Assert . assertTrue ( last . compareTo ( uuid ) < 0 ) ; 
+ + last = uuid ; 
+ + 
+ + Assert . assertEquals ( String . format ( " different values found : expected : ' % d ' , found ' % d ' " , ByteBufferUtil . toInt ( terms . get ( idx ) ) , ByteBufferUtil . toInt ( cell . value ( ) ) ) , 
+ + terms . get ( idx ) , cell . value ( ) ) ; 
+ + idx + + ; 
+ + } 
+ + } 
+ + }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

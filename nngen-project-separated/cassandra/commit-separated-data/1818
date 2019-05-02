@@ -1,0 +1,2214 @@
+BLEU SCORE: 0.02735488212061132
+
+TEST MSG: IndexSummaryBuilder utilises offheap memory , and shares data between
+GENERATED MSG: merge { SSTable , RowIndexed } Reader , { SSTable , RowIndexed } Scanner
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 6133536 . . 3b373ae 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 25 , 6 + 25 , 8 @ @ <nl> * cqlsh : Fix keys ( ) and full ( ) collection indexes in DESCRIBE output <nl> ( CASSANDRA - 8154 ) <nl> * Show progress of streaming in nodetool netstats ( CASSANDRA - 8886 ) <nl> + * IndexSummaryBuilder utilises offheap memory , and shares data between <nl> + each IndexSummary opened from it ( CASSANDRA - 8757 ) <nl> Merged from 2 . 0 : <nl> * Add offline tool to relevel sstables ( CASSANDRA - 8301 ) <nl> * Preserve stream ID for more protocol errors ( CASSANDRA - 8848 ) <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / IndexSummary . java b / src / java / org / apache / cassandra / io / sstable / IndexSummary . java <nl> index 0cde124 . . bad50b4 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / IndexSummary . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / IndexSummary . java <nl> @ @ - 20 , 8 + 20 , 8 @ @ package org . apache . cassandra . io . sstable ; <nl> import java . io . DataInputStream ; <nl> import java . io . IOException ; <nl> import java . nio . ByteBuffer ; <nl> + import java . nio . ByteOrder ; <nl> <nl> - import org . apache . cassandra . cache . RefCountedMemory ; <nl> import org . apache . cassandra . db . DecoratedKey ; <nl> import org . apache . cassandra . db . RowPosition ; <nl> import org . apache . cassandra . dht . IPartitioner ; <nl> @ @ - 54 , 9 + 54 , 16 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> private final int minIndexInterval ; <nl> <nl> private final IPartitioner partitioner ; <nl> - private final int summarySize ; <nl> private final int sizeAtFullSampling ; <nl> - private final Memory bytes ; <nl> + / / we permit the memory to span a range larger than we use , <nl> + / / so we have an accompanying count and length for each part <nl> + / / we split our data into two ranges : offsets ( indexing into entries ) , <nl> + / / and entries containing the summary data <nl> + private final Memory offsets ; <nl> + private final int offsetCount ; <nl> + / / entries is a list of ( partition key , index file offset ) pairs <nl> + private final Memory entries ; <nl> + private final long entriesLength ; <nl> <nl> / * * <nl> * A value between 1 and BASE _ SAMPLING _ LEVEL that represents how many of the original <nl> @ @ - 66 , 15 + 73 , 18 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> * / <nl> private final int samplingLevel ; <nl> <nl> - public IndexSummary ( IPartitioner partitioner , Memory bytes , int summarySize , int sizeAtFullSampling , <nl> - int minIndexInterval , int samplingLevel ) <nl> + public IndexSummary ( IPartitioner partitioner , Memory offsets , int offsetCount , Memory entries , long entriesLength , <nl> + int sizeAtFullSampling , int minIndexInterval , int samplingLevel ) <nl> { <nl> - super ( bytes ) ; <nl> + super ( new Memory [ ] { offsets , entries } ) ; <nl> + assert offsets . getInt ( 0 ) = = 0 ; <nl> this . partitioner = partitioner ; <nl> this . minIndexInterval = minIndexInterval ; <nl> - this . summarySize = summarySize ; <nl> + this . offsetCount = offsetCount ; <nl> + this . entriesLength = entriesLength ; <nl> this . sizeAtFullSampling = sizeAtFullSampling ; <nl> - this . bytes = bytes ; <nl> + this . offsets = offsets ; <nl> + this . entries = entries ; <nl> this . samplingLevel = samplingLevel ; <nl> } <nl> <nl> @ @ - 83 , 9 + 93 , 11 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> super ( copy ) ; <nl> this . partitioner = copy . partitioner ; <nl> this . minIndexInterval = copy . minIndexInterval ; <nl> - this . summarySize = copy . summarySize ; <nl> + this . offsetCount = copy . offsetCount ; <nl> + this . entriesLength = copy . entriesLength ; <nl> this . sizeAtFullSampling = copy . sizeAtFullSampling ; <nl> - this . bytes = copy . bytes ; <nl> + this . offsets = copy . offsets ; <nl> + this . entries = copy . entries ; <nl> this . samplingLevel = copy . samplingLevel ; <nl> } <nl> <nl> @ @ - 93 , 7 + 105 , 7 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> / / Harmony ' s Collections implementation <nl> public int binarySearch ( RowPosition key ) <nl> { <nl> - int low = 0 , mid = summarySize , high = mid - 1 , result = - 1 ; <nl> + int low = 0 , mid = offsetCount , high = mid - 1 , result = - 1 ; <nl> while ( low < = high ) <nl> { <nl> mid = ( low + high ) > > 1 ; <nl> @ @ - 123 , 7 + 135 , 7 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> public int getPositionInSummary ( int index ) <nl> { <nl> / / The first section of bytes holds a four - byte position for each entry in the summary , so just multiply by 4 . <nl> - return bytes . getInt ( index < < 2 ) ; <nl> + return offsets . getInt ( index < < 2 ) ; <nl> } <nl> <nl> public byte [ ] getKey ( int index ) <nl> @ @ - 131 , 27 + 143 , 23 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> long start = getPositionInSummary ( index ) ; <nl> int keySize = ( int ) ( calculateEnd ( index ) - start - 8L ) ; <nl> byte [ ] key = new byte [ keySize ] ; <nl> - bytes . getBytes ( start , key , 0 , keySize ) ; <nl> + entries . getBytes ( start , key , 0 , keySize ) ; <nl> return key ; <nl> } <nl> <nl> public long getPosition ( int index ) <nl> { <nl> - return bytes . getLong ( calculateEnd ( index ) - 8 ) ; <nl> + return entries . getLong ( calculateEnd ( index ) - 8 ) ; <nl> } <nl> <nl> - public byte [ ] getEntry ( int index ) <nl> + public long getEndInSummary ( int index ) <nl> { <nl> - long start = getPositionInSummary ( index ) ; <nl> - long end = calculateEnd ( index ) ; <nl> - byte [ ] entry = new byte [ ( int ) ( end - start ) ] ; <nl> - bytes . getBytes ( start , entry , 0 , ( int ) ( end - start ) ) ; <nl> - return entry ; <nl> + return calculateEnd ( index ) ; <nl> } <nl> <nl> private long calculateEnd ( int index ) <nl> { <nl> - return index = = ( summarySize - 1 ) ? bytes . size ( ) : getPositionInSummary ( index + 1 ) ; <nl> + return index = = ( offsetCount - 1 ) ? entriesLength : getPositionInSummary ( index + 1 ) ; <nl> } <nl> <nl> public int getMinIndexInterval ( ) <nl> @ @ - 174 , 7 + 182 , 7 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> <nl> public int size ( ) <nl> { <nl> - return summarySize ; <nl> + return offsetCount ; <nl> } <nl> <nl> public int getSamplingLevel ( ) <nl> @ @ - 192 , 12 + 200 , 27 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> } <nl> <nl> / * * <nl> - * Returns the amount of off - heap memory used for this summary . <nl> + * Returns the amount of off - heap memory used for the entries portion of this summary . <nl> * @ return size in bytes <nl> * / <nl> - public long getOffHeapSize ( ) <nl> + long getEntriesLength ( ) <nl> + { <nl> + return entriesLength ; <nl> + } <nl> + <nl> + Memory getOffsets ( ) <nl> + { <nl> + return offsets ; <nl> + } <nl> + <nl> + Memory getEntries ( ) <nl> + { <nl> + return entries ; <nl> + } <nl> + <nl> + long getOffHeapSize ( ) <nl> { <nl> - return bytes . size ( ) ; <nl> + return offsetCount * 4 + entriesLength ; <nl> } <nl> <nl> / * * <nl> @ @ - 224 , 14 + 247 , 29 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> public void serialize ( IndexSummary t , DataOutputPlus out , boolean withSamplingLevel ) throws IOException <nl> { <nl> out . writeInt ( t . minIndexInterval ) ; <nl> - out . writeInt ( t . summarySize ) ; <nl> - out . writeLong ( t . bytes . size ( ) ) ; <nl> + out . writeInt ( t . offsetCount ) ; <nl> + out . writeLong ( t . getOffHeapSize ( ) ) ; <nl> if ( withSamplingLevel ) <nl> { <nl> out . writeInt ( t . samplingLevel ) ; <nl> out . writeInt ( t . sizeAtFullSampling ) ; <nl> } <nl> - out . write ( t . bytes ) ; <nl> + / / our on - disk representation treats the offsets and the summary data as one contiguous structure , <nl> + / / in which the offsets are based from the start of the structure . i . e . , if the offsets occupy <nl> + / / X bytes , the value of the first offset will be X . In memory we split the two regions up , so that <nl> + / / the summary values are indexed from zero , so we apply a correction to the offsets when de / serializing . <nl> + / / In this case adding X to each of the offsets . <nl> + int baseOffset = t . offsetCount * 4 ; <nl> + for ( int i = 0 ; i < t . offsetCount ; i + + ) <nl> + { <nl> + int offset = t . offsets . getInt ( i * 4 ) + baseOffset ; <nl> + / / our serialization format for this file uses native byte order , so if this is different to the <nl> + / / default Java serialization order ( BIG _ ENDIAN ) we have to reverse our bytes <nl> + if ( ByteOrder . nativeOrder ( ) ! = ByteOrder . BIG _ ENDIAN ) <nl> + offset = Integer . reverseBytes ( offset ) ; <nl> + out . writeInt ( offset ) ; <nl> + } <nl> + out . write ( t . entries , 0 , t . entriesLength ) ; <nl> } <nl> <nl> public IndexSummary deserialize ( DataInputStream in , IPartitioner partitioner , boolean haveSamplingLevel , int expectedMinIndexInterval , int maxIndexInterval ) throws IOException <nl> @ @ - 243 , 7 + 281 , 7 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> minIndexInterval , expectedMinIndexInterval ) ) ; <nl> } <nl> <nl> - int summarySize = in . readInt ( ) ; <nl> + int offsetCount = in . readInt ( ) ; <nl> long offheapSize = in . readLong ( ) ; <nl> int samplingLevel , fullSamplingSummarySize ; <nl> if ( haveSamplingLevel ) <nl> @ @ - 254 , 7 + 292 , 7 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> else <nl> { <nl> samplingLevel = BASE _ SAMPLING _ LEVEL ; <nl> - fullSamplingSummarySize = summarySize ; <nl> + fullSamplingSummarySize = offsetCount ; <nl> } <nl> <nl> int effectiveIndexInterval = ( int ) Math . ceil ( ( BASE _ SAMPLING _ LEVEL / ( double ) samplingLevel ) * minIndexInterval ) ; <nl> @ @ - 264 , 9 + 302 , 18 @ @ public class IndexSummary extends WrappedSharedCloseable <nl> " the current max index interval ( % d ) " , effectiveIndexInterval , maxIndexInterval ) ) ; <nl> } <nl> <nl> - RefCountedMemory memory = new RefCountedMemory ( offheapSize ) ; <nl> - FBUtilities . copy ( in , new MemoryOutputStream ( memory ) , offheapSize ) ; <nl> - return new IndexSummary ( partitioner , memory , summarySize , fullSamplingSummarySize , minIndexInterval , samplingLevel ) ; <nl> + Memory offsets = Memory . allocate ( offsetCount * 4 ) ; <nl> + Memory entries = Memory . allocate ( offheapSize - offsets . size ( ) ) ; <nl> + FBUtilities . copy ( in , new MemoryOutputStream ( offsets ) , offsets . size ( ) ) ; <nl> + FBUtilities . copy ( in , new MemoryOutputStream ( entries ) , entries . size ( ) ) ; <nl> + / / our on - disk representation treats the offsets and the summary data as one contiguous structure , <nl> + / / in which the offsets are based from the start of the structure . i . e . , if the offsets occupy <nl> + / / X bytes , the value of the first offset will be X . In memory we split the two regions up , so that <nl> + / / the summary values are indexed from zero , so we apply a correction to the offsets when de / serializing . <nl> + / / In this case subtracting X from each of the offsets . <nl> + for ( int i = 0 ; i < offsets . size ( ) ; i + = 4 ) <nl> + offsets . setInt ( i , ( int ) ( offsets . getInt ( i ) - offsets . size ( ) ) ) ; <nl> + return new IndexSummary ( partitioner , offsets , offsetCount , entries , entries . size ( ) , fullSamplingSummarySize , minIndexInterval , samplingLevel ) ; <nl> } <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / IndexSummaryBuilder . java b / src / java / org / apache / cassandra / io / sstable / IndexSummaryBuilder . java <nl> index 3b93b31 . . 54e8dd2 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / IndexSummaryBuilder . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / IndexSummaryBuilder . java <nl> @ @ - 17 , 36 + 17 , 33 @ @ <nl> * / <nl> package org . apache . cassandra . io . sstable ; <nl> <nl> - import java . nio . ByteBuffer ; <nl> - import java . util . ArrayList ; <nl> - import java . util . Collections ; <nl> + import java . nio . ByteOrder ; <nl> import java . util . Map ; <nl> import java . util . TreeMap ; <nl> <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> - import org . apache . cassandra . cache . RefCountedMemory ; <nl> import org . apache . cassandra . db . DecoratedKey ; <nl> - import org . apache . cassandra . db . TypeSizes ; <nl> import org . apache . cassandra . dht . IPartitioner ; <nl> import org . apache . cassandra . io . util . Memory ; <nl> + import org . apache . cassandra . io . util . SafeMemoryWriter ; <nl> <nl> import static org . apache . cassandra . io . sstable . Downsampling . BASE _ SAMPLING _ LEVEL ; <nl> - import static org . apache . cassandra . io . sstable . SSTable . getMinimalKey ; <nl> <nl> - public class IndexSummaryBuilder <nl> + public class IndexSummaryBuilder implements AutoCloseable <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( IndexSummaryBuilder . class ) ; <nl> <nl> - private final ArrayList < Long > positions ; <nl> - private final ArrayList < DecoratedKey > keys ; <nl> + / / the offset in the keys memory region to look for a given summary boundary <nl> + private final SafeMemoryWriter offsets ; <nl> + private final SafeMemoryWriter entries ; <nl> + <nl> private final int minIndexInterval ; <nl> private final int samplingLevel ; <nl> private final int [ ] startPoints ; <nl> private long keysWritten = 0 ; <nl> private long indexIntervalMatches = 0 ; <nl> - private long offheapSize = 0 ; <nl> private long nextSamplePosition ; <nl> <nl> / / for each ReadableBoundary , we map its dataLength property to itself , permitting us to lookup the <nl> @ @ - 75 , 11 + 72 , 15 @ @ public class IndexSummaryBuilder <nl> final DecoratedKey lastKey ; <nl> final long indexLength ; <nl> final long dataLength ; <nl> - public ReadableBoundary ( DecoratedKey lastKey , long indexLength , long dataLength ) <nl> + final int summaryCount ; <nl> + final long entriesLength ; <nl> + public ReadableBoundary ( DecoratedKey lastKey , long indexLength , long dataLength , int summaryCount , long entriesLength ) <nl> { <nl> this . lastKey = lastKey ; <nl> this . indexLength = indexLength ; <nl> this . dataLength = dataLength ; <nl> + this . summaryCount = summaryCount ; <nl> + this . entriesLength = entriesLength ; <nl> } <nl> } <nl> <nl> @ @ - 105 , 10 + 106 , 9 @ @ public class IndexSummaryBuilder <nl> } <nl> <nl> / / for initializing data structures , adjust our estimates based on the sampling level <nl> - maxExpectedEntries = ( maxExpectedEntries * samplingLevel ) / BASE _ SAMPLING _ LEVEL ; <nl> - positions = new ArrayList < > ( ( int ) maxExpectedEntries ) ; <nl> - keys = new ArrayList < > ( ( int ) maxExpectedEntries ) ; <nl> - / / if we ' re downsampling we may not use index 0 <nl> + maxExpectedEntries = Math . max ( 1 , ( maxExpectedEntries * samplingLevel ) / BASE _ SAMPLING _ LEVEL ) ; <nl> + offsets = new SafeMemoryWriter ( 4 * maxExpectedEntries ) . withByteOrder ( ByteOrder . nativeOrder ( ) ) ; <nl> + entries = new SafeMemoryWriter ( 40 * maxExpectedEntries ) . withByteOrder ( ByteOrder . nativeOrder ( ) ) ; <nl> setNextSamplePosition ( - minIndexInterval ) ; <nl> } <nl> <nl> @ @ - 165 , 16 + 165 , 16 @ @ public class IndexSummaryBuilder <nl> { <nl> if ( keysWritten = = nextSamplePosition ) <nl> { <nl> - keys . add ( getMinimalKey ( decoratedKey ) ) ; <nl> - offheapSize + = decoratedKey . getKey ( ) . remaining ( ) ; <nl> - positions . add ( indexStart ) ; <nl> - offheapSize + = TypeSizes . NATIVE . sizeof ( indexStart ) ; <nl> + assert entries . length ( ) < = Integer . MAX _ VALUE ; <nl> + offsets . writeInt ( ( int ) entries . length ( ) ) ; <nl> + entries . write ( decoratedKey . getKey ( ) ) ; <nl> + entries . writeLong ( indexStart ) ; <nl> setNextSamplePosition ( keysWritten ) ; <nl> } <nl> else if ( dataEnd ! = 0 & & keysWritten + 1 = = nextSamplePosition ) <nl> { <nl> / / this is the last key in this summary interval , so stash it <nl> - ReadableBoundary boundary = new ReadableBoundary ( decoratedKey , indexEnd , dataEnd ) ; <nl> + ReadableBoundary boundary = new ReadableBoundary ( decoratedKey , indexEnd , dataEnd , ( int ) ( offsets . length ( ) / 4 ) , entries . length ( ) ) ; <nl> lastReadableByData . put ( dataEnd , boundary ) ; <nl> lastReadableByIndex . put ( indexEnd , boundary ) ; <nl> } <nl> @ @ - 201 , 52 + 201 , 39 @ @ public class IndexSummaryBuilder <nl> <nl> public IndexSummary build ( IPartitioner partitioner ) <nl> { <nl> + / / this method should only be called when we ' ve finished appending records , so we truncate the <nl> + / / memory we ' re using to the exact amount required to represent it before building our summary <nl> + entries . setCapacity ( entries . length ( ) ) ; <nl> + offsets . setCapacity ( offsets . length ( ) ) ; <nl> return build ( partitioner , null ) ; <nl> } <nl> <nl> - / / lastIntervalKey should come from getLastReadableBoundary ( ) . lastKey <nl> - public IndexSummary build ( IPartitioner partitioner , DecoratedKey lastIntervalKey ) <nl> + / / build the summary up to the provided boundary ; this is backed by shared memory between <nl> + / / multiple invocations of this build method <nl> + public IndexSummary build ( IPartitioner partitioner , ReadableBoundary boundary ) <nl> { <nl> - assert keys . size ( ) > 0 ; <nl> - assert keys . size ( ) = = positions . size ( ) ; <nl> - <nl> - int length ; <nl> - if ( lastIntervalKey = = null ) <nl> - length = keys . size ( ) ; <nl> - else / / since it ' s an inclusive upper bound , this should never match exactly <nl> - length = - 1 - Collections . binarySearch ( keys , lastIntervalKey ) ; <nl> - <nl> - assert length > 0 ; <nl> - <nl> - long offheapSize = this . offheapSize ; <nl> - if ( length < keys . size ( ) ) <nl> - for ( int i = length ; i < keys . size ( ) ; i + + ) <nl> - offheapSize - = keys . get ( i ) . getKey ( ) . remaining ( ) + TypeSizes . NATIVE . sizeof ( positions . get ( i ) ) ; <nl> - <nl> - / / first we write out the position in the * summary * for each key in the summary , <nl> - / / then we write out ( key , actual index position ) pairs <nl> - Memory memory = Memory . allocate ( offheapSize + ( length * 4 ) ) ; <nl> - int idxPosition = 0 ; <nl> - int keyPosition = length * 4 ; <nl> - for ( int i = 0 ; i < length ; i + + ) <nl> + assert entries . length ( ) > 0 ; <nl> + <nl> + int count = ( int ) ( offsets . length ( ) / 4 ) ; <nl> + long entriesLength = entries . length ( ) ; <nl> + if ( boundary ! = null ) <nl> { <nl> - / / write the position of the actual entry in the index summary ( 4 bytes ) <nl> - memory . setInt ( idxPosition , keyPosition ) ; <nl> - idxPosition + = TypeSizes . NATIVE . sizeof ( keyPosition ) ; <nl> - <nl> - / / write the key <nl> - ByteBuffer keyBytes = keys . get ( i ) . getKey ( ) ; <nl> - memory . setBytes ( keyPosition , keyBytes ) ; <nl> - keyPosition + = keyBytes . remaining ( ) ; <nl> - <nl> - / / write the position in the actual index file <nl> - long actualIndexPosition = positions . get ( i ) ; <nl> - memory . setLong ( keyPosition , actualIndexPosition ) ; <nl> - keyPosition + = TypeSizes . NATIVE . sizeof ( actualIndexPosition ) ; <nl> + count = boundary . summaryCount ; <nl> + entriesLength = boundary . entriesLength ; <nl> } <nl> - assert keyPosition = = offheapSize + ( length * 4 ) ; <nl> + <nl> int sizeAtFullSampling = ( int ) Math . ceil ( keysWritten / ( double ) minIndexInterval ) ; <nl> - return new IndexSummary ( partitioner , memory , length , sizeAtFullSampling , minIndexInterval , samplingLevel ) ; <nl> + assert count > 0 ; <nl> + return new IndexSummary ( partitioner , offsets . currentBuffer ( ) . sharedCopy ( ) , <nl> + count , entries . currentBuffer ( ) . sharedCopy ( ) , entriesLength , <nl> + sizeAtFullSampling , minIndexInterval , samplingLevel ) ; <nl> + } <nl> + <nl> + / / close the builder and release any associated memory <nl> + public void close ( ) <nl> + { <nl> + entries . close ( ) ; <nl> + offsets . close ( ) ; <nl> } <nl> <nl> public static int entriesAtSamplingLevel ( int samplingLevel , int maxSummarySize ) <nl> @ @ - 294 , 26 + 281 , 25 @ @ public class IndexSummaryBuilder <nl> int [ ] startPoints = Downsampling . getStartPoints ( currentSamplingLevel , newSamplingLevel ) ; <nl> <nl> / / calculate new off - heap size <nl> - int removedKeyCount = 0 ; <nl> - long newOffHeapSize = existing . getOffHeapSize ( ) ; <nl> + int newKeyCount = existing . size ( ) ; <nl> + long newEntriesLength = existing . getEntriesLength ( ) ; <nl> for ( int start : startPoints ) <nl> { <nl> for ( int j = start ; j < existing . size ( ) ; j + = currentSamplingLevel ) <nl> { <nl> - removedKeyCount + + ; <nl> - newOffHeapSize - = existing . getEntry ( j ) . length ; <nl> + newKeyCount - - ; <nl> + long length = existing . getEndInSummary ( j ) - existing . getPositionInSummary ( j ) ; <nl> + newEntriesLength - = length ; <nl> } <nl> } <nl> <nl> - int newKeyCount = existing . size ( ) - removedKeyCount ; <nl> - <nl> - / / Subtract ( removedKeyCount * 4 ) from the new size to account for fewer entries in the first section , which <nl> - / / stores the position of the actual entries in the summary . <nl> - RefCountedMemory memory = new RefCountedMemory ( newOffHeapSize - ( removedKeyCount * 4 ) ) ; <nl> + Memory oldEntries = existing . getEntries ( ) ; <nl> + Memory newOffsets = Memory . allocate ( newKeyCount * 4 ) ; <nl> + Memory newEntries = Memory . allocate ( newEntriesLength ) ; <nl> <nl> / / Copy old entries to our new Memory . <nl> - int idxPosition = 0 ; <nl> - int keyPosition = newKeyCount * 4 ; <nl> + int i = 0 ; <nl> + int newEntriesOffset = 0 ; <nl> outer : <nl> for ( int oldSummaryIndex = 0 ; oldSummaryIndex < existing . size ( ) ; oldSummaryIndex + + ) <nl> { <nl> @ @ - 326 , 15 + 312 , 15 @ @ public class IndexSummaryBuilder <nl> } <nl> <nl> / / write the position of the actual entry in the index summary ( 4 bytes ) <nl> - memory . setInt ( idxPosition , keyPosition ) ; <nl> - idxPosition + = TypeSizes . NATIVE . sizeof ( keyPosition ) ; <nl> - <nl> - / / write the entry itself <nl> - byte [ ] entry = existing . getEntry ( oldSummaryIndex ) ; <nl> - memory . setBytes ( keyPosition , entry , 0 , entry . length ) ; <nl> - keyPosition + = entry . length ; <nl> + newOffsets . setInt ( i * 4 , newEntriesOffset ) ; <nl> + i + + ; <nl> + long start = existing . getPositionInSummary ( oldSummaryIndex ) ; <nl> + long length = existing . getEndInSummary ( oldSummaryIndex ) - start ; <nl> + newEntries . put ( newEntriesOffset , oldEntries , start , length ) ; <nl> + newEntriesOffset + = length ; <nl> } <nl> - return new IndexSummary ( partitioner , memory , newKeyCount , existing . getMaxNumberOfEntries ( ) , <nl> - minIndexInterval , newSamplingLevel ) ; <nl> + assert newEntriesOffset = = newEntriesLength ; <nl> + return new IndexSummary ( partitioner , newOffsets , newKeyCount , newEntries , newEntriesLength , <nl> + existing . getMaxNumberOfEntries ( ) , minIndexInterval , newSamplingLevel ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> index 973b0c9 . . 41e4adb 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> @ @ - 736 , 40 + 736 , 40 @ @ public class SSTableReader extends SSTable implements SelfRefCounted < SSTableRead <nl> long indexSize = primaryIndex . length ( ) ; <nl> long histogramCount = sstableMetadata . estimatedRowSize . count ( ) ; <nl> long estimatedKeys = histogramCount > 0 & & ! sstableMetadata . estimatedRowSize . isOverflowed ( ) <nl> - ? histogramCount <nl> - : estimateRowsFromIndex ( primaryIndex ) ; / / statistics is supposed to be optional <nl> + ? histogramCount <nl> + : estimateRowsFromIndex ( primaryIndex ) ; / / statistics is supposed to be optional <nl> <nl> - if ( recreateBloomFilter ) <nl> - bf = FilterFactory . getFilter ( estimatedKeys , metadata . getBloomFilterFpChance ( ) , true ) ; <nl> - <nl> - IndexSummaryBuilder summaryBuilder = null ; <nl> - if ( ! summaryLoaded ) <nl> - summaryBuilder = new IndexSummaryBuilder ( estimatedKeys , metadata . getMinIndexInterval ( ) , samplingLevel ) ; <nl> - <nl> - long indexPosition ; <nl> - while ( ( indexPosition = primaryIndex . getFilePointer ( ) ) ! = indexSize ) <nl> + try ( IndexSummaryBuilder summaryBuilder = summaryLoaded ? null : new IndexSummaryBuilder ( estimatedKeys , metadata . getMinIndexInterval ( ) , samplingLevel ) ) <nl> { <nl> - ByteBuffer key = ByteBufferUtil . readWithShortLength ( primaryIndex ) ; <nl> - RowIndexEntry indexEntry = metadata . comparator . rowIndexEntrySerializer ( ) . deserialize ( primaryIndex , descriptor . version ) ; <nl> - DecoratedKey decoratedKey = partitioner . decorateKey ( key ) ; <nl> - if ( first = = null ) <nl> - first = decoratedKey ; <nl> - last = decoratedKey ; <nl> <nl> if ( recreateBloomFilter ) <nl> - bf . add ( decoratedKey . getKey ( ) ) ; <nl> + bf = FilterFactory . getFilter ( estimatedKeys , metadata . getBloomFilterFpChance ( ) , true ) ; <nl> <nl> - / / if summary was already read from disk we don ' t want to re - populate it using primary index <nl> - if ( ! summaryLoaded ) <nl> + long indexPosition ; <nl> + while ( ( indexPosition = primaryIndex . getFilePointer ( ) ) ! = indexSize ) <nl> { <nl> - summaryBuilder . maybeAddEntry ( decoratedKey , indexPosition ) ; <nl> - ibuilder . addPotentialBoundary ( indexPosition ) ; <nl> - dbuilder . addPotentialBoundary ( indexEntry . position ) ; <nl> + ByteBuffer key = ByteBufferUtil . readWithShortLength ( primaryIndex ) ; <nl> + RowIndexEntry indexEntry = metadata . comparator . rowIndexEntrySerializer ( ) . deserialize ( primaryIndex , descriptor . version ) ; <nl> + DecoratedKey decoratedKey = partitioner . decorateKey ( key ) ; <nl> + if ( first = = null ) <nl> + first = decoratedKey ; <nl> + last = decoratedKey ; <nl> + <nl> + if ( recreateBloomFilter ) <nl> + bf . add ( decoratedKey . getKey ( ) ) ; <nl> + <nl> + / / if summary was already read from disk we don ' t want to re - populate it using primary index <nl> + if ( ! summaryLoaded ) <nl> + { <nl> + summaryBuilder . maybeAddEntry ( decoratedKey , indexPosition ) ; <nl> + ibuilder . addPotentialBoundary ( indexPosition ) ; <nl> + dbuilder . addPotentialBoundary ( indexEntry . position ) ; <nl> + } <nl> } <nl> - } <nl> <nl> - if ( ! summaryLoaded ) <nl> - indexSummary = summaryBuilder . build ( partitioner ) ; <nl> + if ( ! summaryLoaded ) <nl> + indexSummary = summaryBuilder . build ( partitioner ) ; <nl> + } <nl> } <nl> finally <nl> { <nl> @ @ - 1004 , 16 + 1004 , 17 @ @ public class SSTableReader extends SSTable implements SelfRefCounted < SSTableRead <nl> try <nl> { <nl> long indexSize = primaryIndex . length ( ) ; <nl> - IndexSummaryBuilder summaryBuilder = new IndexSummaryBuilder ( estimatedKeys ( ) , metadata . getMinIndexInterval ( ) , newSamplingLevel ) ; <nl> - <nl> - long indexPosition ; <nl> - while ( ( indexPosition = primaryIndex . getFilePointer ( ) ) ! = indexSize ) <nl> + try ( IndexSummaryBuilder summaryBuilder = new IndexSummaryBuilder ( estimatedKeys ( ) , metadata . getMinIndexInterval ( ) , newSamplingLevel ) ) <nl> { <nl> - summaryBuilder . maybeAddEntry ( partitioner . decorateKey ( ByteBufferUtil . readWithShortLength ( primaryIndex ) ) , indexPosition ) ; <nl> - RowIndexEntry . Serializer . skip ( primaryIndex ) ; <nl> - } <nl> + long indexPosition ; <nl> + while ( ( indexPosition = primaryIndex . getFilePointer ( ) ) ! = indexSize ) <nl> + { <nl> + summaryBuilder . maybeAddEntry ( partitioner . decorateKey ( ByteBufferUtil . readWithShortLength ( primaryIndex ) ) , indexPosition ) ; <nl> + RowIndexEntry . Serializer . skip ( primaryIndex ) ; <nl> + } <nl> <nl> - return summaryBuilder . build ( partitioner ) ; <nl> + return summaryBuilder . build ( partitioner ) ; <nl> + } <nl> } <nl> finally <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> index b67685d . . b35b652 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> @ @ - 403 , 7 + 403 , 7 @ @ public class SSTableWriter extends SSTable <nl> SSTableReader sstable = SSTableReader . internalOpen ( descriptor . asType ( Descriptor . Type . FINAL ) , <nl> components , metadata , <nl> partitioner , ifile , <nl> - dfile , iwriter . summary . build ( partitioner , boundary . lastKey ) , <nl> + dfile , iwriter . summary . build ( partitioner , boundary ) , <nl> iwriter . bf . sharedCopy ( ) , maxDataAge , sstableMetadata , SSTableReader . OpenReason . EARLY ) ; <nl> <nl> / / now it ' s open , find the ACTUAL last readable key ( i . e . for which the data file has also been flushed ) <nl> @ @ - 470 , 6 + 470 , 7 @ @ public class SSTableWriter extends SSTable <nl> if ( finishType . isFinal ) <nl> { <nl> iwriter . bf . close ( ) ; <nl> + iwriter . summary . close ( ) ; <nl> / / try to save the summaries to disk <nl> sstable . saveSummary ( iwriter . builder , dbuilder ) ; <nl> iwriter = null ; <nl> @ @ - 627 , 6 + 628 , 7 @ @ public class SSTableWriter extends SSTable <nl> <nl> public void abort ( ) <nl> { <nl> + summary . close ( ) ; <nl> indexFile . abort ( ) ; <nl> bf . close ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / AbstractDataOutput . java b / src / java / org / apache / cassandra / io / util / AbstractDataOutput . java <nl> index 3e38293 . . 8f4bed8 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / AbstractDataOutput . java <nl> + + + b / src / java / org / apache / cassandra / io / util / AbstractDataOutput . java <nl> @ @ - 321 , 9 + 321 , 9 @ @ public abstract class AbstractDataOutput extends OutputStream implements DataOut <nl> } <nl> } <nl> <nl> - public void write ( Memory memory ) throws IOException <nl> + public void write ( Memory memory , long offset , long length ) throws IOException <nl> { <nl> - for ( ByteBuffer buffer : memory . asByteBuffers ( ) ) <nl> + for ( ByteBuffer buffer : memory . asByteBuffers ( offset , length ) ) <nl> write ( buffer ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / DataOutputPlus . java b / src / java / org / apache / cassandra / io / util / DataOutputPlus . java <nl> index 36c25ee . . c2901e1 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / DataOutputPlus . java <nl> + + + b / src / java / org / apache / cassandra / io / util / DataOutputPlus . java <nl> @ @ - 27 , 6 + 27 , 5 @ @ public interface DataOutputPlus extends DataOutput <nl> / / write the buffer without modifying its position <nl> void write ( ByteBuffer buffer ) throws IOException ; <nl> <nl> - void write ( Memory memory ) throws IOException ; <nl> - <nl> + void write ( Memory memory , long offset , long length ) throws IOException ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / Memory . java b / src / java / org / apache / cassandra / io / util / Memory . java <nl> index ea78840 . . dcb9de6 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / Memory . java <nl> + + + b / src / java / org / apache / cassandra / io / util / Memory . java <nl> @ @ - 25 , 6 + 25 , 7 @ @ import com . sun . jna . Native ; <nl> import net . nicoulaj . compilecommand . annotations . Inline ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . utils . FastByteOperations ; <nl> + import org . apache . cassandra . utils . concurrent . Ref ; <nl> import org . apache . cassandra . utils . memory . MemoryUtil ; <nl> import sun . misc . Unsafe ; <nl> import sun . nio . ch . DirectBuffer ; <nl> @ @ - 77 , 6 + 78 , 9 @ @ public class Memory implements AutoCloseable <nl> if ( bytes < 0 ) <nl> throw new IllegalArgumentException ( ) ; <nl> <nl> + if ( Ref . DEBUG _ ENABLED ) <nl> + return new SafeMemory ( bytes ) ; <nl> + <nl> return new Memory ( bytes ) ; <nl> } <nl> <nl> @ @ - 163 , 6 + 167 , 33 @ @ public class Memory implements AutoCloseable <nl> } <nl> } <nl> <nl> + public void setShort ( long offset , short l ) <nl> + { <nl> + checkBounds ( offset , offset + 4 ) ; <nl> + if ( unaligned ) <nl> + { <nl> + unsafe . putShort ( peer + offset , l ) ; <nl> + } <nl> + else <nl> + { <nl> + putShortByByte ( peer + offset , l ) ; <nl> + } <nl> + } <nl> + <nl> + private void putShortByByte ( long address , short value ) <nl> + { <nl> + if ( bigEndian ) <nl> + { <nl> + unsafe . putByte ( address , ( byte ) ( value > > 8 ) ) ; <nl> + unsafe . putByte ( address + 1 , ( byte ) ( value ) ) ; <nl> + } <nl> + else <nl> + { <nl> + unsafe . putByte ( address + 1 , ( byte ) ( value > > 8 ) ) ; <nl> + unsafe . putByte ( address , ( byte ) ( value ) ) ; <nl> + } <nl> + } <nl> + <nl> public void setBytes ( long memoryOffset , ByteBuffer buffer ) <nl> { <nl> if ( buffer = = null ) <nl> @ @ - 340 , 20 + 371 , 20 @ @ public class Memory implements AutoCloseable <nl> return false ; <nl> } <nl> <nl> - public ByteBuffer [ ] asByteBuffers ( ) <nl> + public ByteBuffer [ ] asByteBuffers ( long offset , long length ) <nl> { <nl> if ( size ( ) = = 0 ) <nl> return new ByteBuffer [ 0 ] ; <nl> <nl> - ByteBuffer [ ] result = new ByteBuffer [ ( int ) ( size ( ) / Integer . MAX _ VALUE ) + 1 ] ; <nl> - long offset = 0 ; <nl> + ByteBuffer [ ] result = new ByteBuffer [ ( int ) ( length / Integer . MAX _ VALUE ) + 1 ] ; <nl> int size = ( int ) ( size ( ) / result . length ) ; <nl> for ( int i = 0 ; i < result . length - 1 ; i + + ) <nl> { <nl> result [ i ] = MemoryUtil . getByteBuffer ( peer + offset , size ) ; <nl> offset + = size ; <nl> + length - = size ; <nl> } <nl> - result [ result . length - 1 ] = MemoryUtil . getByteBuffer ( peer + offset , ( int ) ( size ( ) - offset ) ) ; <nl> + result [ result . length - 1 ] = MemoryUtil . getByteBuffer ( peer + offset , ( int ) length ) ; <nl> return result ; <nl> } <nl> <nl> @ @ - 366 , 5 + 397 , 4 @ @ public class Memory implements AutoCloseable <nl> { <nl> return String . format ( " Memory @ [ % x . . % x ) " , peer , peer + size ) ; <nl> } <nl> - <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java b / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java <nl> new file mode 100644 <nl> index 0000000 . . 1998cc6 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java <nl> @ @ - 0 , 0 + 1 , 136 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + package org . apache . cassandra . io . util ; <nl> + <nl> + import java . io . IOException ; <nl> + import java . nio . ByteBuffer ; <nl> + import java . nio . ByteOrder ; <nl> + <nl> + public class SafeMemoryWriter extends AbstractDataOutput implements DataOutputPlus <nl> + { <nl> + private ByteOrder order = ByteOrder . BIG _ ENDIAN ; <nl> + private SafeMemory buffer ; <nl> + private long length ; <nl> + <nl> + public SafeMemoryWriter ( long initialCapacity ) <nl> + { <nl> + buffer = new SafeMemory ( initialCapacity ) ; <nl> + } <nl> + <nl> + public void write ( byte [ ] buffer , int offset , int count ) <nl> + { <nl> + long newLength = ensureCapacity ( count ) ; <nl> + this . buffer . setBytes ( this . length , buffer , offset , count ) ; <nl> + this . length = newLength ; <nl> + } <nl> + <nl> + public void write ( int oneByte ) <nl> + { <nl> + long newLength = ensureCapacity ( 1 ) ; <nl> + buffer . setByte ( length + + , ( byte ) oneByte ) ; <nl> + length = newLength ; <nl> + } <nl> + <nl> + public void writeShort ( int val ) throws IOException <nl> + { <nl> + if ( order ! = ByteOrder . nativeOrder ( ) ) <nl> + val = Short . reverseBytes ( ( short ) val ) ; <nl> + long newLength = ensureCapacity ( 2 ) ; <nl> + buffer . setShort ( length , ( short ) val ) ; <nl> + length = newLength ; <nl> + } <nl> + <nl> + public void writeInt ( int val ) <nl> + { <nl> + if ( order ! = ByteOrder . nativeOrder ( ) ) <nl> + val = Integer . reverseBytes ( val ) ; <nl> + long newLength = ensureCapacity ( 4 ) ; <nl> + buffer . setInt ( length , val ) ; <nl> + length = newLength ; <nl> + } <nl> + <nl> + public void writeLong ( long val ) <nl> + { <nl> + if ( order ! = ByteOrder . nativeOrder ( ) ) <nl> + val = Long . reverseBytes ( val ) ; <nl> + long newLength = ensureCapacity ( 8 ) ; <nl> + buffer . setLong ( length , val ) ; <nl> + length = newLength ; <nl> + } <nl> + <nl> + public void write ( ByteBuffer buffer ) <nl> + { <nl> + long newLength = ensureCapacity ( buffer . remaining ( ) ) ; <nl> + this . buffer . setBytes ( length , buffer ) ; <nl> + length = newLength ; <nl> + } <nl> + <nl> + public void write ( Memory memory ) <nl> + { <nl> + long newLength = ensureCapacity ( memory . size ( ) ) ; <nl> + buffer . put ( length , memory , 0 , memory . size ( ) ) ; <nl> + length = newLength ; <nl> + } <nl> + <nl> + private long ensureCapacity ( long size ) <nl> + { <nl> + long newLength = this . length + size ; <nl> + if ( newLength > buffer . size ( ) ) <nl> + setCapacity ( Math . max ( newLength , buffer . size ( ) + ( buffer . size ( ) / 2 ) ) ) ; <nl> + return newLength ; <nl> + } <nl> + <nl> + public SafeMemory currentBuffer ( ) <nl> + { <nl> + return buffer ; <nl> + } <nl> + <nl> + public void setCapacity ( long newCapacity ) <nl> + { <nl> + if ( newCapacity ! = capacity ( ) ) <nl> + { <nl> + SafeMemory oldBuffer = buffer ; <nl> + buffer = this . buffer . copy ( newCapacity ) ; <nl> + oldBuffer . free ( ) ; <nl> + } <nl> + } <nl> + <nl> + public void close ( ) <nl> + { <nl> + buffer . close ( ) ; <nl> + } <nl> + <nl> + public long length ( ) <nl> + { <nl> + return length ; <nl> + } <nl> + <nl> + public long capacity ( ) <nl> + { <nl> + return buffer . size ( ) ; <nl> + } <nl> + <nl> + / / TODO : consider hoisting this into DataOutputPlus , since most implementations can copy with this gracefully <nl> + / / this would simplify IndexSummary . IndexSummarySerializer . serialize ( ) <nl> + public SafeMemoryWriter withByteOrder ( ByteOrder order ) <nl> + { <nl> + this . order = order ; <nl> + return this ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / utils / concurrent / Ref . java b / src / java / org / apache / cassandra / utils / concurrent / Ref . java <nl> index 8213c46 . . 4e6cef7 100644 <nl> - - - a / src / java / org / apache / cassandra / utils / concurrent / Ref . java <nl> + + + b / src / java / org / apache / cassandra / utils / concurrent / Ref . java <nl> @ @ - 50 , 7 + 50 , 7 @ @ import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> public final class Ref < T > implements RefCounted < T > , AutoCloseable <nl> { <nl> static final Logger logger = LoggerFactory . getLogger ( Ref . class ) ; <nl> - static final boolean DEBUG _ ENABLED = System . getProperty ( " cassandra . debugrefcount " , " false " ) . equalsIgnoreCase ( " true " ) ; <nl> + public static final boolean DEBUG _ ENABLED = System . getProperty ( " cassandra . debugrefcount " , " false " ) . equalsIgnoreCase ( " true " ) ; <nl> <nl> final State state ; <nl> final T referent ; <nl> diff - - git a / src / java / org / apache / cassandra / utils / concurrent / WrappedSharedCloseable . java b / src / java / org / apache / cassandra / utils / concurrent / WrappedSharedCloseable . java <nl> index c656f28 . . 96e226c 100644 <nl> - - - a / src / java / org / apache / cassandra / utils / concurrent / WrappedSharedCloseable . java <nl> + + + b / src / java / org / apache / cassandra / utils / concurrent / WrappedSharedCloseable . java <nl> @ @ - 18 , 26 + 18 , 34 @ @ <nl> * / <nl> package org . apache . cassandra . utils . concurrent ; <nl> <nl> + import java . util . Arrays ; <nl> + <nl> / * * <nl> * An implementation of SharedCloseable that wraps a normal AutoCloseable , <nl> * ensuring its close method is only called when all instances of SharedCloseable have been <nl> * / <nl> public abstract class WrappedSharedCloseable extends SharedCloseableImpl <nl> { <nl> - final AutoCloseable wrapped ; <nl> + final AutoCloseable [ ] wrapped ; <nl> <nl> public WrappedSharedCloseable ( final AutoCloseable closeable ) <nl> { <nl> + this ( new AutoCloseable [ ] { closeable } ) ; <nl> + } <nl> + <nl> + public WrappedSharedCloseable ( final AutoCloseable [ ] closeable ) <nl> + { <nl> super ( new RefCounted . Tidy ( ) <nl> { <nl> public void tidy ( ) throws Exception <nl> { <nl> - closeable . close ( ) ; <nl> + for ( AutoCloseable c : closeable ) <nl> + c . close ( ) ; <nl> } <nl> <nl> public String name ( ) <nl> { <nl> - return closeable . toString ( ) ; <nl> + return Arrays . toString ( closeable ) ; <nl> } <nl> } ) ; <nl> wrapped = closeable ; <nl> diff - - git a / test / unit / org / apache / cassandra / io / sstable / IndexSummaryTest . java b / test / unit / org / apache / cassandra / io / sstable / IndexSummaryTest . java <nl> index 9aca66d . . 9c709a3 100644 <nl> - - - a / test / unit / org / apache / cassandra / io / sstable / IndexSummaryTest . java <nl> + + + b / test / unit / org / apache / cassandra / io / sstable / IndexSummaryTest . java <nl> @ @ - 91 , 38 + 91 , 42 @ @ public class IndexSummaryTest <nl> public void testAddEmptyKey ( ) throws Exception <nl> { <nl> IPartitioner p = new RandomPartitioner ( ) ; <nl> - IndexSummaryBuilder builder = new IndexSummaryBuilder ( 1 , 1 , BASE _ SAMPLING _ LEVEL ) ; <nl> - builder . maybeAddEntry ( p . decorateKey ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER ) , 0 ) ; <nl> - IndexSummary summary = builder . build ( p ) ; <nl> - assertEquals ( 1 , summary . size ( ) ) ; <nl> - assertEquals ( 0 , summary . getPosition ( 0 ) ) ; <nl> - assertArrayEquals ( new byte [ 0 ] , summary . getKey ( 0 ) ) ; <nl> - <nl> - DataOutputBuffer dos = new DataOutputBuffer ( ) ; <nl> - IndexSummary . serializer . serialize ( summary , dos , false ) ; <nl> - DataInputStream dis = new DataInputStream ( new ByteArrayInputStream ( dos . toByteArray ( ) ) ) ; <nl> - IndexSummary loaded = IndexSummary . serializer . deserialize ( dis , p , false , 1 , 1 ) ; <nl> - <nl> - assertEquals ( 1 , loaded . size ( ) ) ; <nl> - assertEquals ( summary . getPosition ( 0 ) , loaded . getPosition ( 0 ) ) ; <nl> - assertArrayEquals ( summary . getKey ( 0 ) , summary . getKey ( 0 ) ) ; <nl> + try ( IndexSummaryBuilder builder = new IndexSummaryBuilder ( 1 , 1 , BASE _ SAMPLING _ LEVEL ) ) <nl> + { <nl> + builder . maybeAddEntry ( p . decorateKey ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER ) , 0 ) ; <nl> + IndexSummary summary = builder . build ( p ) ; <nl> + assertEquals ( 1 , summary . size ( ) ) ; <nl> + assertEquals ( 0 , summary . getPosition ( 0 ) ) ; <nl> + assertArrayEquals ( new byte [ 0 ] , summary . getKey ( 0 ) ) ; <nl> + <nl> + DataOutputBuffer dos = new DataOutputBuffer ( ) ; <nl> + IndexSummary . serializer . serialize ( summary , dos , false ) ; <nl> + DataInputStream dis = new DataInputStream ( new ByteArrayInputStream ( dos . toByteArray ( ) ) ) ; <nl> + IndexSummary loaded = IndexSummary . serializer . deserialize ( dis , p , false , 1 , 1 ) ; <nl> + <nl> + assertEquals ( 1 , loaded . size ( ) ) ; <nl> + assertEquals ( summary . getPosition ( 0 ) , loaded . getPosition ( 0 ) ) ; <nl> + assertArrayEquals ( summary . getKey ( 0 ) , summary . getKey ( 0 ) ) ; <nl> + } <nl> } <nl> <nl> private Pair < List < DecoratedKey > , IndexSummary > generateRandomIndex ( int size , int interval ) <nl> { <nl> List < DecoratedKey > list = Lists . newArrayList ( ) ; <nl> - IndexSummaryBuilder builder = new IndexSummaryBuilder ( list . size ( ) , interval , BASE _ SAMPLING _ LEVEL ) ; <nl> - for ( int i = 0 ; i < size ; i + + ) <nl> + try ( IndexSummaryBuilder builder = new IndexSummaryBuilder ( list . size ( ) , interval , BASE _ SAMPLING _ LEVEL ) ) <nl> { <nl> - UUID uuid = UUID . randomUUID ( ) ; <nl> - DecoratedKey key = DatabaseDescriptor . getPartitioner ( ) . decorateKey ( ByteBufferUtil . bytes ( uuid ) ) ; <nl> - list . add ( key ) ; <nl> + for ( int i = 0 ; i < size ; i + + ) <nl> + { <nl> + UUID uuid = UUID . randomUUID ( ) ; <nl> + DecoratedKey key = DatabaseDescriptor . getPartitioner ( ) . decorateKey ( ByteBufferUtil . bytes ( uuid ) ) ; <nl> + list . add ( key ) ; <nl> + } <nl> + Collections . sort ( list ) ; <nl> + for ( int i = 0 ; i < size ; i + + ) <nl> + builder . maybeAddEntry ( list . get ( i ) , i ) ; <nl> + IndexSummary summary = builder . build ( DatabaseDescriptor . getPartitioner ( ) ) ; <nl> + return Pair . create ( list , summary ) ; <nl> } <nl> - Collections . sort ( list ) ; <nl> - for ( int i = 0 ; i < size ; i + + ) <nl> - builder . maybeAddEntry ( list . get ( i ) , i ) ; <nl> - IndexSummary summary = builder . build ( DatabaseDescriptor . getPartitioner ( ) ) ; <nl> - return Pair . create ( list , summary ) ; <nl> } <nl> <nl> @ Test <nl> diff - - git a / test / unit / org / apache / cassandra / io / util / DataOutputTest . java b / test / unit / org / apache / cassandra / io / util / DataOutputTest . java <nl> index 76f3304 . . 7110d1d 100644 <nl> - - - a / test / unit / org / apache / cassandra / io / util / DataOutputTest . java <nl> + + + b / test / unit / org / apache / cassandra / io / util / DataOutputTest . java <nl> @ @ - 92 , 6 + 92 , 17 @ @ public class DataOutputTest <nl> } <nl> <nl> @ Test <nl> + public void testSafeMemoryWriter ( ) throws IOException <nl> + { <nl> + SafeMemoryWriter write = new SafeMemoryWriter ( 10 ) ; <nl> + DataInput canon = testWrite ( write ) ; <nl> + byte [ ] bytes = new byte [ 345 ] ; <nl> + write . currentBuffer ( ) . getBytes ( 0 , bytes , 0 , 345 ) ; <nl> + DataInput test = new DataInputStream ( new ByteArrayInputStream ( bytes ) ) ; <nl> + testRead ( test , canon ) ; <nl> + } <nl> + <nl> + @ Test <nl> public void testFileOutputStream ( ) throws IOException <nl> { <nl> File file = FileUtils . createTempFile ( " dataoutput " , " test " ) ;
+NEAREST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / io / sstable / RowIndexedReader . java b / src / java / org / apache / cassandra / io / sstable / RowIndexedReader . java <nl> deleted file mode 100644 <nl> index 733a56a . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / RowIndexedReader . java <nl> + + + / dev / null <nl> @ @ - 1 , 354 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , <nl> - * software distributed under the License is distributed on an <nl> - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> - * KIND , either express or implied . See the License for the <nl> - * specific language governing permissions and limitations <nl> - * under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . io . sstable ; <nl> - <nl> - import java . io . * ; <nl> - import java . util . * ; <nl> - <nl> - import org . slf4j . Logger ; <nl> - import org . slf4j . LoggerFactory ; <nl> - <nl> - import org . apache . cassandra . cache . InstrumentedCache ; <nl> - import org . apache . cassandra . dht . IPartitioner ; <nl> - import org . apache . cassandra . utils . BloomFilter ; <nl> - import org . apache . cassandra . utils . FBUtilities ; <nl> - import org . apache . cassandra . utils . Pair ; <nl> - import org . apache . cassandra . db . * ; <nl> - import org . apache . cassandra . db . filter . QueryFilter ; <nl> - import org . apache . cassandra . io . util . BufferedRandomAccessFile ; <nl> - import org . apache . cassandra . io . util . FileDataInput ; <nl> - import org . apache . cassandra . io . util . SegmentedFile ; <nl> - <nl> - import com . google . common . base . Function ; <nl> - import com . google . common . collect . Collections2 ; <nl> - <nl> - / * * <nl> - * Pre 0 . 7 SSTable implementation , using per row indexes . <nl> - * / <nl> - class RowIndexedReader extends SSTableReader <nl> - { <nl> - private static final Logger logger = LoggerFactory . getLogger ( RowIndexedReader . class ) ; <nl> - <nl> - / / guesstimated size of INDEX _ INTERVAL index entries <nl> - private static final int INDEX _ FILE _ BUFFER _ BYTES = 16 * IndexSummary . INDEX _ INTERVAL ; <nl> - <nl> - / / indexfile and datafile : might be null before a call to load ( ) <nl> - private SegmentedFile ifile ; <nl> - private SegmentedFile dfile ; <nl> - <nl> - private InstrumentedCache < Pair < Descriptor , DecoratedKey > , Long > keyCache ; <nl> - <nl> - RowIndexedReader ( Descriptor desc , <nl> - IPartitioner partitioner , <nl> - SegmentedFile ifile , <nl> - SegmentedFile dfile , <nl> - IndexSummary indexSummary , <nl> - BloomFilter bloomFilter , <nl> - long maxDataAge ) <nl> - throws IOException <nl> - { <nl> - super ( desc , partitioner , maxDataAge ) ; <nl> - <nl> - <nl> - this . ifile = ifile ; <nl> - this . dfile = dfile ; <nl> - this . indexSummary = indexSummary ; <nl> - this . bf = bloomFilter ; <nl> - } <nl> - <nl> - / * * Open a RowIndexedReader which needs its state loaded from disk . * / <nl> - static RowIndexedReader internalOpen ( Descriptor desc , IPartitioner partitioner ) throws IOException <nl> - { <nl> - RowIndexedReader sstable = new RowIndexedReader ( desc , partitioner , null , null , null , null , System . currentTimeMillis ( ) ) ; <nl> - <nl> - / / versions before ' c ' encoded keys as utf - 16 before hashing to the filter <nl> - if ( desc . versionCompareTo ( " c " ) < 0 ) <nl> - sstable . load ( true ) ; <nl> - else <nl> - { <nl> - sstable . load ( false ) ; <nl> - sstable . loadBloomFilter ( ) ; <nl> - } <nl> - <nl> - return sstable ; <nl> - } <nl> - <nl> - / * * <nl> - * Open a RowIndexedReader which already has its state initialized ( by SSTableWriter ) . <nl> - * / <nl> - static RowIndexedReader internalOpen ( Descriptor desc , IPartitioner partitioner , SegmentedFile ifile , SegmentedFile dfile , IndexSummary isummary , BloomFilter bf , long maxDataAge ) throws IOException <nl> - { <nl> - assert desc ! = null & & partitioner ! = null & & ifile ! = null & & dfile ! = null & & isummary ! = null & & bf ! = null ; <nl> - return new RowIndexedReader ( desc , partitioner , ifile , dfile , isummary , bf , maxDataAge ) ; <nl> - } <nl> - <nl> - public long estimatedKeys ( ) <nl> - { <nl> - return indexSummary . getIndexPositions ( ) . size ( ) * IndexSummary . INDEX _ INTERVAL ; <nl> - } <nl> - <nl> - public Collection < DecoratedKey > getKeySamples ( ) <nl> - { <nl> - return Collections2 . transform ( indexSummary . getIndexPositions ( ) , <nl> - new Function < IndexSummary . KeyPosition , DecoratedKey > ( ) { <nl> - public DecoratedKey apply ( IndexSummary . KeyPosition kp ) <nl> - { <nl> - return kp . key ; <nl> - } <nl> - } ) ; <nl> - } <nl> - <nl> - void loadBloomFilter ( ) throws IOException <nl> - { <nl> - DataInputStream stream = new DataInputStream ( new FileInputStream ( filterFilename ( ) ) ) ; <nl> - try <nl> - { <nl> - bf = BloomFilter . serializer ( ) . deserialize ( stream ) ; <nl> - } <nl> - finally <nl> - { <nl> - stream . close ( ) ; <nl> - } <nl> - } <nl> - <nl> - / * * <nl> - * Loads ifile , dfile and indexSummary , and optionally recreates the bloom filter . <nl> - * / <nl> - private void load ( boolean recreatebloom ) throws IOException <nl> - { <nl> - SegmentedFile . Builder ibuilder = SegmentedFile . getBuilder ( ) ; <nl> - SegmentedFile . Builder dbuilder = SegmentedFile . getBuilder ( ) ; <nl> - <nl> - / / we read the positions in a BRAF so we don ' t have to worry about an entry spanning a mmap boundary . <nl> - indexSummary = new IndexSummary ( ) ; <nl> - BufferedRandomAccessFile input = new BufferedRandomAccessFile ( indexFilename ( ) , " r " ) ; <nl> - try <nl> - { <nl> - long indexSize = input . length ( ) ; <nl> - if ( recreatebloom ) <nl> - / / estimate key count based on index length <nl> - bf = BloomFilter . getFilter ( ( int ) ( input . length ( ) / 32 ) , 15 ) ; <nl> - while ( true ) <nl> - { <nl> - long indexPosition = input . getFilePointer ( ) ; <nl> - if ( indexPosition = = indexSize ) <nl> - break ; <nl> - <nl> - DecoratedKey decoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; <nl> - if ( recreatebloom ) <nl> - bf . add ( decoratedKey . key ) ; <nl> - long dataPosition = input . readLong ( ) ; <nl> - <nl> - indexSummary . maybeAddEntry ( decoratedKey , indexPosition ) ; <nl> - ibuilder . addPotentialBoundary ( indexPosition ) ; <nl> - dbuilder . addPotentialBoundary ( dataPosition ) ; <nl> - } <nl> - indexSummary . complete ( ) ; <nl> - } <nl> - finally <nl> - { <nl> - input . close ( ) ; <nl> - } <nl> - <nl> - / / finalize the state of the reader <nl> - indexSummary . complete ( ) ; <nl> - ifile = ibuilder . complete ( indexFilename ( ) ) ; <nl> - dfile = dbuilder . complete ( getFilename ( ) ) ; <nl> - } <nl> - <nl> - @ Override <nl> - public void setTrackedBy ( SSTableTracker tracker ) <nl> - { <nl> - super . setTrackedBy ( tracker ) ; <nl> - keyCache = tracker . getKeyCache ( ) ; <nl> - } <nl> - <nl> - / * * get the position in the index file to start scanning to find the given key ( at most indexInterval keys away ) * / <nl> - private IndexSummary . KeyPosition getIndexScanPosition ( DecoratedKey decoratedKey ) <nl> - { <nl> - assert indexSummary . getIndexPositions ( ) ! = null & & indexSummary . getIndexPositions ( ) . size ( ) > 0 ; <nl> - int index = Collections . binarySearch ( indexSummary . getIndexPositions ( ) , new IndexSummary . KeyPosition ( decoratedKey , - 1 ) ) ; <nl> - if ( index < 0 ) <nl> - { <nl> - / / binary search gives us the first index _ greater _ than the key searched for , <nl> - / / i . e . , its insertion position <nl> - int greaterThan = ( index + 1 ) * - 1 ; <nl> - if ( greaterThan = = 0 ) <nl> - return null ; <nl> - return indexSummary . getIndexPositions ( ) . get ( greaterThan - 1 ) ; <nl> - } <nl> - else <nl> - { <nl> - return indexSummary . getIndexPositions ( ) . get ( index ) ; <nl> - } <nl> - } <nl> - <nl> - / * * <nl> - * @ return The position in the data file to find the given key , or - 1 if the key is not present <nl> - * / <nl> - public long getPosition ( DecoratedKey decoratedKey ) <nl> - { <nl> - / / first , check bloom filter <nl> - if ( ! bf . isPresent ( partitioner . convertToDiskFormat ( decoratedKey ) ) ) <nl> - return - 1 ; <nl> - <nl> - / / next , the key cache <nl> - Pair < Descriptor , DecoratedKey > unifiedKey = new Pair < Descriptor , DecoratedKey > ( desc , decoratedKey ) ; <nl> - if ( keyCache ! = null & & keyCache . getCapacity ( ) > 0 ) <nl> - { <nl> - Long cachedPosition = keyCache . get ( unifiedKey ) ; <nl> - if ( cachedPosition ! = null ) <nl> - { <nl> - return cachedPosition ; <nl> - } <nl> - } <nl> - <nl> - / / next , see if the sampled index says it ' s impossible for the key to be present <nl> - IndexSummary . KeyPosition sampledPosition = getIndexScanPosition ( decoratedKey ) ; <nl> - if ( sampledPosition = = null ) <nl> - return - 1 ; <nl> - <nl> - / / scan the on - disk index , starting at the nearest sampled position <nl> - int i = 0 ; <nl> - Iterator < FileDataInput > segments = ifile . iterator ( sampledPosition . indexPosition , INDEX _ FILE _ BUFFER _ BYTES ) ; <nl> - while ( segments . hasNext ( ) ) <nl> - { <nl> - FileDataInput input = segments . next ( ) ; <nl> - try <nl> - { <nl> - while ( ! input . isEOF ( ) & & i + + < IndexSummary . INDEX _ INTERVAL ) <nl> - { <nl> - / / read key & data position from index entry <nl> - DecoratedKey indexDecoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; <nl> - long dataPosition = input . readLong ( ) ; <nl> - <nl> - int v = indexDecoratedKey . compareTo ( decoratedKey ) ; <nl> - if ( v = = 0 ) <nl> - { <nl> - if ( keyCache ! = null & & keyCache . getCapacity ( ) > 0 ) <nl> - keyCache . put ( unifiedKey , Long . valueOf ( dataPosition ) ) ; <nl> - return dataPosition ; <nl> - } <nl> - if ( v > 0 ) <nl> - return - 1 ; <nl> - } <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new IOError ( e ) ; <nl> - } <nl> - finally <nl> - { <nl> - try <nl> - { <nl> - input . close ( ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - logger . error ( " error closing file " , e ) ; <nl> - } <nl> - } <nl> - } <nl> - return - 1 ; <nl> - } <nl> - <nl> - / * * <nl> - * @ return The location of the first key _ greater _ than the desired one , or - 1 if no such key exists . <nl> - * / <nl> - public long getNearestPosition ( DecoratedKey decoratedKey ) <nl> - { <nl> - IndexSummary . KeyPosition sampledPosition = getIndexScanPosition ( decoratedKey ) ; <nl> - if ( sampledPosition = = null ) <nl> - return 0 ; <nl> - <nl> - / / scan the on - disk index , starting at the nearest sampled position <nl> - Iterator < FileDataInput > segiter = ifile . iterator ( sampledPosition . indexPosition , INDEX _ FILE _ BUFFER _ BYTES ) ; <nl> - while ( segiter . hasNext ( ) ) <nl> - { <nl> - FileDataInput input = segiter . next ( ) ; <nl> - try <nl> - { <nl> - while ( ! input . isEOF ( ) ) <nl> - { <nl> - DecoratedKey indexDecoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; <nl> - long position = input . readLong ( ) ; <nl> - int v = indexDecoratedKey . compareTo ( decoratedKey ) ; <nl> - if ( v > = 0 ) <nl> - return position ; <nl> - } <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new IOError ( e ) ; <nl> - } <nl> - finally <nl> - { <nl> - try <nl> - { <nl> - input . close ( ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - logger . error ( " error closing file " , e ) ; <nl> - } <nl> - } <nl> - } <nl> - return - 1 ; <nl> - } <nl> - <nl> - public long length ( ) <nl> - { <nl> - return dfile . length ; <nl> - } <nl> - <nl> - public int compareTo ( SSTableReader o ) <nl> - { <nl> - return desc . generation - o . desc . generation ; <nl> - } <nl> - <nl> - public void forceFilterFailures ( ) <nl> - { <nl> - bf = BloomFilter . alwaysMatchingBloomFilter ( ) ; <nl> - } <nl> - <nl> - public SSTableScanner getScanner ( int bufferSize ) <nl> - { <nl> - return new RowIndexedScanner ( this , bufferSize ) ; <nl> - } <nl> - <nl> - public SSTableScanner getScanner ( int bufferSize , QueryFilter filter ) <nl> - { <nl> - return new RowIndexedScanner ( this , filter , bufferSize ) ; <nl> - } <nl> - <nl> - public FileDataInput getFileDataInput ( DecoratedKey decoratedKey , int bufferSize ) <nl> - { <nl> - long position = getPosition ( decoratedKey ) ; <nl> - if ( position < 0 ) <nl> - return null ; <nl> - <nl> - return dfile . getSegment ( position , bufferSize ) ; <nl> - } <nl> - <nl> - public InstrumentedCache getKeyCache ( ) <nl> - { <nl> - return keyCache ; <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / RowIndexedScanner . java b / src / java / org / apache / cassandra / io / sstable / RowIndexedScanner . java <nl> deleted file mode 100644 <nl> index 2ad4a11 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / RowIndexedScanner . java <nl> + + + / dev / null <nl> @ @ - 1 , 195 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , <nl> - * software distributed under the License is distributed on an <nl> - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> - * KIND , either express or implied . See the License for the <nl> - * specific language governing permissions and limitations <nl> - * under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . io . sstable ; <nl> - <nl> - import java . io . IOException ; <nl> - import java . io . IOError ; <nl> - import java . util . Iterator ; <nl> - import java . util . Arrays ; <nl> - <nl> - import org . apache . cassandra . db . DecoratedKey ; <nl> - import org . apache . cassandra . db . filter . IColumnIterator ; <nl> - import org . apache . cassandra . db . filter . QueryFilter ; <nl> - import org . apache . cassandra . io . util . BufferedRandomAccessFile ; <nl> - import org . apache . cassandra . service . StorageService ; <nl> - import org . apache . cassandra . utils . FBUtilities ; <nl> - <nl> - import org . slf4j . Logger ; <nl> - import org . slf4j . LoggerFactory ; <nl> - <nl> - <nl> - public class RowIndexedScanner extends SSTableScanner <nl> - { <nl> - private static Logger logger = LoggerFactory . getLogger ( RowIndexedScanner . class ) ; <nl> - <nl> - private final BufferedRandomAccessFile file ; <nl> - private final SSTableReader sstable ; <nl> - private IColumnIterator row ; <nl> - private boolean exhausted = false ; <nl> - private Iterator < IColumnIterator > iterator ; <nl> - private QueryFilter filter ; <nl> - <nl> - / * * <nl> - * @ param sstable SSTable to scan . <nl> - * / <nl> - RowIndexedScanner ( SSTableReader sstable , int bufferSize ) <nl> - { <nl> - try <nl> - { <nl> - this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , bufferSize ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new IOError ( e ) ; <nl> - } <nl> - this . sstable = sstable ; <nl> - } <nl> - <nl> - / * * <nl> - * @ param sstable SSTable to scan . <nl> - * @ param filter filter to use when scanning the columns <nl> - * / <nl> - RowIndexedScanner ( SSTableReader sstable , QueryFilter filter , int bufferSize ) <nl> - { <nl> - try <nl> - { <nl> - this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , bufferSize ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new IOError ( e ) ; <nl> - } <nl> - this . sstable = sstable ; <nl> - this . filter = filter ; <nl> - } <nl> - <nl> - public void close ( ) throws IOException <nl> - { <nl> - file . close ( ) ; <nl> - } <nl> - <nl> - public void seekTo ( DecoratedKey seekKey ) <nl> - { <nl> - try <nl> - { <nl> - long position = sstable . getNearestPosition ( seekKey ) ; <nl> - if ( position < 0 ) <nl> - { <nl> - exhausted = true ; <nl> - return ; <nl> - } <nl> - file . seek ( position ) ; <nl> - row = null ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( " corrupt sstable " , e ) ; <nl> - } <nl> - } <nl> - <nl> - public long getFileLength ( ) <nl> - { <nl> - try <nl> - { <nl> - return file . length ( ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new IOError ( e ) ; <nl> - } <nl> - } <nl> - <nl> - public long getFilePointer ( ) <nl> - { <nl> - return file . getFilePointer ( ) ; <nl> - } <nl> - <nl> - public boolean hasNext ( ) <nl> - { <nl> - if ( iterator = = null ) <nl> - iterator = exhausted ? Arrays . asList ( new IColumnIterator [ 0 ] ) . iterator ( ) : new KeyScanningIterator ( ) ; <nl> - return iterator . hasNext ( ) ; <nl> - } <nl> - <nl> - public IColumnIterator next ( ) <nl> - { <nl> - if ( iterator = = null ) <nl> - iterator = exhausted ? Arrays . asList ( new IColumnIterator [ 0 ] ) . iterator ( ) : new KeyScanningIterator ( ) ; <nl> - return iterator . next ( ) ; <nl> - } <nl> - <nl> - public void remove ( ) <nl> - { <nl> - throw new UnsupportedOperationException ( ) ; <nl> - } <nl> - <nl> - private class KeyScanningIterator implements Iterator < IColumnIterator > <nl> - { <nl> - private long dataStart ; <nl> - private long finishedAt ; <nl> - <nl> - public boolean hasNext ( ) <nl> - { <nl> - try <nl> - { <nl> - if ( row = = null ) <nl> - return ! file . isEOF ( ) ; <nl> - return finishedAt < file . length ( ) ; <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> - } <nl> - <nl> - public IColumnIterator next ( ) <nl> - { <nl> - try <nl> - { <nl> - if ( row ! = null ) <nl> - file . seek ( finishedAt ) ; <nl> - assert ! file . isEOF ( ) ; <nl> - <nl> - DecoratedKey key = StorageService . getPartitioner ( ) . convertFromDiskFormat ( FBUtilities . readShortByteArray ( file ) ) ; <nl> - int dataSize = file . readInt ( ) ; <nl> - dataStart = file . getFilePointer ( ) ; <nl> - finishedAt = dataStart + dataSize ; <nl> - <nl> - if ( filter = = null ) <nl> - { <nl> - return row = new SSTableIdentityIterator ( sstable , file , key , dataStart , finishedAt ) ; <nl> - } <nl> - else <nl> - { <nl> - return row = filter . getSSTableColumnIterator ( sstable , file , key , dataStart ) ; <nl> - } <nl> - } <nl> - catch ( IOException e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> - } <nl> - } <nl> - <nl> - public void remove ( ) <nl> - { <nl> - throw new UnsupportedOperationException ( ) ; <nl> - } <nl> - } <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> index de08b1a . . 997c344 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> @ @ - 26 , 6 + 26 , 13 @ @ import java . lang . ref . Reference ; <nl> import java . nio . channels . FileChannel ; <nl> import java . nio . MappedByteBuffer ; <nl> <nl> + import com . google . common . base . Function ; <nl> + import com . google . common . collect . Collections2 ; <nl> + import org . apache . cassandra . io . util . BufferedRandomAccessFile ; <nl> + import org . apache . cassandra . io . util . SegmentedFile ; <nl> + import org . apache . cassandra . utils . BloomFilter ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . apache . cassandra . utils . Pair ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 44 , 10 + 51 , 13 @ @ import org . apache . cassandra . io . util . FileDataInput ; <nl> * SSTableReaders are open ( ) ed by Table . onStart ; after that they are created by SSTableWriter . renameAndOpen . <nl> * Do not re - call open ( ) on existing SSTable files ; use the references kept by ColumnFamilyStore post - start instead . <nl> * / <nl> - public abstract class SSTableReader extends SSTable implements Comparable < SSTableReader > <nl> + public class SSTableReader extends SSTable implements Comparable < SSTableReader > <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( SSTableReader . class ) ; <nl> <nl> + / / guesstimated size of INDEX _ INTERVAL index entries <nl> + private static final int INDEX _ FILE _ BUFFER _ BYTES = 16 * IndexSummary . INDEX _ INTERVAL ; <nl> + <nl> / / ` finalizers ` is required to keep the PhantomReferences alive after the enclosing SSTR is itself <nl> / / unreferenced . otherwise they will never get enqueued . <nl> private static final Set < Reference < SSTableReader > > finalizers = new HashSet < Reference < SSTableReader > > ( ) ; <nl> @ @ - 97 , 6 + 107 , 14 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl <nl> * / <nl> public final long maxDataAge ; <nl> <nl> + / / indexfile and datafile : might be null before a call to load ( ) <nl> + private SegmentedFile ifile ; <nl> + private SegmentedFile dfile ; <nl> + <nl> + private InstrumentedCache < Pair < Descriptor , DecoratedKey > , Long > keyCache ; <nl> + <nl> + private volatile SSTableDeletingReference phantomReference ; <nl> + <nl> public static int indexInterval ( ) <nl> { <nl> return IndexSummary . INDEX _ INTERVAL ; <nl> @ @ - 144 , 7 + 162 , 7 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl <nl> / / FIXME : version conditional readers here <nl> if ( true ) <nl> { <nl> - sstable = RowIndexedReader . internalOpen ( descriptor , partitioner ) ; <nl> + sstable = internalOpen ( descriptor , partitioner ) ; <nl> } <nl> <nl> if ( logger . isDebugEnabled ( ) ) <nl> @ @ - 153 , 39 + 171 , 173 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl <nl> return sstable ; <nl> } <nl> <nl> + / * * Open a RowIndexedReader which needs its state loaded from disk . * / <nl> + static SSTableReader internalOpen ( Descriptor desc , IPartitioner partitioner ) throws IOException <nl> + { <nl> + SSTableReader sstable = new SSTableReader ( desc , partitioner , null , null , null , null , System . currentTimeMillis ( ) ) ; <nl> + <nl> + / / versions before ' c ' encoded keys as utf - 16 before hashing to the filter <nl> + if ( desc . versionCompareTo ( " c " ) < 0 ) <nl> + sstable . load ( true ) ; <nl> + else <nl> + { <nl> + sstable . load ( false ) ; <nl> + sstable . loadBloomFilter ( ) ; <nl> + } <nl> + <nl> + return sstable ; <nl> + } <nl> + <nl> + / * * <nl> + * Open a RowIndexedReader which already has its state initialized ( by SSTableWriter ) . <nl> + * / <nl> + static SSTableReader internalOpen ( Descriptor desc , IPartitioner partitioner , SegmentedFile ifile , SegmentedFile dfile , IndexSummary isummary , BloomFilter bf , long maxDataAge ) throws IOException <nl> + { <nl> + assert desc ! = null & & partitioner ! = null & & ifile ! = null & & dfile ! = null & & isummary ! = null & & bf ! = null ; <nl> + return new SSTableReader ( desc , partitioner , ifile , dfile , isummary , bf , maxDataAge ) ; <nl> + } <nl> + <nl> + SSTableReader ( Descriptor desc , <nl> + IPartitioner partitioner , <nl> + SegmentedFile ifile , <nl> + SegmentedFile dfile , <nl> + IndexSummary indexSummary , <nl> + BloomFilter bloomFilter , <nl> + long maxDataAge ) <nl> + throws IOException <nl> + { <nl> + super ( desc , partitioner ) ; <nl> + this . maxDataAge = maxDataAge ; <nl> + <nl> + <nl> + this . ifile = ifile ; <nl> + this . dfile = dfile ; <nl> + this . indexSummary = indexSummary ; <nl> + this . bf = bloomFilter ; <nl> + } <nl> + <nl> public void setTrackedBy ( SSTableTracker tracker ) <nl> { <nl> phantomReference = new SSTableDeletingReference ( tracker , this , finalizerQueue ) ; <nl> finalizers . add ( phantomReference ) ; <nl> + keyCache = tracker . getKeyCache ( ) ; <nl> } <nl> <nl> - protected SSTableReader ( Descriptor desc , IPartitioner partitioner , long maxDataAge ) <nl> + void loadBloomFilter ( ) throws IOException <nl> { <nl> - super ( desc , partitioner ) ; <nl> - this . maxDataAge = maxDataAge ; <nl> + DataInputStream stream = new DataInputStream ( new FileInputStream ( filterFilename ( ) ) ) ; <nl> + try <nl> + { <nl> + bf = BloomFilter . serializer ( ) . deserialize ( stream ) ; <nl> + } <nl> + finally <nl> + { <nl> + stream . close ( ) ; <nl> + } <nl> } <nl> <nl> - private volatile SSTableDeletingReference phantomReference ; <nl> + / * * <nl> + * Loads ifile , dfile and indexSummary , and optionally recreates the bloom filter . <nl> + * / <nl> + private void load ( boolean recreatebloom ) throws IOException <nl> + { <nl> + SegmentedFile . Builder ibuilder = SegmentedFile . getBuilder ( ) ; <nl> + SegmentedFile . Builder dbuilder = SegmentedFile . getBuilder ( ) ; <nl> + <nl> + / / we read the positions in a BRAF so we don ' t have to worry about an entry spanning a mmap boundary . <nl> + indexSummary = new IndexSummary ( ) ; <nl> + BufferedRandomAccessFile input = new BufferedRandomAccessFile ( indexFilename ( ) , " r " ) ; <nl> + try <nl> + { <nl> + long indexSize = input . length ( ) ; <nl> + if ( recreatebloom ) <nl> + / / estimate key count based on index length <nl> + bf = BloomFilter . getFilter ( ( int ) ( input . length ( ) / 32 ) , 15 ) ; <nl> + while ( true ) <nl> + { <nl> + long indexPosition = input . getFilePointer ( ) ; <nl> + if ( indexPosition = = indexSize ) <nl> + break ; <nl> + <nl> + DecoratedKey decoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; <nl> + if ( recreatebloom ) <nl> + bf . add ( decoratedKey . key ) ; <nl> + long dataPosition = input . readLong ( ) ; <nl> + <nl> + indexSummary . maybeAddEntry ( decoratedKey , indexPosition ) ; <nl> + ibuilder . addPotentialBoundary ( indexPosition ) ; <nl> + dbuilder . addPotentialBoundary ( dataPosition ) ; <nl> + } <nl> + indexSummary . complete ( ) ; <nl> + } <nl> + finally <nl> + { <nl> + input . close ( ) ; <nl> + } <nl> + <nl> + / / finalize the state of the reader <nl> + indexSummary . complete ( ) ; <nl> + ifile = ibuilder . complete ( indexFilename ( ) ) ; <nl> + dfile = dbuilder . complete ( getFilename ( ) ) ; <nl> + } <nl> + <nl> + / * * get the position in the index file to start scanning to find the given key ( at most indexInterval keys away ) * / <nl> + private IndexSummary . KeyPosition getIndexScanPosition ( DecoratedKey decoratedKey ) <nl> + { <nl> + assert indexSummary . getIndexPositions ( ) ! = null & & indexSummary . getIndexPositions ( ) . size ( ) > 0 ; <nl> + int index = Collections . binarySearch ( indexSummary . getIndexPositions ( ) , new IndexSummary . KeyPosition ( decoratedKey , - 1 ) ) ; <nl> + if ( index < 0 ) <nl> + { <nl> + / / binary search gives us the first index _ greater _ than the key searched for , <nl> + / / i . e . , its insertion position <nl> + int greaterThan = ( index + 1 ) * - 1 ; <nl> + if ( greaterThan = = 0 ) <nl> + return null ; <nl> + return indexSummary . getIndexPositions ( ) . get ( greaterThan - 1 ) ; <nl> + } <nl> + else <nl> + { <nl> + return indexSummary . getIndexPositions ( ) . get ( index ) ; <nl> + } <nl> + } <nl> <nl> / * * <nl> * For testing purposes only . <nl> * / <nl> - public abstract void forceFilterFailures ( ) ; <nl> + public void forceFilterFailures ( ) <nl> + { <nl> + bf = BloomFilter . alwaysMatchingBloomFilter ( ) ; <nl> + } <nl> <nl> / * * <nl> * @ return The key cache : for monitoring purposes . <nl> * / <nl> - public abstract InstrumentedCache getKeyCache ( ) ; <nl> + public InstrumentedCache getKeyCache ( ) <nl> + { <nl> + return keyCache ; <nl> + } <nl> <nl> / * * <nl> * @ return An estimate of the number of keys in this SSTable . <nl> * / <nl> - public abstract long estimatedKeys ( ) ; <nl> + public long estimatedKeys ( ) <nl> + { <nl> + return indexSummary . getIndexPositions ( ) . size ( ) * IndexSummary . INDEX _ INTERVAL ; <nl> + } <nl> <nl> / * * <nl> * @ return Approximately 1 / INDEX _ INTERVALth of the keys in this SSTable . <nl> * / <nl> - public abstract Collection < DecoratedKey > getKeySamples ( ) ; <nl> + public Collection < DecoratedKey > getKeySamples ( ) <nl> + { <nl> + return Collections2 . transform ( indexSummary . getIndexPositions ( ) , <nl> + new Function < IndexSummary . KeyPosition , DecoratedKey > ( ) { <nl> + public DecoratedKey apply ( IndexSummary . KeyPosition kp ) <nl> + { <nl> + return kp . key ; <nl> + } <nl> + } ) ; <nl> + } <nl> <nl> / * * <nl> * Returns the position in the data file to find the given key , or - 1 if the <nl> @ @ - 193 , 7 + 345 , 71 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl <nl> * FIXME : should not be public : use Scanner . <nl> * / <nl> @ Deprecated <nl> - public abstract long getPosition ( DecoratedKey decoratedKey ) throws IOException ; <nl> + public long getPosition ( DecoratedKey decoratedKey ) <nl> + { <nl> + / / first , check bloom filter <nl> + if ( ! bf . isPresent ( partitioner . convertToDiskFormat ( decoratedKey ) ) ) <nl> + return - 1 ; <nl> + <nl> + / / next , the key cache <nl> + Pair < Descriptor , DecoratedKey > unifiedKey = new Pair < Descriptor , DecoratedKey > ( desc , decoratedKey ) ; <nl> + if ( keyCache ! = null & & keyCache . getCapacity ( ) > 0 ) <nl> + { <nl> + Long cachedPosition = keyCache . get ( unifiedKey ) ; <nl> + if ( cachedPosition ! = null ) <nl> + { <nl> + return cachedPosition ; <nl> + } <nl> + } <nl> + <nl> + / / next , see if the sampled index says it ' s impossible for the key to be present <nl> + IndexSummary . KeyPosition sampledPosition = getIndexScanPosition ( decoratedKey ) ; <nl> + if ( sampledPosition = = null ) <nl> + return - 1 ; <nl> + <nl> + / / scan the on - disk index , starting at the nearest sampled position <nl> + int i = 0 ; <nl> + Iterator < FileDataInput > segments = ifile . iterator ( sampledPosition . indexPosition , INDEX _ FILE _ BUFFER _ BYTES ) ; <nl> + while ( segments . hasNext ( ) ) <nl> + { <nl> + FileDataInput input = segments . next ( ) ; <nl> + try <nl> + { <nl> + while ( ! input . isEOF ( ) & & i + + < IndexSummary . INDEX _ INTERVAL ) <nl> + { <nl> + / / read key & data position from index entry <nl> + DecoratedKey indexDecoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; <nl> + long dataPosition = input . readLong ( ) ; <nl> + <nl> + int v = indexDecoratedKey . compareTo ( decoratedKey ) ; <nl> + if ( v = = 0 ) <nl> + { <nl> + if ( keyCache ! = null & & keyCache . getCapacity ( ) > 0 ) <nl> + keyCache . put ( unifiedKey , Long . valueOf ( dataPosition ) ) ; <nl> + return dataPosition ; <nl> + } <nl> + if ( v > 0 ) <nl> + return - 1 ; <nl> + } <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + finally <nl> + { <nl> + try <nl> + { <nl> + input . close ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + logger . error ( " error closing file " , e ) ; <nl> + } <nl> + } <nl> + } <nl> + return - 1 ; <nl> + } <nl> <nl> / * * <nl> * Like getPosition , but if key is not found will return the location of the <nl> @ @ - 201 , 12 + 417 , 54 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl <nl> * FIXME : should not be public : use Scanner . <nl> * / <nl> @ Deprecated <nl> - public abstract long getNearestPosition ( DecoratedKey decoratedKey ) throws IOException ; <nl> + public long getNearestPosition ( DecoratedKey decoratedKey ) <nl> + { <nl> + IndexSummary . KeyPosition sampledPosition = getIndexScanPosition ( decoratedKey ) ; <nl> + if ( sampledPosition = = null ) <nl> + return 0 ; <nl> + <nl> + / / scan the on - disk index , starting at the nearest sampled position <nl> + Iterator < FileDataInput > segiter = ifile . iterator ( sampledPosition . indexPosition , INDEX _ FILE _ BUFFER _ BYTES ) ; <nl> + while ( segiter . hasNext ( ) ) <nl> + { <nl> + FileDataInput input = segiter . next ( ) ; <nl> + try <nl> + { <nl> + while ( ! input . isEOF ( ) ) <nl> + { <nl> + DecoratedKey indexDecoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; <nl> + long position = input . readLong ( ) ; <nl> + int v = indexDecoratedKey . compareTo ( decoratedKey ) ; <nl> + if ( v > = 0 ) <nl> + return position ; <nl> + } <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + finally <nl> + { <nl> + try <nl> + { <nl> + input . close ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + logger . error ( " error closing file " , e ) ; <nl> + } <nl> + } <nl> + } <nl> + return - 1 ; <nl> + } <nl> <nl> / * * <nl> * @ return The length in bytes of the data file for this SSTable . <nl> * / <nl> - public abstract long length ( ) ; <nl> + public long length ( ) <nl> + { <nl> + return dfile . length ; <nl> + } <nl> <nl> public void markCompacted ( ) <nl> { <nl> @ @ - 228 , 16 + 486 , 35 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl <nl> * @ param bufferSize Buffer size in bytes for this Scanner . <nl> * @ return A Scanner for seeking over the rows of the SSTable . <nl> * / <nl> - public abstract SSTableScanner getScanner ( int bufferSize ) ; <nl> + public SSTableScanner getScanner ( int bufferSize ) <nl> + { <nl> + return new SSTableScanner ( this , bufferSize ) ; <nl> + } <nl> <nl> / * * <nl> * @ param bufferSize Buffer size in bytes for this Scanner . <nl> * @ param filter filter to use when reading the columns <nl> * @ return A Scanner for seeking over the rows of the SSTable . <nl> * / <nl> - public abstract SSTableScanner getScanner ( int bufferSize , QueryFilter filter ) ; <nl> - <nl> - public abstract FileDataInput getFileDataInput ( DecoratedKey decoratedKey , int bufferSize ) ; <nl> + public SSTableScanner getScanner ( int bufferSize , QueryFilter filter ) <nl> + { <nl> + return new SSTableScanner ( this , filter , bufferSize ) ; <nl> + } <nl> + <nl> + public FileDataInput getFileDataInput ( DecoratedKey decoratedKey , int bufferSize ) <nl> + { <nl> + long position = getPosition ( decoratedKey ) ; <nl> + if ( position < 0 ) <nl> + return null ; <nl> + <nl> + return dfile . getSegment ( position , bufferSize ) ; <nl> + } <nl> + <nl> + <nl> + public int compareTo ( SSTableReader o ) <nl> + { <nl> + return desc . generation - o . desc . generation ; <nl> + } <nl> <nl> public AbstractType getColumnComparator ( ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableScanner . java b / src / java / org / apache / cassandra / io / sstable / SSTableScanner . java <nl> index 278af6c . . d8d8ac2 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableScanner . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableScanner . java <nl> @ @ - 6 , 9 + 6 , 9 @ @ <nl> * to you under the Apache License , Version 2 . 0 ( the <nl> * " License " ) ; you may not use this file except in compliance <nl> * with the License . You may obtain a copy of the License at <nl> - * <nl> + * <nl> * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> + * <nl> * Unless required by applicable law or agreed to in writing , <nl> * software distributed under the License is distributed on an <nl> * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> @ @ - 20 , 17 + 20 , 177 @ @ <nl> package org . apache . cassandra . io . sstable ; <nl> <nl> import java . io . Closeable ; <nl> + import java . io . IOException ; <nl> + import java . io . IOError ; <nl> import java . util . Iterator ; <nl> + import java . util . Arrays ; <nl> <nl> import org . apache . cassandra . db . DecoratedKey ; <nl> import org . apache . cassandra . db . filter . IColumnIterator ; <nl> + import org . apache . cassandra . db . filter . QueryFilter ; <nl> + import org . apache . cassandra . io . util . BufferedRandomAccessFile ; <nl> + import org . apache . cassandra . service . StorageService ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> <nl> - public abstract class SSTableScanner implements Iterator < IColumnIterator > , Closeable <nl> + <nl> + public class SSTableScanner implements Iterator < IColumnIterator > , Closeable <nl> { <nl> - public abstract void seekTo ( DecoratedKey seekKey ) ; <nl> + private static Logger logger = LoggerFactory . getLogger ( SSTableScanner . class ) ; <nl> + <nl> + private final BufferedRandomAccessFile file ; <nl> + private final SSTableReader sstable ; <nl> + private IColumnIterator row ; <nl> + private boolean exhausted = false ; <nl> + private Iterator < IColumnIterator > iterator ; <nl> + private QueryFilter filter ; <nl> + <nl> + / * * <nl> + * @ param sstable SSTable to scan . <nl> + * / <nl> + SSTableScanner ( SSTableReader sstable , int bufferSize ) <nl> + { <nl> + try <nl> + { <nl> + this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , bufferSize ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + this . sstable = sstable ; <nl> + } <nl> + <nl> + / * * <nl> + * @ param sstable SSTable to scan . <nl> + * @ param filter filter to use when scanning the columns <nl> + * / <nl> + SSTableScanner ( SSTableReader sstable , QueryFilter filter , int bufferSize ) <nl> + { <nl> + try <nl> + { <nl> + this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , bufferSize ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + this . sstable = sstable ; <nl> + this . filter = filter ; <nl> + } <nl> + <nl> + public void close ( ) throws IOException <nl> + { <nl> + file . close ( ) ; <nl> + } <nl> + <nl> + public void seekTo ( DecoratedKey seekKey ) <nl> + { <nl> + try <nl> + { <nl> + long position = sstable . getNearestPosition ( seekKey ) ; <nl> + if ( position < 0 ) <nl> + { <nl> + exhausted = true ; <nl> + return ; <nl> + } <nl> + file . seek ( position ) ; <nl> + row = null ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( " corrupt sstable " , e ) ; <nl> + } <nl> + } <nl> + <nl> + public long getFileLength ( ) <nl> + { <nl> + try <nl> + { <nl> + return file . length ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + } <nl> + <nl> + public long getFilePointer ( ) <nl> + { <nl> + return file . getFilePointer ( ) ; <nl> + } <nl> + <nl> + public boolean hasNext ( ) <nl> + { <nl> + if ( iterator = = null ) <nl> + iterator = exhausted ? Arrays . asList ( new IColumnIterator [ 0 ] ) . iterator ( ) : new KeyScanningIterator ( ) ; <nl> + return iterator . hasNext ( ) ; <nl> + } <nl> + <nl> + public IColumnIterator next ( ) <nl> + { <nl> + if ( iterator = = null ) <nl> + iterator = exhausted ? Arrays . asList ( new IColumnIterator [ 0 ] ) . iterator ( ) : new KeyScanningIterator ( ) ; <nl> + return iterator . next ( ) ; <nl> + } <nl> + <nl> + public void remove ( ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + <nl> + private class KeyScanningIterator implements Iterator < IColumnIterator > <nl> + { <nl> + private long dataStart ; <nl> + private long finishedAt ; <nl> + <nl> + public boolean hasNext ( ) <nl> + { <nl> + try <nl> + { <nl> + if ( row = = null ) <nl> + return ! file . isEOF ( ) ; <nl> + return finishedAt < file . length ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + public IColumnIterator next ( ) <nl> + { <nl> + try <nl> + { <nl> + if ( row ! = null ) <nl> + file . seek ( finishedAt ) ; <nl> + assert ! file . isEOF ( ) ; <nl> + <nl> + DecoratedKey key = StorageService . getPartitioner ( ) . convertFromDiskFormat ( FBUtilities . readShortByteArray ( file ) ) ; <nl> + int dataSize = file . readInt ( ) ; <nl> + dataStart = file . getFilePointer ( ) ; <nl> + finishedAt = dataStart + dataSize ; <nl> <nl> - public abstract long getFileLength ( ) ; <nl> + if ( filter = = null ) <nl> + { <nl> + return row = new SSTableIdentityIterator ( sstable , file , key , dataStart , finishedAt ) ; <nl> + } <nl> + else <nl> + { <nl> + return row = filter . getSSTableColumnIterator ( sstable , file , key , dataStart ) ; <nl> + } <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> <nl> - public abstract long getFilePointer ( ) ; <nl> + public void remove ( ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> index 9463e74 . . 12c09e8 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java <nl> @ @ - 163 , 7 + 163 , 7 @ @ public class SSTableWriter extends SSTable <nl> SegmentedFile dfile = dbuilder . complete ( newdesc . filenameFor ( SSTable . COMPONENT _ DATA ) ) ; <nl> ibuilder = null ; <nl> dbuilder = null ; <nl> - return RowIndexedReader . internalOpen ( newdesc , partitioner , ifile , dfile , indexSummary , bf , maxDataAge ) ; <nl> + return SSTableReader . internalOpen ( newdesc , partitioner , ifile , dfile , indexSummary , bf , maxDataAge ) ; <nl> } <nl> <nl> static Descriptor rename ( Descriptor tmpdesc )
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 6133536 . . 3b373ae 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 25 , 6 + 25 , 8 @ @ 
+ * cqlsh : Fix keys ( ) and full ( ) collection indexes in DESCRIBE output 
+ ( CASSANDRA - 8154 ) 
+ * Show progress of streaming in nodetool netstats ( CASSANDRA - 8886 ) 
+ + * IndexSummaryBuilder utilises offheap memory , and shares data between 
+ + each IndexSummary opened from it ( CASSANDRA - 8757 ) 
+ Merged from 2 . 0 : 
+ * Add offline tool to relevel sstables ( CASSANDRA - 8301 ) 
+ * Preserve stream ID for more protocol errors ( CASSANDRA - 8848 ) 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / IndexSummary . java b / src / java / org / apache / cassandra / io / sstable / IndexSummary . java 
+ index 0cde124 . . bad50b4 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / IndexSummary . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / IndexSummary . java 
+ @ @ - 20 , 8 + 20 , 8 @ @ package org . apache . cassandra . io . sstable ; 
+ import java . io . DataInputStream ; 
+ import java . io . IOException ; 
+ import java . nio . ByteBuffer ; 
+ + import java . nio . ByteOrder ; 
+ 
+ - import org . apache . cassandra . cache . RefCountedMemory ; 
+ import org . apache . cassandra . db . DecoratedKey ; 
+ import org . apache . cassandra . db . RowPosition ; 
+ import org . apache . cassandra . dht . IPartitioner ; 
+ @ @ - 54 , 9 + 54 , 16 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ private final int minIndexInterval ; 
+ 
+ private final IPartitioner partitioner ; 
+ - private final int summarySize ; 
+ private final int sizeAtFullSampling ; 
+ - private final Memory bytes ; 
+ + / / we permit the memory to span a range larger than we use , 
+ + / / so we have an accompanying count and length for each part 
+ + / / we split our data into two ranges : offsets ( indexing into entries ) , 
+ + / / and entries containing the summary data 
+ + private final Memory offsets ; 
+ + private final int offsetCount ; 
+ + / / entries is a list of ( partition key , index file offset ) pairs 
+ + private final Memory entries ; 
+ + private final long entriesLength ; 
+ 
+ / * * 
+ * A value between 1 and BASE _ SAMPLING _ LEVEL that represents how many of the original 
+ @ @ - 66 , 15 + 73 , 18 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ * / 
+ private final int samplingLevel ; 
+ 
+ - public IndexSummary ( IPartitioner partitioner , Memory bytes , int summarySize , int sizeAtFullSampling , 
+ - int minIndexInterval , int samplingLevel ) 
+ + public IndexSummary ( IPartitioner partitioner , Memory offsets , int offsetCount , Memory entries , long entriesLength , 
+ + int sizeAtFullSampling , int minIndexInterval , int samplingLevel ) 
+ { 
+ - super ( bytes ) ; 
+ + super ( new Memory [ ] { offsets , entries } ) ; 
+ + assert offsets . getInt ( 0 ) = = 0 ; 
+ this . partitioner = partitioner ; 
+ this . minIndexInterval = minIndexInterval ; 
+ - this . summarySize = summarySize ; 
+ + this . offsetCount = offsetCount ; 
+ + this . entriesLength = entriesLength ; 
+ this . sizeAtFullSampling = sizeAtFullSampling ; 
+ - this . bytes = bytes ; 
+ + this . offsets = offsets ; 
+ + this . entries = entries ; 
+ this . samplingLevel = samplingLevel ; 
+ } 
+ 
+ @ @ - 83 , 9 + 93 , 11 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ super ( copy ) ; 
+ this . partitioner = copy . partitioner ; 
+ this . minIndexInterval = copy . minIndexInterval ; 
+ - this . summarySize = copy . summarySize ; 
+ + this . offsetCount = copy . offsetCount ; 
+ + this . entriesLength = copy . entriesLength ; 
+ this . sizeAtFullSampling = copy . sizeAtFullSampling ; 
+ - this . bytes = copy . bytes ; 
+ + this . offsets = copy . offsets ; 
+ + this . entries = copy . entries ; 
+ this . samplingLevel = copy . samplingLevel ; 
+ } 
+ 
+ @ @ - 93 , 7 + 105 , 7 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ / / Harmony ' s Collections implementation 
+ public int binarySearch ( RowPosition key ) 
+ { 
+ - int low = 0 , mid = summarySize , high = mid - 1 , result = - 1 ; 
+ + int low = 0 , mid = offsetCount , high = mid - 1 , result = - 1 ; 
+ while ( low < = high ) 
+ { 
+ mid = ( low + high ) > > 1 ; 
+ @ @ - 123 , 7 + 135 , 7 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ public int getPositionInSummary ( int index ) 
+ { 
+ / / The first section of bytes holds a four - byte position for each entry in the summary , so just multiply by 4 . 
+ - return bytes . getInt ( index < < 2 ) ; 
+ + return offsets . getInt ( index < < 2 ) ; 
+ } 
+ 
+ public byte [ ] getKey ( int index ) 
+ @ @ - 131 , 27 + 143 , 23 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ long start = getPositionInSummary ( index ) ; 
+ int keySize = ( int ) ( calculateEnd ( index ) - start - 8L ) ; 
+ byte [ ] key = new byte [ keySize ] ; 
+ - bytes . getBytes ( start , key , 0 , keySize ) ; 
+ + entries . getBytes ( start , key , 0 , keySize ) ; 
+ return key ; 
+ } 
+ 
+ public long getPosition ( int index ) 
+ { 
+ - return bytes . getLong ( calculateEnd ( index ) - 8 ) ; 
+ + return entries . getLong ( calculateEnd ( index ) - 8 ) ; 
+ } 
+ 
+ - public byte [ ] getEntry ( int index ) 
+ + public long getEndInSummary ( int index ) 
+ { 
+ - long start = getPositionInSummary ( index ) ; 
+ - long end = calculateEnd ( index ) ; 
+ - byte [ ] entry = new byte [ ( int ) ( end - start ) ] ; 
+ - bytes . getBytes ( start , entry , 0 , ( int ) ( end - start ) ) ; 
+ - return entry ; 
+ + return calculateEnd ( index ) ; 
+ } 
+ 
+ private long calculateEnd ( int index ) 
+ { 
+ - return index = = ( summarySize - 1 ) ? bytes . size ( ) : getPositionInSummary ( index + 1 ) ; 
+ + return index = = ( offsetCount - 1 ) ? entriesLength : getPositionInSummary ( index + 1 ) ; 
+ } 
+ 
+ public int getMinIndexInterval ( ) 
+ @ @ - 174 , 7 + 182 , 7 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ 
+ public int size ( ) 
+ { 
+ - return summarySize ; 
+ + return offsetCount ; 
+ } 
+ 
+ public int getSamplingLevel ( ) 
+ @ @ - 192 , 12 + 200 , 27 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ } 
+ 
+ / * * 
+ - * Returns the amount of off - heap memory used for this summary . 
+ + * Returns the amount of off - heap memory used for the entries portion of this summary . 
+ * @ return size in bytes 
+ * / 
+ - public long getOffHeapSize ( ) 
+ + long getEntriesLength ( ) 
+ + { 
+ + return entriesLength ; 
+ + } 
+ + 
+ + Memory getOffsets ( ) 
+ + { 
+ + return offsets ; 
+ + } 
+ + 
+ + Memory getEntries ( ) 
+ + { 
+ + return entries ; 
+ + } 
+ + 
+ + long getOffHeapSize ( ) 
+ { 
+ - return bytes . size ( ) ; 
+ + return offsetCount * 4 + entriesLength ; 
+ } 
+ 
+ / * * 
+ @ @ - 224 , 14 + 247 , 29 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ public void serialize ( IndexSummary t , DataOutputPlus out , boolean withSamplingLevel ) throws IOException 
+ { 
+ out . writeInt ( t . minIndexInterval ) ; 
+ - out . writeInt ( t . summarySize ) ; 
+ - out . writeLong ( t . bytes . size ( ) ) ; 
+ + out . writeInt ( t . offsetCount ) ; 
+ + out . writeLong ( t . getOffHeapSize ( ) ) ; 
+ if ( withSamplingLevel ) 
+ { 
+ out . writeInt ( t . samplingLevel ) ; 
+ out . writeInt ( t . sizeAtFullSampling ) ; 
+ } 
+ - out . write ( t . bytes ) ; 
+ + / / our on - disk representation treats the offsets and the summary data as one contiguous structure , 
+ + / / in which the offsets are based from the start of the structure . i . e . , if the offsets occupy 
+ + / / X bytes , the value of the first offset will be X . In memory we split the two regions up , so that 
+ + / / the summary values are indexed from zero , so we apply a correction to the offsets when de / serializing . 
+ + / / In this case adding X to each of the offsets . 
+ + int baseOffset = t . offsetCount * 4 ; 
+ + for ( int i = 0 ; i < t . offsetCount ; i + + ) 
+ + { 
+ + int offset = t . offsets . getInt ( i * 4 ) + baseOffset ; 
+ + / / our serialization format for this file uses native byte order , so if this is different to the 
+ + / / default Java serialization order ( BIG _ ENDIAN ) we have to reverse our bytes 
+ + if ( ByteOrder . nativeOrder ( ) ! = ByteOrder . BIG _ ENDIAN ) 
+ + offset = Integer . reverseBytes ( offset ) ; 
+ + out . writeInt ( offset ) ; 
+ + } 
+ + out . write ( t . entries , 0 , t . entriesLength ) ; 
+ } 
+ 
+ public IndexSummary deserialize ( DataInputStream in , IPartitioner partitioner , boolean haveSamplingLevel , int expectedMinIndexInterval , int maxIndexInterval ) throws IOException 
+ @ @ - 243 , 7 + 281 , 7 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ minIndexInterval , expectedMinIndexInterval ) ) ; 
+ } 
+ 
+ - int summarySize = in . readInt ( ) ; 
+ + int offsetCount = in . readInt ( ) ; 
+ long offheapSize = in . readLong ( ) ; 
+ int samplingLevel , fullSamplingSummarySize ; 
+ if ( haveSamplingLevel ) 
+ @ @ - 254 , 7 + 292 , 7 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ else 
+ { 
+ samplingLevel = BASE _ SAMPLING _ LEVEL ; 
+ - fullSamplingSummarySize = summarySize ; 
+ + fullSamplingSummarySize = offsetCount ; 
+ } 
+ 
+ int effectiveIndexInterval = ( int ) Math . ceil ( ( BASE _ SAMPLING _ LEVEL / ( double ) samplingLevel ) * minIndexInterval ) ; 
+ @ @ - 264 , 9 + 302 , 18 @ @ public class IndexSummary extends WrappedSharedCloseable 
+ " the current max index interval ( % d ) " , effectiveIndexInterval , maxIndexInterval ) ) ; 
+ } 
+ 
+ - RefCountedMemory memory = new RefCountedMemory ( offheapSize ) ; 
+ - FBUtilities . copy ( in , new MemoryOutputStream ( memory ) , offheapSize ) ; 
+ - return new IndexSummary ( partitioner , memory , summarySize , fullSamplingSummarySize , minIndexInterval , samplingLevel ) ; 
+ + Memory offsets = Memory . allocate ( offsetCount * 4 ) ; 
+ + Memory entries = Memory . allocate ( offheapSize - offsets . size ( ) ) ; 
+ + FBUtilities . copy ( in , new MemoryOutputStream ( offsets ) , offsets . size ( ) ) ; 
+ + FBUtilities . copy ( in , new MemoryOutputStream ( entries ) , entries . size ( ) ) ; 
+ + / / our on - disk representation treats the offsets and the summary data as one contiguous structure , 
+ + / / in which the offsets are based from the start of the structure . i . e . , if the offsets occupy 
+ + / / X bytes , the value of the first offset will be X . In memory we split the two regions up , so that 
+ + / / the summary values are indexed from zero , so we apply a correction to the offsets when de / serializing . 
+ + / / In this case subtracting X from each of the offsets . 
+ + for ( int i = 0 ; i < offsets . size ( ) ; i + = 4 ) 
+ + offsets . setInt ( i , ( int ) ( offsets . getInt ( i ) - offsets . size ( ) ) ) ; 
+ + return new IndexSummary ( partitioner , offsets , offsetCount , entries , entries . size ( ) , fullSamplingSummarySize , minIndexInterval , samplingLevel ) ; 
+ } 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / IndexSummaryBuilder . java b / src / java / org / apache / cassandra / io / sstable / IndexSummaryBuilder . java 
+ index 3b93b31 . . 54e8dd2 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / IndexSummaryBuilder . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / IndexSummaryBuilder . java 
+ @ @ - 17 , 36 + 17 , 33 @ @ 
+ * / 
+ package org . apache . cassandra . io . sstable ; 
+ 
+ - import java . nio . ByteBuffer ; 
+ - import java . util . ArrayList ; 
+ - import java . util . Collections ; 
+ + import java . nio . ByteOrder ; 
+ import java . util . Map ; 
+ import java . util . TreeMap ; 
+ 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ - import org . apache . cassandra . cache . RefCountedMemory ; 
+ import org . apache . cassandra . db . DecoratedKey ; 
+ - import org . apache . cassandra . db . TypeSizes ; 
+ import org . apache . cassandra . dht . IPartitioner ; 
+ import org . apache . cassandra . io . util . Memory ; 
+ + import org . apache . cassandra . io . util . SafeMemoryWriter ; 
+ 
+ import static org . apache . cassandra . io . sstable . Downsampling . BASE _ SAMPLING _ LEVEL ; 
+ - import static org . apache . cassandra . io . sstable . SSTable . getMinimalKey ; 
+ 
+ - public class IndexSummaryBuilder 
+ + public class IndexSummaryBuilder implements AutoCloseable 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( IndexSummaryBuilder . class ) ; 
+ 
+ - private final ArrayList < Long > positions ; 
+ - private final ArrayList < DecoratedKey > keys ; 
+ + / / the offset in the keys memory region to look for a given summary boundary 
+ + private final SafeMemoryWriter offsets ; 
+ + private final SafeMemoryWriter entries ; 
+ + 
+ private final int minIndexInterval ; 
+ private final int samplingLevel ; 
+ private final int [ ] startPoints ; 
+ private long keysWritten = 0 ; 
+ private long indexIntervalMatches = 0 ; 
+ - private long offheapSize = 0 ; 
+ private long nextSamplePosition ; 
+ 
+ / / for each ReadableBoundary , we map its dataLength property to itself , permitting us to lookup the 
+ @ @ - 75 , 11 + 72 , 15 @ @ public class IndexSummaryBuilder 
+ final DecoratedKey lastKey ; 
+ final long indexLength ; 
+ final long dataLength ; 
+ - public ReadableBoundary ( DecoratedKey lastKey , long indexLength , long dataLength ) 
+ + final int summaryCount ; 
+ + final long entriesLength ; 
+ + public ReadableBoundary ( DecoratedKey lastKey , long indexLength , long dataLength , int summaryCount , long entriesLength ) 
+ { 
+ this . lastKey = lastKey ; 
+ this . indexLength = indexLength ; 
+ this . dataLength = dataLength ; 
+ + this . summaryCount = summaryCount ; 
+ + this . entriesLength = entriesLength ; 
+ } 
+ } 
+ 
+ @ @ - 105 , 10 + 106 , 9 @ @ public class IndexSummaryBuilder 
+ } 
+ 
+ / / for initializing data structures , adjust our estimates based on the sampling level 
+ - maxExpectedEntries = ( maxExpectedEntries * samplingLevel ) / BASE _ SAMPLING _ LEVEL ; 
+ - positions = new ArrayList < > ( ( int ) maxExpectedEntries ) ; 
+ - keys = new ArrayList < > ( ( int ) maxExpectedEntries ) ; 
+ - / / if we ' re downsampling we may not use index 0 
+ + maxExpectedEntries = Math . max ( 1 , ( maxExpectedEntries * samplingLevel ) / BASE _ SAMPLING _ LEVEL ) ; 
+ + offsets = new SafeMemoryWriter ( 4 * maxExpectedEntries ) . withByteOrder ( ByteOrder . nativeOrder ( ) ) ; 
+ + entries = new SafeMemoryWriter ( 40 * maxExpectedEntries ) . withByteOrder ( ByteOrder . nativeOrder ( ) ) ; 
+ setNextSamplePosition ( - minIndexInterval ) ; 
+ } 
+ 
+ @ @ - 165 , 16 + 165 , 16 @ @ public class IndexSummaryBuilder 
+ { 
+ if ( keysWritten = = nextSamplePosition ) 
+ { 
+ - keys . add ( getMinimalKey ( decoratedKey ) ) ; 
+ - offheapSize + = decoratedKey . getKey ( ) . remaining ( ) ; 
+ - positions . add ( indexStart ) ; 
+ - offheapSize + = TypeSizes . NATIVE . sizeof ( indexStart ) ; 
+ + assert entries . length ( ) < = Integer . MAX _ VALUE ; 
+ + offsets . writeInt ( ( int ) entries . length ( ) ) ; 
+ + entries . write ( decoratedKey . getKey ( ) ) ; 
+ + entries . writeLong ( indexStart ) ; 
+ setNextSamplePosition ( keysWritten ) ; 
+ } 
+ else if ( dataEnd ! = 0 & & keysWritten + 1 = = nextSamplePosition ) 
+ { 
+ / / this is the last key in this summary interval , so stash it 
+ - ReadableBoundary boundary = new ReadableBoundary ( decoratedKey , indexEnd , dataEnd ) ; 
+ + ReadableBoundary boundary = new ReadableBoundary ( decoratedKey , indexEnd , dataEnd , ( int ) ( offsets . length ( ) / 4 ) , entries . length ( ) ) ; 
+ lastReadableByData . put ( dataEnd , boundary ) ; 
+ lastReadableByIndex . put ( indexEnd , boundary ) ; 
+ } 
+ @ @ - 201 , 52 + 201 , 39 @ @ public class IndexSummaryBuilder 
+ 
+ public IndexSummary build ( IPartitioner partitioner ) 
+ { 
+ + / / this method should only be called when we ' ve finished appending records , so we truncate the 
+ + / / memory we ' re using to the exact amount required to represent it before building our summary 
+ + entries . setCapacity ( entries . length ( ) ) ; 
+ + offsets . setCapacity ( offsets . length ( ) ) ; 
+ return build ( partitioner , null ) ; 
+ } 
+ 
+ - / / lastIntervalKey should come from getLastReadableBoundary ( ) . lastKey 
+ - public IndexSummary build ( IPartitioner partitioner , DecoratedKey lastIntervalKey ) 
+ + / / build the summary up to the provided boundary ; this is backed by shared memory between 
+ + / / multiple invocations of this build method 
+ + public IndexSummary build ( IPartitioner partitioner , ReadableBoundary boundary ) 
+ { 
+ - assert keys . size ( ) > 0 ; 
+ - assert keys . size ( ) = = positions . size ( ) ; 
+ - 
+ - int length ; 
+ - if ( lastIntervalKey = = null ) 
+ - length = keys . size ( ) ; 
+ - else / / since it ' s an inclusive upper bound , this should never match exactly 
+ - length = - 1 - Collections . binarySearch ( keys , lastIntervalKey ) ; 
+ - 
+ - assert length > 0 ; 
+ - 
+ - long offheapSize = this . offheapSize ; 
+ - if ( length < keys . size ( ) ) 
+ - for ( int i = length ; i < keys . size ( ) ; i + + ) 
+ - offheapSize - = keys . get ( i ) . getKey ( ) . remaining ( ) + TypeSizes . NATIVE . sizeof ( positions . get ( i ) ) ; 
+ - 
+ - / / first we write out the position in the * summary * for each key in the summary , 
+ - / / then we write out ( key , actual index position ) pairs 
+ - Memory memory = Memory . allocate ( offheapSize + ( length * 4 ) ) ; 
+ - int idxPosition = 0 ; 
+ - int keyPosition = length * 4 ; 
+ - for ( int i = 0 ; i < length ; i + + ) 
+ + assert entries . length ( ) > 0 ; 
+ + 
+ + int count = ( int ) ( offsets . length ( ) / 4 ) ; 
+ + long entriesLength = entries . length ( ) ; 
+ + if ( boundary ! = null ) 
+ { 
+ - / / write the position of the actual entry in the index summary ( 4 bytes ) 
+ - memory . setInt ( idxPosition , keyPosition ) ; 
+ - idxPosition + = TypeSizes . NATIVE . sizeof ( keyPosition ) ; 
+ - 
+ - / / write the key 
+ - ByteBuffer keyBytes = keys . get ( i ) . getKey ( ) ; 
+ - memory . setBytes ( keyPosition , keyBytes ) ; 
+ - keyPosition + = keyBytes . remaining ( ) ; 
+ - 
+ - / / write the position in the actual index file 
+ - long actualIndexPosition = positions . get ( i ) ; 
+ - memory . setLong ( keyPosition , actualIndexPosition ) ; 
+ - keyPosition + = TypeSizes . NATIVE . sizeof ( actualIndexPosition ) ; 
+ + count = boundary . summaryCount ; 
+ + entriesLength = boundary . entriesLength ; 
+ } 
+ - assert keyPosition = = offheapSize + ( length * 4 ) ; 
+ + 
+ int sizeAtFullSampling = ( int ) Math . ceil ( keysWritten / ( double ) minIndexInterval ) ; 
+ - return new IndexSummary ( partitioner , memory , length , sizeAtFullSampling , minIndexInterval , samplingLevel ) ; 
+ + assert count > 0 ; 
+ + return new IndexSummary ( partitioner , offsets . currentBuffer ( ) . sharedCopy ( ) , 
+ + count , entries . currentBuffer ( ) . sharedCopy ( ) , entriesLength , 
+ + sizeAtFullSampling , minIndexInterval , samplingLevel ) ; 
+ + } 
+ + 
+ + / / close the builder and release any associated memory 
+ + public void close ( ) 
+ + { 
+ + entries . close ( ) ; 
+ + offsets . close ( ) ; 
+ } 
+ 
+ public static int entriesAtSamplingLevel ( int samplingLevel , int maxSummarySize ) 
+ @ @ - 294 , 26 + 281 , 25 @ @ public class IndexSummaryBuilder 
+ int [ ] startPoints = Downsampling . getStartPoints ( currentSamplingLevel , newSamplingLevel ) ; 
+ 
+ / / calculate new off - heap size 
+ - int removedKeyCount = 0 ; 
+ - long newOffHeapSize = existing . getOffHeapSize ( ) ; 
+ + int newKeyCount = existing . size ( ) ; 
+ + long newEntriesLength = existing . getEntriesLength ( ) ; 
+ for ( int start : startPoints ) 
+ { 
+ for ( int j = start ; j < existing . size ( ) ; j + = currentSamplingLevel ) 
+ { 
+ - removedKeyCount + + ; 
+ - newOffHeapSize - = existing . getEntry ( j ) . length ; 
+ + newKeyCount - - ; 
+ + long length = existing . getEndInSummary ( j ) - existing . getPositionInSummary ( j ) ; 
+ + newEntriesLength - = length ; 
+ } 
+ } 
+ 
+ - int newKeyCount = existing . size ( ) - removedKeyCount ; 
+ - 
+ - / / Subtract ( removedKeyCount * 4 ) from the new size to account for fewer entries in the first section , which 
+ - / / stores the position of the actual entries in the summary . 
+ - RefCountedMemory memory = new RefCountedMemory ( newOffHeapSize - ( removedKeyCount * 4 ) ) ; 
+ + Memory oldEntries = existing . getEntries ( ) ; 
+ + Memory newOffsets = Memory . allocate ( newKeyCount * 4 ) ; 
+ + Memory newEntries = Memory . allocate ( newEntriesLength ) ; 
+ 
+ / / Copy old entries to our new Memory . 
+ - int idxPosition = 0 ; 
+ - int keyPosition = newKeyCount * 4 ; 
+ + int i = 0 ; 
+ + int newEntriesOffset = 0 ; 
+ outer : 
+ for ( int oldSummaryIndex = 0 ; oldSummaryIndex < existing . size ( ) ; oldSummaryIndex + + ) 
+ { 
+ @ @ - 326 , 15 + 312 , 15 @ @ public class IndexSummaryBuilder 
+ } 
+ 
+ / / write the position of the actual entry in the index summary ( 4 bytes ) 
+ - memory . setInt ( idxPosition , keyPosition ) ; 
+ - idxPosition + = TypeSizes . NATIVE . sizeof ( keyPosition ) ; 
+ - 
+ - / / write the entry itself 
+ - byte [ ] entry = existing . getEntry ( oldSummaryIndex ) ; 
+ - memory . setBytes ( keyPosition , entry , 0 , entry . length ) ; 
+ - keyPosition + = entry . length ; 
+ + newOffsets . setInt ( i * 4 , newEntriesOffset ) ; 
+ + i + + ; 
+ + long start = existing . getPositionInSummary ( oldSummaryIndex ) ; 
+ + long length = existing . getEndInSummary ( oldSummaryIndex ) - start ; 
+ + newEntries . put ( newEntriesOffset , oldEntries , start , length ) ; 
+ + newEntriesOffset + = length ; 
+ } 
+ - return new IndexSummary ( partitioner , memory , newKeyCount , existing . getMaxNumberOfEntries ( ) , 
+ - minIndexInterval , newSamplingLevel ) ; 
+ + assert newEntriesOffset = = newEntriesLength ; 
+ + return new IndexSummary ( partitioner , newOffsets , newKeyCount , newEntries , newEntriesLength , 
+ + existing . getMaxNumberOfEntries ( ) , minIndexInterval , newSamplingLevel ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ index 973b0c9 . . 41e4adb 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ @ @ - 736 , 40 + 736 , 40 @ @ public class SSTableReader extends SSTable implements SelfRefCounted < SSTableRead 
+ long indexSize = primaryIndex . length ( ) ; 
+ long histogramCount = sstableMetadata . estimatedRowSize . count ( ) ; 
+ long estimatedKeys = histogramCount > 0 & & ! sstableMetadata . estimatedRowSize . isOverflowed ( ) 
+ - ? histogramCount 
+ - : estimateRowsFromIndex ( primaryIndex ) ; / / statistics is supposed to be optional 
+ + ? histogramCount 
+ + : estimateRowsFromIndex ( primaryIndex ) ; / / statistics is supposed to be optional 
+ 
+ - if ( recreateBloomFilter ) 
+ - bf = FilterFactory . getFilter ( estimatedKeys , metadata . getBloomFilterFpChance ( ) , true ) ; 
+ - 
+ - IndexSummaryBuilder summaryBuilder = null ; 
+ - if ( ! summaryLoaded ) 
+ - summaryBuilder = new IndexSummaryBuilder ( estimatedKeys , metadata . getMinIndexInterval ( ) , samplingLevel ) ; 
+ - 
+ - long indexPosition ; 
+ - while ( ( indexPosition = primaryIndex . getFilePointer ( ) ) ! = indexSize ) 
+ + try ( IndexSummaryBuilder summaryBuilder = summaryLoaded ? null : new IndexSummaryBuilder ( estimatedKeys , metadata . getMinIndexInterval ( ) , samplingLevel ) ) 
+ { 
+ - ByteBuffer key = ByteBufferUtil . readWithShortLength ( primaryIndex ) ; 
+ - RowIndexEntry indexEntry = metadata . comparator . rowIndexEntrySerializer ( ) . deserialize ( primaryIndex , descriptor . version ) ; 
+ - DecoratedKey decoratedKey = partitioner . decorateKey ( key ) ; 
+ - if ( first = = null ) 
+ - first = decoratedKey ; 
+ - last = decoratedKey ; 
+ 
+ if ( recreateBloomFilter ) 
+ - bf . add ( decoratedKey . getKey ( ) ) ; 
+ + bf = FilterFactory . getFilter ( estimatedKeys , metadata . getBloomFilterFpChance ( ) , true ) ; 
+ 
+ - / / if summary was already read from disk we don ' t want to re - populate it using primary index 
+ - if ( ! summaryLoaded ) 
+ + long indexPosition ; 
+ + while ( ( indexPosition = primaryIndex . getFilePointer ( ) ) ! = indexSize ) 
+ { 
+ - summaryBuilder . maybeAddEntry ( decoratedKey , indexPosition ) ; 
+ - ibuilder . addPotentialBoundary ( indexPosition ) ; 
+ - dbuilder . addPotentialBoundary ( indexEntry . position ) ; 
+ + ByteBuffer key = ByteBufferUtil . readWithShortLength ( primaryIndex ) ; 
+ + RowIndexEntry indexEntry = metadata . comparator . rowIndexEntrySerializer ( ) . deserialize ( primaryIndex , descriptor . version ) ; 
+ + DecoratedKey decoratedKey = partitioner . decorateKey ( key ) ; 
+ + if ( first = = null ) 
+ + first = decoratedKey ; 
+ + last = decoratedKey ; 
+ + 
+ + if ( recreateBloomFilter ) 
+ + bf . add ( decoratedKey . getKey ( ) ) ; 
+ + 
+ + / / if summary was already read from disk we don ' t want to re - populate it using primary index 
+ + if ( ! summaryLoaded ) 
+ + { 
+ + summaryBuilder . maybeAddEntry ( decoratedKey , indexPosition ) ; 
+ + ibuilder . addPotentialBoundary ( indexPosition ) ; 
+ + dbuilder . addPotentialBoundary ( indexEntry . position ) ; 
+ + } 
+ } 
+ - } 
+ 
+ - if ( ! summaryLoaded ) 
+ - indexSummary = summaryBuilder . build ( partitioner ) ; 
+ + if ( ! summaryLoaded ) 
+ + indexSummary = summaryBuilder . build ( partitioner ) ; 
+ + } 
+ } 
+ finally 
+ { 
+ @ @ - 1004 , 16 + 1004 , 17 @ @ public class SSTableReader extends SSTable implements SelfRefCounted < SSTableRead 
+ try 
+ { 
+ long indexSize = primaryIndex . length ( ) ; 
+ - IndexSummaryBuilder summaryBuilder = new IndexSummaryBuilder ( estimatedKeys ( ) , metadata . getMinIndexInterval ( ) , newSamplingLevel ) ; 
+ - 
+ - long indexPosition ; 
+ - while ( ( indexPosition = primaryIndex . getFilePointer ( ) ) ! = indexSize ) 
+ + try ( IndexSummaryBuilder summaryBuilder = new IndexSummaryBuilder ( estimatedKeys ( ) , metadata . getMinIndexInterval ( ) , newSamplingLevel ) ) 
+ { 
+ - summaryBuilder . maybeAddEntry ( partitioner . decorateKey ( ByteBufferUtil . readWithShortLength ( primaryIndex ) ) , indexPosition ) ; 
+ - RowIndexEntry . Serializer . skip ( primaryIndex ) ; 
+ - } 
+ + long indexPosition ; 
+ + while ( ( indexPosition = primaryIndex . getFilePointer ( ) ) ! = indexSize ) 
+ + { 
+ + summaryBuilder . maybeAddEntry ( partitioner . decorateKey ( ByteBufferUtil . readWithShortLength ( primaryIndex ) ) , indexPosition ) ; 
+ + RowIndexEntry . Serializer . skip ( primaryIndex ) ; 
+ + } 
+ 
+ - return summaryBuilder . build ( partitioner ) ; 
+ + return summaryBuilder . build ( partitioner ) ; 
+ + } 
+ } 
+ finally 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ index b67685d . . b35b652 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ @ @ - 403 , 7 + 403 , 7 @ @ public class SSTableWriter extends SSTable 
+ SSTableReader sstable = SSTableReader . internalOpen ( descriptor . asType ( Descriptor . Type . FINAL ) , 
+ components , metadata , 
+ partitioner , ifile , 
+ - dfile , iwriter . summary . build ( partitioner , boundary . lastKey ) , 
+ + dfile , iwriter . summary . build ( partitioner , boundary ) , 
+ iwriter . bf . sharedCopy ( ) , maxDataAge , sstableMetadata , SSTableReader . OpenReason . EARLY ) ; 
+ 
+ / / now it ' s open , find the ACTUAL last readable key ( i . e . for which the data file has also been flushed ) 
+ @ @ - 470 , 6 + 470 , 7 @ @ public class SSTableWriter extends SSTable 
+ if ( finishType . isFinal ) 
+ { 
+ iwriter . bf . close ( ) ; 
+ + iwriter . summary . close ( ) ; 
+ / / try to save the summaries to disk 
+ sstable . saveSummary ( iwriter . builder , dbuilder ) ; 
+ iwriter = null ; 
+ @ @ - 627 , 6 + 628 , 7 @ @ public class SSTableWriter extends SSTable 
+ 
+ public void abort ( ) 
+ { 
+ + summary . close ( ) ; 
+ indexFile . abort ( ) ; 
+ bf . close ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / AbstractDataOutput . java b / src / java / org / apache / cassandra / io / util / AbstractDataOutput . java 
+ index 3e38293 . . 8f4bed8 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / AbstractDataOutput . java 
+ + + + b / src / java / org / apache / cassandra / io / util / AbstractDataOutput . java 
+ @ @ - 321 , 9 + 321 , 9 @ @ public abstract class AbstractDataOutput extends OutputStream implements DataOut 
+ } 
+ } 
+ 
+ - public void write ( Memory memory ) throws IOException 
+ + public void write ( Memory memory , long offset , long length ) throws IOException 
+ { 
+ - for ( ByteBuffer buffer : memory . asByteBuffers ( ) ) 
+ + for ( ByteBuffer buffer : memory . asByteBuffers ( offset , length ) ) 
+ write ( buffer ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / DataOutputPlus . java b / src / java / org / apache / cassandra / io / util / DataOutputPlus . java 
+ index 36c25ee . . c2901e1 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / DataOutputPlus . java 
+ + + + b / src / java / org / apache / cassandra / io / util / DataOutputPlus . java 
+ @ @ - 27 , 6 + 27 , 5 @ @ public interface DataOutputPlus extends DataOutput 
+ / / write the buffer without modifying its position 
+ void write ( ByteBuffer buffer ) throws IOException ; 
+ 
+ - void write ( Memory memory ) throws IOException ; 
+ - 
+ + void write ( Memory memory , long offset , long length ) throws IOException ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / Memory . java b / src / java / org / apache / cassandra / io / util / Memory . java 
+ index ea78840 . . dcb9de6 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / Memory . java 
+ + + + b / src / java / org / apache / cassandra / io / util / Memory . java 
+ @ @ - 25 , 6 + 25 , 7 @ @ import com . sun . jna . Native ; 
+ import net . nicoulaj . compilecommand . annotations . Inline ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . utils . FastByteOperations ; 
+ + import org . apache . cassandra . utils . concurrent . Ref ; 
+ import org . apache . cassandra . utils . memory . MemoryUtil ; 
+ import sun . misc . Unsafe ; 
+ import sun . nio . ch . DirectBuffer ; 
+ @ @ - 77 , 6 + 78 , 9 @ @ public class Memory implements AutoCloseable 
+ if ( bytes < 0 ) 
+ throw new IllegalArgumentException ( ) ; 
+ 
+ + if ( Ref . DEBUG _ ENABLED ) 
+ + return new SafeMemory ( bytes ) ; 
+ + 
+ return new Memory ( bytes ) ; 
+ } 
+ 
+ @ @ - 163 , 6 + 167 , 33 @ @ public class Memory implements AutoCloseable 
+ } 
+ } 
+ 
+ + public void setShort ( long offset , short l ) 
+ + { 
+ + checkBounds ( offset , offset + 4 ) ; 
+ + if ( unaligned ) 
+ + { 
+ + unsafe . putShort ( peer + offset , l ) ; 
+ + } 
+ + else 
+ + { 
+ + putShortByByte ( peer + offset , l ) ; 
+ + } 
+ + } 
+ + 
+ + private void putShortByByte ( long address , short value ) 
+ + { 
+ + if ( bigEndian ) 
+ + { 
+ + unsafe . putByte ( address , ( byte ) ( value > > 8 ) ) ; 
+ + unsafe . putByte ( address + 1 , ( byte ) ( value ) ) ; 
+ + } 
+ + else 
+ + { 
+ + unsafe . putByte ( address + 1 , ( byte ) ( value > > 8 ) ) ; 
+ + unsafe . putByte ( address , ( byte ) ( value ) ) ; 
+ + } 
+ + } 
+ + 
+ public void setBytes ( long memoryOffset , ByteBuffer buffer ) 
+ { 
+ if ( buffer = = null ) 
+ @ @ - 340 , 20 + 371 , 20 @ @ public class Memory implements AutoCloseable 
+ return false ; 
+ } 
+ 
+ - public ByteBuffer [ ] asByteBuffers ( ) 
+ + public ByteBuffer [ ] asByteBuffers ( long offset , long length ) 
+ { 
+ if ( size ( ) = = 0 ) 
+ return new ByteBuffer [ 0 ] ; 
+ 
+ - ByteBuffer [ ] result = new ByteBuffer [ ( int ) ( size ( ) / Integer . MAX _ VALUE ) + 1 ] ; 
+ - long offset = 0 ; 
+ + ByteBuffer [ ] result = new ByteBuffer [ ( int ) ( length / Integer . MAX _ VALUE ) + 1 ] ; 
+ int size = ( int ) ( size ( ) / result . length ) ; 
+ for ( int i = 0 ; i < result . length - 1 ; i + + ) 
+ { 
+ result [ i ] = MemoryUtil . getByteBuffer ( peer + offset , size ) ; 
+ offset + = size ; 
+ + length - = size ; 
+ } 
+ - result [ result . length - 1 ] = MemoryUtil . getByteBuffer ( peer + offset , ( int ) ( size ( ) - offset ) ) ; 
+ + result [ result . length - 1 ] = MemoryUtil . getByteBuffer ( peer + offset , ( int ) length ) ; 
+ return result ; 
+ } 
+ 
+ @ @ - 366 , 5 + 397 , 4 @ @ public class Memory implements AutoCloseable 
+ { 
+ return String . format ( " Memory @ [ % x . . % x ) " , peer , peer + size ) ; 
+ } 
+ - 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java b / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java 
+ new file mode 100644 
+ index 0000000 . . 1998cc6 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java 
+ @ @ - 0 , 0 + 1 , 136 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + package org . apache . cassandra . io . util ; 
+ + 
+ + import java . io . IOException ; 
+ + import java . nio . ByteBuffer ; 
+ + import java . nio . ByteOrder ; 
+ + 
+ + public class SafeMemoryWriter extends AbstractDataOutput implements DataOutputPlus 
+ + { 
+ + private ByteOrder order = ByteOrder . BIG _ ENDIAN ; 
+ + private SafeMemory buffer ; 
+ + private long length ; 
+ + 
+ + public SafeMemoryWriter ( long initialCapacity ) 
+ + { 
+ + buffer = new SafeMemory ( initialCapacity ) ; 
+ + } 
+ + 
+ + public void write ( byte [ ] buffer , int offset , int count ) 
+ + { 
+ + long newLength = ensureCapacity ( count ) ; 
+ + this . buffer . setBytes ( this . length , buffer , offset , count ) ; 
+ + this . length = newLength ; 
+ + } 
+ + 
+ + public void write ( int oneByte ) 
+ + { 
+ + long newLength = ensureCapacity ( 1 ) ; 
+ + buffer . setByte ( length + + , ( byte ) oneByte ) ; 
+ + length = newLength ; 
+ + } 
+ + 
+ + public void writeShort ( int val ) throws IOException 
+ + { 
+ + if ( order ! = ByteOrder . nativeOrder ( ) ) 
+ + val = Short . reverseBytes ( ( short ) val ) ; 
+ + long newLength = ensureCapacity ( 2 ) ; 
+ + buffer . setShort ( length , ( short ) val ) ; 
+ + length = newLength ; 
+ + } 
+ + 
+ + public void writeInt ( int val ) 
+ + { 
+ + if ( order ! = ByteOrder . nativeOrder ( ) ) 
+ + val = Integer . reverseBytes ( val ) ; 
+ + long newLength = ensureCapacity ( 4 ) ; 
+ + buffer . setInt ( length , val ) ; 
+ + length = newLength ; 
+ + } 
+ + 
+ + public void writeLong ( long val ) 
+ + { 
+ + if ( order ! = ByteOrder . nativeOrder ( ) ) 
+ + val = Long . reverseBytes ( val ) ; 
+ + long newLength = ensureCapacity ( 8 ) ; 
+ + buffer . setLong ( length , val ) ; 
+ + length = newLength ; 
+ + } 
+ + 
+ + public void write ( ByteBuffer buffer ) 
+ + { 
+ + long newLength = ensureCapacity ( buffer . remaining ( ) ) ; 
+ + this . buffer . setBytes ( length , buffer ) ; 
+ + length = newLength ; 
+ + } 
+ + 
+ + public void write ( Memory memory ) 
+ + { 
+ + long newLength = ensureCapacity ( memory . size ( ) ) ; 
+ + buffer . put ( length , memory , 0 , memory . size ( ) ) ; 
+ + length = newLength ; 
+ + } 
+ + 
+ + private long ensureCapacity ( long size ) 
+ + { 
+ + long newLength = this . length + size ; 
+ + if ( newLength > buffer . size ( ) ) 
+ + setCapacity ( Math . max ( newLength , buffer . size ( ) + ( buffer . size ( ) / 2 ) ) ) ; 
+ + return newLength ; 
+ + } 
+ + 
+ + public SafeMemory currentBuffer ( ) 
+ + { 
+ + return buffer ; 
+ + } 
+ + 
+ + public void setCapacity ( long newCapacity ) 
+ + { 
+ + if ( newCapacity ! = capacity ( ) ) 
+ + { 
+ + SafeMemory oldBuffer = buffer ; 
+ + buffer = this . buffer . copy ( newCapacity ) ; 
+ + oldBuffer . free ( ) ; 
+ + } 
+ + } 
+ + 
+ + public void close ( ) 
+ + { 
+ + buffer . close ( ) ; 
+ + } 
+ + 
+ + public long length ( ) 
+ + { 
+ + return length ; 
+ + } 
+ + 
+ + public long capacity ( ) 
+ + { 
+ + return buffer . size ( ) ; 
+ + } 
+ + 
+ + / / TODO : consider hoisting this into DataOutputPlus , since most implementations can copy with this gracefully 
+ + / / this would simplify IndexSummary . IndexSummarySerializer . serialize ( ) 
+ + public SafeMemoryWriter withByteOrder ( ByteOrder order ) 
+ + { 
+ + this . order = order ; 
+ + return this ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / utils / concurrent / Ref . java b / src / java / org / apache / cassandra / utils / concurrent / Ref . java 
+ index 8213c46 . . 4e6cef7 100644 
+ - - - a / src / java / org / apache / cassandra / utils / concurrent / Ref . java 
+ + + + b / src / java / org / apache / cassandra / utils / concurrent / Ref . java 
+ @ @ - 50 , 7 + 50 , 7 @ @ import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ public final class Ref < T > implements RefCounted < T > , AutoCloseable 
+ { 
+ static final Logger logger = LoggerFactory . getLogger ( Ref . class ) ; 
+ - static final boolean DEBUG _ ENABLED = System . getProperty ( " cassandra . debugrefcount " , " false " ) . equalsIgnoreCase ( " true " ) ; 
+ + public static final boolean DEBUG _ ENABLED = System . getProperty ( " cassandra . debugrefcount " , " false " ) . equalsIgnoreCase ( " true " ) ; 
+ 
+ final State state ; 
+ final T referent ; 
+ diff - - git a / src / java / org / apache / cassandra / utils / concurrent / WrappedSharedCloseable . java b / src / java / org / apache / cassandra / utils / concurrent / WrappedSharedCloseable . java 
+ index c656f28 . . 96e226c 100644 
+ - - - a / src / java / org / apache / cassandra / utils / concurrent / WrappedSharedCloseable . java 
+ + + + b / src / java / org / apache / cassandra / utils / concurrent / WrappedSharedCloseable . java 
+ @ @ - 18 , 26 + 18 , 34 @ @ 
+ * / 
+ package org . apache . cassandra . utils . concurrent ; 
+ 
+ + import java . util . Arrays ; 
+ + 
+ / * * 
+ * An implementation of SharedCloseable that wraps a normal AutoCloseable , 
+ * ensuring its close method is only called when all instances of SharedCloseable have been 
+ * / 
+ public abstract class WrappedSharedCloseable extends SharedCloseableImpl 
+ { 
+ - final AutoCloseable wrapped ; 
+ + final AutoCloseable [ ] wrapped ; 
+ 
+ public WrappedSharedCloseable ( final AutoCloseable closeable ) 
+ { 
+ + this ( new AutoCloseable [ ] { closeable } ) ; 
+ + } 
+ + 
+ + public WrappedSharedCloseable ( final AutoCloseable [ ] closeable ) 
+ + { 
+ super ( new RefCounted . Tidy ( ) 
+ { 
+ public void tidy ( ) throws Exception 
+ { 
+ - closeable . close ( ) ; 
+ + for ( AutoCloseable c : closeable ) 
+ + c . close ( ) ; 
+ } 
+ 
+ public String name ( ) 
+ { 
+ - return closeable . toString ( ) ; 
+ + return Arrays . toString ( closeable ) ; 
+ } 
+ } ) ; 
+ wrapped = closeable ; 
+ diff - - git a / test / unit / org / apache / cassandra / io / sstable / IndexSummaryTest . java b / test / unit / org / apache / cassandra / io / sstable / IndexSummaryTest . java 
+ index 9aca66d . . 9c709a3 100644 
+ - - - a / test / unit / org / apache / cassandra / io / sstable / IndexSummaryTest . java 
+ + + + b / test / unit / org / apache / cassandra / io / sstable / IndexSummaryTest . java 
+ @ @ - 91 , 38 + 91 , 42 @ @ public class IndexSummaryTest 
+ public void testAddEmptyKey ( ) throws Exception 
+ { 
+ IPartitioner p = new RandomPartitioner ( ) ; 
+ - IndexSummaryBuilder builder = new IndexSummaryBuilder ( 1 , 1 , BASE _ SAMPLING _ LEVEL ) ; 
+ - builder . maybeAddEntry ( p . decorateKey ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER ) , 0 ) ; 
+ - IndexSummary summary = builder . build ( p ) ; 
+ - assertEquals ( 1 , summary . size ( ) ) ; 
+ - assertEquals ( 0 , summary . getPosition ( 0 ) ) ; 
+ - assertArrayEquals ( new byte [ 0 ] , summary . getKey ( 0 ) ) ; 
+ - 
+ - DataOutputBuffer dos = new DataOutputBuffer ( ) ; 
+ - IndexSummary . serializer . serialize ( summary , dos , false ) ; 
+ - DataInputStream dis = new DataInputStream ( new ByteArrayInputStream ( dos . toByteArray ( ) ) ) ; 
+ - IndexSummary loaded = IndexSummary . serializer . deserialize ( dis , p , false , 1 , 1 ) ; 
+ - 
+ - assertEquals ( 1 , loaded . size ( ) ) ; 
+ - assertEquals ( summary . getPosition ( 0 ) , loaded . getPosition ( 0 ) ) ; 
+ - assertArrayEquals ( summary . getKey ( 0 ) , summary . getKey ( 0 ) ) ; 
+ + try ( IndexSummaryBuilder builder = new IndexSummaryBuilder ( 1 , 1 , BASE _ SAMPLING _ LEVEL ) ) 
+ + { 
+ + builder . maybeAddEntry ( p . decorateKey ( ByteBufferUtil . EMPTY _ BYTE _ BUFFER ) , 0 ) ; 
+ + IndexSummary summary = builder . build ( p ) ; 
+ + assertEquals ( 1 , summary . size ( ) ) ; 
+ + assertEquals ( 0 , summary . getPosition ( 0 ) ) ; 
+ + assertArrayEquals ( new byte [ 0 ] , summary . getKey ( 0 ) ) ; 
+ + 
+ + DataOutputBuffer dos = new DataOutputBuffer ( ) ; 
+ + IndexSummary . serializer . serialize ( summary , dos , false ) ; 
+ + DataInputStream dis = new DataInputStream ( new ByteArrayInputStream ( dos . toByteArray ( ) ) ) ; 
+ + IndexSummary loaded = IndexSummary . serializer . deserialize ( dis , p , false , 1 , 1 ) ; 
+ + 
+ + assertEquals ( 1 , loaded . size ( ) ) ; 
+ + assertEquals ( summary . getPosition ( 0 ) , loaded . getPosition ( 0 ) ) ; 
+ + assertArrayEquals ( summary . getKey ( 0 ) , summary . getKey ( 0 ) ) ; 
+ + } 
+ } 
+ 
+ private Pair < List < DecoratedKey > , IndexSummary > generateRandomIndex ( int size , int interval ) 
+ { 
+ List < DecoratedKey > list = Lists . newArrayList ( ) ; 
+ - IndexSummaryBuilder builder = new IndexSummaryBuilder ( list . size ( ) , interval , BASE _ SAMPLING _ LEVEL ) ; 
+ - for ( int i = 0 ; i < size ; i + + ) 
+ + try ( IndexSummaryBuilder builder = new IndexSummaryBuilder ( list . size ( ) , interval , BASE _ SAMPLING _ LEVEL ) ) 
+ { 
+ - UUID uuid = UUID . randomUUID ( ) ; 
+ - DecoratedKey key = DatabaseDescriptor . getPartitioner ( ) . decorateKey ( ByteBufferUtil . bytes ( uuid ) ) ; 
+ - list . add ( key ) ; 
+ + for ( int i = 0 ; i < size ; i + + ) 
+ + { 
+ + UUID uuid = UUID . randomUUID ( ) ; 
+ + DecoratedKey key = DatabaseDescriptor . getPartitioner ( ) . decorateKey ( ByteBufferUtil . bytes ( uuid ) ) ; 
+ + list . add ( key ) ; 
+ + } 
+ + Collections . sort ( list ) ; 
+ + for ( int i = 0 ; i < size ; i + + ) 
+ + builder . maybeAddEntry ( list . get ( i ) , i ) ; 
+ + IndexSummary summary = builder . build ( DatabaseDescriptor . getPartitioner ( ) ) ; 
+ + return Pair . create ( list , summary ) ; 
+ } 
+ - Collections . sort ( list ) ; 
+ - for ( int i = 0 ; i < size ; i + + ) 
+ - builder . maybeAddEntry ( list . get ( i ) , i ) ; 
+ - IndexSummary summary = builder . build ( DatabaseDescriptor . getPartitioner ( ) ) ; 
+ - return Pair . create ( list , summary ) ; 
+ } 
+ 
+ @ Test 
+ diff - - git a / test / unit / org / apache / cassandra / io / util / DataOutputTest . java b / test / unit / org / apache / cassandra / io / util / DataOutputTest . java 
+ index 76f3304 . . 7110d1d 100644 
+ - - - a / test / unit / org / apache / cassandra / io / util / DataOutputTest . java 
+ + + + b / test / unit / org / apache / cassandra / io / util / DataOutputTest . java 
+ @ @ - 92 , 6 + 92 , 17 @ @ public class DataOutputTest 
+ } 
+ 
+ @ Test 
+ + public void testSafeMemoryWriter ( ) throws IOException 
+ + { 
+ + SafeMemoryWriter write = new SafeMemoryWriter ( 10 ) ; 
+ + DataInput canon = testWrite ( write ) ; 
+ + byte [ ] bytes = new byte [ 345 ] ; 
+ + write . currentBuffer ( ) . getBytes ( 0 , bytes , 0 , 345 ) ; 
+ + DataInput test = new DataInputStream ( new ByteArrayInputStream ( bytes ) ) ; 
+ + testRead ( test , canon ) ; 
+ + } 
+ + 
+ + @ Test 
+ public void testFileOutputStream ( ) throws IOException 
+ { 
+ File file = FileUtils . createTempFile ( " dataoutput " , " test " ) ;
+
+NEAREST DIFF:
+diff - - git a / src / java / org / apache / cassandra / io / sstable / RowIndexedReader . java b / src / java / org / apache / cassandra / io / sstable / RowIndexedReader . java 
+ deleted file mode 100644 
+ index 733a56a . . 0000000 
+ - - - a / src / java / org / apache / cassandra / io / sstable / RowIndexedReader . java 
+ + + + / dev / null 
+ @ @ - 1 , 354 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , 
+ - * software distributed under the License is distributed on an 
+ - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ - * KIND , either express or implied . See the License for the 
+ - * specific language governing permissions and limitations 
+ - * under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . io . sstable ; 
+ - 
+ - import java . io . * ; 
+ - import java . util . * ; 
+ - 
+ - import org . slf4j . Logger ; 
+ - import org . slf4j . LoggerFactory ; 
+ - 
+ - import org . apache . cassandra . cache . InstrumentedCache ; 
+ - import org . apache . cassandra . dht . IPartitioner ; 
+ - import org . apache . cassandra . utils . BloomFilter ; 
+ - import org . apache . cassandra . utils . FBUtilities ; 
+ - import org . apache . cassandra . utils . Pair ; 
+ - import org . apache . cassandra . db . * ; 
+ - import org . apache . cassandra . db . filter . QueryFilter ; 
+ - import org . apache . cassandra . io . util . BufferedRandomAccessFile ; 
+ - import org . apache . cassandra . io . util . FileDataInput ; 
+ - import org . apache . cassandra . io . util . SegmentedFile ; 
+ - 
+ - import com . google . common . base . Function ; 
+ - import com . google . common . collect . Collections2 ; 
+ - 
+ - / * * 
+ - * Pre 0 . 7 SSTable implementation , using per row indexes . 
+ - * / 
+ - class RowIndexedReader extends SSTableReader 
+ - { 
+ - private static final Logger logger = LoggerFactory . getLogger ( RowIndexedReader . class ) ; 
+ - 
+ - / / guesstimated size of INDEX _ INTERVAL index entries 
+ - private static final int INDEX _ FILE _ BUFFER _ BYTES = 16 * IndexSummary . INDEX _ INTERVAL ; 
+ - 
+ - / / indexfile and datafile : might be null before a call to load ( ) 
+ - private SegmentedFile ifile ; 
+ - private SegmentedFile dfile ; 
+ - 
+ - private InstrumentedCache < Pair < Descriptor , DecoratedKey > , Long > keyCache ; 
+ - 
+ - RowIndexedReader ( Descriptor desc , 
+ - IPartitioner partitioner , 
+ - SegmentedFile ifile , 
+ - SegmentedFile dfile , 
+ - IndexSummary indexSummary , 
+ - BloomFilter bloomFilter , 
+ - long maxDataAge ) 
+ - throws IOException 
+ - { 
+ - super ( desc , partitioner , maxDataAge ) ; 
+ - 
+ - 
+ - this . ifile = ifile ; 
+ - this . dfile = dfile ; 
+ - this . indexSummary = indexSummary ; 
+ - this . bf = bloomFilter ; 
+ - } 
+ - 
+ - / * * Open a RowIndexedReader which needs its state loaded from disk . * / 
+ - static RowIndexedReader internalOpen ( Descriptor desc , IPartitioner partitioner ) throws IOException 
+ - { 
+ - RowIndexedReader sstable = new RowIndexedReader ( desc , partitioner , null , null , null , null , System . currentTimeMillis ( ) ) ; 
+ - 
+ - / / versions before ' c ' encoded keys as utf - 16 before hashing to the filter 
+ - if ( desc . versionCompareTo ( " c " ) < 0 ) 
+ - sstable . load ( true ) ; 
+ - else 
+ - { 
+ - sstable . load ( false ) ; 
+ - sstable . loadBloomFilter ( ) ; 
+ - } 
+ - 
+ - return sstable ; 
+ - } 
+ - 
+ - / * * 
+ - * Open a RowIndexedReader which already has its state initialized ( by SSTableWriter ) . 
+ - * / 
+ - static RowIndexedReader internalOpen ( Descriptor desc , IPartitioner partitioner , SegmentedFile ifile , SegmentedFile dfile , IndexSummary isummary , BloomFilter bf , long maxDataAge ) throws IOException 
+ - { 
+ - assert desc ! = null & & partitioner ! = null & & ifile ! = null & & dfile ! = null & & isummary ! = null & & bf ! = null ; 
+ - return new RowIndexedReader ( desc , partitioner , ifile , dfile , isummary , bf , maxDataAge ) ; 
+ - } 
+ - 
+ - public long estimatedKeys ( ) 
+ - { 
+ - return indexSummary . getIndexPositions ( ) . size ( ) * IndexSummary . INDEX _ INTERVAL ; 
+ - } 
+ - 
+ - public Collection < DecoratedKey > getKeySamples ( ) 
+ - { 
+ - return Collections2 . transform ( indexSummary . getIndexPositions ( ) , 
+ - new Function < IndexSummary . KeyPosition , DecoratedKey > ( ) { 
+ - public DecoratedKey apply ( IndexSummary . KeyPosition kp ) 
+ - { 
+ - return kp . key ; 
+ - } 
+ - } ) ; 
+ - } 
+ - 
+ - void loadBloomFilter ( ) throws IOException 
+ - { 
+ - DataInputStream stream = new DataInputStream ( new FileInputStream ( filterFilename ( ) ) ) ; 
+ - try 
+ - { 
+ - bf = BloomFilter . serializer ( ) . deserialize ( stream ) ; 
+ - } 
+ - finally 
+ - { 
+ - stream . close ( ) ; 
+ - } 
+ - } 
+ - 
+ - / * * 
+ - * Loads ifile , dfile and indexSummary , and optionally recreates the bloom filter . 
+ - * / 
+ - private void load ( boolean recreatebloom ) throws IOException 
+ - { 
+ - SegmentedFile . Builder ibuilder = SegmentedFile . getBuilder ( ) ; 
+ - SegmentedFile . Builder dbuilder = SegmentedFile . getBuilder ( ) ; 
+ - 
+ - / / we read the positions in a BRAF so we don ' t have to worry about an entry spanning a mmap boundary . 
+ - indexSummary = new IndexSummary ( ) ; 
+ - BufferedRandomAccessFile input = new BufferedRandomAccessFile ( indexFilename ( ) , " r " ) ; 
+ - try 
+ - { 
+ - long indexSize = input . length ( ) ; 
+ - if ( recreatebloom ) 
+ - / / estimate key count based on index length 
+ - bf = BloomFilter . getFilter ( ( int ) ( input . length ( ) / 32 ) , 15 ) ; 
+ - while ( true ) 
+ - { 
+ - long indexPosition = input . getFilePointer ( ) ; 
+ - if ( indexPosition = = indexSize ) 
+ - break ; 
+ - 
+ - DecoratedKey decoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; 
+ - if ( recreatebloom ) 
+ - bf . add ( decoratedKey . key ) ; 
+ - long dataPosition = input . readLong ( ) ; 
+ - 
+ - indexSummary . maybeAddEntry ( decoratedKey , indexPosition ) ; 
+ - ibuilder . addPotentialBoundary ( indexPosition ) ; 
+ - dbuilder . addPotentialBoundary ( dataPosition ) ; 
+ - } 
+ - indexSummary . complete ( ) ; 
+ - } 
+ - finally 
+ - { 
+ - input . close ( ) ; 
+ - } 
+ - 
+ - / / finalize the state of the reader 
+ - indexSummary . complete ( ) ; 
+ - ifile = ibuilder . complete ( indexFilename ( ) ) ; 
+ - dfile = dbuilder . complete ( getFilename ( ) ) ; 
+ - } 
+ - 
+ - @ Override 
+ - public void setTrackedBy ( SSTableTracker tracker ) 
+ - { 
+ - super . setTrackedBy ( tracker ) ; 
+ - keyCache = tracker . getKeyCache ( ) ; 
+ - } 
+ - 
+ - / * * get the position in the index file to start scanning to find the given key ( at most indexInterval keys away ) * / 
+ - private IndexSummary . KeyPosition getIndexScanPosition ( DecoratedKey decoratedKey ) 
+ - { 
+ - assert indexSummary . getIndexPositions ( ) ! = null & & indexSummary . getIndexPositions ( ) . size ( ) > 0 ; 
+ - int index = Collections . binarySearch ( indexSummary . getIndexPositions ( ) , new IndexSummary . KeyPosition ( decoratedKey , - 1 ) ) ; 
+ - if ( index < 0 ) 
+ - { 
+ - / / binary search gives us the first index _ greater _ than the key searched for , 
+ - / / i . e . , its insertion position 
+ - int greaterThan = ( index + 1 ) * - 1 ; 
+ - if ( greaterThan = = 0 ) 
+ - return null ; 
+ - return indexSummary . getIndexPositions ( ) . get ( greaterThan - 1 ) ; 
+ - } 
+ - else 
+ - { 
+ - return indexSummary . getIndexPositions ( ) . get ( index ) ; 
+ - } 
+ - } 
+ - 
+ - / * * 
+ - * @ return The position in the data file to find the given key , or - 1 if the key is not present 
+ - * / 
+ - public long getPosition ( DecoratedKey decoratedKey ) 
+ - { 
+ - / / first , check bloom filter 
+ - if ( ! bf . isPresent ( partitioner . convertToDiskFormat ( decoratedKey ) ) ) 
+ - return - 1 ; 
+ - 
+ - / / next , the key cache 
+ - Pair < Descriptor , DecoratedKey > unifiedKey = new Pair < Descriptor , DecoratedKey > ( desc , decoratedKey ) ; 
+ - if ( keyCache ! = null & & keyCache . getCapacity ( ) > 0 ) 
+ - { 
+ - Long cachedPosition = keyCache . get ( unifiedKey ) ; 
+ - if ( cachedPosition ! = null ) 
+ - { 
+ - return cachedPosition ; 
+ - } 
+ - } 
+ - 
+ - / / next , see if the sampled index says it ' s impossible for the key to be present 
+ - IndexSummary . KeyPosition sampledPosition = getIndexScanPosition ( decoratedKey ) ; 
+ - if ( sampledPosition = = null ) 
+ - return - 1 ; 
+ - 
+ - / / scan the on - disk index , starting at the nearest sampled position 
+ - int i = 0 ; 
+ - Iterator < FileDataInput > segments = ifile . iterator ( sampledPosition . indexPosition , INDEX _ FILE _ BUFFER _ BYTES ) ; 
+ - while ( segments . hasNext ( ) ) 
+ - { 
+ - FileDataInput input = segments . next ( ) ; 
+ - try 
+ - { 
+ - while ( ! input . isEOF ( ) & & i + + < IndexSummary . INDEX _ INTERVAL ) 
+ - { 
+ - / / read key & data position from index entry 
+ - DecoratedKey indexDecoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; 
+ - long dataPosition = input . readLong ( ) ; 
+ - 
+ - int v = indexDecoratedKey . compareTo ( decoratedKey ) ; 
+ - if ( v = = 0 ) 
+ - { 
+ - if ( keyCache ! = null & & keyCache . getCapacity ( ) > 0 ) 
+ - keyCache . put ( unifiedKey , Long . valueOf ( dataPosition ) ) ; 
+ - return dataPosition ; 
+ - } 
+ - if ( v > 0 ) 
+ - return - 1 ; 
+ - } 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new IOError ( e ) ; 
+ - } 
+ - finally 
+ - { 
+ - try 
+ - { 
+ - input . close ( ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - logger . error ( " error closing file " , e ) ; 
+ - } 
+ - } 
+ - } 
+ - return - 1 ; 
+ - } 
+ - 
+ - / * * 
+ - * @ return The location of the first key _ greater _ than the desired one , or - 1 if no such key exists . 
+ - * / 
+ - public long getNearestPosition ( DecoratedKey decoratedKey ) 
+ - { 
+ - IndexSummary . KeyPosition sampledPosition = getIndexScanPosition ( decoratedKey ) ; 
+ - if ( sampledPosition = = null ) 
+ - return 0 ; 
+ - 
+ - / / scan the on - disk index , starting at the nearest sampled position 
+ - Iterator < FileDataInput > segiter = ifile . iterator ( sampledPosition . indexPosition , INDEX _ FILE _ BUFFER _ BYTES ) ; 
+ - while ( segiter . hasNext ( ) ) 
+ - { 
+ - FileDataInput input = segiter . next ( ) ; 
+ - try 
+ - { 
+ - while ( ! input . isEOF ( ) ) 
+ - { 
+ - DecoratedKey indexDecoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; 
+ - long position = input . readLong ( ) ; 
+ - int v = indexDecoratedKey . compareTo ( decoratedKey ) ; 
+ - if ( v > = 0 ) 
+ - return position ; 
+ - } 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new IOError ( e ) ; 
+ - } 
+ - finally 
+ - { 
+ - try 
+ - { 
+ - input . close ( ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - logger . error ( " error closing file " , e ) ; 
+ - } 
+ - } 
+ - } 
+ - return - 1 ; 
+ - } 
+ - 
+ - public long length ( ) 
+ - { 
+ - return dfile . length ; 
+ - } 
+ - 
+ - public int compareTo ( SSTableReader o ) 
+ - { 
+ - return desc . generation - o . desc . generation ; 
+ - } 
+ - 
+ - public void forceFilterFailures ( ) 
+ - { 
+ - bf = BloomFilter . alwaysMatchingBloomFilter ( ) ; 
+ - } 
+ - 
+ - public SSTableScanner getScanner ( int bufferSize ) 
+ - { 
+ - return new RowIndexedScanner ( this , bufferSize ) ; 
+ - } 
+ - 
+ - public SSTableScanner getScanner ( int bufferSize , QueryFilter filter ) 
+ - { 
+ - return new RowIndexedScanner ( this , filter , bufferSize ) ; 
+ - } 
+ - 
+ - public FileDataInput getFileDataInput ( DecoratedKey decoratedKey , int bufferSize ) 
+ - { 
+ - long position = getPosition ( decoratedKey ) ; 
+ - if ( position < 0 ) 
+ - return null ; 
+ - 
+ - return dfile . getSegment ( position , bufferSize ) ; 
+ - } 
+ - 
+ - public InstrumentedCache getKeyCache ( ) 
+ - { 
+ - return keyCache ; 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / RowIndexedScanner . java b / src / java / org / apache / cassandra / io / sstable / RowIndexedScanner . java 
+ deleted file mode 100644 
+ index 2ad4a11 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / io / sstable / RowIndexedScanner . java 
+ + + + / dev / null 
+ @ @ - 1 , 195 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , 
+ - * software distributed under the License is distributed on an 
+ - * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ - * KIND , either express or implied . See the License for the 
+ - * specific language governing permissions and limitations 
+ - * under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . io . sstable ; 
+ - 
+ - import java . io . IOException ; 
+ - import java . io . IOError ; 
+ - import java . util . Iterator ; 
+ - import java . util . Arrays ; 
+ - 
+ - import org . apache . cassandra . db . DecoratedKey ; 
+ - import org . apache . cassandra . db . filter . IColumnIterator ; 
+ - import org . apache . cassandra . db . filter . QueryFilter ; 
+ - import org . apache . cassandra . io . util . BufferedRandomAccessFile ; 
+ - import org . apache . cassandra . service . StorageService ; 
+ - import org . apache . cassandra . utils . FBUtilities ; 
+ - 
+ - import org . slf4j . Logger ; 
+ - import org . slf4j . LoggerFactory ; 
+ - 
+ - 
+ - public class RowIndexedScanner extends SSTableScanner 
+ - { 
+ - private static Logger logger = LoggerFactory . getLogger ( RowIndexedScanner . class ) ; 
+ - 
+ - private final BufferedRandomAccessFile file ; 
+ - private final SSTableReader sstable ; 
+ - private IColumnIterator row ; 
+ - private boolean exhausted = false ; 
+ - private Iterator < IColumnIterator > iterator ; 
+ - private QueryFilter filter ; 
+ - 
+ - / * * 
+ - * @ param sstable SSTable to scan . 
+ - * / 
+ - RowIndexedScanner ( SSTableReader sstable , int bufferSize ) 
+ - { 
+ - try 
+ - { 
+ - this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , bufferSize ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new IOError ( e ) ; 
+ - } 
+ - this . sstable = sstable ; 
+ - } 
+ - 
+ - / * * 
+ - * @ param sstable SSTable to scan . 
+ - * @ param filter filter to use when scanning the columns 
+ - * / 
+ - RowIndexedScanner ( SSTableReader sstable , QueryFilter filter , int bufferSize ) 
+ - { 
+ - try 
+ - { 
+ - this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , bufferSize ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new IOError ( e ) ; 
+ - } 
+ - this . sstable = sstable ; 
+ - this . filter = filter ; 
+ - } 
+ - 
+ - public void close ( ) throws IOException 
+ - { 
+ - file . close ( ) ; 
+ - } 
+ - 
+ - public void seekTo ( DecoratedKey seekKey ) 
+ - { 
+ - try 
+ - { 
+ - long position = sstable . getNearestPosition ( seekKey ) ; 
+ - if ( position < 0 ) 
+ - { 
+ - exhausted = true ; 
+ - return ; 
+ - } 
+ - file . seek ( position ) ; 
+ - row = null ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( " corrupt sstable " , e ) ; 
+ - } 
+ - } 
+ - 
+ - public long getFileLength ( ) 
+ - { 
+ - try 
+ - { 
+ - return file . length ( ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new IOError ( e ) ; 
+ - } 
+ - } 
+ - 
+ - public long getFilePointer ( ) 
+ - { 
+ - return file . getFilePointer ( ) ; 
+ - } 
+ - 
+ - public boolean hasNext ( ) 
+ - { 
+ - if ( iterator = = null ) 
+ - iterator = exhausted ? Arrays . asList ( new IColumnIterator [ 0 ] ) . iterator ( ) : new KeyScanningIterator ( ) ; 
+ - return iterator . hasNext ( ) ; 
+ - } 
+ - 
+ - public IColumnIterator next ( ) 
+ - { 
+ - if ( iterator = = null ) 
+ - iterator = exhausted ? Arrays . asList ( new IColumnIterator [ 0 ] ) . iterator ( ) : new KeyScanningIterator ( ) ; 
+ - return iterator . next ( ) ; 
+ - } 
+ - 
+ - public void remove ( ) 
+ - { 
+ - throw new UnsupportedOperationException ( ) ; 
+ - } 
+ - 
+ - private class KeyScanningIterator implements Iterator < IColumnIterator > 
+ - { 
+ - private long dataStart ; 
+ - private long finishedAt ; 
+ - 
+ - public boolean hasNext ( ) 
+ - { 
+ - try 
+ - { 
+ - if ( row = = null ) 
+ - return ! file . isEOF ( ) ; 
+ - return finishedAt < file . length ( ) ; 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ - } 
+ - 
+ - public IColumnIterator next ( ) 
+ - { 
+ - try 
+ - { 
+ - if ( row ! = null ) 
+ - file . seek ( finishedAt ) ; 
+ - assert ! file . isEOF ( ) ; 
+ - 
+ - DecoratedKey key = StorageService . getPartitioner ( ) . convertFromDiskFormat ( FBUtilities . readShortByteArray ( file ) ) ; 
+ - int dataSize = file . readInt ( ) ; 
+ - dataStart = file . getFilePointer ( ) ; 
+ - finishedAt = dataStart + dataSize ; 
+ - 
+ - if ( filter = = null ) 
+ - { 
+ - return row = new SSTableIdentityIterator ( sstable , file , key , dataStart , finishedAt ) ; 
+ - } 
+ - else 
+ - { 
+ - return row = filter . getSSTableColumnIterator ( sstable , file , key , dataStart ) ; 
+ - } 
+ - } 
+ - catch ( IOException e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ - } 
+ - } 
+ - 
+ - public void remove ( ) 
+ - { 
+ - throw new UnsupportedOperationException ( ) ; 
+ - } 
+ - } 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ index de08b1a . . 997c344 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ @ @ - 26 , 6 + 26 , 13 @ @ import java . lang . ref . Reference ; 
+ import java . nio . channels . FileChannel ; 
+ import java . nio . MappedByteBuffer ; 
+ 
+ + import com . google . common . base . Function ; 
+ + import com . google . common . collect . Collections2 ; 
+ + import org . apache . cassandra . io . util . BufferedRandomAccessFile ; 
+ + import org . apache . cassandra . io . util . SegmentedFile ; 
+ + import org . apache . cassandra . utils . BloomFilter ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . apache . cassandra . utils . Pair ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 44 , 10 + 51 , 13 @ @ import org . apache . cassandra . io . util . FileDataInput ; 
+ * SSTableReaders are open ( ) ed by Table . onStart ; after that they are created by SSTableWriter . renameAndOpen . 
+ * Do not re - call open ( ) on existing SSTable files ; use the references kept by ColumnFamilyStore post - start instead . 
+ * / 
+ - public abstract class SSTableReader extends SSTable implements Comparable < SSTableReader > 
+ + public class SSTableReader extends SSTable implements Comparable < SSTableReader > 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( SSTableReader . class ) ; 
+ 
+ + / / guesstimated size of INDEX _ INTERVAL index entries 
+ + private static final int INDEX _ FILE _ BUFFER _ BYTES = 16 * IndexSummary . INDEX _ INTERVAL ; 
+ + 
+ / / ` finalizers ` is required to keep the PhantomReferences alive after the enclosing SSTR is itself 
+ / / unreferenced . otherwise they will never get enqueued . 
+ private static final Set < Reference < SSTableReader > > finalizers = new HashSet < Reference < SSTableReader > > ( ) ; 
+ @ @ - 97 , 6 + 107 , 14 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl 
+ * / 
+ public final long maxDataAge ; 
+ 
+ + / / indexfile and datafile : might be null before a call to load ( ) 
+ + private SegmentedFile ifile ; 
+ + private SegmentedFile dfile ; 
+ + 
+ + private InstrumentedCache < Pair < Descriptor , DecoratedKey > , Long > keyCache ; 
+ + 
+ + private volatile SSTableDeletingReference phantomReference ; 
+ + 
+ public static int indexInterval ( ) 
+ { 
+ return IndexSummary . INDEX _ INTERVAL ; 
+ @ @ - 144 , 7 + 162 , 7 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl 
+ / / FIXME : version conditional readers here 
+ if ( true ) 
+ { 
+ - sstable = RowIndexedReader . internalOpen ( descriptor , partitioner ) ; 
+ + sstable = internalOpen ( descriptor , partitioner ) ; 
+ } 
+ 
+ if ( logger . isDebugEnabled ( ) ) 
+ @ @ - 153 , 39 + 171 , 173 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl 
+ return sstable ; 
+ } 
+ 
+ + / * * Open a RowIndexedReader which needs its state loaded from disk . * / 
+ + static SSTableReader internalOpen ( Descriptor desc , IPartitioner partitioner ) throws IOException 
+ + { 
+ + SSTableReader sstable = new SSTableReader ( desc , partitioner , null , null , null , null , System . currentTimeMillis ( ) ) ; 
+ + 
+ + / / versions before ' c ' encoded keys as utf - 16 before hashing to the filter 
+ + if ( desc . versionCompareTo ( " c " ) < 0 ) 
+ + sstable . load ( true ) ; 
+ + else 
+ + { 
+ + sstable . load ( false ) ; 
+ + sstable . loadBloomFilter ( ) ; 
+ + } 
+ + 
+ + return sstable ; 
+ + } 
+ + 
+ + / * * 
+ + * Open a RowIndexedReader which already has its state initialized ( by SSTableWriter ) . 
+ + * / 
+ + static SSTableReader internalOpen ( Descriptor desc , IPartitioner partitioner , SegmentedFile ifile , SegmentedFile dfile , IndexSummary isummary , BloomFilter bf , long maxDataAge ) throws IOException 
+ + { 
+ + assert desc ! = null & & partitioner ! = null & & ifile ! = null & & dfile ! = null & & isummary ! = null & & bf ! = null ; 
+ + return new SSTableReader ( desc , partitioner , ifile , dfile , isummary , bf , maxDataAge ) ; 
+ + } 
+ + 
+ + SSTableReader ( Descriptor desc , 
+ + IPartitioner partitioner , 
+ + SegmentedFile ifile , 
+ + SegmentedFile dfile , 
+ + IndexSummary indexSummary , 
+ + BloomFilter bloomFilter , 
+ + long maxDataAge ) 
+ + throws IOException 
+ + { 
+ + super ( desc , partitioner ) ; 
+ + this . maxDataAge = maxDataAge ; 
+ + 
+ + 
+ + this . ifile = ifile ; 
+ + this . dfile = dfile ; 
+ + this . indexSummary = indexSummary ; 
+ + this . bf = bloomFilter ; 
+ + } 
+ + 
+ public void setTrackedBy ( SSTableTracker tracker ) 
+ { 
+ phantomReference = new SSTableDeletingReference ( tracker , this , finalizerQueue ) ; 
+ finalizers . add ( phantomReference ) ; 
+ + keyCache = tracker . getKeyCache ( ) ; 
+ } 
+ 
+ - protected SSTableReader ( Descriptor desc , IPartitioner partitioner , long maxDataAge ) 
+ + void loadBloomFilter ( ) throws IOException 
+ { 
+ - super ( desc , partitioner ) ; 
+ - this . maxDataAge = maxDataAge ; 
+ + DataInputStream stream = new DataInputStream ( new FileInputStream ( filterFilename ( ) ) ) ; 
+ + try 
+ + { 
+ + bf = BloomFilter . serializer ( ) . deserialize ( stream ) ; 
+ + } 
+ + finally 
+ + { 
+ + stream . close ( ) ; 
+ + } 
+ } 
+ 
+ - private volatile SSTableDeletingReference phantomReference ; 
+ + / * * 
+ + * Loads ifile , dfile and indexSummary , and optionally recreates the bloom filter . 
+ + * / 
+ + private void load ( boolean recreatebloom ) throws IOException 
+ + { 
+ + SegmentedFile . Builder ibuilder = SegmentedFile . getBuilder ( ) ; 
+ + SegmentedFile . Builder dbuilder = SegmentedFile . getBuilder ( ) ; 
+ + 
+ + / / we read the positions in a BRAF so we don ' t have to worry about an entry spanning a mmap boundary . 
+ + indexSummary = new IndexSummary ( ) ; 
+ + BufferedRandomAccessFile input = new BufferedRandomAccessFile ( indexFilename ( ) , " r " ) ; 
+ + try 
+ + { 
+ + long indexSize = input . length ( ) ; 
+ + if ( recreatebloom ) 
+ + / / estimate key count based on index length 
+ + bf = BloomFilter . getFilter ( ( int ) ( input . length ( ) / 32 ) , 15 ) ; 
+ + while ( true ) 
+ + { 
+ + long indexPosition = input . getFilePointer ( ) ; 
+ + if ( indexPosition = = indexSize ) 
+ + break ; 
+ + 
+ + DecoratedKey decoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; 
+ + if ( recreatebloom ) 
+ + bf . add ( decoratedKey . key ) ; 
+ + long dataPosition = input . readLong ( ) ; 
+ + 
+ + indexSummary . maybeAddEntry ( decoratedKey , indexPosition ) ; 
+ + ibuilder . addPotentialBoundary ( indexPosition ) ; 
+ + dbuilder . addPotentialBoundary ( dataPosition ) ; 
+ + } 
+ + indexSummary . complete ( ) ; 
+ + } 
+ + finally 
+ + { 
+ + input . close ( ) ; 
+ + } 
+ + 
+ + / / finalize the state of the reader 
+ + indexSummary . complete ( ) ; 
+ + ifile = ibuilder . complete ( indexFilename ( ) ) ; 
+ + dfile = dbuilder . complete ( getFilename ( ) ) ; 
+ + } 
+ + 
+ + / * * get the position in the index file to start scanning to find the given key ( at most indexInterval keys away ) * / 
+ + private IndexSummary . KeyPosition getIndexScanPosition ( DecoratedKey decoratedKey ) 
+ + { 
+ + assert indexSummary . getIndexPositions ( ) ! = null & & indexSummary . getIndexPositions ( ) . size ( ) > 0 ; 
+ + int index = Collections . binarySearch ( indexSummary . getIndexPositions ( ) , new IndexSummary . KeyPosition ( decoratedKey , - 1 ) ) ; 
+ + if ( index < 0 ) 
+ + { 
+ + / / binary search gives us the first index _ greater _ than the key searched for , 
+ + / / i . e . , its insertion position 
+ + int greaterThan = ( index + 1 ) * - 1 ; 
+ + if ( greaterThan = = 0 ) 
+ + return null ; 
+ + return indexSummary . getIndexPositions ( ) . get ( greaterThan - 1 ) ; 
+ + } 
+ + else 
+ + { 
+ + return indexSummary . getIndexPositions ( ) . get ( index ) ; 
+ + } 
+ + } 
+ 
+ / * * 
+ * For testing purposes only . 
+ * / 
+ - public abstract void forceFilterFailures ( ) ; 
+ + public void forceFilterFailures ( ) 
+ + { 
+ + bf = BloomFilter . alwaysMatchingBloomFilter ( ) ; 
+ + } 
+ 
+ / * * 
+ * @ return The key cache : for monitoring purposes . 
+ * / 
+ - public abstract InstrumentedCache getKeyCache ( ) ; 
+ + public InstrumentedCache getKeyCache ( ) 
+ + { 
+ + return keyCache ; 
+ + } 
+ 
+ / * * 
+ * @ return An estimate of the number of keys in this SSTable . 
+ * / 
+ - public abstract long estimatedKeys ( ) ; 
+ + public long estimatedKeys ( ) 
+ + { 
+ + return indexSummary . getIndexPositions ( ) . size ( ) * IndexSummary . INDEX _ INTERVAL ; 
+ + } 
+ 
+ / * * 
+ * @ return Approximately 1 / INDEX _ INTERVALth of the keys in this SSTable . 
+ * / 
+ - public abstract Collection < DecoratedKey > getKeySamples ( ) ; 
+ + public Collection < DecoratedKey > getKeySamples ( ) 
+ + { 
+ + return Collections2 . transform ( indexSummary . getIndexPositions ( ) , 
+ + new Function < IndexSummary . KeyPosition , DecoratedKey > ( ) { 
+ + public DecoratedKey apply ( IndexSummary . KeyPosition kp ) 
+ + { 
+ + return kp . key ; 
+ + } 
+ + } ) ; 
+ + } 
+ 
+ / * * 
+ * Returns the position in the data file to find the given key , or - 1 if the 
+ @ @ - 193 , 7 + 345 , 71 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl 
+ * FIXME : should not be public : use Scanner . 
+ * / 
+ @ Deprecated 
+ - public abstract long getPosition ( DecoratedKey decoratedKey ) throws IOException ; 
+ + public long getPosition ( DecoratedKey decoratedKey ) 
+ + { 
+ + / / first , check bloom filter 
+ + if ( ! bf . isPresent ( partitioner . convertToDiskFormat ( decoratedKey ) ) ) 
+ + return - 1 ; 
+ + 
+ + / / next , the key cache 
+ + Pair < Descriptor , DecoratedKey > unifiedKey = new Pair < Descriptor , DecoratedKey > ( desc , decoratedKey ) ; 
+ + if ( keyCache ! = null & & keyCache . getCapacity ( ) > 0 ) 
+ + { 
+ + Long cachedPosition = keyCache . get ( unifiedKey ) ; 
+ + if ( cachedPosition ! = null ) 
+ + { 
+ + return cachedPosition ; 
+ + } 
+ + } 
+ + 
+ + / / next , see if the sampled index says it ' s impossible for the key to be present 
+ + IndexSummary . KeyPosition sampledPosition = getIndexScanPosition ( decoratedKey ) ; 
+ + if ( sampledPosition = = null ) 
+ + return - 1 ; 
+ + 
+ + / / scan the on - disk index , starting at the nearest sampled position 
+ + int i = 0 ; 
+ + Iterator < FileDataInput > segments = ifile . iterator ( sampledPosition . indexPosition , INDEX _ FILE _ BUFFER _ BYTES ) ; 
+ + while ( segments . hasNext ( ) ) 
+ + { 
+ + FileDataInput input = segments . next ( ) ; 
+ + try 
+ + { 
+ + while ( ! input . isEOF ( ) & & i + + < IndexSummary . INDEX _ INTERVAL ) 
+ + { 
+ + / / read key & data position from index entry 
+ + DecoratedKey indexDecoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; 
+ + long dataPosition = input . readLong ( ) ; 
+ + 
+ + int v = indexDecoratedKey . compareTo ( decoratedKey ) ; 
+ + if ( v = = 0 ) 
+ + { 
+ + if ( keyCache ! = null & & keyCache . getCapacity ( ) > 0 ) 
+ + keyCache . put ( unifiedKey , Long . valueOf ( dataPosition ) ) ; 
+ + return dataPosition ; 
+ + } 
+ + if ( v > 0 ) 
+ + return - 1 ; 
+ + } 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + finally 
+ + { 
+ + try 
+ + { 
+ + input . close ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + logger . error ( " error closing file " , e ) ; 
+ + } 
+ + } 
+ + } 
+ + return - 1 ; 
+ + } 
+ 
+ / * * 
+ * Like getPosition , but if key is not found will return the location of the 
+ @ @ - 201 , 12 + 417 , 54 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl 
+ * FIXME : should not be public : use Scanner . 
+ * / 
+ @ Deprecated 
+ - public abstract long getNearestPosition ( DecoratedKey decoratedKey ) throws IOException ; 
+ + public long getNearestPosition ( DecoratedKey decoratedKey ) 
+ + { 
+ + IndexSummary . KeyPosition sampledPosition = getIndexScanPosition ( decoratedKey ) ; 
+ + if ( sampledPosition = = null ) 
+ + return 0 ; 
+ + 
+ + / / scan the on - disk index , starting at the nearest sampled position 
+ + Iterator < FileDataInput > segiter = ifile . iterator ( sampledPosition . indexPosition , INDEX _ FILE _ BUFFER _ BYTES ) ; 
+ + while ( segiter . hasNext ( ) ) 
+ + { 
+ + FileDataInput input = segiter . next ( ) ; 
+ + try 
+ + { 
+ + while ( ! input . isEOF ( ) ) 
+ + { 
+ + DecoratedKey indexDecoratedKey = partitioner . convertFromDiskFormat ( FBUtilities . readShortByteArray ( input ) ) ; 
+ + long position = input . readLong ( ) ; 
+ + int v = indexDecoratedKey . compareTo ( decoratedKey ) ; 
+ + if ( v > = 0 ) 
+ + return position ; 
+ + } 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + finally 
+ + { 
+ + try 
+ + { 
+ + input . close ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + logger . error ( " error closing file " , e ) ; 
+ + } 
+ + } 
+ + } 
+ + return - 1 ; 
+ + } 
+ 
+ / * * 
+ * @ return The length in bytes of the data file for this SSTable . 
+ * / 
+ - public abstract long length ( ) ; 
+ + public long length ( ) 
+ + { 
+ + return dfile . length ; 
+ + } 
+ 
+ public void markCompacted ( ) 
+ { 
+ @ @ - 228 , 16 + 486 , 35 @ @ public abstract class SSTableReader extends SSTable implements Comparable < SSTabl 
+ * @ param bufferSize Buffer size in bytes for this Scanner . 
+ * @ return A Scanner for seeking over the rows of the SSTable . 
+ * / 
+ - public abstract SSTableScanner getScanner ( int bufferSize ) ; 
+ + public SSTableScanner getScanner ( int bufferSize ) 
+ + { 
+ + return new SSTableScanner ( this , bufferSize ) ; 
+ + } 
+ 
+ / * * 
+ * @ param bufferSize Buffer size in bytes for this Scanner . 
+ * @ param filter filter to use when reading the columns 
+ * @ return A Scanner for seeking over the rows of the SSTable . 
+ * / 
+ - public abstract SSTableScanner getScanner ( int bufferSize , QueryFilter filter ) ; 
+ - 
+ - public abstract FileDataInput getFileDataInput ( DecoratedKey decoratedKey , int bufferSize ) ; 
+ + public SSTableScanner getScanner ( int bufferSize , QueryFilter filter ) 
+ + { 
+ + return new SSTableScanner ( this , filter , bufferSize ) ; 
+ + } 
+ + 
+ + public FileDataInput getFileDataInput ( DecoratedKey decoratedKey , int bufferSize ) 
+ + { 
+ + long position = getPosition ( decoratedKey ) ; 
+ + if ( position < 0 ) 
+ + return null ; 
+ + 
+ + return dfile . getSegment ( position , bufferSize ) ; 
+ + } 
+ + 
+ + 
+ + public int compareTo ( SSTableReader o ) 
+ + { 
+ + return desc . generation - o . desc . generation ; 
+ + } 
+ 
+ public AbstractType getColumnComparator ( ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableScanner . java b / src / java / org / apache / cassandra / io / sstable / SSTableScanner . java 
+ index 278af6c . . d8d8ac2 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableScanner . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableScanner . java 
+ @ @ - 6 , 9 + 6 , 9 @ @ 
+ * to you under the Apache License , Version 2 . 0 ( the 
+ * " License " ) ; you may not use this file except in compliance 
+ * with the License . You may obtain a copy of the License at 
+ - * 
+ + * 
+ * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ + * 
+ * Unless required by applicable law or agreed to in writing , 
+ * software distributed under the License is distributed on an 
+ * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ @ @ - 20 , 17 + 20 , 177 @ @ 
+ package org . apache . cassandra . io . sstable ; 
+ 
+ import java . io . Closeable ; 
+ + import java . io . IOException ; 
+ + import java . io . IOError ; 
+ import java . util . Iterator ; 
+ + import java . util . Arrays ; 
+ 
+ import org . apache . cassandra . db . DecoratedKey ; 
+ import org . apache . cassandra . db . filter . IColumnIterator ; 
+ + import org . apache . cassandra . db . filter . QueryFilter ; 
+ + import org . apache . cassandra . io . util . BufferedRandomAccessFile ; 
+ + import org . apache . cassandra . service . StorageService ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ 
+ - public abstract class SSTableScanner implements Iterator < IColumnIterator > , Closeable 
+ + 
+ + public class SSTableScanner implements Iterator < IColumnIterator > , Closeable 
+ { 
+ - public abstract void seekTo ( DecoratedKey seekKey ) ; 
+ + private static Logger logger = LoggerFactory . getLogger ( SSTableScanner . class ) ; 
+ + 
+ + private final BufferedRandomAccessFile file ; 
+ + private final SSTableReader sstable ; 
+ + private IColumnIterator row ; 
+ + private boolean exhausted = false ; 
+ + private Iterator < IColumnIterator > iterator ; 
+ + private QueryFilter filter ; 
+ + 
+ + / * * 
+ + * @ param sstable SSTable to scan . 
+ + * / 
+ + SSTableScanner ( SSTableReader sstable , int bufferSize ) 
+ + { 
+ + try 
+ + { 
+ + this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , bufferSize ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + this . sstable = sstable ; 
+ + } 
+ + 
+ + / * * 
+ + * @ param sstable SSTable to scan . 
+ + * @ param filter filter to use when scanning the columns 
+ + * / 
+ + SSTableScanner ( SSTableReader sstable , QueryFilter filter , int bufferSize ) 
+ + { 
+ + try 
+ + { 
+ + this . file = new BufferedRandomAccessFile ( sstable . getFilename ( ) , " r " , bufferSize ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + this . sstable = sstable ; 
+ + this . filter = filter ; 
+ + } 
+ + 
+ + public void close ( ) throws IOException 
+ + { 
+ + file . close ( ) ; 
+ + } 
+ + 
+ + public void seekTo ( DecoratedKey seekKey ) 
+ + { 
+ + try 
+ + { 
+ + long position = sstable . getNearestPosition ( seekKey ) ; 
+ + if ( position < 0 ) 
+ + { 
+ + exhausted = true ; 
+ + return ; 
+ + } 
+ + file . seek ( position ) ; 
+ + row = null ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( " corrupt sstable " , e ) ; 
+ + } 
+ + } 
+ + 
+ + public long getFileLength ( ) 
+ + { 
+ + try 
+ + { 
+ + return file . length ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + } 
+ + 
+ + public long getFilePointer ( ) 
+ + { 
+ + return file . getFilePointer ( ) ; 
+ + } 
+ + 
+ + public boolean hasNext ( ) 
+ + { 
+ + if ( iterator = = null ) 
+ + iterator = exhausted ? Arrays . asList ( new IColumnIterator [ 0 ] ) . iterator ( ) : new KeyScanningIterator ( ) ; 
+ + return iterator . hasNext ( ) ; 
+ + } 
+ + 
+ + public IColumnIterator next ( ) 
+ + { 
+ + if ( iterator = = null ) 
+ + iterator = exhausted ? Arrays . asList ( new IColumnIterator [ 0 ] ) . iterator ( ) : new KeyScanningIterator ( ) ; 
+ + return iterator . next ( ) ; 
+ + } 
+ + 
+ + public void remove ( ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + 
+ + private class KeyScanningIterator implements Iterator < IColumnIterator > 
+ + { 
+ + private long dataStart ; 
+ + private long finishedAt ; 
+ + 
+ + public boolean hasNext ( ) 
+ + { 
+ + try 
+ + { 
+ + if ( row = = null ) 
+ + return ! file . isEOF ( ) ; 
+ + return finishedAt < file . length ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + public IColumnIterator next ( ) 
+ + { 
+ + try 
+ + { 
+ + if ( row ! = null ) 
+ + file . seek ( finishedAt ) ; 
+ + assert ! file . isEOF ( ) ; 
+ + 
+ + DecoratedKey key = StorageService . getPartitioner ( ) . convertFromDiskFormat ( FBUtilities . readShortByteArray ( file ) ) ; 
+ + int dataSize = file . readInt ( ) ; 
+ + dataStart = file . getFilePointer ( ) ; 
+ + finishedAt = dataStart + dataSize ; 
+ 
+ - public abstract long getFileLength ( ) ; 
+ + if ( filter = = null ) 
+ + { 
+ + return row = new SSTableIdentityIterator ( sstable , file , key , dataStart , finishedAt ) ; 
+ + } 
+ + else 
+ + { 
+ + return row = filter . getSSTableColumnIterator ( sstable , file , key , dataStart ) ; 
+ + } 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ 
+ - public abstract long getFilePointer ( ) ; 
+ + public void remove ( ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ index 9463e74 . . 12c09e8 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableWriter . java 
+ @ @ - 163 , 7 + 163 , 7 @ @ public class SSTableWriter extends SSTable 
+ SegmentedFile dfile = dbuilder . complete ( newdesc . filenameFor ( SSTable . COMPONENT _ DATA ) ) ; 
+ ibuilder = null ; 
+ dbuilder = null ; 
+ - return RowIndexedReader . internalOpen ( newdesc , partitioner , ifile , dfile , indexSummary , bf , maxDataAge ) ; 
+ + return SSTableReader . internalOpen ( newdesc , partitioner , ifile , dfile , indexSummary , bf , maxDataAge ) ; 
+ } 
+ 
+ static Descriptor rename ( Descriptor tmpdesc )

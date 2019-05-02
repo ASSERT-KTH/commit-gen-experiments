@@ -1,0 +1,141 @@
+BLEU SCORE: 0.02931251013275449
+
+TEST MSG: Make getFullyExpiredSSTables less expensive .
+GENERATED MSG: More aggressive check for expired sstables in DTCS
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 7d84538 . . 905445e 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 0 . 17 <nl> + * Make getFullyExpiredSSTables less expensive ( CASSANDRA - 9882 ) <nl> * Add tool to find why expired sstables are not getting dropped ( CASSANDRA - 10015 ) <nl> * Remove erroneous pending HH tasks from tpstats / jmx ( CASSANDRA - 9129 ) <nl> * Don ' t cast expected bf size to an int ( CASSANDRA - 9959 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index c125cf0 . . eb688f7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1028 , 17 + 1028 , 56 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> if ( sstables . isEmpty ( ) ) <nl> return ImmutableSet . of ( ) ; <nl> <nl> - DataTracker . SSTableIntervalTree tree = data . getView ( ) . intervalTree ; <nl> - <nl> - Set < SSTableReader > results = null ; <nl> - for ( SSTableReader sstable : sstables ) <nl> + List < SSTableReader > sortedByFirst = new ArrayList < > ( sstables ) ; <nl> + Collections . sort ( sortedByFirst , new Comparator < SSTableReader > ( ) <nl> { <nl> - Set < SSTableReader > overlaps = ImmutableSet . copyOf ( tree . search ( Interval . < RowPosition , SSTableReader > create ( sstable . first , sstable . last ) ) ) ; <nl> - results = results = = null ? overlaps : Sets . union ( results , overlaps ) . immutableCopy ( ) ; <nl> + @ Override <nl> + public int compare ( SSTableReader o1 , SSTableReader o2 ) <nl> + { <nl> + return o1 . first . compareTo ( o2 . first ) ; <nl> + } <nl> + } ) ; <nl> + List < Interval < RowPosition , SSTableReader > > intervals = new ArrayList < > ( ) ; <nl> + DecoratedKey first = null , last = null ; <nl> + / * <nl> + normalize the intervals covered by the sstables <nl> + assume we have sstables like this ( brackets representing first / last key in the sstable ) ; <nl> + [ ] [ ] [ ] [ ] <nl> + [ ] [ ] <nl> + then we can , instead of searching the interval tree 6 times , normalize the intervals and <nl> + only query the tree 2 times , for these intervals ; <nl> + [ ] [ ] <nl> + * / <nl> + for ( SSTableReader sstable : sortedByFirst ) <nl> + { <nl> + if ( first = = null ) <nl> + { <nl> + first = sstable . first ; <nl> + last = sstable . last ; <nl> + } <nl> + else <nl> + { <nl> + if ( sstable . first . compareTo ( last ) < = 0 ) / / we do overlap <nl> + { <nl> + if ( sstable . last . compareTo ( last ) > 0 ) <nl> + last = sstable . last ; <nl> + } <nl> + else <nl> + { <nl> + intervals . add ( Interval . < RowPosition , SSTableReader > create ( first , last ) ) ; <nl> + first = sstable . first ; <nl> + last = sstable . last ; <nl> + } <nl> + } <nl> } <nl> - results = Sets . difference ( results , ImmutableSet . copyOf ( sstables ) ) ; <nl> + intervals . add ( Interval . < RowPosition , SSTableReader > create ( first , last ) ) ; <nl> + DataTracker . SSTableIntervalTree tree = data . getView ( ) . intervalTree ; <nl> + Set < SSTableReader > results = new HashSet < > ( ) ; <nl> + <nl> + for ( Interval < RowPosition , SSTableReader > interval : intervals ) <nl> + results . addAll ( tree . search ( interval ) ) ; <nl> <nl> - return results ; <nl> + return Sets . difference ( results , ImmutableSet . copyOf ( sstables ) ) ; <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java <nl> index df28bd4 . . fea4995 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java <nl> @ @ - 18 , 6 + 18 , 7 @ @ <nl> package org . apache . cassandra . db . compaction ; <nl> <nl> import java . util . * ; <nl> + import java . util . concurrent . TimeUnit ; <nl> <nl> import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . base . Predicate ; <nl> @ @ - 37 , 6 + 38 , 8 @ @ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy <nl> <nl> protected DateTieredCompactionStrategyOptions options ; <nl> protected volatile int estimatedRemainingTasks ; <nl> + @ VisibleForTesting <nl> + long lastExpiredCheck ; <nl> <nl> public DateTieredCompactionStrategy ( ColumnFamilyStore cfs , Map < String , String > options ) <nl> { <nl> @ @ - 83 , 8 + 86 , 14 @ @ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy <nl> <nl> Set < SSTableReader > uncompacting = cfs . getUncompactingSSTables ( ) ; <nl> <nl> - / / Find fully expired SSTables . Those will be included no matter what . <nl> - Set < SSTableReader > expired = CompactionController . getFullyExpiredSSTables ( cfs , uncompacting , cfs . getOverlappingSSTables ( uncompacting ) , gcBefore ) ; <nl> + Set < SSTableReader > expired = Collections . emptySet ( ) ; <nl> + / / we only check for expired sstables every 10 minutes due to it being an expensive operation <nl> + if ( System . currentTimeMillis ( ) - lastExpiredCheck > TimeUnit . MINUTES . toMillis ( 10 ) ) <nl> + { <nl> + / / Find fully expired SSTables . Those will be included no matter what . <nl> + expired = CompactionController . getFullyExpiredSSTables ( cfs , uncompacting , cfs . getOverlappingSSTables ( uncompacting ) , gcBefore ) ; <nl> + lastExpiredCheck = System . currentTimeMillis ( ) ; <nl> + } <nl> Set < SSTableReader > candidates = Sets . newHashSet ( filterSuspectSSTables ( uncompacting ) ) ; <nl> <nl> List < SSTableReader > compactionCandidates = new ArrayList < > ( getNextNonExpiredSSTables ( Sets . difference ( candidates , expired ) , gcBefore ) ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java <nl> index d7caf6b . . 0084a16 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java <nl> @ @ - 308 , 6 + 308 , 7 @ @ public class DateTieredCompactionStrategyTest extends SchemaLoader <nl> DateTieredCompactionStrategy dtcs = new DateTieredCompactionStrategy ( cfs , options ) ; <nl> dtcs . startup ( ) ; <nl> assertNull ( dtcs . getNextBackgroundTask ( ( int ) ( System . currentTimeMillis ( ) / 1000 ) ) ) ; <nl> + dtcs . lastExpiredCheck = 0 ; <nl> Thread . sleep ( 2000 ) ; <nl> AbstractCompactionTask t = dtcs . getNextBackgroundTask ( ( int ) ( System . currentTimeMillis ( ) / 1000 ) ) ; <nl> assertNotNull ( t ) ;
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 7d84538 . . 905445e 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 0 . 17 
+ + * Make getFullyExpiredSSTables less expensive ( CASSANDRA - 9882 ) 
+ * Add tool to find why expired sstables are not getting dropped ( CASSANDRA - 10015 ) 
+ * Remove erroneous pending HH tasks from tpstats / jmx ( CASSANDRA - 9129 ) 
+ * Don ' t cast expected bf size to an int ( CASSANDRA - 9959 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index c125cf0 . . eb688f7 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1028 , 17 + 1028 , 56 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ if ( sstables . isEmpty ( ) ) 
+ return ImmutableSet . of ( ) ; 
+ 
+ - DataTracker . SSTableIntervalTree tree = data . getView ( ) . intervalTree ; 
+ - 
+ - Set < SSTableReader > results = null ; 
+ - for ( SSTableReader sstable : sstables ) 
+ + List < SSTableReader > sortedByFirst = new ArrayList < > ( sstables ) ; 
+ + Collections . sort ( sortedByFirst , new Comparator < SSTableReader > ( ) 
+ { 
+ - Set < SSTableReader > overlaps = ImmutableSet . copyOf ( tree . search ( Interval . < RowPosition , SSTableReader > create ( sstable . first , sstable . last ) ) ) ; 
+ - results = results = = null ? overlaps : Sets . union ( results , overlaps ) . immutableCopy ( ) ; 
+ + @ Override 
+ + public int compare ( SSTableReader o1 , SSTableReader o2 ) 
+ + { 
+ + return o1 . first . compareTo ( o2 . first ) ; 
+ + } 
+ + } ) ; 
+ + List < Interval < RowPosition , SSTableReader > > intervals = new ArrayList < > ( ) ; 
+ + DecoratedKey first = null , last = null ; 
+ + / * 
+ + normalize the intervals covered by the sstables 
+ + assume we have sstables like this ( brackets representing first / last key in the sstable ) ; 
+ + [ ] [ ] [ ] [ ] 
+ + [ ] [ ] 
+ + then we can , instead of searching the interval tree 6 times , normalize the intervals and 
+ + only query the tree 2 times , for these intervals ; 
+ + [ ] [ ] 
+ + * / 
+ + for ( SSTableReader sstable : sortedByFirst ) 
+ + { 
+ + if ( first = = null ) 
+ + { 
+ + first = sstable . first ; 
+ + last = sstable . last ; 
+ + } 
+ + else 
+ + { 
+ + if ( sstable . first . compareTo ( last ) < = 0 ) / / we do overlap 
+ + { 
+ + if ( sstable . last . compareTo ( last ) > 0 ) 
+ + last = sstable . last ; 
+ + } 
+ + else 
+ + { 
+ + intervals . add ( Interval . < RowPosition , SSTableReader > create ( first , last ) ) ; 
+ + first = sstable . first ; 
+ + last = sstable . last ; 
+ + } 
+ + } 
+ } 
+ - results = Sets . difference ( results , ImmutableSet . copyOf ( sstables ) ) ; 
+ + intervals . add ( Interval . < RowPosition , SSTableReader > create ( first , last ) ) ; 
+ + DataTracker . SSTableIntervalTree tree = data . getView ( ) . intervalTree ; 
+ + Set < SSTableReader > results = new HashSet < > ( ) ; 
+ + 
+ + for ( Interval < RowPosition , SSTableReader > interval : intervals ) 
+ + results . addAll ( tree . search ( interval ) ) ; 
+ 
+ - return results ; 
+ + return Sets . difference ( results , ImmutableSet . copyOf ( sstables ) ) ; 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java 
+ index df28bd4 . . fea4995 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java 
+ @ @ - 18 , 6 + 18 , 7 @ @ 
+ package org . apache . cassandra . db . compaction ; 
+ 
+ import java . util . * ; 
+ + import java . util . concurrent . TimeUnit ; 
+ 
+ import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . base . Predicate ; 
+ @ @ - 37 , 6 + 38 , 8 @ @ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy 
+ 
+ protected DateTieredCompactionStrategyOptions options ; 
+ protected volatile int estimatedRemainingTasks ; 
+ + @ VisibleForTesting 
+ + long lastExpiredCheck ; 
+ 
+ public DateTieredCompactionStrategy ( ColumnFamilyStore cfs , Map < String , String > options ) 
+ { 
+ @ @ - 83 , 8 + 86 , 14 @ @ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy 
+ 
+ Set < SSTableReader > uncompacting = cfs . getUncompactingSSTables ( ) ; 
+ 
+ - / / Find fully expired SSTables . Those will be included no matter what . 
+ - Set < SSTableReader > expired = CompactionController . getFullyExpiredSSTables ( cfs , uncompacting , cfs . getOverlappingSSTables ( uncompacting ) , gcBefore ) ; 
+ + Set < SSTableReader > expired = Collections . emptySet ( ) ; 
+ + / / we only check for expired sstables every 10 minutes due to it being an expensive operation 
+ + if ( System . currentTimeMillis ( ) - lastExpiredCheck > TimeUnit . MINUTES . toMillis ( 10 ) ) 
+ + { 
+ + / / Find fully expired SSTables . Those will be included no matter what . 
+ + expired = CompactionController . getFullyExpiredSSTables ( cfs , uncompacting , cfs . getOverlappingSSTables ( uncompacting ) , gcBefore ) ; 
+ + lastExpiredCheck = System . currentTimeMillis ( ) ; 
+ + } 
+ Set < SSTableReader > candidates = Sets . newHashSet ( filterSuspectSSTables ( uncompacting ) ) ; 
+ 
+ List < SSTableReader > compactionCandidates = new ArrayList < > ( getNextNonExpiredSSTables ( Sets . difference ( candidates , expired ) , gcBefore ) ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java 
+ index d7caf6b . . 0084a16 100644 
+ - - - a / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java 
+ @ @ - 308 , 6 + 308 , 7 @ @ public class DateTieredCompactionStrategyTest extends SchemaLoader 
+ DateTieredCompactionStrategy dtcs = new DateTieredCompactionStrategy ( cfs , options ) ; 
+ dtcs . startup ( ) ; 
+ assertNull ( dtcs . getNextBackgroundTask ( ( int ) ( System . currentTimeMillis ( ) / 1000 ) ) ) ; 
+ + dtcs . lastExpiredCheck = 0 ; 
+ Thread . sleep ( 2000 ) ; 
+ AbstractCompactionTask t = dtcs . getNextBackgroundTask ( ( int ) ( System . currentTimeMillis ( ) / 1000 ) ) ; 
+ assertNotNull ( t ) ;
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

@@ -1,0 +1,1258 @@
+BLEU SCORE: 0.034353182138500235
+
+TEST MSG: Extend triggers to support CAS updates
+GENERATED MSG: merge from 0 . 8 . 1
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index e738a2e . . 9caca38 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 17 , 6 + 17 , 7 @ @ <nl> * Properly use the Paxos consistency for ( non - protocol ) batch ( CASSANDRA - 6837 ) <nl> * Add paranoid disk failure option ( CASSANDRA - 6646 ) <nl> * Improve PerRowSecondaryIndex performance ( CASSANDRA - 6876 ) <nl> + * Extend triggers to support CAS updates ( CASSANDRA - 6882 ) <nl> Merged from 1 . 2 : <nl> * add extra SSL cipher suites ( CASSANDRA - 6613 ) <nl> * fix nodetool getsstables for blob PK ( CASSANDRA - 6803 ) <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index a5542e6 . . fda9819 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 234 , 6 + 234 , 16 @ @ public class StorageProxy implements StorageProxyMBean <nl> <nl> / / finish the paxos round w / the desired updates <nl> / / TODO turn null updates into delete ? <nl> + <nl> + / / Apply triggers to cas updates . A consideration here is that <nl> + / / triggers emit RowMutations , and so a given trigger implementation <nl> + / / may generate mutations for partitions other than the one this <nl> + / / paxos round is scoped for . In this case , TriggerExecutor will <nl> + / / validate that the generated mutations are targetted at the same <nl> + / / partition as the initial updates and reject ( via an <nl> + / / InvalidRequestException ) any which aren ' t . <nl> + updates = TriggerExecutor . instance . execute ( key , updates ) ; <nl> + <nl> Commit proposal = Commit . newProposal ( key , ballot , updates ) ; <nl> Tracing . trace ( " CAS precondition is met ; proposing client - requested updates for { } " , ballot ) ; <nl> if ( proposePaxos ( proposal , liveEndpoints , requiredParticipants , true ) ) <nl> diff - - git a / src / java / org / apache / cassandra / triggers / TriggerExecutor . java b / src / java / org / apache / cassandra / triggers / TriggerExecutor . java <nl> index 4b3c24a . . 8ccf937 100644 <nl> - - - a / src / java / org / apache / cassandra / triggers / TriggerExecutor . java <nl> + + + b / src / java / org / apache / cassandra / triggers / TriggerExecutor . java <nl> @ @ - 23 , 6 + 23 , 7 @ @ import java . nio . ByteBuffer ; <nl> import java . util . Collection ; <nl> import java . util . List ; <nl> import java . util . Map ; <nl> + import java . util . UUID ; <nl> <nl> import com . google . common . collect . Lists ; <nl> import com . google . common . collect . Maps ; <nl> @ @ - 33 , 8 + 34 , 10 @ @ import org . apache . cassandra . db . ColumnFamily ; <nl> import org . apache . cassandra . db . CounterMutation ; <nl> import org . apache . cassandra . db . IMutation ; <nl> import org . apache . cassandra . db . RowMutation ; <nl> + import org . apache . cassandra . db . marshal . AbstractType ; <nl> import org . apache . cassandra . exceptions . InvalidRequestException ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . apache . cassandra . utils . HeapAllocator ; <nl> <nl> public class TriggerExecutor <nl> { <nl> @ @ - 62 , 6 + 65 , 21 @ @ public class TriggerExecutor <nl> cachedTriggers . clear ( ) ; <nl> } <nl> <nl> + public ColumnFamily execute ( ByteBuffer key , ColumnFamily updates ) throws InvalidRequestException <nl> + { <nl> + List < RowMutation > intermediate = executeInternal ( key , updates ) ; <nl> + if ( intermediate = = null ) <nl> + return updates ; <nl> + <nl> + validateForSinglePartition ( updates . metadata ( ) . getKeyValidator ( ) , updates . id ( ) , key , intermediate ) ; <nl> + <nl> + for ( RowMutation mutation : intermediate ) <nl> + for ( ColumnFamily cf : mutation . getColumnFamilies ( ) ) <nl> + updates . addAll ( cf , HeapAllocator . instance ) ; <nl> + <nl> + return updates ; <nl> + } <nl> + <nl> public Collection < RowMutation > execute ( Collection < ? extends IMutation > updates ) throws InvalidRequestException <nl> { <nl> boolean hasCounters = false ; <nl> @ @ - 70 , 7 + 88 , 7 @ @ public class TriggerExecutor <nl> { <nl> for ( ColumnFamily cf : mutation . getColumnFamilies ( ) ) <nl> { <nl> - List < RowMutation > intermediate = execute ( mutation . key ( ) , cf ) ; <nl> + List < RowMutation > intermediate = executeInternal ( mutation . key ( ) , cf ) ; <nl> if ( intermediate = = null ) <nl> continue ; <nl> <nl> @ @ - 88 , 6 + 106 , 24 @ @ public class TriggerExecutor <nl> return tmutations ; <nl> } <nl> <nl> + private void validateForSinglePartition ( AbstractType < ? > keyValidator , <nl> + UUID cfId , <nl> + ByteBuffer key , <nl> + Collection < RowMutation > tmutations ) <nl> + throws InvalidRequestException <nl> + { <nl> + for ( RowMutation mutation : tmutations ) <nl> + { <nl> + if ( keyValidator . compare ( mutation . key ( ) , key ) ! = 0 ) <nl> + throw new InvalidRequestException ( " Partition key of additional mutation does not match primary update key " ) ; <nl> + <nl> + for ( ColumnFamily cf : mutation . getColumnFamilies ( ) ) <nl> + if ( ! cf . id ( ) . equals ( cfId ) ) <nl> + throw new InvalidRequestException ( " Column family of additional mutation does not match primary update cf " ) ; <nl> + } <nl> + validate ( tmutations ) ; <nl> + } <nl> + <nl> private void validate ( Collection < RowMutation > tmutations ) throws InvalidRequestException <nl> { <nl> for ( RowMutation mutation : tmutations ) <nl> @ @ - 103 , 7 + 139 , 7 @ @ public class TriggerExecutor <nl> * Switch class loader before using the triggers for the column family , if <nl> * not loaded them with the custom class loader . <nl> * / <nl> - private List < RowMutation > execute ( ByteBuffer key , ColumnFamily columnFamily ) <nl> + private List < RowMutation > executeInternal ( ByteBuffer key , ColumnFamily columnFamily ) <nl> { <nl> Map < String , TriggerDefinition > triggers = columnFamily . metadata ( ) . getTriggers ( ) ; <nl> if ( triggers . isEmpty ( ) ) <nl> diff - - git a / test / unit / org / apache / cassandra / triggers / TriggersTest . java b / test / unit / org / apache / cassandra / triggers / TriggersTest . java <nl> index 6ca3880 . . 5b9b27d 100644 <nl> - - - a / test / unit / org / apache / cassandra / triggers / TriggersTest . java <nl> + + + b / test / unit / org / apache / cassandra / triggers / TriggersTest . java <nl> @ @ - 35 , 10 + 35 , 12 @ @ import org . apache . cassandra . db . Column ; <nl> import org . apache . cassandra . db . ColumnFamily ; <nl> import org . apache . cassandra . db . ConsistencyLevel ; <nl> import org . apache . cassandra . db . RowMutation ; <nl> + import org . apache . cassandra . exceptions . RequestExecutionException ; <nl> import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . thrift . Cassandra ; <nl> import org . apache . cassandra . thrift . ColumnOrSuperColumn ; <nl> import org . apache . cassandra . thrift . ColumnParent ; <nl> + import org . apache . cassandra . thrift . InvalidRequestException ; <nl> import org . apache . cassandra . thrift . Mutation ; <nl> import org . apache . cassandra . thrift . TFramedTransportFactory ; <nl> import org . apache . cassandra . thrift . ThriftServer ; <nl> @ @ - 46 , 6 + 48 , 7 @ @ import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . thrift . protocol . TBinaryProtocol ; <nl> <nl> import static org . junit . Assert . assertEquals ; <nl> + import static org . junit . Assert . assertTrue ; <nl> <nl> public class TriggersTest extends SchemaLoader <nl> { <nl> @ @ - 54 , 6 + 57 , 7 @ @ public class TriggersTest extends SchemaLoader <nl> <nl> private static String ksName = " triggers _ test _ ks " ; <nl> private static String cfName = " test _ table " ; <nl> + private static String otherCf = " other _ table " ; <nl> <nl> @ Before <nl> public void setup ( ) throws Exception <nl> @ @ - 73 , 6 + 77 , 9 @ @ public class TriggersTest extends SchemaLoader <nl> cql = String . format ( " CREATE TABLE IF NOT EXISTS % s . % s ( k int , v1 int , v2 int , PRIMARY KEY ( k ) ) " , ksName , cfName ) ; <nl> QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; <nl> <nl> + cql = String . format ( " CREATE TABLE IF NOT EXISTS % s . % s ( k int , v1 int , v2 int , PRIMARY KEY ( k ) ) " , ksName , otherCf ) ; <nl> + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; <nl> + <nl> / / no conditional execution of create trigger stmt yet <nl> if ( ! triggerCreated ) <nl> { <nl> @ @ - 148 , 13 + 155 , 157 @ @ public class TriggersTest extends SchemaLoader <nl> assertUpdateIsAugmented ( 3 ) ; <nl> } <nl> <nl> + @ Test <nl> + public void executeTriggerOnCqlInsertWithConditions ( ) throws Exception <nl> + { <nl> + String cql = String . format ( " INSERT INTO % s . % s ( k , v1 ) VALUES ( 4 , 4 ) IF NOT EXISTS " , ksName , cfName ) ; <nl> + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; <nl> + assertUpdateIsAugmented ( 4 ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void executeTriggerOnCqlBatchWithConditions ( ) throws Exception <nl> + { <nl> + String cql = String . format ( " BEGIN BATCH " + <nl> + " INSERT INTO % 1 $ s . % 2 $ s ( k , v1 ) VALUES ( 5 , 5 ) IF NOT EXISTS ; " + <nl> + " INSERT INTO % 1 $ s . % 2 $ s ( k , v1 ) VALUES ( 5 , 5 ) ; " + <nl> + " APPLY BATCH " , <nl> + ksName , cfName ) ; <nl> + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; <nl> + assertUpdateIsAugmented ( 5 ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void executeTriggerOnThriftCASOperation ( ) throws Exception <nl> + { <nl> + Cassandra . Client client = new Cassandra . Client ( <nl> + new TBinaryProtocol ( <nl> + new TFramedTransportFactory ( ) . openTransport ( <nl> + InetAddress . getLocalHost ( ) . getHostName ( ) , 9170 ) ) ) ; <nl> + client . set _ keyspace ( ksName ) ; <nl> + client . cas ( ByteBufferUtil . bytes ( 6 ) , <nl> + cfName , <nl> + Collections . EMPTY _ LIST , <nl> + Collections . singletonList ( getColumnForInsert ( " v1 " , 6 ) ) , <nl> + org . apache . cassandra . thrift . ConsistencyLevel . LOCAL _ SERIAL , <nl> + org . apache . cassandra . thrift . ConsistencyLevel . ONE ) ; <nl> + <nl> + assertUpdateIsAugmented ( 6 ) ; <nl> + } <nl> + <nl> + / / Unfortunately , an IRE thrown from StorageProxy . cas <nl> + / / results in a RuntimeException from QueryProcessor . process <nl> + @ Test ( expected = RuntimeException . class ) <nl> + public void onCqlUpdateWithConditionsRejectGeneratedUpdatesForDifferentPartition ( ) throws Exception <nl> + { <nl> + String cf = " cf " + System . nanoTime ( ) ; <nl> + try <nl> + { <nl> + setupTableWithTrigger ( cf , CrossPartitionTrigger . class ) ; <nl> + String cql = String . format ( " INSERT INTO % s . % s ( k , v1 ) VALUES ( 7 , 7 ) IF NOT EXISTS " , ksName , cf ) ; <nl> + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; <nl> + } <nl> + finally <nl> + { <nl> + assertUpdateNotExecuted ( cf , 7 ) ; <nl> + } <nl> + } <nl> + <nl> + / / Unfortunately , an IRE thrown from StorageProxy . cas <nl> + / / results in a RuntimeException from QueryProcessor . process <nl> + @ Test ( expected = RuntimeException . class ) <nl> + public void onCqlUpdateWithConditionsRejectGeneratedUpdatesForDifferentTable ( ) throws Exception <nl> + { <nl> + String cf = " cf " + System . nanoTime ( ) ; <nl> + try <nl> + { <nl> + setupTableWithTrigger ( cf , CrossTableTrigger . class ) ; <nl> + String cql = String . format ( " INSERT INTO % s . % s ( k , v1 ) VALUES ( 8 , 8 ) IF NOT EXISTS " , ksName , cf ) ; <nl> + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; <nl> + } <nl> + finally <nl> + { <nl> + assertUpdateNotExecuted ( cf , 7 ) ; <nl> + } <nl> + } <nl> + <nl> + @ Test ( expected = InvalidRequestException . class ) <nl> + public void onThriftCASRejectGeneratedUpdatesForDifferentPartition ( ) throws Exception <nl> + { <nl> + String cf = " cf " + System . nanoTime ( ) ; <nl> + try <nl> + { <nl> + setupTableWithTrigger ( cf , CrossPartitionTrigger . class ) ; <nl> + Cassandra . Client client = new Cassandra . Client ( <nl> + new TBinaryProtocol ( <nl> + new TFramedTransportFactory ( ) . openTransport ( <nl> + InetAddress . getLocalHost ( ) . getHostName ( ) , 9170 ) ) ) ; <nl> + client . set _ keyspace ( ksName ) ; <nl> + client . cas ( ByteBufferUtil . bytes ( 9 ) , <nl> + cf , <nl> + Collections . EMPTY _ LIST , <nl> + Collections . singletonList ( getColumnForInsert ( " v1 " , 9 ) ) , <nl> + org . apache . cassandra . thrift . ConsistencyLevel . LOCAL _ SERIAL , <nl> + org . apache . cassandra . thrift . ConsistencyLevel . ONE ) ; <nl> + } <nl> + finally <nl> + { <nl> + assertUpdateNotExecuted ( cf , 9 ) ; <nl> + } <nl> + } <nl> + <nl> + @ Test ( expected = InvalidRequestException . class ) <nl> + public void onThriftCASRejectGeneratedUpdatesForDifferentCF ( ) throws Exception <nl> + { <nl> + String cf = " cf " + System . nanoTime ( ) ; <nl> + try <nl> + { <nl> + setupTableWithTrigger ( cf , CrossTableTrigger . class ) ; <nl> + Cassandra . Client client = new Cassandra . Client ( <nl> + new TBinaryProtocol ( <nl> + new TFramedTransportFactory ( ) . openTransport ( <nl> + InetAddress . getLocalHost ( ) . getHostName ( ) , 9170 ) ) ) ; <nl> + client . set _ keyspace ( ksName ) ; <nl> + client . cas ( ByteBufferUtil . bytes ( 10 ) , <nl> + cf , <nl> + Collections . EMPTY _ LIST , <nl> + Collections . singletonList ( getColumnForInsert ( " v1 " , 10 ) ) , <nl> + org . apache . cassandra . thrift . ConsistencyLevel . LOCAL _ SERIAL , <nl> + org . apache . cassandra . thrift . ConsistencyLevel . ONE ) ; <nl> + } <nl> + finally <nl> + { <nl> + assertUpdateNotExecuted ( cf , 10 ) ; <nl> + } <nl> + } <nl> + <nl> + private void setupTableWithTrigger ( String cf , Class < ? extends ITrigger > triggerImpl ) <nl> + throws RequestExecutionException <nl> + { <nl> + String cql = String . format ( " CREATE TABLE IF NOT EXISTS % s . % s ( k int , v1 int , v2 int , PRIMARY KEY ( k ) ) " , ksName , cf ) ; <nl> + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; <nl> + <nl> + / / no conditional execution of create trigger stmt yet <nl> + cql = String . format ( " CREATE TRIGGER trigger _ 1 ON % s . % s USING ' % s ' " , <nl> + ksName , cf , triggerImpl . getName ( ) ) ; <nl> + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; <nl> + } <nl> + <nl> private void assertUpdateIsAugmented ( int key ) <nl> { <nl> UntypedResultSet rs = QueryProcessor . processInternal ( <nl> String . format ( " SELECT * FROM % s . % s WHERE k = % s " , ksName , cfName , key ) ) ; <nl> + assertTrue ( String . format ( " Expected value ( % s ) for augmented cell v2 was not found " , key ) , rs . one ( ) . has ( " v2 " ) ) ; <nl> assertEquals ( 999 , rs . one ( ) . getInt ( " v2 " ) ) ; <nl> } <nl> <nl> + private void assertUpdateNotExecuted ( String cf , int key ) <nl> + { <nl> + UntypedResultSet rs = QueryProcessor . processInternal ( <nl> + String . format ( " SELECT * FROM % s . % s WHERE k = % s " , ksName , cf , key ) ) ; <nl> + assertTrue ( rs . isEmpty ( ) ) ; <nl> + } <nl> + <nl> private org . apache . cassandra . thrift . Column getColumnForInsert ( String columnName , int value ) <nl> { <nl> org . apache . cassandra . thrift . Column column = new org . apache . cassandra . thrift . Column ( ) ; <nl> @ @ - 176 , 4 + 327 , 33 @ @ public class TriggersTest extends SchemaLoader <nl> return Collections . singletonList ( rm ) ; <nl> } <nl> } <nl> + <nl> + public static class CrossPartitionTrigger implements ITrigger <nl> + { <nl> + public Collection < RowMutation > augment ( ByteBuffer key , ColumnFamily update ) <nl> + { <nl> + ColumnFamily extraUpdate = update . cloneMeShallow ( ArrayBackedSortedColumns . factory , false ) ; <nl> + extraUpdate . addColumn ( new Column ( update . metadata ( ) . comparator . fromString ( " v2 " ) , <nl> + ByteBufferUtil . bytes ( 999 ) ) ) ; <nl> + <nl> + int newKey = ByteBufferUtil . toInt ( key ) + 1000 ; <nl> + RowMutation rm = new RowMutation ( ksName , ByteBufferUtil . bytes ( newKey ) ) ; <nl> + rm . add ( extraUpdate ) ; <nl> + return Collections . singletonList ( rm ) ; <nl> + } <nl> + } <nl> + <nl> + public static class CrossTableTrigger implements ITrigger <nl> + { <nl> + public Collection < RowMutation > augment ( ByteBuffer key , ColumnFamily update ) <nl> + { <nl> + ColumnFamily extraUpdate = ArrayBackedSortedColumns . factory . create ( ksName , otherCf ) ; <nl> + extraUpdate . addColumn ( new Column ( extraUpdate . metadata ( ) . comparator . fromString ( " v2 " ) , <nl> + ByteBufferUtil . bytes ( 999 ) ) ) ; <nl> + <nl> + RowMutation rm = new RowMutation ( ksName , key ) ; <nl> + rm . add ( extraUpdate ) ; <nl> + return Collections . singletonList ( rm ) ; <nl> + } <nl> + } <nl> }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 429aef0 . . 65becfb 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 3 , 6 + 3 , 9 @ @ <nl> * add support for IN to cql SELECT , UPDATE ( CASSANDRA - 2553 ) <nl> * add timestamp support to cql INSERT , UPDATE , and BATCH ( CASSANDRA - 2555 ) <nl> <nl> + 0 . 8 . 1 <nl> + * add support for comparator parameters and a generic ReverseType <nl> + ( CASSANDRA - 2355 ) <nl> <nl> 0 . 8 . 0 - ? <nl> * faster flushes and compaction from fixing excessively pessimistic <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliClient . java b / src / java / org / apache / cassandra / cli / CliClient . java <nl> index 58d24e7 . . 2e3aa68 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliClient . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliClient . java <nl> @ @ - 602 , 7 + 602 , 7 @ @ public class CliClient <nl> / / setting value for output <nl> valueAsString = valueValidator . getString ( ByteBuffer . wrap ( columnValue ) ) ; <nl> / / updating column value validator class <nl> - updateColumnMetaData ( cfDef , columnName , valueValidator . getClass ( ) . getName ( ) ) ; <nl> + updateColumnMetaData ( cfDef , columnName , valueValidator . toString ( ) ) ; <nl> } <nl> else <nl> { <nl> @ @ - 2159 , 7 + 2159 , 7 @ @ public class CliClient <nl> / / performing ColumnDef local validator update <nl> if ( withUpdate ) <nl> { <nl> - updateColumnMetaData ( columnFamily , columnName , validator . getClass ( ) . getName ( ) ) ; <nl> + updateColumnMetaData ( columnFamily , columnName , validator . toString ( ) ) ; <nl> } <nl> <nl> return value ; <nl> diff - - git a / src / java / org / apache / cassandra / config / CFMetaData . java b / src / java / org / apache / cassandra / config / CFMetaData . java <nl> index 992c55d . . d1f8684 100644 <nl> - - - a / src / java / org / apache / cassandra / config / CFMetaData . java <nl> + + + b / src / java / org / apache / cassandra / config / CFMetaData . java <nl> @ @ - 322 , 17 + 322 , 17 @ @ public final class CFMetaData <nl> cf . keyspace = new Utf8 ( ksName ) ; <nl> cf . name = new Utf8 ( cfName ) ; <nl> cf . column _ type = new Utf8 ( cfType . name ( ) ) ; <nl> - cf . comparator _ type = new Utf8 ( comparator . getClass ( ) . getName ( ) ) ; <nl> + cf . comparator _ type = new Utf8 ( comparator . toString ( ) ) ; <nl> if ( subcolumnComparator ! = null ) <nl> - cf . subcomparator _ type = new Utf8 ( subcolumnComparator . getClass ( ) . getName ( ) ) ; <nl> + cf . subcomparator _ type = new Utf8 ( subcolumnComparator . toString ( ) ) ; <nl> cf . comment = new Utf8 ( comment ) ; <nl> cf . row _ cache _ size = rowCacheSize ; <nl> cf . key _ cache _ size = keyCacheSize ; <nl> cf . read _ repair _ chance = readRepairChance ; <nl> cf . replicate _ on _ write = replicateOnWrite ; <nl> cf . gc _ grace _ seconds = gcGraceSeconds ; <nl> - cf . default _ validation _ class = new Utf8 ( defaultValidator . getClass ( ) . getName ( ) ) ; <nl> - cf . key _ validation _ class = new Utf8 ( keyValidator . getClass ( ) . getName ( ) ) ; <nl> + cf . default _ validation _ class = new Utf8 ( defaultValidator . toString ( ) ) ; <nl> + cf . key _ validation _ class = new Utf8 ( keyValidator . toString ( ) ) ; <nl> cf . min _ compaction _ threshold = minCompactionThreshold ; <nl> cf . max _ compaction _ threshold = maxCompactionThreshold ; <nl> cf . row _ cache _ save _ period _ in _ seconds = rowCacheSavePeriodInSeconds ; <nl> @ @ - 763 , 10 + 763 , 10 @ @ public final class CFMetaData <nl> org . apache . cassandra . thrift . CfDef def = new org . apache . cassandra . thrift . CfDef ( cfm . ksName , cfm . cfName ) ; <nl> def . setId ( cfm . cfId ) ; <nl> def . setColumn _ type ( cfm . cfType . name ( ) ) ; <nl> - def . setComparator _ type ( cfm . comparator . getClass ( ) . getName ( ) ) ; <nl> + def . setComparator _ type ( cfm . comparator . toString ( ) ) ; <nl> if ( cfm . subcolumnComparator ! = null ) <nl> { <nl> - def . setSubcomparator _ type ( cfm . subcolumnComparator . getClass ( ) . getName ( ) ) ; <nl> + def . setSubcomparator _ type ( cfm . subcolumnComparator . toString ( ) ) ; <nl> def . setColumn _ type ( " Super " ) ; <nl> } <nl> def . setComment ( enforceCommentNotNull ( cfm . comment ) ) ; <nl> @ @ - 775 , 8 + 775 , 8 @ @ public final class CFMetaData <nl> def . setRead _ repair _ chance ( cfm . readRepairChance ) ; <nl> def . setReplicate _ on _ write ( cfm . replicateOnWrite ) ; <nl> def . setGc _ grace _ seconds ( cfm . gcGraceSeconds ) ; <nl> - def . setDefault _ validation _ class ( cfm . defaultValidator . getClass ( ) . getName ( ) ) ; <nl> - def . setKey _ validation _ class ( cfm . keyValidator . getClass ( ) . getName ( ) ) ; <nl> + def . setDefault _ validation _ class ( cfm . defaultValidator . toString ( ) ) ; <nl> + def . setKey _ validation _ class ( cfm . keyValidator . toString ( ) ) ; <nl> def . setMin _ compaction _ threshold ( cfm . minCompactionThreshold ) ; <nl> def . setMax _ compaction _ threshold ( cfm . maxCompactionThreshold ) ; <nl> def . setRow _ cache _ save _ period _ in _ seconds ( cfm . rowCacheSavePeriodInSeconds ) ; <nl> @ @ - 793 , 7 + 793 , 7 @ @ public final class CFMetaData <nl> tcd . setIndex _ name ( cd . getIndexName ( ) ) ; <nl> tcd . setIndex _ type ( cd . getIndexType ( ) ) ; <nl> tcd . setName ( cd . name ) ; <nl> - tcd . setValidation _ class ( cd . getValidator ( ) . getClass ( ) . getName ( ) ) ; <nl> + tcd . setValidation _ class ( cd . getValidator ( ) . toString ( ) ) ; <nl> column _ meta . add ( tcd ) ; <nl> } <nl> def . setColumn _ metadata ( column _ meta ) ; <nl> @ @ - 808 , 10 + 808 , 10 @ @ public final class CFMetaData <nl> def . keyspace = cfm . ksName ; <nl> def . id = cfm . cfId ; <nl> def . column _ type = cfm . cfType . name ( ) ; <nl> - def . comparator _ type = cfm . comparator . getClass ( ) . getName ( ) ; <nl> + def . comparator _ type = cfm . comparator . toString ( ) ; <nl> if ( cfm . subcolumnComparator ! = null ) <nl> { <nl> - def . subcomparator _ type = cfm . subcolumnComparator . getClass ( ) . getName ( ) ; <nl> + def . subcomparator _ type = cfm . subcolumnComparator . toString ( ) ; <nl> def . column _ type = " Super " ; <nl> } <nl> def . comment = enforceCommentNotNull ( cfm . comment ) ; <nl> @ @ - 820 , 7 + 820 , 7 @ @ public final class CFMetaData <nl> def . read _ repair _ chance = cfm . readRepairChance ; <nl> def . replicate _ on _ write = cfm . replicateOnWrite ; <nl> def . gc _ grace _ seconds = cfm . gcGraceSeconds ; <nl> - def . default _ validation _ class = cfm . defaultValidator = = null ? null : cfm . defaultValidator . getClass ( ) . getName ( ) ; <nl> + def . default _ validation _ class = cfm . defaultValidator = = null ? null : cfm . defaultValidator . toString ( ) ; <nl> def . min _ compaction _ threshold = cfm . minCompactionThreshold ; <nl> def . max _ compaction _ threshold = cfm . maxCompactionThreshold ; <nl> def . row _ cache _ save _ period _ in _ seconds = cfm . rowCacheSavePeriodInSeconds ; <nl> @ @ - 838 , 7 + 838 , 7 @ @ public final class CFMetaData <nl> tcd . index _ name = cd . getIndexName ( ) ; <nl> tcd . index _ type = cd . getIndexType ( ) = = null ? null : org . apache . cassandra . db . migration . avro . IndexType . valueOf ( cd . getIndexType ( ) . name ( ) ) ; <nl> tcd . name = ByteBufferUtil . clone ( cd . name ) ; <nl> - tcd . validation _ class = cd . getValidator ( ) . getClass ( ) . getName ( ) ; <nl> + tcd . validation _ class = cd . getValidator ( ) . toString ( ) ; <nl> column _ meta . add ( tcd ) ; <nl> } <nl> def . column _ metadata = column _ meta ; <nl> diff - - git a / src / java / org / apache / cassandra / config / ColumnDefinition . java b / src / java / org / apache / cassandra / config / ColumnDefinition . java <nl> index 1cb357a . . 2d77d6c 100644 <nl> - - - a / src / java / org / apache / cassandra / config / ColumnDefinition . java <nl> + + + b / src / java / org / apache / cassandra / config / ColumnDefinition . java <nl> @ @ - 79 , 7 + 79 , 7 @ @ public class ColumnDefinition <nl> { <nl> org . apache . cassandra . db . migration . avro . ColumnDef cd = new org . apache . cassandra . db . migration . avro . ColumnDef ( ) ; <nl> cd . name = name ; <nl> - cd . validation _ class = new Utf8 ( validator . getClass ( ) . getName ( ) ) ; <nl> + cd . validation _ class = new Utf8 ( validator . toString ( ) ) ; <nl> cd . index _ type = index _ type = = null ? null : <nl> Enum . valueOf ( org . apache . cassandra . db . migration . avro . IndexType . class , index _ type . name ( ) ) ; <nl> cd . index _ name = index _ name = = null ? null : new Utf8 ( index _ name ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / marshal / AbstractType . java b / src / java / org / apache / cassandra / db / marshal / AbstractType . java <nl> index 77c999c . . 30118f3 100644 <nl> - - - a / src / java / org / apache / cassandra / db / marshal / AbstractType . java <nl> + + + b / src / java / org / apache / cassandra / db / marshal / AbstractType . java <nl> @ @ - 24 , 7 + 24 , 9 @ @ package org . apache . cassandra . db . marshal ; <nl> import java . nio . ByteBuffer ; <nl> import java . util . Collection ; <nl> import java . util . Comparator ; <nl> + import java . util . Map ; <nl> <nl> + import org . apache . cassandra . config . ConfigurationException ; <nl> import org . apache . cassandra . db . IColumn ; <nl> import static org . apache . cassandra . io . sstable . IndexHelper . IndexInfo ; <nl> <nl> @ @ - 159 , 4 + 161 , 28 @ @ public abstract class AbstractType < T > implements Comparator < ByteBuffer > <nl> public abstract int getScale ( T obj ) ; <nl> public abstract int getJdbcType ( ) ; <nl> public abstract boolean needsQuotes ( ) ; <nl> + <nl> + public static AbstractType parseDefaultParameters ( AbstractType baseType , TypeParser parser ) throws ConfigurationException <nl> + { <nl> + Map < String , String > parameters = parser . getKeyValueParameters ( ) ; <nl> + String reversed = parameters . get ( " reversed " ) ; <nl> + if ( reversed ! = null & & ( reversed . isEmpty ( ) | | reversed . equals ( " true " ) ) ) <nl> + { <nl> + return ReversedType . getInstance ( baseType ) ; <nl> + } <nl> + else <nl> + { <nl> + return baseType ; <nl> + } <nl> + } <nl> + <nl> + / * * <nl> + * This must be overriden by subclasses if necessary so that for any <nl> + * AbstractType , this = = TypeParser . parse ( toString ( ) ) . <nl> + * / <nl> + @ Override <nl> + public String toString ( ) <nl> + { <nl> + return getClass ( ) . getName ( ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / marshal / ReversedType . java b / src / java / org / apache / cassandra / db / marshal / ReversedType . java <nl> new file mode 100644 <nl> index 0000000 . . 8963b7b <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / db / marshal / ReversedType . java <nl> @ @ - 0 , 0 + 1 , 129 @ @ <nl> + / * * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + package org . apache . cassandra . db . marshal ; <nl> + <nl> + import java . nio . ByteBuffer ; <nl> + import java . util . HashMap ; <nl> + import java . util . Map ; <nl> + <nl> + public class ReversedType < T > extends AbstractType < T > <nl> + { <nl> + / / interning instances <nl> + private static final Map < AbstractType , ReversedType > instances = new HashMap < AbstractType , ReversedType > ( ) ; <nl> + <nl> + / / package protected for unit tests sake <nl> + final AbstractType < T > baseType ; <nl> + <nl> + public static synchronized < T > ReversedType < T > getInstance ( AbstractType < T > baseType ) <nl> + { <nl> + ReversedType type = instances . get ( baseType ) ; <nl> + if ( type = = null ) <nl> + { <nl> + type = new ReversedType ( baseType ) ; <nl> + instances . put ( baseType , type ) ; <nl> + } <nl> + return ( ReversedType < T > ) type ; <nl> + } <nl> + <nl> + private ReversedType ( AbstractType < T > baseType ) <nl> + { <nl> + this . baseType = baseType ; <nl> + } <nl> + <nl> + public int compare ( ByteBuffer o1 , ByteBuffer o2 ) <nl> + { <nl> + return - baseType . compare ( o1 , o2 ) ; <nl> + } <nl> + <nl> + public String getString ( ByteBuffer bytes ) <nl> + { <nl> + return baseType . getString ( bytes ) ; <nl> + } <nl> + <nl> + public ByteBuffer fromString ( String source ) <nl> + { <nl> + return baseType . fromString ( source ) ; <nl> + } <nl> + <nl> + public void validate ( ByteBuffer bytes ) throws MarshalException <nl> + { <nl> + baseType . validate ( bytes ) ; <nl> + } <nl> + <nl> + public T compose ( ByteBuffer bytes ) <nl> + { <nl> + return baseType . compose ( bytes ) ; <nl> + } <nl> + <nl> + public ByteBuffer decompose ( T value ) <nl> + { <nl> + return baseType . decompose ( value ) ; <nl> + } <nl> + <nl> + public Class < T > getType ( ) <nl> + { <nl> + return baseType . getType ( ) ; <nl> + } <nl> + <nl> + public String toString ( T t ) <nl> + { <nl> + return baseType . toString ( t ) ; <nl> + } <nl> + <nl> + public boolean isSigned ( ) <nl> + { <nl> + return baseType . isSigned ( ) ; <nl> + } <nl> + <nl> + public boolean isCaseSensitive ( ) <nl> + { <nl> + return baseType . isCaseSensitive ( ) ; <nl> + } <nl> + <nl> + public boolean isCurrency ( ) <nl> + { <nl> + return baseType . isCurrency ( ) ; <nl> + } <nl> + <nl> + public int getPrecision ( T obj ) <nl> + { <nl> + return baseType . getPrecision ( obj ) ; <nl> + } <nl> + <nl> + public int getScale ( T obj ) <nl> + { <nl> + return baseType . getScale ( obj ) ; <nl> + } <nl> + <nl> + public int getJdbcType ( ) <nl> + { <nl> + return baseType . getJdbcType ( ) ; <nl> + } <nl> + <nl> + public boolean needsQuotes ( ) <nl> + { <nl> + return baseType . needsQuotes ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public String toString ( ) <nl> + { <nl> + return getClass ( ) . getName ( ) + " ( " + baseType + " ) " ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / db / marshal / TypeParser . java b / src / java / org / apache / cassandra / db / marshal / TypeParser . java <nl> new file mode 100644 <nl> index 0000000 . . 2efe30a <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / db / marshal / TypeParser . java <nl> @ @ - 0 , 0 + 1 , 430 @ @ <nl> + / * * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + package org . apache . cassandra . db . marshal ; <nl> + <nl> + import java . lang . reflect . Field ; <nl> + import java . lang . reflect . InvocationTargetException ; <nl> + import java . lang . reflect . Method ; <nl> + import java . util . ArrayList ; <nl> + import java . util . HashMap ; <nl> + import java . util . Iterator ; <nl> + import java . util . List ; <nl> + import java . util . Map ; <nl> + <nl> + import org . apache . cassandra . config . ConfigurationException ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> + <nl> + / * * <nl> + * Parse a string containing an Type definition . <nl> + * / <nl> + public class TypeParser <nl> + { <nl> + private final String str ; <nl> + private int idx ; <nl> + <nl> + / / A cache of parsed string , specially useful for DynamicCompositeType <nl> + private static final Map < String , AbstractType > cache = new HashMap < String , AbstractType > ( ) ; <nl> + <nl> + public static final TypeParser EMPTY _ PARSER = new TypeParser ( " " , 0 ) ; <nl> + <nl> + private TypeParser ( String str , int idx ) <nl> + { <nl> + this . str = str ; <nl> + this . idx = idx ; <nl> + } <nl> + <nl> + / * * <nl> + * Parse a string containing an type definition . <nl> + * / <nl> + public static AbstractType parse ( String str ) throws ConfigurationException <nl> + { <nl> + if ( str = = null ) <nl> + return BytesType . instance ; <nl> + <nl> + AbstractType type = cache . get ( str ) ; <nl> + <nl> + if ( type ! = null ) <nl> + return type ; <nl> + <nl> + / / This could be simplier ( i . e . new TypeParser ( str ) . parse ( ) ) but we avoid creating a TypeParser object if not really necessary . <nl> + int i = 0 ; <nl> + i = skipBlank ( str , i ) ; <nl> + int j = i ; <nl> + while ( ! isEOS ( str , i ) & & isIdentifierChar ( str . charAt ( i ) ) ) <nl> + + + i ; <nl> + <nl> + if ( i = = j ) <nl> + return BytesType . instance ; <nl> + <nl> + String name = str . substring ( j , i ) ; <nl> + i = skipBlank ( str , i ) ; <nl> + <nl> + if ( ! isEOS ( str , i ) & & str . charAt ( i ) = = ' ( ' ) <nl> + type = getAbstractType ( name , new TypeParser ( str , i ) ) ; <nl> + else <nl> + type = getAbstractType ( name ) ; <nl> + <nl> + / / We don ' t really care about concurrency here . Worst case scenario , we do some parsing unnecessarily <nl> + cache . put ( str , type ) ; <nl> + return type ; <nl> + } <nl> + <nl> + / * * <nl> + * Parse an AbstractType from current position of this parser . <nl> + * / <nl> + private AbstractType parse ( ) throws ConfigurationException <nl> + { <nl> + skipBlank ( ) ; <nl> + String name = readNextIdentifier ( ) ; <nl> + <nl> + skipBlank ( ) ; <nl> + if ( ! isEOS ( ) & & str . charAt ( idx ) = = ' ( ' ) <nl> + return getAbstractType ( name , this ) ; <nl> + else <nl> + return getAbstractType ( name ) ; <nl> + } <nl> + <nl> + public Map < String , String > getKeyValueParameters ( ) throws ConfigurationException <nl> + { <nl> + Map < String , String > map = new HashMap < String , String > ( ) ; <nl> + <nl> + if ( isEOS ( ) ) <nl> + return map ; <nl> + <nl> + if ( str . charAt ( idx ) ! = ' ( ' ) <nl> + throw new IllegalStateException ( ) ; <nl> + <nl> + + + idx ; / / skipping ' ( ' <nl> + <nl> + while ( skipBlankAndComma ( ) ) <nl> + { <nl> + if ( str . charAt ( idx ) = = ' ) ' ) <nl> + { <nl> + + + idx ; <nl> + return map ; <nl> + } <nl> + <nl> + String k = readNextIdentifier ( ) ; <nl> + String v = " " ; <nl> + skipBlank ( ) ; <nl> + if ( str . charAt ( idx ) = = ' = ' ) <nl> + { <nl> + + + idx ; <nl> + skipBlank ( ) ; <nl> + v = readNextIdentifier ( ) ; <nl> + } <nl> + else if ( str . charAt ( idx ) ! = ' , ' & & str . charAt ( idx ) ! = ' ) ' ) <nl> + { <nl> + throwSyntaxError ( " unexpected character ' " + str . charAt ( idx ) + " ' " ) ; <nl> + } <nl> + map . put ( k , v ) ; <nl> + } <nl> + throw new ConfigurationException ( String . format ( " Syntax error parsing ' % s ' at char % d : unexpected end of string " , str , idx ) ) ; <nl> + } <nl> + <nl> + public List < AbstractType > getTypeParameters ( ) throws ConfigurationException <nl> + { <nl> + List < AbstractType > list = new ArrayList < AbstractType > ( ) ; <nl> + <nl> + if ( isEOS ( ) ) <nl> + return list ; <nl> + <nl> + if ( str . charAt ( idx ) ! = ' ( ' ) <nl> + throw new IllegalStateException ( ) ; <nl> + <nl> + + + idx ; / / skipping ' ( ' <nl> + <nl> + while ( skipBlankAndComma ( ) ) <nl> + { <nl> + if ( str . charAt ( idx ) = = ' ) ' ) <nl> + { <nl> + + + idx ; <nl> + return list ; <nl> + } <nl> + <nl> + try <nl> + { <nl> + list . add ( parse ( ) ) ; <nl> + } <nl> + catch ( ConfigurationException e ) <nl> + { <nl> + ConfigurationException ex = new ConfigurationException ( String . format ( " Exception while parsing ' % s ' around char % d " , str , idx ) ) ; <nl> + ex . initCause ( e ) ; <nl> + throw ex ; <nl> + } <nl> + } <nl> + throw new ConfigurationException ( String . format ( " Syntax error parsing ' % s ' at char % d : unexpected end of string " , str , idx ) ) ; <nl> + } <nl> + <nl> + public Map < Byte , AbstractType > getAliasParameters ( ) throws ConfigurationException <nl> + { <nl> + Map < Byte , AbstractType > map = new HashMap < Byte , AbstractType > ( ) ; <nl> + <nl> + if ( isEOS ( ) ) <nl> + return map ; <nl> + <nl> + if ( str . charAt ( idx ) ! = ' ( ' ) <nl> + throw new IllegalStateException ( ) ; <nl> + <nl> + + + idx ; / / skipping ' ( ' <nl> + <nl> + <nl> + while ( skipBlankAndComma ( ) ) <nl> + { <nl> + if ( str . charAt ( idx ) = = ' ) ' ) <nl> + { <nl> + + + idx ; <nl> + return map ; <nl> + } <nl> + <nl> + String alias = readNextIdentifier ( ) ; <nl> + if ( alias . length ( ) ! = 1 ) <nl> + throwSyntaxError ( " An alias should be a single character " ) ; <nl> + char aliasChar = alias . charAt ( 0 ) ; <nl> + if ( aliasChar < 33 | | aliasChar > 127 ) <nl> + throwSyntaxError ( " An alias should be a single character in [ 0 . . 9a . . bA . . B - + . _ & ] " ) ; <nl> + <nl> + skipBlank ( ) ; <nl> + if ( ! ( str . charAt ( idx ) = = ' = ' & & str . charAt ( idx + 1 ) = = ' > ' ) ) <nl> + throwSyntaxError ( " expecting ' = > ' token " ) ; <nl> + <nl> + idx + = 2 ; <nl> + skipBlank ( ) ; <nl> + try <nl> + { <nl> + map . put ( ( byte ) aliasChar , parse ( ) ) ; <nl> + } <nl> + catch ( ConfigurationException e ) <nl> + { <nl> + ConfigurationException ex = new ConfigurationException ( String . format ( " Exception while parsing ' % s ' around char % d " , str , idx ) ) ; <nl> + ex . initCause ( e ) ; <nl> + throw ex ; <nl> + } <nl> + } <nl> + throw new ConfigurationException ( String . format ( " Syntax error parsing ' % s ' at char % d : unexpected end of string " , str , idx ) ) ; <nl> + } <nl> + <nl> + private static AbstractType getAbstractType ( String compareWith ) throws ConfigurationException <nl> + { <nl> + String className = compareWith . contains ( " . " ) ? compareWith : " org . apache . cassandra . db . marshal . " + compareWith ; <nl> + Class < ? extends AbstractType > typeClass = FBUtilities . < AbstractType > classForName ( className , " abstract - type " ) ; <nl> + try <nl> + { <nl> + Field field = typeClass . getDeclaredField ( " instance " ) ; <nl> + return ( AbstractType ) field . get ( null ) ; <nl> + } <nl> + catch ( NoSuchFieldException e ) <nl> + { <nl> + / / Trying with empty parser <nl> + return getRawAbstractType ( typeClass , EMPTY _ PARSER ) ; <nl> + } <nl> + catch ( IllegalAccessException e ) <nl> + { <nl> + / / Trying with empty parser <nl> + return getRawAbstractType ( typeClass , EMPTY _ PARSER ) ; <nl> + } <nl> + } <nl> + <nl> + private static AbstractType getAbstractType ( String compareWith , TypeParser parser ) throws ConfigurationException <nl> + { <nl> + String className = compareWith . contains ( " . " ) ? compareWith : " org . apache . cassandra . db . marshal . " + compareWith ; <nl> + Class < ? extends AbstractType > typeClass = FBUtilities . < AbstractType > classForName ( className , " abstract - type " ) ; <nl> + try <nl> + { <nl> + Method method = typeClass . getDeclaredMethod ( " getInstance " , TypeParser . class ) ; <nl> + return ( AbstractType ) method . invoke ( null , parser ) ; <nl> + } <nl> + catch ( NoSuchMethodException e ) <nl> + { <nl> + / / Trying to see if we have an instance field and apply the default parameter to it <nl> + AbstractType type = getRawAbstractType ( typeClass ) ; <nl> + return AbstractType . parseDefaultParameters ( type , parser ) ; <nl> + } <nl> + catch ( IllegalAccessException e ) <nl> + { <nl> + / / Trying to see if we have an instance field and apply the default parameter to it <nl> + AbstractType type = getRawAbstractType ( typeClass ) ; <nl> + return AbstractType . parseDefaultParameters ( type , parser ) ; <nl> + } <nl> + catch ( InvocationTargetException e ) <nl> + { <nl> + ConfigurationException ex = new ConfigurationException ( " Invalid definition for comparator " + typeClass . getName ( ) + " . " ) ; <nl> + ex . initCause ( e . getTargetException ( ) ) ; <nl> + throw ex ; <nl> + } <nl> + } <nl> + <nl> + private static AbstractType getRawAbstractType ( Class < ? extends AbstractType > typeClass ) throws ConfigurationException <nl> + { <nl> + try <nl> + { <nl> + Field field = typeClass . getDeclaredField ( " instance " ) ; <nl> + return ( AbstractType ) field . get ( null ) ; <nl> + } <nl> + catch ( NoSuchFieldException e ) <nl> + { <nl> + throw new ConfigurationException ( " Invalid comparator class " + typeClass . getName ( ) + " : must define a public static instance field or a public static method getInstance ( TypeParser ) . " ) ; <nl> + } <nl> + catch ( IllegalAccessException e ) <nl> + { <nl> + throw new ConfigurationException ( " Invalid comparator class " + typeClass . getName ( ) + " : must define a public static instance field or a public static method getInstance ( TypeParser ) . " ) ; <nl> + } <nl> + } <nl> + <nl> + private static AbstractType getRawAbstractType ( Class < ? extends AbstractType > typeClass , TypeParser parser ) throws ConfigurationException <nl> + { <nl> + try <nl> + { <nl> + Method method = typeClass . getDeclaredMethod ( " getInstance " , TypeParser . class ) ; <nl> + return ( AbstractType ) method . invoke ( null , parser ) ; <nl> + } <nl> + catch ( NoSuchMethodException e ) <nl> + { <nl> + throw new ConfigurationException ( " Invalid comparator class " + typeClass . getName ( ) + " : must define a public static instance field or a public static method getInstance ( TypeParser ) . " ) ; <nl> + } <nl> + catch ( IllegalAccessException e ) <nl> + { <nl> + throw new ConfigurationException ( " Invalid comparator class " + typeClass . getName ( ) + " : must define a public static instance field or a public static method getInstance ( TypeParser ) . " ) ; <nl> + } <nl> + catch ( InvocationTargetException e ) <nl> + { <nl> + ConfigurationException ex = new ConfigurationException ( " Invalid definition for comparator " + typeClass . getName ( ) + " . " ) ; <nl> + ex . initCause ( e . getTargetException ( ) ) ; <nl> + throw ex ; <nl> + } <nl> + } <nl> + <nl> + private void throwSyntaxError ( String msg ) throws ConfigurationException <nl> + { <nl> + throw new ConfigurationException ( String . format ( " Syntax error parsing ' % s ' at char % d : % s " , str , idx , msg ) ) ; <nl> + } <nl> + <nl> + private boolean isEOS ( ) <nl> + { <nl> + return isEOS ( str , idx ) ; <nl> + } <nl> + <nl> + private static boolean isEOS ( String str , int i ) <nl> + { <nl> + return i > = str . length ( ) ; <nl> + } <nl> + <nl> + private static boolean isBlank ( int c ) <nl> + { <nl> + return c = = ' ' | | c = = ' \ t ' | | c = = ' \ n ' ; <nl> + } <nl> + <nl> + private void skipBlank ( ) <nl> + { <nl> + idx = skipBlank ( str , idx ) ; <nl> + } <nl> + <nl> + private static int skipBlank ( String str , int i ) <nl> + { <nl> + while ( ! isEOS ( str , i ) & & isBlank ( str . charAt ( i ) ) ) <nl> + + + i ; <nl> + <nl> + return i ; <nl> + } <nl> + <nl> + / / skip all blank and at best one comma , return true if there not EOS <nl> + private boolean skipBlankAndComma ( ) <nl> + { <nl> + boolean commaFound = false ; <nl> + while ( ! isEOS ( ) ) <nl> + { <nl> + int c = str . charAt ( idx ) ; <nl> + if ( c = = ' , ' ) <nl> + { <nl> + if ( commaFound ) <nl> + return true ; <nl> + else <nl> + commaFound = true ; <nl> + } <nl> + else if ( ! isBlank ( c ) ) <nl> + { <nl> + return true ; <nl> + } <nl> + + + idx ; <nl> + } <nl> + return false ; <nl> + } <nl> + <nl> + / * <nl> + * [ 0 . . 9a . . bA . . B - + . _ & ] <nl> + * / <nl> + private static boolean isIdentifierChar ( int c ) <nl> + { <nl> + return ( c > = ' 0 ' & & c < = ' 9 ' ) <nl> + | | ( c > = ' a ' & & c < = ' z ' ) | | ( c > = ' A ' & & c < = ' Z ' ) <nl> + | | c = = ' - ' | | c = = ' + ' | | c = = ' . ' | | c = = ' _ ' | | c = = ' & ' ; <nl> + } <nl> + <nl> + / / left idx positioned on the character stopping the read <nl> + private String readNextIdentifier ( ) <nl> + { <nl> + int i = idx ; <nl> + while ( ! isEOS ( ) & & isIdentifierChar ( str . charAt ( idx ) ) ) <nl> + + + idx ; <nl> + <nl> + return str . substring ( i , idx ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Helper function to ease the writing of AbstractType . toString ( ) methods . <nl> + * / <nl> + public static String stringifyAliasesParameters ( Map < Byte , AbstractType > aliases ) <nl> + { <nl> + StringBuilder sb = new StringBuilder ( ) ; <nl> + sb . append ( ' ( ' ) ; <nl> + Iterator < Map . Entry < Byte , AbstractType > > iter = aliases . entrySet ( ) . iterator ( ) ; <nl> + if ( iter . hasNext ( ) ) <nl> + { <nl> + Map . Entry < Byte , AbstractType > entry = iter . next ( ) ; <nl> + sb . append ( ( char ) ( byte ) entry . getKey ( ) ) . append ( " = > " ) . append ( entry . getValue ( ) ) ; <nl> + } <nl> + while ( iter . hasNext ( ) ) <nl> + { <nl> + Map . Entry < Byte , AbstractType > entry = iter . next ( ) ; <nl> + sb . append ( ' , ' ) . append ( ( char ) ( byte ) entry . getKey ( ) ) . append ( " = > " ) . append ( entry . getValue ( ) ) ; <nl> + } <nl> + sb . append ( ' ) ' ) ; <nl> + return sb . toString ( ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Helper function to ease the writing of AbstractType . toString ( ) methods . <nl> + * / <nl> + public static String stringifyTypeParameters ( List < AbstractType > types ) <nl> + { <nl> + StringBuilder sb = new StringBuilder ( ) ; <nl> + sb . append ( ' ( ' ) ; <nl> + Iterator < AbstractType > iter = types . iterator ( ) ; <nl> + if ( iter . hasNext ( ) ) <nl> + { <nl> + sb . append ( iter . next ( ) ) ; <nl> + } <nl> + while ( iter . hasNext ( ) ) <nl> + { <nl> + sb . append ( ' , ' ) . append ( iter . next ( ) ) ; <nl> + } <nl> + sb . append ( ' ) ' ) ; <nl> + return sb . toString ( ) ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / utils / FBUtilities . java b / src / java / org / apache / cassandra / utils / FBUtilities . java <nl> index f38e152 . . cd3f9c3 100644 <nl> - - - a / src / java / org / apache / cassandra / utils / FBUtilities . java <nl> + + + b / src / java / org / apache / cassandra / utils / FBUtilities . java <nl> @ @ - 44 , 6 + 44 , 7 @ @ import org . apache . cassandra . config . ConfigurationException ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . DecoratedKey ; <nl> import org . apache . cassandra . db . marshal . AbstractType ; <nl> + import org . apache . cassandra . db . marshal . TypeParser ; <nl> import org . apache . cassandra . dht . IPartitioner ; <nl> import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . dht . Token ; <nl> @ @ - 523 , 25 + 524 , 7 @ @ public class FBUtilities <nl> <nl> public static AbstractType getComparator ( String compareWith ) throws ConfigurationException <nl> { <nl> - String className = compareWith . contains ( " . " ) ? compareWith : " org . apache . cassandra . db . marshal . " + compareWith ; <nl> - Class < ? extends AbstractType > typeClass = FBUtilities . < AbstractType > classForName ( className , " abstract - type " ) ; <nl> - try <nl> - { <nl> - Field field = typeClass . getDeclaredField ( " instance " ) ; <nl> - return ( AbstractType ) field . get ( null ) ; <nl> - } <nl> - catch ( NoSuchFieldException e ) <nl> - { <nl> - ConfigurationException ex = new ConfigurationException ( " Invalid comparator " + compareWith + " : must define a public static instance field . " ) ; <nl> - ex . initCause ( e ) ; <nl> - throw ex ; <nl> - } <nl> - catch ( IllegalAccessException e ) <nl> - { <nl> - ConfigurationException ex = new ConfigurationException ( " Invalid comparator " + compareWith + " : must define a public static instance field . " ) ; <nl> - ex . initCause ( e ) ; <nl> - throw ex ; <nl> - } <nl> + return TypeParser . parse ( compareWith ) ; <nl> } <nl> <nl> / * * <nl> diff - - git a / test / unit / org / apache / cassandra / db / marshal / TypeParserTest . java b / test / unit / org / apache / cassandra / db / marshal / TypeParserTest . java <nl> new file mode 100644 <nl> index 0000000 . . ff60676 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / db / marshal / TypeParserTest . java <nl> @ @ - 0 , 0 + 1 , 93 @ @ <nl> + / * * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + package org . apache . cassandra . db . marshal ; <nl> + <nl> + import java . nio . ByteBuffer ; <nl> + import java . util . Iterator ; <nl> + import java . util . HashMap ; <nl> + import java . util . Map ; <nl> + import java . util . UUID ; <nl> + <nl> + import org . junit . Test ; <nl> + import static org . junit . Assert . fail ; <nl> + <nl> + import org . apache . cassandra . CleanupHelper ; <nl> + import org . apache . cassandra . Util ; <nl> + import org . apache . cassandra . config . ConfigurationException ; <nl> + import org . apache . cassandra . db . * ; <nl> + import org . apache . cassandra . db . columniterator . IdentityQueryFilter ; <nl> + import org . apache . cassandra . db . filter . QueryFilter ; <nl> + import org . apache . cassandra . db . filter . QueryPath ; <nl> + import org . apache . cassandra . utils . * ; <nl> + <nl> + public class TypeParserTest <nl> + { <nl> + @ Test <nl> + public void testParse ( ) throws ConfigurationException <nl> + { <nl> + AbstractType type ; <nl> + <nl> + type = TypeParser . parse ( null ) ; <nl> + assert type = = BytesType . instance ; <nl> + <nl> + type = TypeParser . parse ( " " ) ; <nl> + assert type = = BytesType . instance ; <nl> + <nl> + type = TypeParser . parse ( " " ) ; <nl> + assert type = = BytesType . instance ; <nl> + <nl> + type = TypeParser . parse ( " LongType " ) ; <nl> + assert type = = LongType . instance ; <nl> + <nl> + type = TypeParser . parse ( " LongType " ) ; <nl> + assert type = = LongType . instance ; <nl> + <nl> + type = TypeParser . parse ( " LongType ( ) " ) ; <nl> + assert type = = LongType . instance ; <nl> + <nl> + type = TypeParser . parse ( " LongType ( reversed = false ) " ) ; <nl> + assert type = = LongType . instance ; <nl> + <nl> + type = TypeParser . parse ( " LongType ( reversed = true ) " ) ; <nl> + assert type = = ReversedType . getInstance ( LongType . instance ) ; <nl> + assert ( ( ReversedType ) type ) . baseType = = LongType . instance ; <nl> + <nl> + type = TypeParser . parse ( " LongType ( reversed ) " ) ; <nl> + assert type = = ReversedType . getInstance ( LongType . instance ) ; <nl> + assert ( ( ReversedType ) type ) . baseType = = LongType . instance ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testParseError ( ) throws ConfigurationException <nl> + { <nl> + try <nl> + { <nl> + TypeParser . parse ( " y " ) ; <nl> + fail ( " Should not pass " ) ; <nl> + } <nl> + catch ( ConfigurationException e ) { } <nl> + <nl> + try <nl> + { <nl> + TypeParser . parse ( " LongType ( reversed @ ) " ) ; <nl> + fail ( " Should not pass " ) ; <nl> + } <nl> + catch ( ConfigurationException e ) { } <nl> + } <nl> + }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index e738a2e . . 9caca38 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 17 , 6 + 17 , 7 @ @ 
+ * Properly use the Paxos consistency for ( non - protocol ) batch ( CASSANDRA - 6837 ) 
+ * Add paranoid disk failure option ( CASSANDRA - 6646 ) 
+ * Improve PerRowSecondaryIndex performance ( CASSANDRA - 6876 ) 
+ + * Extend triggers to support CAS updates ( CASSANDRA - 6882 ) 
+ Merged from 1 . 2 : 
+ * add extra SSL cipher suites ( CASSANDRA - 6613 ) 
+ * fix nodetool getsstables for blob PK ( CASSANDRA - 6803 ) 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index a5542e6 . . fda9819 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 234 , 6 + 234 , 16 @ @ public class StorageProxy implements StorageProxyMBean 
+ 
+ / / finish the paxos round w / the desired updates 
+ / / TODO turn null updates into delete ? 
+ + 
+ + / / Apply triggers to cas updates . A consideration here is that 
+ + / / triggers emit RowMutations , and so a given trigger implementation 
+ + / / may generate mutations for partitions other than the one this 
+ + / / paxos round is scoped for . In this case , TriggerExecutor will 
+ + / / validate that the generated mutations are targetted at the same 
+ + / / partition as the initial updates and reject ( via an 
+ + / / InvalidRequestException ) any which aren ' t . 
+ + updates = TriggerExecutor . instance . execute ( key , updates ) ; 
+ + 
+ Commit proposal = Commit . newProposal ( key , ballot , updates ) ; 
+ Tracing . trace ( " CAS precondition is met ; proposing client - requested updates for { } " , ballot ) ; 
+ if ( proposePaxos ( proposal , liveEndpoints , requiredParticipants , true ) ) 
+ diff - - git a / src / java / org / apache / cassandra / triggers / TriggerExecutor . java b / src / java / org / apache / cassandra / triggers / TriggerExecutor . java 
+ index 4b3c24a . . 8ccf937 100644 
+ - - - a / src / java / org / apache / cassandra / triggers / TriggerExecutor . java 
+ + + + b / src / java / org / apache / cassandra / triggers / TriggerExecutor . java 
+ @ @ - 23 , 6 + 23 , 7 @ @ import java . nio . ByteBuffer ; 
+ import java . util . Collection ; 
+ import java . util . List ; 
+ import java . util . Map ; 
+ + import java . util . UUID ; 
+ 
+ import com . google . common . collect . Lists ; 
+ import com . google . common . collect . Maps ; 
+ @ @ - 33 , 8 + 34 , 10 @ @ import org . apache . cassandra . db . ColumnFamily ; 
+ import org . apache . cassandra . db . CounterMutation ; 
+ import org . apache . cassandra . db . IMutation ; 
+ import org . apache . cassandra . db . RowMutation ; 
+ + import org . apache . cassandra . db . marshal . AbstractType ; 
+ import org . apache . cassandra . exceptions . InvalidRequestException ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . apache . cassandra . utils . HeapAllocator ; 
+ 
+ public class TriggerExecutor 
+ { 
+ @ @ - 62 , 6 + 65 , 21 @ @ public class TriggerExecutor 
+ cachedTriggers . clear ( ) ; 
+ } 
+ 
+ + public ColumnFamily execute ( ByteBuffer key , ColumnFamily updates ) throws InvalidRequestException 
+ + { 
+ + List < RowMutation > intermediate = executeInternal ( key , updates ) ; 
+ + if ( intermediate = = null ) 
+ + return updates ; 
+ + 
+ + validateForSinglePartition ( updates . metadata ( ) . getKeyValidator ( ) , updates . id ( ) , key , intermediate ) ; 
+ + 
+ + for ( RowMutation mutation : intermediate ) 
+ + for ( ColumnFamily cf : mutation . getColumnFamilies ( ) ) 
+ + updates . addAll ( cf , HeapAllocator . instance ) ; 
+ + 
+ + return updates ; 
+ + } 
+ + 
+ public Collection < RowMutation > execute ( Collection < ? extends IMutation > updates ) throws InvalidRequestException 
+ { 
+ boolean hasCounters = false ; 
+ @ @ - 70 , 7 + 88 , 7 @ @ public class TriggerExecutor 
+ { 
+ for ( ColumnFamily cf : mutation . getColumnFamilies ( ) ) 
+ { 
+ - List < RowMutation > intermediate = execute ( mutation . key ( ) , cf ) ; 
+ + List < RowMutation > intermediate = executeInternal ( mutation . key ( ) , cf ) ; 
+ if ( intermediate = = null ) 
+ continue ; 
+ 
+ @ @ - 88 , 6 + 106 , 24 @ @ public class TriggerExecutor 
+ return tmutations ; 
+ } 
+ 
+ + private void validateForSinglePartition ( AbstractType < ? > keyValidator , 
+ + UUID cfId , 
+ + ByteBuffer key , 
+ + Collection < RowMutation > tmutations ) 
+ + throws InvalidRequestException 
+ + { 
+ + for ( RowMutation mutation : tmutations ) 
+ + { 
+ + if ( keyValidator . compare ( mutation . key ( ) , key ) ! = 0 ) 
+ + throw new InvalidRequestException ( " Partition key of additional mutation does not match primary update key " ) ; 
+ + 
+ + for ( ColumnFamily cf : mutation . getColumnFamilies ( ) ) 
+ + if ( ! cf . id ( ) . equals ( cfId ) ) 
+ + throw new InvalidRequestException ( " Column family of additional mutation does not match primary update cf " ) ; 
+ + } 
+ + validate ( tmutations ) ; 
+ + } 
+ + 
+ private void validate ( Collection < RowMutation > tmutations ) throws InvalidRequestException 
+ { 
+ for ( RowMutation mutation : tmutations ) 
+ @ @ - 103 , 7 + 139 , 7 @ @ public class TriggerExecutor 
+ * Switch class loader before using the triggers for the column family , if 
+ * not loaded them with the custom class loader . 
+ * / 
+ - private List < RowMutation > execute ( ByteBuffer key , ColumnFamily columnFamily ) 
+ + private List < RowMutation > executeInternal ( ByteBuffer key , ColumnFamily columnFamily ) 
+ { 
+ Map < String , TriggerDefinition > triggers = columnFamily . metadata ( ) . getTriggers ( ) ; 
+ if ( triggers . isEmpty ( ) ) 
+ diff - - git a / test / unit / org / apache / cassandra / triggers / TriggersTest . java b / test / unit / org / apache / cassandra / triggers / TriggersTest . java 
+ index 6ca3880 . . 5b9b27d 100644 
+ - - - a / test / unit / org / apache / cassandra / triggers / TriggersTest . java 
+ + + + b / test / unit / org / apache / cassandra / triggers / TriggersTest . java 
+ @ @ - 35 , 10 + 35 , 12 @ @ import org . apache . cassandra . db . Column ; 
+ import org . apache . cassandra . db . ColumnFamily ; 
+ import org . apache . cassandra . db . ConsistencyLevel ; 
+ import org . apache . cassandra . db . RowMutation ; 
+ + import org . apache . cassandra . exceptions . RequestExecutionException ; 
+ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . thrift . Cassandra ; 
+ import org . apache . cassandra . thrift . ColumnOrSuperColumn ; 
+ import org . apache . cassandra . thrift . ColumnParent ; 
+ + import org . apache . cassandra . thrift . InvalidRequestException ; 
+ import org . apache . cassandra . thrift . Mutation ; 
+ import org . apache . cassandra . thrift . TFramedTransportFactory ; 
+ import org . apache . cassandra . thrift . ThriftServer ; 
+ @ @ - 46 , 6 + 48 , 7 @ @ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . thrift . protocol . TBinaryProtocol ; 
+ 
+ import static org . junit . Assert . assertEquals ; 
+ + import static org . junit . Assert . assertTrue ; 
+ 
+ public class TriggersTest extends SchemaLoader 
+ { 
+ @ @ - 54 , 6 + 57 , 7 @ @ public class TriggersTest extends SchemaLoader 
+ 
+ private static String ksName = " triggers _ test _ ks " ; 
+ private static String cfName = " test _ table " ; 
+ + private static String otherCf = " other _ table " ; 
+ 
+ @ Before 
+ public void setup ( ) throws Exception 
+ @ @ - 73 , 6 + 77 , 9 @ @ public class TriggersTest extends SchemaLoader 
+ cql = String . format ( " CREATE TABLE IF NOT EXISTS % s . % s ( k int , v1 int , v2 int , PRIMARY KEY ( k ) ) " , ksName , cfName ) ; 
+ QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; 
+ 
+ + cql = String . format ( " CREATE TABLE IF NOT EXISTS % s . % s ( k int , v1 int , v2 int , PRIMARY KEY ( k ) ) " , ksName , otherCf ) ; 
+ + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; 
+ + 
+ / / no conditional execution of create trigger stmt yet 
+ if ( ! triggerCreated ) 
+ { 
+ @ @ - 148 , 13 + 155 , 157 @ @ public class TriggersTest extends SchemaLoader 
+ assertUpdateIsAugmented ( 3 ) ; 
+ } 
+ 
+ + @ Test 
+ + public void executeTriggerOnCqlInsertWithConditions ( ) throws Exception 
+ + { 
+ + String cql = String . format ( " INSERT INTO % s . % s ( k , v1 ) VALUES ( 4 , 4 ) IF NOT EXISTS " , ksName , cfName ) ; 
+ + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; 
+ + assertUpdateIsAugmented ( 4 ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void executeTriggerOnCqlBatchWithConditions ( ) throws Exception 
+ + { 
+ + String cql = String . format ( " BEGIN BATCH " + 
+ + " INSERT INTO % 1 $ s . % 2 $ s ( k , v1 ) VALUES ( 5 , 5 ) IF NOT EXISTS ; " + 
+ + " INSERT INTO % 1 $ s . % 2 $ s ( k , v1 ) VALUES ( 5 , 5 ) ; " + 
+ + " APPLY BATCH " , 
+ + ksName , cfName ) ; 
+ + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; 
+ + assertUpdateIsAugmented ( 5 ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void executeTriggerOnThriftCASOperation ( ) throws Exception 
+ + { 
+ + Cassandra . Client client = new Cassandra . Client ( 
+ + new TBinaryProtocol ( 
+ + new TFramedTransportFactory ( ) . openTransport ( 
+ + InetAddress . getLocalHost ( ) . getHostName ( ) , 9170 ) ) ) ; 
+ + client . set _ keyspace ( ksName ) ; 
+ + client . cas ( ByteBufferUtil . bytes ( 6 ) , 
+ + cfName , 
+ + Collections . EMPTY _ LIST , 
+ + Collections . singletonList ( getColumnForInsert ( " v1 " , 6 ) ) , 
+ + org . apache . cassandra . thrift . ConsistencyLevel . LOCAL _ SERIAL , 
+ + org . apache . cassandra . thrift . ConsistencyLevel . ONE ) ; 
+ + 
+ + assertUpdateIsAugmented ( 6 ) ; 
+ + } 
+ + 
+ + / / Unfortunately , an IRE thrown from StorageProxy . cas 
+ + / / results in a RuntimeException from QueryProcessor . process 
+ + @ Test ( expected = RuntimeException . class ) 
+ + public void onCqlUpdateWithConditionsRejectGeneratedUpdatesForDifferentPartition ( ) throws Exception 
+ + { 
+ + String cf = " cf " + System . nanoTime ( ) ; 
+ + try 
+ + { 
+ + setupTableWithTrigger ( cf , CrossPartitionTrigger . class ) ; 
+ + String cql = String . format ( " INSERT INTO % s . % s ( k , v1 ) VALUES ( 7 , 7 ) IF NOT EXISTS " , ksName , cf ) ; 
+ + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; 
+ + } 
+ + finally 
+ + { 
+ + assertUpdateNotExecuted ( cf , 7 ) ; 
+ + } 
+ + } 
+ + 
+ + / / Unfortunately , an IRE thrown from StorageProxy . cas 
+ + / / results in a RuntimeException from QueryProcessor . process 
+ + @ Test ( expected = RuntimeException . class ) 
+ + public void onCqlUpdateWithConditionsRejectGeneratedUpdatesForDifferentTable ( ) throws Exception 
+ + { 
+ + String cf = " cf " + System . nanoTime ( ) ; 
+ + try 
+ + { 
+ + setupTableWithTrigger ( cf , CrossTableTrigger . class ) ; 
+ + String cql = String . format ( " INSERT INTO % s . % s ( k , v1 ) VALUES ( 8 , 8 ) IF NOT EXISTS " , ksName , cf ) ; 
+ + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; 
+ + } 
+ + finally 
+ + { 
+ + assertUpdateNotExecuted ( cf , 7 ) ; 
+ + } 
+ + } 
+ + 
+ + @ Test ( expected = InvalidRequestException . class ) 
+ + public void onThriftCASRejectGeneratedUpdatesForDifferentPartition ( ) throws Exception 
+ + { 
+ + String cf = " cf " + System . nanoTime ( ) ; 
+ + try 
+ + { 
+ + setupTableWithTrigger ( cf , CrossPartitionTrigger . class ) ; 
+ + Cassandra . Client client = new Cassandra . Client ( 
+ + new TBinaryProtocol ( 
+ + new TFramedTransportFactory ( ) . openTransport ( 
+ + InetAddress . getLocalHost ( ) . getHostName ( ) , 9170 ) ) ) ; 
+ + client . set _ keyspace ( ksName ) ; 
+ + client . cas ( ByteBufferUtil . bytes ( 9 ) , 
+ + cf , 
+ + Collections . EMPTY _ LIST , 
+ + Collections . singletonList ( getColumnForInsert ( " v1 " , 9 ) ) , 
+ + org . apache . cassandra . thrift . ConsistencyLevel . LOCAL _ SERIAL , 
+ + org . apache . cassandra . thrift . ConsistencyLevel . ONE ) ; 
+ + } 
+ + finally 
+ + { 
+ + assertUpdateNotExecuted ( cf , 9 ) ; 
+ + } 
+ + } 
+ + 
+ + @ Test ( expected = InvalidRequestException . class ) 
+ + public void onThriftCASRejectGeneratedUpdatesForDifferentCF ( ) throws Exception 
+ + { 
+ + String cf = " cf " + System . nanoTime ( ) ; 
+ + try 
+ + { 
+ + setupTableWithTrigger ( cf , CrossTableTrigger . class ) ; 
+ + Cassandra . Client client = new Cassandra . Client ( 
+ + new TBinaryProtocol ( 
+ + new TFramedTransportFactory ( ) . openTransport ( 
+ + InetAddress . getLocalHost ( ) . getHostName ( ) , 9170 ) ) ) ; 
+ + client . set _ keyspace ( ksName ) ; 
+ + client . cas ( ByteBufferUtil . bytes ( 10 ) , 
+ + cf , 
+ + Collections . EMPTY _ LIST , 
+ + Collections . singletonList ( getColumnForInsert ( " v1 " , 10 ) ) , 
+ + org . apache . cassandra . thrift . ConsistencyLevel . LOCAL _ SERIAL , 
+ + org . apache . cassandra . thrift . ConsistencyLevel . ONE ) ; 
+ + } 
+ + finally 
+ + { 
+ + assertUpdateNotExecuted ( cf , 10 ) ; 
+ + } 
+ + } 
+ + 
+ + private void setupTableWithTrigger ( String cf , Class < ? extends ITrigger > triggerImpl ) 
+ + throws RequestExecutionException 
+ + { 
+ + String cql = String . format ( " CREATE TABLE IF NOT EXISTS % s . % s ( k int , v1 int , v2 int , PRIMARY KEY ( k ) ) " , ksName , cf ) ; 
+ + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; 
+ + 
+ + / / no conditional execution of create trigger stmt yet 
+ + cql = String . format ( " CREATE TRIGGER trigger _ 1 ON % s . % s USING ' % s ' " , 
+ + ksName , cf , triggerImpl . getName ( ) ) ; 
+ + QueryProcessor . process ( cql , ConsistencyLevel . ONE ) ; 
+ + } 
+ + 
+ private void assertUpdateIsAugmented ( int key ) 
+ { 
+ UntypedResultSet rs = QueryProcessor . processInternal ( 
+ String . format ( " SELECT * FROM % s . % s WHERE k = % s " , ksName , cfName , key ) ) ; 
+ + assertTrue ( String . format ( " Expected value ( % s ) for augmented cell v2 was not found " , key ) , rs . one ( ) . has ( " v2 " ) ) ; 
+ assertEquals ( 999 , rs . one ( ) . getInt ( " v2 " ) ) ; 
+ } 
+ 
+ + private void assertUpdateNotExecuted ( String cf , int key ) 
+ + { 
+ + UntypedResultSet rs = QueryProcessor . processInternal ( 
+ + String . format ( " SELECT * FROM % s . % s WHERE k = % s " , ksName , cf , key ) ) ; 
+ + assertTrue ( rs . isEmpty ( ) ) ; 
+ + } 
+ + 
+ private org . apache . cassandra . thrift . Column getColumnForInsert ( String columnName , int value ) 
+ { 
+ org . apache . cassandra . thrift . Column column = new org . apache . cassandra . thrift . Column ( ) ; 
+ @ @ - 176 , 4 + 327 , 33 @ @ public class TriggersTest extends SchemaLoader 
+ return Collections . singletonList ( rm ) ; 
+ } 
+ } 
+ + 
+ + public static class CrossPartitionTrigger implements ITrigger 
+ + { 
+ + public Collection < RowMutation > augment ( ByteBuffer key , ColumnFamily update ) 
+ + { 
+ + ColumnFamily extraUpdate = update . cloneMeShallow ( ArrayBackedSortedColumns . factory , false ) ; 
+ + extraUpdate . addColumn ( new Column ( update . metadata ( ) . comparator . fromString ( " v2 " ) , 
+ + ByteBufferUtil . bytes ( 999 ) ) ) ; 
+ + 
+ + int newKey = ByteBufferUtil . toInt ( key ) + 1000 ; 
+ + RowMutation rm = new RowMutation ( ksName , ByteBufferUtil . bytes ( newKey ) ) ; 
+ + rm . add ( extraUpdate ) ; 
+ + return Collections . singletonList ( rm ) ; 
+ + } 
+ + } 
+ + 
+ + public static class CrossTableTrigger implements ITrigger 
+ + { 
+ + public Collection < RowMutation > augment ( ByteBuffer key , ColumnFamily update ) 
+ + { 
+ + ColumnFamily extraUpdate = ArrayBackedSortedColumns . factory . create ( ksName , otherCf ) ; 
+ + extraUpdate . addColumn ( new Column ( extraUpdate . metadata ( ) . comparator . fromString ( " v2 " ) , 
+ + ByteBufferUtil . bytes ( 999 ) ) ) ; 
+ + 
+ + RowMutation rm = new RowMutation ( ksName , key ) ; 
+ + rm . add ( extraUpdate ) ; 
+ + return Collections . singletonList ( rm ) ; 
+ + } 
+ + } 
+ }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 429aef0 . . 65becfb 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 3 , 6 + 3 , 9 @ @ 
+ * add support for IN to cql SELECT , UPDATE ( CASSANDRA - 2553 ) 
+ * add timestamp support to cql INSERT , UPDATE , and BATCH ( CASSANDRA - 2555 ) 
+ 
+ + 0 . 8 . 1 
+ + * add support for comparator parameters and a generic ReverseType 
+ + ( CASSANDRA - 2355 ) 
+ 
+ 0 . 8 . 0 - ? 
+ * faster flushes and compaction from fixing excessively pessimistic 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliClient . java b / src / java / org / apache / cassandra / cli / CliClient . java 
+ index 58d24e7 . . 2e3aa68 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliClient . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliClient . java 
+ @ @ - 602 , 7 + 602 , 7 @ @ public class CliClient 
+ / / setting value for output 
+ valueAsString = valueValidator . getString ( ByteBuffer . wrap ( columnValue ) ) ; 
+ / / updating column value validator class 
+ - updateColumnMetaData ( cfDef , columnName , valueValidator . getClass ( ) . getName ( ) ) ; 
+ + updateColumnMetaData ( cfDef , columnName , valueValidator . toString ( ) ) ; 
+ } 
+ else 
+ { 
+ @ @ - 2159 , 7 + 2159 , 7 @ @ public class CliClient 
+ / / performing ColumnDef local validator update 
+ if ( withUpdate ) 
+ { 
+ - updateColumnMetaData ( columnFamily , columnName , validator . getClass ( ) . getName ( ) ) ; 
+ + updateColumnMetaData ( columnFamily , columnName , validator . toString ( ) ) ; 
+ } 
+ 
+ return value ; 
+ diff - - git a / src / java / org / apache / cassandra / config / CFMetaData . java b / src / java / org / apache / cassandra / config / CFMetaData . java 
+ index 992c55d . . d1f8684 100644 
+ - - - a / src / java / org / apache / cassandra / config / CFMetaData . java 
+ + + + b / src / java / org / apache / cassandra / config / CFMetaData . java 
+ @ @ - 322 , 17 + 322 , 17 @ @ public final class CFMetaData 
+ cf . keyspace = new Utf8 ( ksName ) ; 
+ cf . name = new Utf8 ( cfName ) ; 
+ cf . column _ type = new Utf8 ( cfType . name ( ) ) ; 
+ - cf . comparator _ type = new Utf8 ( comparator . getClass ( ) . getName ( ) ) ; 
+ + cf . comparator _ type = new Utf8 ( comparator . toString ( ) ) ; 
+ if ( subcolumnComparator ! = null ) 
+ - cf . subcomparator _ type = new Utf8 ( subcolumnComparator . getClass ( ) . getName ( ) ) ; 
+ + cf . subcomparator _ type = new Utf8 ( subcolumnComparator . toString ( ) ) ; 
+ cf . comment = new Utf8 ( comment ) ; 
+ cf . row _ cache _ size = rowCacheSize ; 
+ cf . key _ cache _ size = keyCacheSize ; 
+ cf . read _ repair _ chance = readRepairChance ; 
+ cf . replicate _ on _ write = replicateOnWrite ; 
+ cf . gc _ grace _ seconds = gcGraceSeconds ; 
+ - cf . default _ validation _ class = new Utf8 ( defaultValidator . getClass ( ) . getName ( ) ) ; 
+ - cf . key _ validation _ class = new Utf8 ( keyValidator . getClass ( ) . getName ( ) ) ; 
+ + cf . default _ validation _ class = new Utf8 ( defaultValidator . toString ( ) ) ; 
+ + cf . key _ validation _ class = new Utf8 ( keyValidator . toString ( ) ) ; 
+ cf . min _ compaction _ threshold = minCompactionThreshold ; 
+ cf . max _ compaction _ threshold = maxCompactionThreshold ; 
+ cf . row _ cache _ save _ period _ in _ seconds = rowCacheSavePeriodInSeconds ; 
+ @ @ - 763 , 10 + 763 , 10 @ @ public final class CFMetaData 
+ org . apache . cassandra . thrift . CfDef def = new org . apache . cassandra . thrift . CfDef ( cfm . ksName , cfm . cfName ) ; 
+ def . setId ( cfm . cfId ) ; 
+ def . setColumn _ type ( cfm . cfType . name ( ) ) ; 
+ - def . setComparator _ type ( cfm . comparator . getClass ( ) . getName ( ) ) ; 
+ + def . setComparator _ type ( cfm . comparator . toString ( ) ) ; 
+ if ( cfm . subcolumnComparator ! = null ) 
+ { 
+ - def . setSubcomparator _ type ( cfm . subcolumnComparator . getClass ( ) . getName ( ) ) ; 
+ + def . setSubcomparator _ type ( cfm . subcolumnComparator . toString ( ) ) ; 
+ def . setColumn _ type ( " Super " ) ; 
+ } 
+ def . setComment ( enforceCommentNotNull ( cfm . comment ) ) ; 
+ @ @ - 775 , 8 + 775 , 8 @ @ public final class CFMetaData 
+ def . setRead _ repair _ chance ( cfm . readRepairChance ) ; 
+ def . setReplicate _ on _ write ( cfm . replicateOnWrite ) ; 
+ def . setGc _ grace _ seconds ( cfm . gcGraceSeconds ) ; 
+ - def . setDefault _ validation _ class ( cfm . defaultValidator . getClass ( ) . getName ( ) ) ; 
+ - def . setKey _ validation _ class ( cfm . keyValidator . getClass ( ) . getName ( ) ) ; 
+ + def . setDefault _ validation _ class ( cfm . defaultValidator . toString ( ) ) ; 
+ + def . setKey _ validation _ class ( cfm . keyValidator . toString ( ) ) ; 
+ def . setMin _ compaction _ threshold ( cfm . minCompactionThreshold ) ; 
+ def . setMax _ compaction _ threshold ( cfm . maxCompactionThreshold ) ; 
+ def . setRow _ cache _ save _ period _ in _ seconds ( cfm . rowCacheSavePeriodInSeconds ) ; 
+ @ @ - 793 , 7 + 793 , 7 @ @ public final class CFMetaData 
+ tcd . setIndex _ name ( cd . getIndexName ( ) ) ; 
+ tcd . setIndex _ type ( cd . getIndexType ( ) ) ; 
+ tcd . setName ( cd . name ) ; 
+ - tcd . setValidation _ class ( cd . getValidator ( ) . getClass ( ) . getName ( ) ) ; 
+ + tcd . setValidation _ class ( cd . getValidator ( ) . toString ( ) ) ; 
+ column _ meta . add ( tcd ) ; 
+ } 
+ def . setColumn _ metadata ( column _ meta ) ; 
+ @ @ - 808 , 10 + 808 , 10 @ @ public final class CFMetaData 
+ def . keyspace = cfm . ksName ; 
+ def . id = cfm . cfId ; 
+ def . column _ type = cfm . cfType . name ( ) ; 
+ - def . comparator _ type = cfm . comparator . getClass ( ) . getName ( ) ; 
+ + def . comparator _ type = cfm . comparator . toString ( ) ; 
+ if ( cfm . subcolumnComparator ! = null ) 
+ { 
+ - def . subcomparator _ type = cfm . subcolumnComparator . getClass ( ) . getName ( ) ; 
+ + def . subcomparator _ type = cfm . subcolumnComparator . toString ( ) ; 
+ def . column _ type = " Super " ; 
+ } 
+ def . comment = enforceCommentNotNull ( cfm . comment ) ; 
+ @ @ - 820 , 7 + 820 , 7 @ @ public final class CFMetaData 
+ def . read _ repair _ chance = cfm . readRepairChance ; 
+ def . replicate _ on _ write = cfm . replicateOnWrite ; 
+ def . gc _ grace _ seconds = cfm . gcGraceSeconds ; 
+ - def . default _ validation _ class = cfm . defaultValidator = = null ? null : cfm . defaultValidator . getClass ( ) . getName ( ) ; 
+ + def . default _ validation _ class = cfm . defaultValidator = = null ? null : cfm . defaultValidator . toString ( ) ; 
+ def . min _ compaction _ threshold = cfm . minCompactionThreshold ; 
+ def . max _ compaction _ threshold = cfm . maxCompactionThreshold ; 
+ def . row _ cache _ save _ period _ in _ seconds = cfm . rowCacheSavePeriodInSeconds ; 
+ @ @ - 838 , 7 + 838 , 7 @ @ public final class CFMetaData 
+ tcd . index _ name = cd . getIndexName ( ) ; 
+ tcd . index _ type = cd . getIndexType ( ) = = null ? null : org . apache . cassandra . db . migration . avro . IndexType . valueOf ( cd . getIndexType ( ) . name ( ) ) ; 
+ tcd . name = ByteBufferUtil . clone ( cd . name ) ; 
+ - tcd . validation _ class = cd . getValidator ( ) . getClass ( ) . getName ( ) ; 
+ + tcd . validation _ class = cd . getValidator ( ) . toString ( ) ; 
+ column _ meta . add ( tcd ) ; 
+ } 
+ def . column _ metadata = column _ meta ; 
+ diff - - git a / src / java / org / apache / cassandra / config / ColumnDefinition . java b / src / java / org / apache / cassandra / config / ColumnDefinition . java 
+ index 1cb357a . . 2d77d6c 100644 
+ - - - a / src / java / org / apache / cassandra / config / ColumnDefinition . java 
+ + + + b / src / java / org / apache / cassandra / config / ColumnDefinition . java 
+ @ @ - 79 , 7 + 79 , 7 @ @ public class ColumnDefinition 
+ { 
+ org . apache . cassandra . db . migration . avro . ColumnDef cd = new org . apache . cassandra . db . migration . avro . ColumnDef ( ) ; 
+ cd . name = name ; 
+ - cd . validation _ class = new Utf8 ( validator . getClass ( ) . getName ( ) ) ; 
+ + cd . validation _ class = new Utf8 ( validator . toString ( ) ) ; 
+ cd . index _ type = index _ type = = null ? null : 
+ Enum . valueOf ( org . apache . cassandra . db . migration . avro . IndexType . class , index _ type . name ( ) ) ; 
+ cd . index _ name = index _ name = = null ? null : new Utf8 ( index _ name ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / marshal / AbstractType . java b / src / java / org / apache / cassandra / db / marshal / AbstractType . java 
+ index 77c999c . . 30118f3 100644 
+ - - - a / src / java / org / apache / cassandra / db / marshal / AbstractType . java 
+ + + + b / src / java / org / apache / cassandra / db / marshal / AbstractType . java 
+ @ @ - 24 , 7 + 24 , 9 @ @ package org . apache . cassandra . db . marshal ; 
+ import java . nio . ByteBuffer ; 
+ import java . util . Collection ; 
+ import java . util . Comparator ; 
+ + import java . util . Map ; 
+ 
+ + import org . apache . cassandra . config . ConfigurationException ; 
+ import org . apache . cassandra . db . IColumn ; 
+ import static org . apache . cassandra . io . sstable . IndexHelper . IndexInfo ; 
+ 
+ @ @ - 159 , 4 + 161 , 28 @ @ public abstract class AbstractType < T > implements Comparator < ByteBuffer > 
+ public abstract int getScale ( T obj ) ; 
+ public abstract int getJdbcType ( ) ; 
+ public abstract boolean needsQuotes ( ) ; 
+ + 
+ + public static AbstractType parseDefaultParameters ( AbstractType baseType , TypeParser parser ) throws ConfigurationException 
+ + { 
+ + Map < String , String > parameters = parser . getKeyValueParameters ( ) ; 
+ + String reversed = parameters . get ( " reversed " ) ; 
+ + if ( reversed ! = null & & ( reversed . isEmpty ( ) | | reversed . equals ( " true " ) ) ) 
+ + { 
+ + return ReversedType . getInstance ( baseType ) ; 
+ + } 
+ + else 
+ + { 
+ + return baseType ; 
+ + } 
+ + } 
+ + 
+ + / * * 
+ + * This must be overriden by subclasses if necessary so that for any 
+ + * AbstractType , this = = TypeParser . parse ( toString ( ) ) . 
+ + * / 
+ + @ Override 
+ + public String toString ( ) 
+ + { 
+ + return getClass ( ) . getName ( ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / marshal / ReversedType . java b / src / java / org / apache / cassandra / db / marshal / ReversedType . java 
+ new file mode 100644 
+ index 0000000 . . 8963b7b 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / db / marshal / ReversedType . java 
+ @ @ - 0 , 0 + 1 , 129 @ @ 
+ + / * * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + package org . apache . cassandra . db . marshal ; 
+ + 
+ + import java . nio . ByteBuffer ; 
+ + import java . util . HashMap ; 
+ + import java . util . Map ; 
+ + 
+ + public class ReversedType < T > extends AbstractType < T > 
+ + { 
+ + / / interning instances 
+ + private static final Map < AbstractType , ReversedType > instances = new HashMap < AbstractType , ReversedType > ( ) ; 
+ + 
+ + / / package protected for unit tests sake 
+ + final AbstractType < T > baseType ; 
+ + 
+ + public static synchronized < T > ReversedType < T > getInstance ( AbstractType < T > baseType ) 
+ + { 
+ + ReversedType type = instances . get ( baseType ) ; 
+ + if ( type = = null ) 
+ + { 
+ + type = new ReversedType ( baseType ) ; 
+ + instances . put ( baseType , type ) ; 
+ + } 
+ + return ( ReversedType < T > ) type ; 
+ + } 
+ + 
+ + private ReversedType ( AbstractType < T > baseType ) 
+ + { 
+ + this . baseType = baseType ; 
+ + } 
+ + 
+ + public int compare ( ByteBuffer o1 , ByteBuffer o2 ) 
+ + { 
+ + return - baseType . compare ( o1 , o2 ) ; 
+ + } 
+ + 
+ + public String getString ( ByteBuffer bytes ) 
+ + { 
+ + return baseType . getString ( bytes ) ; 
+ + } 
+ + 
+ + public ByteBuffer fromString ( String source ) 
+ + { 
+ + return baseType . fromString ( source ) ; 
+ + } 
+ + 
+ + public void validate ( ByteBuffer bytes ) throws MarshalException 
+ + { 
+ + baseType . validate ( bytes ) ; 
+ + } 
+ + 
+ + public T compose ( ByteBuffer bytes ) 
+ + { 
+ + return baseType . compose ( bytes ) ; 
+ + } 
+ + 
+ + public ByteBuffer decompose ( T value ) 
+ + { 
+ + return baseType . decompose ( value ) ; 
+ + } 
+ + 
+ + public Class < T > getType ( ) 
+ + { 
+ + return baseType . getType ( ) ; 
+ + } 
+ + 
+ + public String toString ( T t ) 
+ + { 
+ + return baseType . toString ( t ) ; 
+ + } 
+ + 
+ + public boolean isSigned ( ) 
+ + { 
+ + return baseType . isSigned ( ) ; 
+ + } 
+ + 
+ + public boolean isCaseSensitive ( ) 
+ + { 
+ + return baseType . isCaseSensitive ( ) ; 
+ + } 
+ + 
+ + public boolean isCurrency ( ) 
+ + { 
+ + return baseType . isCurrency ( ) ; 
+ + } 
+ + 
+ + public int getPrecision ( T obj ) 
+ + { 
+ + return baseType . getPrecision ( obj ) ; 
+ + } 
+ + 
+ + public int getScale ( T obj ) 
+ + { 
+ + return baseType . getScale ( obj ) ; 
+ + } 
+ + 
+ + public int getJdbcType ( ) 
+ + { 
+ + return baseType . getJdbcType ( ) ; 
+ + } 
+ + 
+ + public boolean needsQuotes ( ) 
+ + { 
+ + return baseType . needsQuotes ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public String toString ( ) 
+ + { 
+ + return getClass ( ) . getName ( ) + " ( " + baseType + " ) " ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / db / marshal / TypeParser . java b / src / java / org / apache / cassandra / db / marshal / TypeParser . java 
+ new file mode 100644 
+ index 0000000 . . 2efe30a 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / db / marshal / TypeParser . java 
+ @ @ - 0 , 0 + 1 , 430 @ @ 
+ + / * * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + package org . apache . cassandra . db . marshal ; 
+ + 
+ + import java . lang . reflect . Field ; 
+ + import java . lang . reflect . InvocationTargetException ; 
+ + import java . lang . reflect . Method ; 
+ + import java . util . ArrayList ; 
+ + import java . util . HashMap ; 
+ + import java . util . Iterator ; 
+ + import java . util . List ; 
+ + import java . util . Map ; 
+ + 
+ + import org . apache . cassandra . config . ConfigurationException ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ + 
+ + / * * 
+ + * Parse a string containing an Type definition . 
+ + * / 
+ + public class TypeParser 
+ + { 
+ + private final String str ; 
+ + private int idx ; 
+ + 
+ + / / A cache of parsed string , specially useful for DynamicCompositeType 
+ + private static final Map < String , AbstractType > cache = new HashMap < String , AbstractType > ( ) ; 
+ + 
+ + public static final TypeParser EMPTY _ PARSER = new TypeParser ( " " , 0 ) ; 
+ + 
+ + private TypeParser ( String str , int idx ) 
+ + { 
+ + this . str = str ; 
+ + this . idx = idx ; 
+ + } 
+ + 
+ + / * * 
+ + * Parse a string containing an type definition . 
+ + * / 
+ + public static AbstractType parse ( String str ) throws ConfigurationException 
+ + { 
+ + if ( str = = null ) 
+ + return BytesType . instance ; 
+ + 
+ + AbstractType type = cache . get ( str ) ; 
+ + 
+ + if ( type ! = null ) 
+ + return type ; 
+ + 
+ + / / This could be simplier ( i . e . new TypeParser ( str ) . parse ( ) ) but we avoid creating a TypeParser object if not really necessary . 
+ + int i = 0 ; 
+ + i = skipBlank ( str , i ) ; 
+ + int j = i ; 
+ + while ( ! isEOS ( str , i ) & & isIdentifierChar ( str . charAt ( i ) ) ) 
+ + + + i ; 
+ + 
+ + if ( i = = j ) 
+ + return BytesType . instance ; 
+ + 
+ + String name = str . substring ( j , i ) ; 
+ + i = skipBlank ( str , i ) ; 
+ + 
+ + if ( ! isEOS ( str , i ) & & str . charAt ( i ) = = ' ( ' ) 
+ + type = getAbstractType ( name , new TypeParser ( str , i ) ) ; 
+ + else 
+ + type = getAbstractType ( name ) ; 
+ + 
+ + / / We don ' t really care about concurrency here . Worst case scenario , we do some parsing unnecessarily 
+ + cache . put ( str , type ) ; 
+ + return type ; 
+ + } 
+ + 
+ + / * * 
+ + * Parse an AbstractType from current position of this parser . 
+ + * / 
+ + private AbstractType parse ( ) throws ConfigurationException 
+ + { 
+ + skipBlank ( ) ; 
+ + String name = readNextIdentifier ( ) ; 
+ + 
+ + skipBlank ( ) ; 
+ + if ( ! isEOS ( ) & & str . charAt ( idx ) = = ' ( ' ) 
+ + return getAbstractType ( name , this ) ; 
+ + else 
+ + return getAbstractType ( name ) ; 
+ + } 
+ + 
+ + public Map < String , String > getKeyValueParameters ( ) throws ConfigurationException 
+ + { 
+ + Map < String , String > map = new HashMap < String , String > ( ) ; 
+ + 
+ + if ( isEOS ( ) ) 
+ + return map ; 
+ + 
+ + if ( str . charAt ( idx ) ! = ' ( ' ) 
+ + throw new IllegalStateException ( ) ; 
+ + 
+ + + + idx ; / / skipping ' ( ' 
+ + 
+ + while ( skipBlankAndComma ( ) ) 
+ + { 
+ + if ( str . charAt ( idx ) = = ' ) ' ) 
+ + { 
+ + + + idx ; 
+ + return map ; 
+ + } 
+ + 
+ + String k = readNextIdentifier ( ) ; 
+ + String v = " " ; 
+ + skipBlank ( ) ; 
+ + if ( str . charAt ( idx ) = = ' = ' ) 
+ + { 
+ + + + idx ; 
+ + skipBlank ( ) ; 
+ + v = readNextIdentifier ( ) ; 
+ + } 
+ + else if ( str . charAt ( idx ) ! = ' , ' & & str . charAt ( idx ) ! = ' ) ' ) 
+ + { 
+ + throwSyntaxError ( " unexpected character ' " + str . charAt ( idx ) + " ' " ) ; 
+ + } 
+ + map . put ( k , v ) ; 
+ + } 
+ + throw new ConfigurationException ( String . format ( " Syntax error parsing ' % s ' at char % d : unexpected end of string " , str , idx ) ) ; 
+ + } 
+ + 
+ + public List < AbstractType > getTypeParameters ( ) throws ConfigurationException 
+ + { 
+ + List < AbstractType > list = new ArrayList < AbstractType > ( ) ; 
+ + 
+ + if ( isEOS ( ) ) 
+ + return list ; 
+ + 
+ + if ( str . charAt ( idx ) ! = ' ( ' ) 
+ + throw new IllegalStateException ( ) ; 
+ + 
+ + + + idx ; / / skipping ' ( ' 
+ + 
+ + while ( skipBlankAndComma ( ) ) 
+ + { 
+ + if ( str . charAt ( idx ) = = ' ) ' ) 
+ + { 
+ + + + idx ; 
+ + return list ; 
+ + } 
+ + 
+ + try 
+ + { 
+ + list . add ( parse ( ) ) ; 
+ + } 
+ + catch ( ConfigurationException e ) 
+ + { 
+ + ConfigurationException ex = new ConfigurationException ( String . format ( " Exception while parsing ' % s ' around char % d " , str , idx ) ) ; 
+ + ex . initCause ( e ) ; 
+ + throw ex ; 
+ + } 
+ + } 
+ + throw new ConfigurationException ( String . format ( " Syntax error parsing ' % s ' at char % d : unexpected end of string " , str , idx ) ) ; 
+ + } 
+ + 
+ + public Map < Byte , AbstractType > getAliasParameters ( ) throws ConfigurationException 
+ + { 
+ + Map < Byte , AbstractType > map = new HashMap < Byte , AbstractType > ( ) ; 
+ + 
+ + if ( isEOS ( ) ) 
+ + return map ; 
+ + 
+ + if ( str . charAt ( idx ) ! = ' ( ' ) 
+ + throw new IllegalStateException ( ) ; 
+ + 
+ + + + idx ; / / skipping ' ( ' 
+ + 
+ + 
+ + while ( skipBlankAndComma ( ) ) 
+ + { 
+ + if ( str . charAt ( idx ) = = ' ) ' ) 
+ + { 
+ + + + idx ; 
+ + return map ; 
+ + } 
+ + 
+ + String alias = readNextIdentifier ( ) ; 
+ + if ( alias . length ( ) ! = 1 ) 
+ + throwSyntaxError ( " An alias should be a single character " ) ; 
+ + char aliasChar = alias . charAt ( 0 ) ; 
+ + if ( aliasChar < 33 | | aliasChar > 127 ) 
+ + throwSyntaxError ( " An alias should be a single character in [ 0 . . 9a . . bA . . B - + . _ & ] " ) ; 
+ + 
+ + skipBlank ( ) ; 
+ + if ( ! ( str . charAt ( idx ) = = ' = ' & & str . charAt ( idx + 1 ) = = ' > ' ) ) 
+ + throwSyntaxError ( " expecting ' = > ' token " ) ; 
+ + 
+ + idx + = 2 ; 
+ + skipBlank ( ) ; 
+ + try 
+ + { 
+ + map . put ( ( byte ) aliasChar , parse ( ) ) ; 
+ + } 
+ + catch ( ConfigurationException e ) 
+ + { 
+ + ConfigurationException ex = new ConfigurationException ( String . format ( " Exception while parsing ' % s ' around char % d " , str , idx ) ) ; 
+ + ex . initCause ( e ) ; 
+ + throw ex ; 
+ + } 
+ + } 
+ + throw new ConfigurationException ( String . format ( " Syntax error parsing ' % s ' at char % d : unexpected end of string " , str , idx ) ) ; 
+ + } 
+ + 
+ + private static AbstractType getAbstractType ( String compareWith ) throws ConfigurationException 
+ + { 
+ + String className = compareWith . contains ( " . " ) ? compareWith : " org . apache . cassandra . db . marshal . " + compareWith ; 
+ + Class < ? extends AbstractType > typeClass = FBUtilities . < AbstractType > classForName ( className , " abstract - type " ) ; 
+ + try 
+ + { 
+ + Field field = typeClass . getDeclaredField ( " instance " ) ; 
+ + return ( AbstractType ) field . get ( null ) ; 
+ + } 
+ + catch ( NoSuchFieldException e ) 
+ + { 
+ + / / Trying with empty parser 
+ + return getRawAbstractType ( typeClass , EMPTY _ PARSER ) ; 
+ + } 
+ + catch ( IllegalAccessException e ) 
+ + { 
+ + / / Trying with empty parser 
+ + return getRawAbstractType ( typeClass , EMPTY _ PARSER ) ; 
+ + } 
+ + } 
+ + 
+ + private static AbstractType getAbstractType ( String compareWith , TypeParser parser ) throws ConfigurationException 
+ + { 
+ + String className = compareWith . contains ( " . " ) ? compareWith : " org . apache . cassandra . db . marshal . " + compareWith ; 
+ + Class < ? extends AbstractType > typeClass = FBUtilities . < AbstractType > classForName ( className , " abstract - type " ) ; 
+ + try 
+ + { 
+ + Method method = typeClass . getDeclaredMethod ( " getInstance " , TypeParser . class ) ; 
+ + return ( AbstractType ) method . invoke ( null , parser ) ; 
+ + } 
+ + catch ( NoSuchMethodException e ) 
+ + { 
+ + / / Trying to see if we have an instance field and apply the default parameter to it 
+ + AbstractType type = getRawAbstractType ( typeClass ) ; 
+ + return AbstractType . parseDefaultParameters ( type , parser ) ; 
+ + } 
+ + catch ( IllegalAccessException e ) 
+ + { 
+ + / / Trying to see if we have an instance field and apply the default parameter to it 
+ + AbstractType type = getRawAbstractType ( typeClass ) ; 
+ + return AbstractType . parseDefaultParameters ( type , parser ) ; 
+ + } 
+ + catch ( InvocationTargetException e ) 
+ + { 
+ + ConfigurationException ex = new ConfigurationException ( " Invalid definition for comparator " + typeClass . getName ( ) + " . " ) ; 
+ + ex . initCause ( e . getTargetException ( ) ) ; 
+ + throw ex ; 
+ + } 
+ + } 
+ + 
+ + private static AbstractType getRawAbstractType ( Class < ? extends AbstractType > typeClass ) throws ConfigurationException 
+ + { 
+ + try 
+ + { 
+ + Field field = typeClass . getDeclaredField ( " instance " ) ; 
+ + return ( AbstractType ) field . get ( null ) ; 
+ + } 
+ + catch ( NoSuchFieldException e ) 
+ + { 
+ + throw new ConfigurationException ( " Invalid comparator class " + typeClass . getName ( ) + " : must define a public static instance field or a public static method getInstance ( TypeParser ) . " ) ; 
+ + } 
+ + catch ( IllegalAccessException e ) 
+ + { 
+ + throw new ConfigurationException ( " Invalid comparator class " + typeClass . getName ( ) + " : must define a public static instance field or a public static method getInstance ( TypeParser ) . " ) ; 
+ + } 
+ + } 
+ + 
+ + private static AbstractType getRawAbstractType ( Class < ? extends AbstractType > typeClass , TypeParser parser ) throws ConfigurationException 
+ + { 
+ + try 
+ + { 
+ + Method method = typeClass . getDeclaredMethod ( " getInstance " , TypeParser . class ) ; 
+ + return ( AbstractType ) method . invoke ( null , parser ) ; 
+ + } 
+ + catch ( NoSuchMethodException e ) 
+ + { 
+ + throw new ConfigurationException ( " Invalid comparator class " + typeClass . getName ( ) + " : must define a public static instance field or a public static method getInstance ( TypeParser ) . " ) ; 
+ + } 
+ + catch ( IllegalAccessException e ) 
+ + { 
+ + throw new ConfigurationException ( " Invalid comparator class " + typeClass . getName ( ) + " : must define a public static instance field or a public static method getInstance ( TypeParser ) . " ) ; 
+ + } 
+ + catch ( InvocationTargetException e ) 
+ + { 
+ + ConfigurationException ex = new ConfigurationException ( " Invalid definition for comparator " + typeClass . getName ( ) + " . " ) ; 
+ + ex . initCause ( e . getTargetException ( ) ) ; 
+ + throw ex ; 
+ + } 
+ + } 
+ + 
+ + private void throwSyntaxError ( String msg ) throws ConfigurationException 
+ + { 
+ + throw new ConfigurationException ( String . format ( " Syntax error parsing ' % s ' at char % d : % s " , str , idx , msg ) ) ; 
+ + } 
+ + 
+ + private boolean isEOS ( ) 
+ + { 
+ + return isEOS ( str , idx ) ; 
+ + } 
+ + 
+ + private static boolean isEOS ( String str , int i ) 
+ + { 
+ + return i > = str . length ( ) ; 
+ + } 
+ + 
+ + private static boolean isBlank ( int c ) 
+ + { 
+ + return c = = ' ' | | c = = ' \ t ' | | c = = ' \ n ' ; 
+ + } 
+ + 
+ + private void skipBlank ( ) 
+ + { 
+ + idx = skipBlank ( str , idx ) ; 
+ + } 
+ + 
+ + private static int skipBlank ( String str , int i ) 
+ + { 
+ + while ( ! isEOS ( str , i ) & & isBlank ( str . charAt ( i ) ) ) 
+ + + + i ; 
+ + 
+ + return i ; 
+ + } 
+ + 
+ + / / skip all blank and at best one comma , return true if there not EOS 
+ + private boolean skipBlankAndComma ( ) 
+ + { 
+ + boolean commaFound = false ; 
+ + while ( ! isEOS ( ) ) 
+ + { 
+ + int c = str . charAt ( idx ) ; 
+ + if ( c = = ' , ' ) 
+ + { 
+ + if ( commaFound ) 
+ + return true ; 
+ + else 
+ + commaFound = true ; 
+ + } 
+ + else if ( ! isBlank ( c ) ) 
+ + { 
+ + return true ; 
+ + } 
+ + + + idx ; 
+ + } 
+ + return false ; 
+ + } 
+ + 
+ + / * 
+ + * [ 0 . . 9a . . bA . . B - + . _ & ] 
+ + * / 
+ + private static boolean isIdentifierChar ( int c ) 
+ + { 
+ + return ( c > = ' 0 ' & & c < = ' 9 ' ) 
+ + | | ( c > = ' a ' & & c < = ' z ' ) | | ( c > = ' A ' & & c < = ' Z ' ) 
+ + | | c = = ' - ' | | c = = ' + ' | | c = = ' . ' | | c = = ' _ ' | | c = = ' & ' ; 
+ + } 
+ + 
+ + / / left idx positioned on the character stopping the read 
+ + private String readNextIdentifier ( ) 
+ + { 
+ + int i = idx ; 
+ + while ( ! isEOS ( ) & & isIdentifierChar ( str . charAt ( idx ) ) ) 
+ + + + idx ; 
+ + 
+ + return str . substring ( i , idx ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Helper function to ease the writing of AbstractType . toString ( ) methods . 
+ + * / 
+ + public static String stringifyAliasesParameters ( Map < Byte , AbstractType > aliases ) 
+ + { 
+ + StringBuilder sb = new StringBuilder ( ) ; 
+ + sb . append ( ' ( ' ) ; 
+ + Iterator < Map . Entry < Byte , AbstractType > > iter = aliases . entrySet ( ) . iterator ( ) ; 
+ + if ( iter . hasNext ( ) ) 
+ + { 
+ + Map . Entry < Byte , AbstractType > entry = iter . next ( ) ; 
+ + sb . append ( ( char ) ( byte ) entry . getKey ( ) ) . append ( " = > " ) . append ( entry . getValue ( ) ) ; 
+ + } 
+ + while ( iter . hasNext ( ) ) 
+ + { 
+ + Map . Entry < Byte , AbstractType > entry = iter . next ( ) ; 
+ + sb . append ( ' , ' ) . append ( ( char ) ( byte ) entry . getKey ( ) ) . append ( " = > " ) . append ( entry . getValue ( ) ) ; 
+ + } 
+ + sb . append ( ' ) ' ) ; 
+ + return sb . toString ( ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Helper function to ease the writing of AbstractType . toString ( ) methods . 
+ + * / 
+ + public static String stringifyTypeParameters ( List < AbstractType > types ) 
+ + { 
+ + StringBuilder sb = new StringBuilder ( ) ; 
+ + sb . append ( ' ( ' ) ; 
+ + Iterator < AbstractType > iter = types . iterator ( ) ; 
+ + if ( iter . hasNext ( ) ) 
+ + { 
+ + sb . append ( iter . next ( ) ) ; 
+ + } 
+ + while ( iter . hasNext ( ) ) 
+ + { 
+ + sb . append ( ' , ' ) . append ( iter . next ( ) ) ; 
+ + } 
+ + sb . append ( ' ) ' ) ; 
+ + return sb . toString ( ) ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / utils / FBUtilities . java b / src / java / org / apache / cassandra / utils / FBUtilities . java 
+ index f38e152 . . cd3f9c3 100644 
+ - - - a / src / java / org / apache / cassandra / utils / FBUtilities . java 
+ + + + b / src / java / org / apache / cassandra / utils / FBUtilities . java 
+ @ @ - 44 , 6 + 44 , 7 @ @ import org . apache . cassandra . config . ConfigurationException ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . DecoratedKey ; 
+ import org . apache . cassandra . db . marshal . AbstractType ; 
+ + import org . apache . cassandra . db . marshal . TypeParser ; 
+ import org . apache . cassandra . dht . IPartitioner ; 
+ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . dht . Token ; 
+ @ @ - 523 , 25 + 524 , 7 @ @ public class FBUtilities 
+ 
+ public static AbstractType getComparator ( String compareWith ) throws ConfigurationException 
+ { 
+ - String className = compareWith . contains ( " . " ) ? compareWith : " org . apache . cassandra . db . marshal . " + compareWith ; 
+ - Class < ? extends AbstractType > typeClass = FBUtilities . < AbstractType > classForName ( className , " abstract - type " ) ; 
+ - try 
+ - { 
+ - Field field = typeClass . getDeclaredField ( " instance " ) ; 
+ - return ( AbstractType ) field . get ( null ) ; 
+ - } 
+ - catch ( NoSuchFieldException e ) 
+ - { 
+ - ConfigurationException ex = new ConfigurationException ( " Invalid comparator " + compareWith + " : must define a public static instance field . " ) ; 
+ - ex . initCause ( e ) ; 
+ - throw ex ; 
+ - } 
+ - catch ( IllegalAccessException e ) 
+ - { 
+ - ConfigurationException ex = new ConfigurationException ( " Invalid comparator " + compareWith + " : must define a public static instance field . " ) ; 
+ - ex . initCause ( e ) ; 
+ - throw ex ; 
+ - } 
+ + return TypeParser . parse ( compareWith ) ; 
+ } 
+ 
+ / * * 
+ diff - - git a / test / unit / org / apache / cassandra / db / marshal / TypeParserTest . java b / test / unit / org / apache / cassandra / db / marshal / TypeParserTest . java 
+ new file mode 100644 
+ index 0000000 . . ff60676 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / db / marshal / TypeParserTest . java 
+ @ @ - 0 , 0 + 1 , 93 @ @ 
+ + / * * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + package org . apache . cassandra . db . marshal ; 
+ + 
+ + import java . nio . ByteBuffer ; 
+ + import java . util . Iterator ; 
+ + import java . util . HashMap ; 
+ + import java . util . Map ; 
+ + import java . util . UUID ; 
+ + 
+ + import org . junit . Test ; 
+ + import static org . junit . Assert . fail ; 
+ + 
+ + import org . apache . cassandra . CleanupHelper ; 
+ + import org . apache . cassandra . Util ; 
+ + import org . apache . cassandra . config . ConfigurationException ; 
+ + import org . apache . cassandra . db . * ; 
+ + import org . apache . cassandra . db . columniterator . IdentityQueryFilter ; 
+ + import org . apache . cassandra . db . filter . QueryFilter ; 
+ + import org . apache . cassandra . db . filter . QueryPath ; 
+ + import org . apache . cassandra . utils . * ; 
+ + 
+ + public class TypeParserTest 
+ + { 
+ + @ Test 
+ + public void testParse ( ) throws ConfigurationException 
+ + { 
+ + AbstractType type ; 
+ + 
+ + type = TypeParser . parse ( null ) ; 
+ + assert type = = BytesType . instance ; 
+ + 
+ + type = TypeParser . parse ( " " ) ; 
+ + assert type = = BytesType . instance ; 
+ + 
+ + type = TypeParser . parse ( " " ) ; 
+ + assert type = = BytesType . instance ; 
+ + 
+ + type = TypeParser . parse ( " LongType " ) ; 
+ + assert type = = LongType . instance ; 
+ + 
+ + type = TypeParser . parse ( " LongType " ) ; 
+ + assert type = = LongType . instance ; 
+ + 
+ + type = TypeParser . parse ( " LongType ( ) " ) ; 
+ + assert type = = LongType . instance ; 
+ + 
+ + type = TypeParser . parse ( " LongType ( reversed = false ) " ) ; 
+ + assert type = = LongType . instance ; 
+ + 
+ + type = TypeParser . parse ( " LongType ( reversed = true ) " ) ; 
+ + assert type = = ReversedType . getInstance ( LongType . instance ) ; 
+ + assert ( ( ReversedType ) type ) . baseType = = LongType . instance ; 
+ + 
+ + type = TypeParser . parse ( " LongType ( reversed ) " ) ; 
+ + assert type = = ReversedType . getInstance ( LongType . instance ) ; 
+ + assert ( ( ReversedType ) type ) . baseType = = LongType . instance ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testParseError ( ) throws ConfigurationException 
+ + { 
+ + try 
+ + { 
+ + TypeParser . parse ( " y " ) ; 
+ + fail ( " Should not pass " ) ; 
+ + } 
+ + catch ( ConfigurationException e ) { } 
+ + 
+ + try 
+ + { 
+ + TypeParser . parse ( " LongType ( reversed @ ) " ) ; 
+ + fail ( " Should not pass " ) ; 
+ + } 
+ + catch ( ConfigurationException e ) { } 
+ + } 
+ + }

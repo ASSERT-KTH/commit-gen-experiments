@@ -1,0 +1,1114 @@
+BLEU SCORE: 0.014929831413909562
+
+TEST MSG: Support direct buffer decompression for reads
+GENERATED MSG: directly stream compressed sstable with java nio . patch by yukim ,
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 27b511a . . 79181e1 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 <nl> + * Support direct buffer decompression for reads ( CASSANDRA - 8464 ) <nl> * DirectByteBuffer compatible LZ4 methods ( CASSANDRA - 7039 ) <nl> * Add role based access control ( CASSANDRA - 7653 ) <nl> * Group sstables for anticompaction correctly ( CASSANDRA - 8578 ) <nl> diff - - git a / conf / cassandra - env . sh b / conf / cassandra - env . sh <nl> index 58605ca . . f9641ed 100644 <nl> - - - a / conf / cassandra - env . sh <nl> + + + b / conf / cassandra - env . sh <nl> @ @ - 251 , 6 + 251 , 7 @ @ fi <nl> <nl> # uncomment to have Cassandra JVM log internal method compilation ( developers only ) <nl> # JVM _ OPTS = " $ JVM _ OPTS - XX : + UnlockDiagnosticVMOptions - XX : + LogCompilation " <nl> + # JVM _ OPTS = " $ JVM _ OPTS - XX : + UnlockCommercialFeatures - XX : + FlightRecorder " <nl> <nl> # Prefer binding to IPv4 network intefaces ( when net . ipv6 . bindv6only = 1 ) . See <nl> # http : / / bugs . sun . com / bugdatabase / view _ bug . do ? bug _ id = 6342561 ( short version : <nl> diff - - git a / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java b / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java <nl> index dca5ade . . 57abba9 100644 <nl> - - - a / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java <nl> + + + b / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java <nl> @ @ - 19 , 14 + 19 , 22 @ @ package org . apache . cassandra . io . compress ; <nl> <nl> import java . io . * ; <nl> import java . nio . ByteBuffer ; <nl> + import java . nio . MappedByteBuffer ; <nl> + import java . nio . channels . FileChannel ; <nl> + import java . util . Map ; <nl> + import java . util . TreeMap ; <nl> import java . util . concurrent . ThreadLocalRandom ; <nl> import java . util . zip . Adler32 ; <nl> - import java . util . zip . CRC32 ; <nl> - import java . util . zip . Checksum ; <nl> <nl> + <nl> + import com . google . common . primitives . Ints ; <nl> + <nl> + import org . apache . cassandra . config . Config ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . io . FSReadError ; <nl> import org . apache . cassandra . io . sstable . CorruptSSTableException ; <nl> import org . apache . cassandra . io . util . CompressedPoolingSegmentedFile ; <nl> + import org . apache . cassandra . io . util . FileUtils ; <nl> import org . apache . cassandra . io . util . PoolingSegmentedFile ; <nl> import org . apache . cassandra . io . util . RandomAccessReader ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> @ @ - 37 , 6 + 45 , 8 @ @ import org . apache . cassandra . utils . FBUtilities ; <nl> * / <nl> public class CompressedRandomAccessReader extends RandomAccessReader <nl> { <nl> + private static final boolean useMmap = DatabaseDescriptor . getDiskAccessMode ( ) = = Config . DiskAccessMode . mmap ; <nl> + <nl> public static CompressedRandomAccessReader open ( String path , CompressionMetadata metadata , CompressedPoolingSegmentedFile owner ) <nl> { <nl> try <nl> @ @ - 61 , 33 + 71 , 96 @ @ public class CompressedRandomAccessReader extends RandomAccessReader <nl> } <nl> } <nl> <nl> + private TreeMap < Long , MappedByteBuffer > chunkSegments ; <nl> + private int MAX _ SEGMENT _ SIZE = Integer . MAX _ VALUE ; <nl> + <nl> private final CompressionMetadata metadata ; <nl> <nl> / / we read the raw compressed bytes into this buffer , then move the uncompressed ones into super . buffer . <nl> private ByteBuffer compressed ; <nl> <nl> / / re - use single crc object <nl> - private final Checksum checksum ; <nl> + private final Adler32 checksum ; <nl> <nl> / / raw checksum bytes <nl> - private final ByteBuffer checksumBytes = ByteBuffer . wrap ( new byte [ 4 ] ) ; <nl> + private ByteBuffer checksumBytes ; <nl> <nl> protected CompressedRandomAccessReader ( String dataFilePath , CompressionMetadata metadata , PoolingSegmentedFile owner ) throws FileNotFoundException <nl> { <nl> - super ( new File ( dataFilePath ) , metadata . chunkLength ( ) , owner ) ; <nl> + super ( new File ( dataFilePath ) , metadata . chunkLength ( ) , metadata . compressor ( ) . useDirectOutputByteBuffers ( ) , owner ) ; <nl> this . metadata = metadata ; <nl> - checksum = metadata . hasPostCompressionAdlerChecksums ? new Adler32 ( ) : new CRC32 ( ) ; <nl> - compressed = ByteBuffer . wrap ( new byte [ metadata . compressor ( ) . initialCompressedBufferLength ( metadata . chunkLength ( ) ) ] ) ; <nl> + checksum = new Adler32 ( ) ; <nl> + <nl> + if ( ! useMmap ) <nl> + { <nl> + compressed = ByteBuffer . wrap ( new byte [ metadata . compressor ( ) . initialCompressedBufferLength ( metadata . chunkLength ( ) ) ] ) ; <nl> + checksumBytes = ByteBuffer . wrap ( new byte [ 4 ] ) ; <nl> + } <nl> + else <nl> + { <nl> + try <nl> + { <nl> + createMappedSegments ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + } <nl> + } <nl> + <nl> + private void createMappedSegments ( ) throws IOException <nl> + { <nl> + chunkSegments = new TreeMap < > ( ) ; <nl> + long offset = 0 ; <nl> + long lastSegmentOffset = 0 ; <nl> + long segmentSize = 0 ; <nl> + <nl> + while ( offset < metadata . dataLength ) <nl> + { <nl> + CompressionMetadata . Chunk chunk = metadata . chunkFor ( offset ) ; <nl> + <nl> + / / Reached a new mmap boundary <nl> + if ( segmentSize + chunk . length + 4 > MAX _ SEGMENT _ SIZE ) <nl> + { <nl> + chunkSegments . put ( lastSegmentOffset , channel . map ( FileChannel . MapMode . READ _ ONLY , lastSegmentOffset , segmentSize ) ) ; <nl> + lastSegmentOffset + = segmentSize ; <nl> + segmentSize = 0 ; <nl> + } <nl> + <nl> + segmentSize + = chunk . length + 4 ; / / checksum <nl> + offset + = metadata . chunkLength ( ) ; <nl> + } <nl> + <nl> + if ( segmentSize > 0 ) <nl> + chunkSegments . put ( lastSegmentOffset , channel . map ( FileChannel . MapMode . READ _ ONLY , lastSegmentOffset , segmentSize ) ) ; <nl> } <nl> <nl> - protected ByteBuffer allocateBuffer ( int bufferSize ) <nl> + protected ByteBuffer allocateBuffer ( int bufferSize , boolean useDirect ) <nl> { <nl> assert Integer . bitCount ( bufferSize ) = = 1 ; <nl> - return ByteBuffer . allocate ( bufferSize ) ; <nl> + return useMmap & & useDirect <nl> + ? ByteBuffer . allocateDirect ( bufferSize ) <nl> + : ByteBuffer . allocate ( bufferSize ) ; <nl> } <nl> <nl> @ Override <nl> - protected void reBuffer ( ) <nl> + public void deallocate ( ) <nl> + { <nl> + super . deallocate ( ) ; <nl> + <nl> + if ( chunkSegments ! = null ) <nl> + { <nl> + for ( Map . Entry < Long , MappedByteBuffer > entry : chunkSegments . entrySet ( ) ) <nl> + { <nl> + FileUtils . clean ( entry . getValue ( ) ) ; <nl> + } <nl> + } <nl> + <nl> + chunkSegments = null ; <nl> + } <nl> + <nl> + private void reBufferStandard ( ) <nl> { <nl> try <nl> { <nl> @ @ - 126 , 14 + 199 , 7 @ @ public class CompressedRandomAccessReader extends RandomAccessReader <nl> if ( metadata . parameters . getCrcCheckChance ( ) > ThreadLocalRandom . current ( ) . nextDouble ( ) ) <nl> { <nl> <nl> - if ( metadata . hasPostCompressionAdlerChecksums ) <nl> - { <nl> - checksum . update ( compressed . array ( ) , 0 , chunk . length ) ; <nl> - } <nl> - else <nl> - { <nl> - checksum . update ( buffer . array ( ) , 0 , decompressedBytes ) ; <nl> - } <nl> + checksum . update ( compressed . array ( ) , 0 , chunk . length ) ; <nl> <nl> if ( checksum ( chunk ) ! = ( int ) checksum . getValue ( ) ) <nl> throw new CorruptBlockException ( getPath ( ) , chunk ) ; <nl> @ @ - 156 , 6 + 222 , 81 @ @ public class CompressedRandomAccessReader extends RandomAccessReader <nl> } <nl> } <nl> <nl> + private void reBufferMmap ( ) <nl> + { <nl> + try <nl> + { <nl> + long position = current ( ) ; <nl> + assert position < metadata . dataLength ; <nl> + <nl> + CompressionMetadata . Chunk chunk = metadata . chunkFor ( position ) ; <nl> + <nl> + Map . Entry < Long , MappedByteBuffer > entry = chunkSegments . floorEntry ( chunk . offset ) ; <nl> + long segmentOffset = entry . getKey ( ) ; <nl> + int chunkOffset = Ints . checkedCast ( chunk . offset - segmentOffset ) ; <nl> + MappedByteBuffer compressedChunk = entry . getValue ( ) ; <nl> + <nl> + compressedChunk . position ( chunkOffset ) ; <nl> + compressedChunk . limit ( chunkOffset + chunk . length ) ; <nl> + compressedChunk . mark ( ) ; <nl> + <nl> + buffer . clear ( ) ; <nl> + int decompressedBytes ; <nl> + try <nl> + { <nl> + decompressedBytes = metadata . compressor ( ) . uncompress ( compressedChunk , buffer ) ; <nl> + buffer . limit ( decompressedBytes ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new CorruptBlockException ( getPath ( ) , chunk ) ; <nl> + } <nl> + finally <nl> + { <nl> + compressedChunk . limit ( compressedChunk . capacity ( ) ) ; <nl> + } <nl> + <nl> + if ( metadata . parameters . getCrcCheckChance ( ) > ThreadLocalRandom . current ( ) . nextDouble ( ) ) <nl> + { <nl> + compressedChunk . reset ( ) ; <nl> + compressedChunk . limit ( chunkOffset + chunk . length ) ; <nl> + <nl> + FBUtilities . directCheckSum ( checksum , compressedChunk ) ; <nl> + <nl> + compressedChunk . limit ( compressedChunk . capacity ( ) ) ; <nl> + <nl> + <nl> + if ( compressedChunk . getInt ( ) ! = ( int ) checksum . getValue ( ) ) <nl> + throw new CorruptBlockException ( getPath ( ) , chunk ) ; <nl> + <nl> + / / reset checksum object back to the original ( blank ) state <nl> + checksum . reset ( ) ; <nl> + } <nl> + <nl> + / / buffer offset is always aligned <nl> + bufferOffset = position & ~ ( buffer . capacity ( ) - 1 ) ; <nl> + buffer . position ( ( int ) ( position - bufferOffset ) ) ; <nl> + } <nl> + catch ( CorruptBlockException e ) <nl> + { <nl> + throw new CorruptSSTableException ( e , getPath ( ) ) ; <nl> + } <nl> + <nl> + } <nl> + <nl> + @ Override <nl> + protected void reBuffer ( ) <nl> + { <nl> + if ( useMmap ) <nl> + { <nl> + reBufferMmap ( ) ; <nl> + } <nl> + else <nl> + { <nl> + reBufferStandard ( ) ; <nl> + } <nl> + } <nl> + <nl> private int checksum ( CompressionMetadata . Chunk chunk ) throws IOException <nl> { <nl> assert channel . position ( ) = = chunk . offset + chunk . length ; <nl> @ @ - 167 , 7 + 308 , 7 @ @ public class CompressedRandomAccessReader extends RandomAccessReader <nl> <nl> public int getTotalBufferSize ( ) <nl> { <nl> - return super . getTotalBufferSize ( ) + compressed . capacity ( ) ; <nl> + return super . getTotalBufferSize ( ) + ( useMmap ? 0 : compressed . capacity ( ) ) ; <nl> } <nl> <nl> @ Override <nl> diff - - git a / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java b / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java <nl> index 57d7cbe . . 6139a5c 100644 <nl> - - - a / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java <nl> + + + b / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java <nl> @ @ - 62 , 7 + 62 , 6 @ @ public class CompressionMetadata <nl> { <nl> public final long dataLength ; <nl> public final long compressedFileLength ; <nl> - public final boolean hasPostCompressionAdlerChecksums ; <nl> private final Memory chunkOffsets ; <nl> private final long chunkOffsetsSize ; <nl> public final String indexFilePath ; <nl> @ @ - 82 , 14 + 81 , 13 @ @ public class CompressionMetadata <nl> public static CompressionMetadata create ( String dataFilePath ) <nl> { <nl> Descriptor desc = Descriptor . fromFilename ( dataFilePath ) ; <nl> - return new CompressionMetadata ( desc . filenameFor ( Component . COMPRESSION _ INFO ) , new File ( dataFilePath ) . length ( ) , desc . version . hasPostCompressionAdlerChecksums ( ) ) ; <nl> + return new CompressionMetadata ( desc . filenameFor ( Component . COMPRESSION _ INFO ) , new File ( dataFilePath ) . length ( ) ) ; <nl> } <nl> <nl> @ VisibleForTesting <nl> - CompressionMetadata ( String indexFilePath , long compressedLength , boolean hasPostCompressionAdlerChecksums ) <nl> + CompressionMetadata ( String indexFilePath , long compressedLength ) <nl> { <nl> this . indexFilePath = indexFilePath ; <nl> - this . hasPostCompressionAdlerChecksums = hasPostCompressionAdlerChecksums ; <nl> <nl> DataInputStream stream ; <nl> try <nl> @ @ - 137 , 13 + 135 , 12 @ @ public class CompressionMetadata <nl> this . chunkOffsetsSize = chunkOffsets . size ( ) ; <nl> } <nl> <nl> - private CompressionMetadata ( String filePath , CompressionParameters parameters , RefCountedMemory offsets , long offsetsSize , long dataLength , long compressedLength , boolean hasPostCompressionAdlerChecksums ) <nl> + private CompressionMetadata ( String filePath , CompressionParameters parameters , RefCountedMemory offsets , long offsetsSize , long dataLength , long compressedLength ) <nl> { <nl> this . indexFilePath = filePath ; <nl> this . parameters = parameters ; <nl> this . dataLength = dataLength ; <nl> this . compressedFileLength = compressedLength ; <nl> - this . hasPostCompressionAdlerChecksums = hasPostCompressionAdlerChecksums ; <nl> this . chunkOffsets = offsets ; <nl> offsets . reference ( ) ; <nl> this . chunkOffsetsSize = offsetsSize ; <nl> @ @ - 342 , 7 + 339 , 7 @ @ public class CompressionMetadata <nl> default : <nl> throw new AssertionError ( ) ; <nl> } <nl> - return new CompressionMetadata ( filePath , parameters , offsets , count * 8L , dataLength , compressedLength , latestVersion . hasPostCompressionAdlerChecksums ( ) ) ; <nl> + return new CompressionMetadata ( filePath , parameters , offsets , count * 8L , dataLength , compressedLength ) ; <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / io / compress / DeflateCompressor . java b / src / java / org / apache / cassandra / io / compress / DeflateCompressor . java <nl> index 125a08f . . 546b506 100644 <nl> - - - a / src / java / org / apache / cassandra / io / compress / DeflateCompressor . java <nl> + + + b / src / java / org / apache / cassandra / io / compress / DeflateCompressor . java <nl> @ @ - 17 , 7 + 17 , 10 @ @ <nl> * / <nl> package org . apache . cassandra . io . compress ; <nl> <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> + <nl> import java . io . IOException ; <nl> + import java . nio . ByteBuffer ; <nl> import java . util . Collections ; <nl> import java . util . Map ; <nl> import java . util . Set ; <nl> @ @ - 113 , 4 + 116 , 18 @ @ public class DeflateCompressor implements ICompressor <nl> throw new IOException ( e ) ; <nl> } <nl> } <nl> + <nl> + public int uncompress ( ByteBuffer input _ , ByteBuffer output ) throws IOException <nl> + { <nl> + if ( ! output . hasArray ( ) ) <nl> + throw new IllegalArgumentException ( " DeflateCompressor doesn ' t work with direct byte buffers " ) ; <nl> + <nl> + byte [ ] input = ByteBufferUtil . getArray ( input _ ) ; <nl> + return uncompress ( input , 0 , input . length , output . array ( ) , output . arrayOffset ( ) + output . position ( ) ) ; <nl> + } <nl> + <nl> + public boolean useDirectOutputByteBuffers ( ) <nl> + { <nl> + return false ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / compress / ICompressor . java b / src / java / org / apache / cassandra / io / compress / ICompressor . java <nl> index be76bc5 . . 81d1425 100644 <nl> - - - a / src / java / org / apache / cassandra / io / compress / ICompressor . java <nl> + + + b / src / java / org / apache / cassandra / io / compress / ICompressor . java <nl> @ @ - 18 , 6 + 18 , 7 @ @ <nl> package org . apache . cassandra . io . compress ; <nl> <nl> import java . io . IOException ; <nl> + import java . nio . ByteBuffer ; <nl> import java . util . Set ; <nl> <nl> public interface ICompressor <nl> @ @ - 28 , 6 + 29 , 17 @ @ public interface ICompressor <nl> <nl> public int uncompress ( byte [ ] input , int inputOffset , int inputLength , byte [ ] output , int outputOffset ) throws IOException ; <nl> <nl> + / * * <nl> + * Decompression for DirectByteBuffers <nl> + * / <nl> + public int uncompress ( ByteBuffer input , ByteBuffer output ) throws IOException ; <nl> + <nl> + / * * <nl> + * Notifies user if this compressor will wants / requires a direct byte buffers to <nl> + * decompress direct byteBuffers <nl> + * / <nl> + public boolean useDirectOutputByteBuffers ( ) ; <nl> + <nl> public Set < String > supportedOptions ( ) ; <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / io / compress / LZ4Compressor . java b / src / java / org / apache / cassandra / io / compress / LZ4Compressor . java <nl> index 0cf36c1 . . f458cb6 100644 <nl> - - - a / src / java / org / apache / cassandra / io / compress / LZ4Compressor . java <nl> + + + b / src / java / org / apache / cassandra / io / compress / LZ4Compressor . java <nl> @ @ - 18 , 6 + 18 , 7 @ @ <nl> package org . apache . cassandra . io . compress ; <nl> <nl> import java . io . IOException ; <nl> + import java . nio . ByteBuffer ; <nl> import java . util . Arrays ; <nl> import java . util . HashSet ; <nl> import java . util . Map ; <nl> @ @ - 25 , 10 + 26 , 10 @ @ import java . util . Set ; <nl> <nl> import net . jpountz . lz4 . LZ4Exception ; <nl> import net . jpountz . lz4 . LZ4Factory ; <nl> + import org . apache . cassandra . utils . FastByteOperations ; <nl> <nl> public class LZ4Compressor implements ICompressor <nl> { <nl> - <nl> private static final int INTEGER _ BYTES = 4 ; <nl> private static final LZ4Compressor instance = new LZ4Compressor ( ) ; <nl> <nl> @ @ - 38 , 13 + 39 , 13 @ @ public class LZ4Compressor implements ICompressor <nl> } <nl> <nl> private final net . jpountz . lz4 . LZ4Compressor compressor ; <nl> - private final net . jpountz . lz4 . LZ4Decompressor decompressor ; <nl> + private final net . jpountz . lz4 . LZ4FastDecompressor decompressor ; <nl> <nl> private LZ4Compressor ( ) <nl> { <nl> final LZ4Factory lz4Factory = LZ4Factory . fastestInstance ( ) ; <nl> compressor = lz4Factory . fastCompressor ( ) ; <nl> - decompressor = lz4Factory . decompressor ( ) ; <nl> + decompressor = lz4Factory . fastDecompressor ( ) ; <nl> } <nl> <nl> public int initialCompressedBufferLength ( int chunkLength ) <nl> @ @ - 97 , 8 + 98 , 42 @ @ public class LZ4Compressor implements ICompressor <nl> return decompressedLength ; <nl> } <nl> <nl> + public int uncompress ( ByteBuffer input , ByteBuffer output ) throws IOException <nl> + { <nl> + int pos = input . position ( ) ; <nl> + final int decompressedLength = ( input . get ( pos ) & 0xFF ) <nl> + | ( ( input . get ( pos + 1 ) & 0xFF ) < < 8 ) <nl> + | ( ( input . get ( pos + 2 ) & 0xFF ) < < 16 ) <nl> + | ( ( input . get ( pos + 3 ) & 0xFF ) < < 24 ) ; <nl> + <nl> + int inputLength = input . remaining ( ) - INTEGER _ BYTES ; <nl> + <nl> + final int compressedLength ; <nl> + try <nl> + { <nl> + compressedLength = decompressor . decompress ( input , input . position ( ) + INTEGER _ BYTES , output , output . position ( ) , decompressedLength ) ; <nl> + } <nl> + catch ( LZ4Exception e ) <nl> + { <nl> + throw new IOException ( e ) ; <nl> + } <nl> + <nl> + if ( compressedLength ! = inputLength ) <nl> + { <nl> + throw new IOException ( " Compressed lengths mismatch : " + compressedLength + " vs " + inputLength ) ; <nl> + } <nl> + <nl> + return decompressedLength ; <nl> + } <nl> + <nl> + @ Override <nl> + public boolean useDirectOutputByteBuffers ( ) <nl> + { <nl> + return false ; <nl> + } <nl> + <nl> public Set < String > supportedOptions ( ) <nl> { <nl> - return new HashSet < String > ( Arrays . asList ( CompressionParameters . CRC _ CHECK _ CHANCE ) ) ; <nl> + return new HashSet < > ( Arrays . asList ( CompressionParameters . CRC _ CHECK _ CHANCE ) ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / compress / SnappyCompressor . java b / src / java / org / apache / cassandra / io / compress / SnappyCompressor . java <nl> index 3583201 . . f5a2062 100644 <nl> - - - a / src / java / org / apache / cassandra / io / compress / SnappyCompressor . java <nl> + + + b / src / java / org / apache / cassandra / io / compress / SnappyCompressor . java <nl> @ @ - 18 , 10 + 18 , 12 @ @ <nl> package org . apache . cassandra . io . compress ; <nl> <nl> import java . io . IOException ; <nl> + import java . nio . ByteBuffer ; <nl> import java . util . Collections ; <nl> import java . util . Map ; <nl> import java . util . Set ; <nl> <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> import org . xerial . snappy . Snappy ; <nl> @ @ - 95 , 4 + 97 , 15 @ @ public class SnappyCompressor implements ICompressor <nl> { <nl> return Snappy . rawUncompress ( input , inputOffset , inputLength , output , outputOffset ) ; <nl> } <nl> + <nl> + public int uncompress ( ByteBuffer input , ByteBuffer output ) throws IOException <nl> + { <nl> + return Snappy . uncompress ( input , output ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public boolean useDirectOutputByteBuffers ( ) <nl> + { <nl> + return true ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / format / Version . java b / src / java / org / apache / cassandra / io / sstable / format / Version . java <nl> index 5da0cb8 . . faaa89e 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / format / Version . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / format / Version . java <nl> @ @ - 40 , 8 + 40 , 6 @ @ public abstract class Version <nl> <nl> public abstract boolean isLatestVersion ( ) ; <nl> <nl> - public abstract boolean hasPostCompressionAdlerChecksums ( ) ; <nl> - <nl> public abstract boolean hasSamplingLevel ( ) ; <nl> <nl> public abstract boolean hasNewStatsFile ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / format / big / BigFormat . java b / src / java / org / apache / cassandra / io / sstable / format / big / BigFormat . java <nl> index eb43968 . . e1a5622 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / format / big / BigFormat . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / format / big / BigFormat . java <nl> @ @ - 126 , 16 + 126 , 8 @ @ public class BigFormat implements SSTableFormat <nl> static class BigVersion extends Version <nl> { <nl> public static final String current _ version = " la " ; <nl> - public static final String earliest _ supported _ version = " ja " ; <nl> - <nl> - / / ja ( 2 . 0 . 0 ) : super columns are serialized as composites ( note that there is no real format change , <nl> - / / this is mostly a marker to know if we should expect super columns or not . We do need <nl> - / / a major version bump however , because we should not allow streaming of super columns <nl> - / / into this new format ) <nl> - / / tracks max local deletiontime in sstable metadata <nl> - / / records bloom _ filter _ fp _ chance in metadata component <nl> - / / remove data size and column count from data file ( CASSANDRA - 4180 ) <nl> - / / tracks max / min column values ( according to comparator ) <nl> + public static final String earliest _ supported _ version = " jb " ; <nl> + <nl> / / jb ( 2 . 0 . 1 ) : switch from crc32 to adler32 for compression checksums <nl> / / checksum the compressed data <nl> / / ka ( 2 . 1 . 0 ) : new Statistics . db file format <nl> @ @ - 145 , 7 + 137 , 6 @ @ public class BigFormat implements SSTableFormat <nl> / / la ( 3 . 0 . 0 ) : new file name format <nl> <nl> private final boolean isLatestVersion ; <nl> - private final boolean hasPostCompressionAdlerChecksums ; <nl> private final boolean hasSamplingLevel ; <nl> private final boolean newStatsFile ; <nl> private final boolean hasAllAdlerChecksums ; <nl> @ @ - 158 , 7 + 149 , 6 @ @ public class BigFormat implements SSTableFormat <nl> super ( instance , version ) ; <nl> <nl> isLatestVersion = version . compareTo ( current _ version ) = = 0 ; <nl> - hasPostCompressionAdlerChecksums = version . compareTo ( " jb " ) > = 0 ; <nl> hasSamplingLevel = version . compareTo ( " ka " ) > = 0 ; <nl> newStatsFile = version . compareTo ( " ka " ) > = 0 ; <nl> hasAllAdlerChecksums = version . compareTo ( " ka " ) > = 0 ; <nl> @ @ - 174 , 12 + 164 , 6 @ @ public class BigFormat implements SSTableFormat <nl> } <nl> <nl> @ Override <nl> - public boolean hasPostCompressionAdlerChecksums ( ) <nl> - { <nl> - return hasPostCompressionAdlerChecksums ; <nl> - } <nl> - <nl> - @ Override <nl> public boolean hasSamplingLevel ( ) <nl> { <nl> return hasSamplingLevel ; <nl> diff - - git a / src / java / org / apache / cassandra / io / util / FileUtils . java b / src / java / org / apache / cassandra / io / util / FileUtils . java <nl> index 080caa5 . . 837cc6a 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / FileUtils . java <nl> + + + b / src / java / org / apache / cassandra / io / util / FileUtils . java <nl> @ @ - 278 , 9 + 278 , 10 @ @ public class FileUtils <nl> return canCleanDirectBuffers ; <nl> } <nl> <nl> - public static void clean ( MappedByteBuffer buffer ) <nl> + public static void clean ( ByteBuffer buffer ) <nl> { <nl> - ( ( DirectBuffer ) buffer ) . cleaner ( ) . clean ( ) ; <nl> + if ( isCleanerAvailable ( ) & & buffer . isDirect ( ) ) <nl> + ( ( DirectBuffer ) buffer ) . cleaner ( ) . clean ( ) ; <nl> } <nl> <nl> public static void createDirectory ( String directory ) <nl> diff - - git a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> index bf120a3 . . 6f2def0 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> @ @ - 30 , 6 + 30 , 7 @ @ import org . slf4j . LoggerFactory ; <nl> import org . apache . cassandra . io . FSReadError ; <nl> import org . apache . cassandra . io . sstable . format . SSTableWriter ; <nl> import org . apache . cassandra . utils . JVMStabilityInspector ; <nl> + import sun . nio . ch . DirectBuffer ; <nl> <nl> public class MmappedSegmentedFile extends SegmentedFile <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java <nl> index 58205d8 . . 6bff378 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java <nl> + + + b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java <nl> @ @ - 53 , 6 + 53 , 11 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp <nl> <nl> protected RandomAccessReader ( File file , int bufferSize , PoolingSegmentedFile owner ) throws FileNotFoundException <nl> { <nl> + this ( file , bufferSize , false , owner ) ; <nl> + } <nl> + <nl> + protected RandomAccessReader ( File file , int bufferSize , boolean useDirectBuffer , PoolingSegmentedFile owner ) throws FileNotFoundException <nl> + { <nl> this . owner = owner ; <nl> <nl> filePath = file . getAbsolutePath ( ) ; <nl> @ @ - 79 , 13 + 84 , 16 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp <nl> { <nl> throw new FSReadError ( e , filePath ) ; <nl> } <nl> - buffer = allocateBuffer ( bufferSize ) ; <nl> + buffer = allocateBuffer ( bufferSize , useDirectBuffer ) ; <nl> buffer . limit ( 0 ) ; <nl> } <nl> <nl> - protected ByteBuffer allocateBuffer ( int bufferSize ) <nl> + protected ByteBuffer allocateBuffer ( int bufferSize , boolean useDirectBuffer ) <nl> { <nl> - return ByteBuffer . allocate ( ( int ) Math . min ( fileLength , bufferSize ) ) ; <nl> + int size = ( int ) Math . min ( fileLength , bufferSize ) ; <nl> + return useDirectBuffer <nl> + ? ByteBuffer . allocate ( size ) <nl> + : ByteBuffer . allocateDirect ( size ) ; <nl> } <nl> <nl> public static RandomAccessReader open ( File file , PoolingSegmentedFile owner ) <nl> @ @ - 239 , 6 + 247 , 8 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp <nl> public void deallocate ( ) <nl> { <nl> bufferOffset + = buffer . position ( ) ; <nl> + FileUtils . clean ( buffer ) ; <nl> + <nl> buffer = null ; / / makes sure we don ' t use this after it ' s ostensibly closed <nl> <nl> try <nl> diff - - git a / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java b / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java <nl> index 449546f . . 54f6eda 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java <nl> + + + b / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java <nl> @ @ - 62 , 17 + 62 , 15 @ @ public class CompressedInputStream extends InputStream <nl> private static final byte [ ] POISON _ PILL = new byte [ 0 ] ; <nl> <nl> private long totalCompressedBytesRead ; <nl> - private final boolean hasPostCompressionAdlerChecksums ; <nl> <nl> / * * <nl> * @ param source Input source to read compressed data from <nl> * @ param info Compression info <nl> * / <nl> - public CompressedInputStream ( InputStream source , CompressionInfo info , boolean hasPostCompressionAdlerChecksums ) <nl> + public CompressedInputStream ( InputStream source , CompressionInfo info ) <nl> { <nl> this . info = info ; <nl> - this . checksum = hasPostCompressionAdlerChecksums ? new Adler32 ( ) : new CRC32 ( ) ; <nl> - this . hasPostCompressionAdlerChecksums = hasPostCompressionAdlerChecksums ; <nl> + this . checksum = new Adler32 ( ) ; <nl> this . buffer = new byte [ info . parameters . chunkLength ( ) ] ; <nl> / / buffer is limited to store up to 1024 chunks <nl> this . dataBuffer = new ArrayBlockingQueue < byte [ ] > ( Math . min ( info . chunks . length , 1024 ) ) ; <nl> @ @ - 117 , 14 + 115 , 7 @ @ public class CompressedInputStream extends InputStream <nl> / / validate crc randomly <nl> if ( info . parameters . getCrcCheckChance ( ) > ThreadLocalRandom . current ( ) . nextDouble ( ) ) <nl> { <nl> - if ( hasPostCompressionAdlerChecksums ) <nl> - { <nl> - checksum . update ( compressed , 0 , compressed . length - checksumBytes . length ) ; <nl> - } <nl> - else <nl> - { <nl> - checksum . update ( buffer , 0 , validBufferBytes ) ; <nl> - } <nl> + checksum . update ( compressed , 0 , compressed . length - checksumBytes . length ) ; <nl> <nl> System . arraycopy ( compressed , compressed . length - checksumBytes . length , checksumBytes , 0 , checksumBytes . length ) ; <nl> if ( Ints . fromByteArray ( checksumBytes ) ! = ( int ) checksum . getValue ( ) ) <nl> diff - - git a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java <nl> index 0595e0c . . 46f7d4f 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java <nl> + + + b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java <nl> @ @ - 76 , 7 + 76 , 7 @ @ public class CompressedStreamReader extends StreamReader <nl> <nl> SSTableWriter writer = createWriter ( cfs , totalSize , repairedAt , format ) ; <nl> <nl> - CompressedInputStream cis = new CompressedInputStream ( Channels . newInputStream ( channel ) , compressionInfo , inputVersion . hasPostCompressionAdlerChecksums ( ) ) ; <nl> + CompressedInputStream cis = new CompressedInputStream ( Channels . newInputStream ( channel ) , compressionInfo ) ; <nl> BytesReadTracker in = new BytesReadTracker ( new DataInputStream ( cis ) ) ; <nl> try <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / utils / FBUtilities . java b / src / java / org / apache / cassandra / utils / FBUtilities . java <nl> index 0462e5e . . c9024ec 100644 <nl> - - - a / src / java / org / apache / cassandra / utils / FBUtilities . java <nl> + + + b / src / java / org / apache / cassandra / utils / FBUtilities . java <nl> @ @ - 19 , 6 + 19 , 8 @ @ package org . apache . cassandra . utils ; <nl> <nl> import java . io . * ; <nl> import java . lang . reflect . Field ; <nl> + import java . lang . reflect . InvocationTargetException ; <nl> + import java . lang . reflect . Method ; <nl> import java . math . BigInteger ; <nl> import java . net . * ; <nl> import java . nio . ByteBuffer ; <nl> @ @ - 26 , 10 + 28 , 12 @ @ import java . security . MessageDigest ; <nl> import java . security . NoSuchAlgorithmException ; <nl> import java . util . * ; <nl> import java . util . concurrent . * ; <nl> + import java . util . zip . Adler32 ; <nl> import java . util . zip . Checksum ; <nl> <nl> import com . google . common . base . Joiner ; <nl> import com . google . common . collect . AbstractIterator ; <nl> + import com . google . common . primitives . Ints ; <nl> import org . apache . commons . lang3 . StringUtils ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 44 , 6 + 48 , 8 @ @ import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . exceptions . ConfigurationException ; <nl> import org . apache . cassandra . io . IVersionedSerializer ; <nl> + import org . apache . cassandra . io . compress . CompressedRandomAccessReader ; <nl> + import org . apache . cassandra . io . compress . CompressionParameters ; <nl> import org . apache . cassandra . io . util . DataOutputBuffer ; <nl> import org . apache . cassandra . io . util . FileUtils ; <nl> import org . apache . cassandra . io . util . IAllocator ; <nl> @ @ - 634 , 6 + 640 , 67 @ @ public class FBUtilities <nl> checksum . update ( ( v > > > 0 ) & 0xFF ) ; <nl> } <nl> <nl> + private static Method directUpdate ; <nl> + static <nl> + { <nl> + try <nl> + { <nl> + directUpdate = Adler32 . class . getDeclaredMethod ( " update " , new Class [ ] { ByteBuffer . class } ) ; <nl> + directUpdate . setAccessible ( true ) ; <nl> + } catch ( NoSuchMethodException e ) <nl> + { <nl> + logger . warn ( " JVM doesn ' t support Adler32 byte buffer access " ) ; <nl> + directUpdate = null ; <nl> + } <nl> + } <nl> + <nl> + private static final ThreadLocal < byte [ ] > localDigestBuffer = new ThreadLocal < byte [ ] > ( ) <nl> + { <nl> + @ Override <nl> + protected byte [ ] initialValue ( ) <nl> + { <nl> + return new byte [ CompressionParameters . DEFAULT _ CHUNK _ LENGTH ] ; <nl> + } <nl> + } ; <nl> + <nl> + / / Java 7 has this method but it ' s private till Java 8 . Thanks JDK ! <nl> + public static boolean supportsDirectChecksum ( ) <nl> + { <nl> + return directUpdate ! = null ; <nl> + } <nl> + <nl> + public static void directCheckSum ( Adler32 checksum , ByteBuffer bb ) <nl> + { <nl> + if ( directUpdate ! = null ) <nl> + { <nl> + try <nl> + { <nl> + directUpdate . invoke ( checksum , bb ) ; <nl> + return ; <nl> + } catch ( IllegalAccessException e ) <nl> + { <nl> + directUpdate = null ; <nl> + logger . warn ( " JVM doesn ' t support Adler32 byte buffer access " ) ; <nl> + } <nl> + catch ( InvocationTargetException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + / / Fallback <nl> + byte [ ] buffer = localDigestBuffer . get ( ) ; <nl> + <nl> + int remaining ; <nl> + while ( ( remaining = bb . remaining ( ) ) > 0 ) <nl> + { <nl> + remaining = Math . min ( remaining , buffer . length ) ; <nl> + ByteBufferUtil . arrayCopy ( bb , bb . position ( ) , buffer , 0 , remaining ) ; <nl> + bb . position ( bb . position ( ) + remaining ) ; <nl> + checksum . update ( buffer , 0 , remaining ) ; <nl> + } <nl> + } <nl> + <nl> public static long abs ( long index ) <nl> { <nl> long negbit = index > > 63 ; <nl> diff - - git a / test / unit / org / apache / cassandra / io / compress / CompressedRandomAccessReaderTest . java b / test / unit / org / apache / cassandra / io / compress / CompressedRandomAccessReaderTest . java <nl> index 900abd8 . . 58bf5cb 100644 <nl> - - - a / test / unit / org / apache / cassandra / io / compress / CompressedRandomAccessReaderTest . java <nl> + + + b / test / unit / org / apache / cassandra / io / compress / CompressedRandomAccessReaderTest . java <nl> @ @ - 80 , 7 + 80 , 7 @ @ public class CompressedRandomAccessReaderTest <nl> writer . write ( " x " . getBytes ( ) ) ; <nl> writer . close ( ) ; <nl> <nl> - CompressedRandomAccessReader reader = CompressedRandomAccessReader . open ( filename , new CompressionMetadata ( filename + " . metadata " , f . length ( ) , true ) ) ; <nl> + CompressedRandomAccessReader reader = CompressedRandomAccessReader . open ( filename , new CompressionMetadata ( filename + " . metadata " , f . length ( ) ) ) ; <nl> String res = reader . readLine ( ) ; <nl> assertEquals ( res , " xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx " ) ; <nl> assertEquals ( 40 , res . length ( ) ) ; <nl> @ @ - 123 , 7 + 123 , 7 @ @ public class CompressedRandomAccessReaderTest <nl> <nl> assert f . exists ( ) ; <nl> RandomAccessReader reader = compressed <nl> - ? CompressedRandomAccessReader . open ( filename , new CompressionMetadata ( filename + " . metadata " , f . length ( ) , true ) ) <nl> + ? CompressedRandomAccessReader . open ( filename , new CompressionMetadata ( filename + " . metadata " , f . length ( ) ) ) <nl> : RandomAccessReader . open ( f ) ; <nl> String expected = " The quick brown fox jumps over the lazy dog " ; <nl> assertEquals ( expected . length ( ) , reader . length ( ) ) ; <nl> @ @ - 160 , 7 + 160 , 7 @ @ public class CompressedRandomAccessReaderTest <nl> writer . close ( ) ; <nl> <nl> / / open compression metadata and get chunk information <nl> - CompressionMetadata meta = new CompressionMetadata ( metadata . getPath ( ) , file . length ( ) , true ) ; <nl> + CompressionMetadata meta = new CompressionMetadata ( metadata . getPath ( ) , file . length ( ) ) ; <nl> CompressionMetadata . Chunk chunk = meta . chunkFor ( 0 ) ; <nl> <nl> RandomAccessReader reader = CompressedRandomAccessReader . open ( file . getPath ( ) , meta ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / io / compress / CompressorTest . java b / test / unit / org / apache / cassandra / io / compress / CompressorTest . java <nl> new file mode 100644 <nl> index 0000000 . . 04396e0 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / io / compress / CompressorTest . java <nl> @ @ - 0 , 0 + 1 , 133 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . io . compress ; <nl> + <nl> + import java . io . * ; <nl> + import java . nio . ByteBuffer ; <nl> + import java . nio . MappedByteBuffer ; <nl> + import java . util . Arrays ; <nl> + import java . util . Collections ; <nl> + import java . util . Random ; <nl> + <nl> + import com . google . common . io . Files ; <nl> + import org . apache . cassandra . io . compress . ICompressor . WrappedArray ; <nl> + <nl> + import org . junit . Assert ; <nl> + import org . junit . Before ; <nl> + import org . junit . Test ; <nl> + <nl> + import static org . junit . Assert . * ; <nl> + <nl> + public class CompressorTest <nl> + { <nl> + ICompressor compressor ; <nl> + <nl> + ICompressor [ ] compressors = new ICompressor [ ] { <nl> + LZ4Compressor . create ( Collections . < String , String > emptyMap ( ) ) , <nl> + DeflateCompressor . create ( Collections . < String , String > emptyMap ( ) ) , <nl> + SnappyCompressor . create ( Collections . < String , String > emptyMap ( ) ) <nl> + } ; <nl> + <nl> + <nl> + @ Test <nl> + public void testAllCompressors ( ) throws IOException <nl> + { <nl> + for ( ICompressor compressor : compressors ) <nl> + { <nl> + this . compressor = compressor ; <nl> + <nl> + testEmptyArray ( ) ; <nl> + testLongArray ( ) ; <nl> + testShortArray ( ) ; <nl> + testMappedFile ( ) ; <nl> + } <nl> + } <nl> + <nl> + <nl> + public void test ( byte [ ] data , int off , int len ) throws IOException <nl> + { <nl> + final int outOffset = 3 ; <nl> + final WrappedArray out = new WrappedArray ( new byte [ outOffset + compressor . initialCompressedBufferLength ( len ) ] ) ; <nl> + new Random ( ) . nextBytes ( out . buffer ) ; <nl> + final int compressedLength = compressor . compress ( data , off , len , out , outOffset ) ; <nl> + final int restoredOffset = 5 ; <nl> + final byte [ ] restored = new byte [ restoredOffset + len ] ; <nl> + new Random ( ) . nextBytes ( restored ) ; <nl> + final int decompressedLength = compressor . uncompress ( out . buffer , outOffset , compressedLength , restored , restoredOffset ) ; <nl> + assertEquals ( decompressedLength , len ) ; <nl> + assertArrayEquals ( Arrays . copyOfRange ( data , off , off + len ) , <nl> + Arrays . copyOfRange ( restored , restoredOffset , restoredOffset + decompressedLength ) ) ; <nl> + } <nl> + <nl> + public void test ( byte [ ] data ) throws IOException <nl> + { <nl> + test ( data , 0 , data . length ) ; <nl> + } <nl> + <nl> + public void testEmptyArray ( ) throws IOException <nl> + { <nl> + test ( new byte [ 0 ] ) ; <nl> + } <nl> + <nl> + public void testShortArray ( ) throws UnsupportedEncodingException , IOException <nl> + { <nl> + test ( " Cassandra " . getBytes ( " UTF - 8 " ) , 1 , 7 ) ; <nl> + } <nl> + <nl> + public void testLongArray ( ) throws UnsupportedEncodingException , IOException <nl> + { <nl> + byte [ ] data = new byte [ 1 < < 20 ] ; <nl> + test ( data , 13 , 1 < < 19 ) ; <nl> + new Random ( 0 ) . nextBytes ( data ) ; <nl> + test ( data , 13 , 1 < < 19 ) ; <nl> + } <nl> + <nl> + public void testMappedFile ( ) throws IOException <nl> + { <nl> + byte [ ] data = new byte [ 1 < < 20 ] ; <nl> + new Random ( ) . nextBytes ( data ) ; <nl> + <nl> + / / create a temp file <nl> + File temp = File . createTempFile ( " tempfile " , " . tmp " ) ; <nl> + temp . deleteOnExit ( ) ; <nl> + <nl> + / / Prepend some random bytes to the output and compress <nl> + final int outOffset = 3 ; <nl> + final WrappedArray out = new WrappedArray ( new byte [ outOffset + compressor . initialCompressedBufferLength ( data . length ) ] ) ; <nl> + new Random ( ) . nextBytes ( out . buffer ) ; <nl> + final int compressedLength = compressor . compress ( data , 0 , data . length , out , outOffset ) ; <nl> + Files . write ( out . buffer , temp ) ; <nl> + <nl> + MappedByteBuffer mappedData = Files . map ( temp ) ; <nl> + mappedData . position ( outOffset ) ; <nl> + mappedData . limit ( compressedLength + outOffset ) ; <nl> + <nl> + <nl> + ByteBuffer result = compressor . useDirectOutputByteBuffers ( ) <nl> + ? ByteBuffer . allocateDirect ( data . length + 100 ) <nl> + : ByteBuffer . allocate ( data . length + 100 ) ; <nl> + <nl> + int length = compressor . uncompress ( mappedData , result ) ; <nl> + <nl> + Assert . assertEquals ( data . length , length ) ; <nl> + for ( int i = 0 ; i < length ; i + + ) <nl> + { <nl> + Assert . assertEquals ( " Decompression mismatch at byte " + i , data [ i ] , result . get ( ) ) ; <nl> + } <nl> + } <nl> + } <nl> diff - - git a / test / unit / org / apache / cassandra / io / compress / LZ4CompressorTest . java b / test / unit / org / apache / cassandra / io / compress / LZ4CompressorTest . java <nl> deleted file mode 100644 <nl> index 56ffdf1 . . 0000000 <nl> - - - a / test / unit / org / apache / cassandra / io / compress / LZ4CompressorTest . java <nl> + + + / dev / null <nl> @ @ - 1 , 84 + 0 , 0 @ @ <nl> - / * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - package org . apache . cassandra . io . compress ; <nl> - <nl> - import java . io . IOException ; <nl> - import java . io . UnsupportedEncodingException ; <nl> - import java . util . Arrays ; <nl> - import java . util . Collections ; <nl> - import java . util . Random ; <nl> - <nl> - import org . apache . cassandra . io . compress . ICompressor . WrappedArray ; <nl> - <nl> - import org . junit . Before ; <nl> - import org . junit . Test ; <nl> - <nl> - import static org . junit . Assert . * ; <nl> - <nl> - public class LZ4CompressorTest <nl> - { <nl> - <nl> - LZ4Compressor compressor ; <nl> - <nl> - @ Before <nl> - public void setUp ( ) <nl> - { <nl> - compressor = LZ4Compressor . create ( Collections . < String , String > emptyMap ( ) ) ; <nl> - } <nl> - <nl> - public void test ( byte [ ] data , int off , int len ) throws IOException <nl> - { <nl> - final int outOffset = 3 ; <nl> - final WrappedArray out = new WrappedArray ( new byte [ outOffset + compressor . initialCompressedBufferLength ( len ) ] ) ; <nl> - new Random ( ) . nextBytes ( out . buffer ) ; <nl> - final int compressedLength = compressor . compress ( data , off , len , out , outOffset ) ; <nl> - final int restoredOffset = 5 ; <nl> - final byte [ ] restored = new byte [ restoredOffset + len ] ; <nl> - new Random ( ) . nextBytes ( restored ) ; <nl> - final int decompressedLength = compressor . uncompress ( out . buffer , outOffset , compressedLength , restored , restoredOffset ) ; <nl> - assertEquals ( decompressedLength , len ) ; <nl> - assertArrayEquals ( Arrays . copyOfRange ( data , off , off + len ) , <nl> - Arrays . copyOfRange ( restored , restoredOffset , restoredOffset + decompressedLength ) ) ; <nl> - } <nl> - <nl> - public void test ( byte [ ] data ) throws IOException <nl> - { <nl> - test ( data , 0 , data . length ) ; <nl> - } <nl> - <nl> - @ Test <nl> - public void testEmptyArray ( ) throws IOException <nl> - { <nl> - test ( new byte [ 0 ] ) ; <nl> - } <nl> - <nl> - @ Test <nl> - public void testShortArray ( ) throws UnsupportedEncodingException , IOException <nl> - { <nl> - test ( " Cassandra " . getBytes ( " UTF - 8 " ) , 1 , 7 ) ; <nl> - } <nl> - <nl> - @ Test <nl> - public void testLongArray ( ) throws UnsupportedEncodingException , IOException <nl> - { <nl> - byte [ ] data = new byte [ 1 < < 20 ] ; <nl> - test ( data , 13 , 1 < < 19 ) ; <nl> - new Random ( 0 ) . nextBytes ( data ) ; <nl> - test ( data , 13 , 1 < < 19 ) ; <nl> - } <nl> - } <nl> diff - - git a / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java b / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java <nl> index 42a83a0 . . 128ec3c 100644 <nl> - - - a / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java <nl> + + + b / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java <nl> @ @ - 111 , 7 + 111 , 7 @ @ public class CompressedInputStreamTest <nl> <nl> / / read buffer using CompressedInputStream <nl> CompressionInfo info = new CompressionInfo ( chunks , param ) ; <nl> - CompressedInputStream input = new CompressedInputStream ( new ByteArrayInputStream ( toRead ) , info , true ) ; <nl> + CompressedInputStream input = new CompressedInputStream ( new ByteArrayInputStream ( toRead ) , info ) ; <nl> DataInputStream in = new DataInputStream ( input ) ; <nl> <nl> for ( int i = 0 ; i < sections . size ( ) ; i + + )
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 270a7ee . . fcfff37 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 1 . 1 . 2 <nl> + * skip tombstones during hint replay ( CASSANDRA - 4320 ) <nl> * fix NPE in compactionstats ( CASSANDRA - 4318 ) <nl> * enforce 1m min keycache for auto ( CASSANDRA - 4306 ) <nl> * Have DeletedColumn . isMFD always return true ( CASSANDRA - 4307 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / HintedHandOffManager . java b / src / java / org / apache / cassandra / db / HintedHandOffManager . java <nl> index 2a3e6b1 . . c7b160d 100644 <nl> - - - a / src / java / org / apache / cassandra / db / HintedHandOffManager . java <nl> + + + b / src / java / org / apache / cassandra / db / HintedHandOffManager . java <nl> @ @ - 330 , 6 + 330 , 14 @ @ public class HintedHandOffManager implements HintedHandOffManagerMBean <nl> } <nl> } <nl> <nl> + / / Skip tombstones : <nl> + / / if we iterate quickly enough , it ' s possible that we could request a new page in the same millisecond <nl> + / / in which the local deletion timestamp was generated on the last column in the old page , in which <nl> + / / case the hint will have no columns ( since it ' s deleted ) but will still be included in the resultset <nl> + / / since ( even with gcgs = 0 ) it ' s still a " relevant " tombstone . <nl> + if ( ! hint . isLive ( ) ) <nl> + continue ; <nl> + <nl> IColumn versionColumn = hint . getSubColumn ( ByteBufferUtil . bytes ( " version " ) ) ; <nl> IColumn tableColumn = hint . getSubColumn ( ByteBufferUtil . bytes ( " table " ) ) ; <nl> IColumn keyColumn = hint . getSubColumn ( ByteBufferUtil . bytes ( " key " ) ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 27b511a . . 79181e1 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 
+ + * Support direct buffer decompression for reads ( CASSANDRA - 8464 ) 
+ * DirectByteBuffer compatible LZ4 methods ( CASSANDRA - 7039 ) 
+ * Add role based access control ( CASSANDRA - 7653 ) 
+ * Group sstables for anticompaction correctly ( CASSANDRA - 8578 ) 
+ diff - - git a / conf / cassandra - env . sh b / conf / cassandra - env . sh 
+ index 58605ca . . f9641ed 100644 
+ - - - a / conf / cassandra - env . sh 
+ + + + b / conf / cassandra - env . sh 
+ @ @ - 251 , 6 + 251 , 7 @ @ fi 
+ 
+ # uncomment to have Cassandra JVM log internal method compilation ( developers only ) 
+ # JVM _ OPTS = " $ JVM _ OPTS - XX : + UnlockDiagnosticVMOptions - XX : + LogCompilation " 
+ + # JVM _ OPTS = " $ JVM _ OPTS - XX : + UnlockCommercialFeatures - XX : + FlightRecorder " 
+ 
+ # Prefer binding to IPv4 network intefaces ( when net . ipv6 . bindv6only = 1 ) . See 
+ # http : / / bugs . sun . com / bugdatabase / view _ bug . do ? bug _ id = 6342561 ( short version : 
+ diff - - git a / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java b / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java 
+ index dca5ade . . 57abba9 100644 
+ - - - a / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java 
+ + + + b / src / java / org / apache / cassandra / io / compress / CompressedRandomAccessReader . java 
+ @ @ - 19 , 14 + 19 , 22 @ @ package org . apache . cassandra . io . compress ; 
+ 
+ import java . io . * ; 
+ import java . nio . ByteBuffer ; 
+ + import java . nio . MappedByteBuffer ; 
+ + import java . nio . channels . FileChannel ; 
+ + import java . util . Map ; 
+ + import java . util . TreeMap ; 
+ import java . util . concurrent . ThreadLocalRandom ; 
+ import java . util . zip . Adler32 ; 
+ - import java . util . zip . CRC32 ; 
+ - import java . util . zip . Checksum ; 
+ 
+ + 
+ + import com . google . common . primitives . Ints ; 
+ + 
+ + import org . apache . cassandra . config . Config ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . io . FSReadError ; 
+ import org . apache . cassandra . io . sstable . CorruptSSTableException ; 
+ import org . apache . cassandra . io . util . CompressedPoolingSegmentedFile ; 
+ + import org . apache . cassandra . io . util . FileUtils ; 
+ import org . apache . cassandra . io . util . PoolingSegmentedFile ; 
+ import org . apache . cassandra . io . util . RandomAccessReader ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ @ @ - 37 , 6 + 45 , 8 @ @ import org . apache . cassandra . utils . FBUtilities ; 
+ * / 
+ public class CompressedRandomAccessReader extends RandomAccessReader 
+ { 
+ + private static final boolean useMmap = DatabaseDescriptor . getDiskAccessMode ( ) = = Config . DiskAccessMode . mmap ; 
+ + 
+ public static CompressedRandomAccessReader open ( String path , CompressionMetadata metadata , CompressedPoolingSegmentedFile owner ) 
+ { 
+ try 
+ @ @ - 61 , 33 + 71 , 96 @ @ public class CompressedRandomAccessReader extends RandomAccessReader 
+ } 
+ } 
+ 
+ + private TreeMap < Long , MappedByteBuffer > chunkSegments ; 
+ + private int MAX _ SEGMENT _ SIZE = Integer . MAX _ VALUE ; 
+ + 
+ private final CompressionMetadata metadata ; 
+ 
+ / / we read the raw compressed bytes into this buffer , then move the uncompressed ones into super . buffer . 
+ private ByteBuffer compressed ; 
+ 
+ / / re - use single crc object 
+ - private final Checksum checksum ; 
+ + private final Adler32 checksum ; 
+ 
+ / / raw checksum bytes 
+ - private final ByteBuffer checksumBytes = ByteBuffer . wrap ( new byte [ 4 ] ) ; 
+ + private ByteBuffer checksumBytes ; 
+ 
+ protected CompressedRandomAccessReader ( String dataFilePath , CompressionMetadata metadata , PoolingSegmentedFile owner ) throws FileNotFoundException 
+ { 
+ - super ( new File ( dataFilePath ) , metadata . chunkLength ( ) , owner ) ; 
+ + super ( new File ( dataFilePath ) , metadata . chunkLength ( ) , metadata . compressor ( ) . useDirectOutputByteBuffers ( ) , owner ) ; 
+ this . metadata = metadata ; 
+ - checksum = metadata . hasPostCompressionAdlerChecksums ? new Adler32 ( ) : new CRC32 ( ) ; 
+ - compressed = ByteBuffer . wrap ( new byte [ metadata . compressor ( ) . initialCompressedBufferLength ( metadata . chunkLength ( ) ) ] ) ; 
+ + checksum = new Adler32 ( ) ; 
+ + 
+ + if ( ! useMmap ) 
+ + { 
+ + compressed = ByteBuffer . wrap ( new byte [ metadata . compressor ( ) . initialCompressedBufferLength ( metadata . chunkLength ( ) ) ] ) ; 
+ + checksumBytes = ByteBuffer . wrap ( new byte [ 4 ] ) ; 
+ + } 
+ + else 
+ + { 
+ + try 
+ + { 
+ + createMappedSegments ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + } 
+ + } 
+ + 
+ + private void createMappedSegments ( ) throws IOException 
+ + { 
+ + chunkSegments = new TreeMap < > ( ) ; 
+ + long offset = 0 ; 
+ + long lastSegmentOffset = 0 ; 
+ + long segmentSize = 0 ; 
+ + 
+ + while ( offset < metadata . dataLength ) 
+ + { 
+ + CompressionMetadata . Chunk chunk = metadata . chunkFor ( offset ) ; 
+ + 
+ + / / Reached a new mmap boundary 
+ + if ( segmentSize + chunk . length + 4 > MAX _ SEGMENT _ SIZE ) 
+ + { 
+ + chunkSegments . put ( lastSegmentOffset , channel . map ( FileChannel . MapMode . READ _ ONLY , lastSegmentOffset , segmentSize ) ) ; 
+ + lastSegmentOffset + = segmentSize ; 
+ + segmentSize = 0 ; 
+ + } 
+ + 
+ + segmentSize + = chunk . length + 4 ; / / checksum 
+ + offset + = metadata . chunkLength ( ) ; 
+ + } 
+ + 
+ + if ( segmentSize > 0 ) 
+ + chunkSegments . put ( lastSegmentOffset , channel . map ( FileChannel . MapMode . READ _ ONLY , lastSegmentOffset , segmentSize ) ) ; 
+ } 
+ 
+ - protected ByteBuffer allocateBuffer ( int bufferSize ) 
+ + protected ByteBuffer allocateBuffer ( int bufferSize , boolean useDirect ) 
+ { 
+ assert Integer . bitCount ( bufferSize ) = = 1 ; 
+ - return ByteBuffer . allocate ( bufferSize ) ; 
+ + return useMmap & & useDirect 
+ + ? ByteBuffer . allocateDirect ( bufferSize ) 
+ + : ByteBuffer . allocate ( bufferSize ) ; 
+ } 
+ 
+ @ Override 
+ - protected void reBuffer ( ) 
+ + public void deallocate ( ) 
+ + { 
+ + super . deallocate ( ) ; 
+ + 
+ + if ( chunkSegments ! = null ) 
+ + { 
+ + for ( Map . Entry < Long , MappedByteBuffer > entry : chunkSegments . entrySet ( ) ) 
+ + { 
+ + FileUtils . clean ( entry . getValue ( ) ) ; 
+ + } 
+ + } 
+ + 
+ + chunkSegments = null ; 
+ + } 
+ + 
+ + private void reBufferStandard ( ) 
+ { 
+ try 
+ { 
+ @ @ - 126 , 14 + 199 , 7 @ @ public class CompressedRandomAccessReader extends RandomAccessReader 
+ if ( metadata . parameters . getCrcCheckChance ( ) > ThreadLocalRandom . current ( ) . nextDouble ( ) ) 
+ { 
+ 
+ - if ( metadata . hasPostCompressionAdlerChecksums ) 
+ - { 
+ - checksum . update ( compressed . array ( ) , 0 , chunk . length ) ; 
+ - } 
+ - else 
+ - { 
+ - checksum . update ( buffer . array ( ) , 0 , decompressedBytes ) ; 
+ - } 
+ + checksum . update ( compressed . array ( ) , 0 , chunk . length ) ; 
+ 
+ if ( checksum ( chunk ) ! = ( int ) checksum . getValue ( ) ) 
+ throw new CorruptBlockException ( getPath ( ) , chunk ) ; 
+ @ @ - 156 , 6 + 222 , 81 @ @ public class CompressedRandomAccessReader extends RandomAccessReader 
+ } 
+ } 
+ 
+ + private void reBufferMmap ( ) 
+ + { 
+ + try 
+ + { 
+ + long position = current ( ) ; 
+ + assert position < metadata . dataLength ; 
+ + 
+ + CompressionMetadata . Chunk chunk = metadata . chunkFor ( position ) ; 
+ + 
+ + Map . Entry < Long , MappedByteBuffer > entry = chunkSegments . floorEntry ( chunk . offset ) ; 
+ + long segmentOffset = entry . getKey ( ) ; 
+ + int chunkOffset = Ints . checkedCast ( chunk . offset - segmentOffset ) ; 
+ + MappedByteBuffer compressedChunk = entry . getValue ( ) ; 
+ + 
+ + compressedChunk . position ( chunkOffset ) ; 
+ + compressedChunk . limit ( chunkOffset + chunk . length ) ; 
+ + compressedChunk . mark ( ) ; 
+ + 
+ + buffer . clear ( ) ; 
+ + int decompressedBytes ; 
+ + try 
+ + { 
+ + decompressedBytes = metadata . compressor ( ) . uncompress ( compressedChunk , buffer ) ; 
+ + buffer . limit ( decompressedBytes ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new CorruptBlockException ( getPath ( ) , chunk ) ; 
+ + } 
+ + finally 
+ + { 
+ + compressedChunk . limit ( compressedChunk . capacity ( ) ) ; 
+ + } 
+ + 
+ + if ( metadata . parameters . getCrcCheckChance ( ) > ThreadLocalRandom . current ( ) . nextDouble ( ) ) 
+ + { 
+ + compressedChunk . reset ( ) ; 
+ + compressedChunk . limit ( chunkOffset + chunk . length ) ; 
+ + 
+ + FBUtilities . directCheckSum ( checksum , compressedChunk ) ; 
+ + 
+ + compressedChunk . limit ( compressedChunk . capacity ( ) ) ; 
+ + 
+ + 
+ + if ( compressedChunk . getInt ( ) ! = ( int ) checksum . getValue ( ) ) 
+ + throw new CorruptBlockException ( getPath ( ) , chunk ) ; 
+ + 
+ + / / reset checksum object back to the original ( blank ) state 
+ + checksum . reset ( ) ; 
+ + } 
+ + 
+ + / / buffer offset is always aligned 
+ + bufferOffset = position & ~ ( buffer . capacity ( ) - 1 ) ; 
+ + buffer . position ( ( int ) ( position - bufferOffset ) ) ; 
+ + } 
+ + catch ( CorruptBlockException e ) 
+ + { 
+ + throw new CorruptSSTableException ( e , getPath ( ) ) ; 
+ + } 
+ + 
+ + } 
+ + 
+ + @ Override 
+ + protected void reBuffer ( ) 
+ + { 
+ + if ( useMmap ) 
+ + { 
+ + reBufferMmap ( ) ; 
+ + } 
+ + else 
+ + { 
+ + reBufferStandard ( ) ; 
+ + } 
+ + } 
+ + 
+ private int checksum ( CompressionMetadata . Chunk chunk ) throws IOException 
+ { 
+ assert channel . position ( ) = = chunk . offset + chunk . length ; 
+ @ @ - 167 , 7 + 308 , 7 @ @ public class CompressedRandomAccessReader extends RandomAccessReader 
+ 
+ public int getTotalBufferSize ( ) 
+ { 
+ - return super . getTotalBufferSize ( ) + compressed . capacity ( ) ; 
+ + return super . getTotalBufferSize ( ) + ( useMmap ? 0 : compressed . capacity ( ) ) ; 
+ } 
+ 
+ @ Override 
+ diff - - git a / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java b / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java 
+ index 57d7cbe . . 6139a5c 100644 
+ - - - a / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java 
+ + + + b / src / java / org / apache / cassandra / io / compress / CompressionMetadata . java 
+ @ @ - 62 , 7 + 62 , 6 @ @ public class CompressionMetadata 
+ { 
+ public final long dataLength ; 
+ public final long compressedFileLength ; 
+ - public final boolean hasPostCompressionAdlerChecksums ; 
+ private final Memory chunkOffsets ; 
+ private final long chunkOffsetsSize ; 
+ public final String indexFilePath ; 
+ @ @ - 82 , 14 + 81 , 13 @ @ public class CompressionMetadata 
+ public static CompressionMetadata create ( String dataFilePath ) 
+ { 
+ Descriptor desc = Descriptor . fromFilename ( dataFilePath ) ; 
+ - return new CompressionMetadata ( desc . filenameFor ( Component . COMPRESSION _ INFO ) , new File ( dataFilePath ) . length ( ) , desc . version . hasPostCompressionAdlerChecksums ( ) ) ; 
+ + return new CompressionMetadata ( desc . filenameFor ( Component . COMPRESSION _ INFO ) , new File ( dataFilePath ) . length ( ) ) ; 
+ } 
+ 
+ @ VisibleForTesting 
+ - CompressionMetadata ( String indexFilePath , long compressedLength , boolean hasPostCompressionAdlerChecksums ) 
+ + CompressionMetadata ( String indexFilePath , long compressedLength ) 
+ { 
+ this . indexFilePath = indexFilePath ; 
+ - this . hasPostCompressionAdlerChecksums = hasPostCompressionAdlerChecksums ; 
+ 
+ DataInputStream stream ; 
+ try 
+ @ @ - 137 , 13 + 135 , 12 @ @ public class CompressionMetadata 
+ this . chunkOffsetsSize = chunkOffsets . size ( ) ; 
+ } 
+ 
+ - private CompressionMetadata ( String filePath , CompressionParameters parameters , RefCountedMemory offsets , long offsetsSize , long dataLength , long compressedLength , boolean hasPostCompressionAdlerChecksums ) 
+ + private CompressionMetadata ( String filePath , CompressionParameters parameters , RefCountedMemory offsets , long offsetsSize , long dataLength , long compressedLength ) 
+ { 
+ this . indexFilePath = filePath ; 
+ this . parameters = parameters ; 
+ this . dataLength = dataLength ; 
+ this . compressedFileLength = compressedLength ; 
+ - this . hasPostCompressionAdlerChecksums = hasPostCompressionAdlerChecksums ; 
+ this . chunkOffsets = offsets ; 
+ offsets . reference ( ) ; 
+ this . chunkOffsetsSize = offsetsSize ; 
+ @ @ - 342 , 7 + 339 , 7 @ @ public class CompressionMetadata 
+ default : 
+ throw new AssertionError ( ) ; 
+ } 
+ - return new CompressionMetadata ( filePath , parameters , offsets , count * 8L , dataLength , compressedLength , latestVersion . hasPostCompressionAdlerChecksums ( ) ) ; 
+ + return new CompressionMetadata ( filePath , parameters , offsets , count * 8L , dataLength , compressedLength ) ; 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / io / compress / DeflateCompressor . java b / src / java / org / apache / cassandra / io / compress / DeflateCompressor . java 
+ index 125a08f . . 546b506 100644 
+ - - - a / src / java / org / apache / cassandra / io / compress / DeflateCompressor . java 
+ + + + b / src / java / org / apache / cassandra / io / compress / DeflateCompressor . java 
+ @ @ - 17 , 7 + 17 , 10 @ @ 
+ * / 
+ package org . apache . cassandra . io . compress ; 
+ 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ + 
+ import java . io . IOException ; 
+ + import java . nio . ByteBuffer ; 
+ import java . util . Collections ; 
+ import java . util . Map ; 
+ import java . util . Set ; 
+ @ @ - 113 , 4 + 116 , 18 @ @ public class DeflateCompressor implements ICompressor 
+ throw new IOException ( e ) ; 
+ } 
+ } 
+ + 
+ + public int uncompress ( ByteBuffer input _ , ByteBuffer output ) throws IOException 
+ + { 
+ + if ( ! output . hasArray ( ) ) 
+ + throw new IllegalArgumentException ( " DeflateCompressor doesn ' t work with direct byte buffers " ) ; 
+ + 
+ + byte [ ] input = ByteBufferUtil . getArray ( input _ ) ; 
+ + return uncompress ( input , 0 , input . length , output . array ( ) , output . arrayOffset ( ) + output . position ( ) ) ; 
+ + } 
+ + 
+ + public boolean useDirectOutputByteBuffers ( ) 
+ + { 
+ + return false ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / compress / ICompressor . java b / src / java / org / apache / cassandra / io / compress / ICompressor . java 
+ index be76bc5 . . 81d1425 100644 
+ - - - a / src / java / org / apache / cassandra / io / compress / ICompressor . java 
+ + + + b / src / java / org / apache / cassandra / io / compress / ICompressor . java 
+ @ @ - 18 , 6 + 18 , 7 @ @ 
+ package org . apache . cassandra . io . compress ; 
+ 
+ import java . io . IOException ; 
+ + import java . nio . ByteBuffer ; 
+ import java . util . Set ; 
+ 
+ public interface ICompressor 
+ @ @ - 28 , 6 + 29 , 17 @ @ public interface ICompressor 
+ 
+ public int uncompress ( byte [ ] input , int inputOffset , int inputLength , byte [ ] output , int outputOffset ) throws IOException ; 
+ 
+ + / * * 
+ + * Decompression for DirectByteBuffers 
+ + * / 
+ + public int uncompress ( ByteBuffer input , ByteBuffer output ) throws IOException ; 
+ + 
+ + / * * 
+ + * Notifies user if this compressor will wants / requires a direct byte buffers to 
+ + * decompress direct byteBuffers 
+ + * / 
+ + public boolean useDirectOutputByteBuffers ( ) ; 
+ + 
+ public Set < String > supportedOptions ( ) ; 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / io / compress / LZ4Compressor . java b / src / java / org / apache / cassandra / io / compress / LZ4Compressor . java 
+ index 0cf36c1 . . f458cb6 100644 
+ - - - a / src / java / org / apache / cassandra / io / compress / LZ4Compressor . java 
+ + + + b / src / java / org / apache / cassandra / io / compress / LZ4Compressor . java 
+ @ @ - 18 , 6 + 18 , 7 @ @ 
+ package org . apache . cassandra . io . compress ; 
+ 
+ import java . io . IOException ; 
+ + import java . nio . ByteBuffer ; 
+ import java . util . Arrays ; 
+ import java . util . HashSet ; 
+ import java . util . Map ; 
+ @ @ - 25 , 10 + 26 , 10 @ @ import java . util . Set ; 
+ 
+ import net . jpountz . lz4 . LZ4Exception ; 
+ import net . jpountz . lz4 . LZ4Factory ; 
+ + import org . apache . cassandra . utils . FastByteOperations ; 
+ 
+ public class LZ4Compressor implements ICompressor 
+ { 
+ - 
+ private static final int INTEGER _ BYTES = 4 ; 
+ private static final LZ4Compressor instance = new LZ4Compressor ( ) ; 
+ 
+ @ @ - 38 , 13 + 39 , 13 @ @ public class LZ4Compressor implements ICompressor 
+ } 
+ 
+ private final net . jpountz . lz4 . LZ4Compressor compressor ; 
+ - private final net . jpountz . lz4 . LZ4Decompressor decompressor ; 
+ + private final net . jpountz . lz4 . LZ4FastDecompressor decompressor ; 
+ 
+ private LZ4Compressor ( ) 
+ { 
+ final LZ4Factory lz4Factory = LZ4Factory . fastestInstance ( ) ; 
+ compressor = lz4Factory . fastCompressor ( ) ; 
+ - decompressor = lz4Factory . decompressor ( ) ; 
+ + decompressor = lz4Factory . fastDecompressor ( ) ; 
+ } 
+ 
+ public int initialCompressedBufferLength ( int chunkLength ) 
+ @ @ - 97 , 8 + 98 , 42 @ @ public class LZ4Compressor implements ICompressor 
+ return decompressedLength ; 
+ } 
+ 
+ + public int uncompress ( ByteBuffer input , ByteBuffer output ) throws IOException 
+ + { 
+ + int pos = input . position ( ) ; 
+ + final int decompressedLength = ( input . get ( pos ) & 0xFF ) 
+ + | ( ( input . get ( pos + 1 ) & 0xFF ) < < 8 ) 
+ + | ( ( input . get ( pos + 2 ) & 0xFF ) < < 16 ) 
+ + | ( ( input . get ( pos + 3 ) & 0xFF ) < < 24 ) ; 
+ + 
+ + int inputLength = input . remaining ( ) - INTEGER _ BYTES ; 
+ + 
+ + final int compressedLength ; 
+ + try 
+ + { 
+ + compressedLength = decompressor . decompress ( input , input . position ( ) + INTEGER _ BYTES , output , output . position ( ) , decompressedLength ) ; 
+ + } 
+ + catch ( LZ4Exception e ) 
+ + { 
+ + throw new IOException ( e ) ; 
+ + } 
+ + 
+ + if ( compressedLength ! = inputLength ) 
+ + { 
+ + throw new IOException ( " Compressed lengths mismatch : " + compressedLength + " vs " + inputLength ) ; 
+ + } 
+ + 
+ + return decompressedLength ; 
+ + } 
+ + 
+ + @ Override 
+ + public boolean useDirectOutputByteBuffers ( ) 
+ + { 
+ + return false ; 
+ + } 
+ + 
+ public Set < String > supportedOptions ( ) 
+ { 
+ - return new HashSet < String > ( Arrays . asList ( CompressionParameters . CRC _ CHECK _ CHANCE ) ) ; 
+ + return new HashSet < > ( Arrays . asList ( CompressionParameters . CRC _ CHECK _ CHANCE ) ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / compress / SnappyCompressor . java b / src / java / org / apache / cassandra / io / compress / SnappyCompressor . java 
+ index 3583201 . . f5a2062 100644 
+ - - - a / src / java / org / apache / cassandra / io / compress / SnappyCompressor . java 
+ + + + b / src / java / org / apache / cassandra / io / compress / SnappyCompressor . java 
+ @ @ - 18 , 10 + 18 , 12 @ @ 
+ package org . apache . cassandra . io . compress ; 
+ 
+ import java . io . IOException ; 
+ + import java . nio . ByteBuffer ; 
+ import java . util . Collections ; 
+ import java . util . Map ; 
+ import java . util . Set ; 
+ 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ import org . xerial . snappy . Snappy ; 
+ @ @ - 95 , 4 + 97 , 15 @ @ public class SnappyCompressor implements ICompressor 
+ { 
+ return Snappy . rawUncompress ( input , inputOffset , inputLength , output , outputOffset ) ; 
+ } 
+ + 
+ + public int uncompress ( ByteBuffer input , ByteBuffer output ) throws IOException 
+ + { 
+ + return Snappy . uncompress ( input , output ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public boolean useDirectOutputByteBuffers ( ) 
+ + { 
+ + return true ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / format / Version . java b / src / java / org / apache / cassandra / io / sstable / format / Version . java 
+ index 5da0cb8 . . faaa89e 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / format / Version . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / format / Version . java 
+ @ @ - 40 , 8 + 40 , 6 @ @ public abstract class Version 
+ 
+ public abstract boolean isLatestVersion ( ) ; 
+ 
+ - public abstract boolean hasPostCompressionAdlerChecksums ( ) ; 
+ - 
+ public abstract boolean hasSamplingLevel ( ) ; 
+ 
+ public abstract boolean hasNewStatsFile ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / format / big / BigFormat . java b / src / java / org / apache / cassandra / io / sstable / format / big / BigFormat . java 
+ index eb43968 . . e1a5622 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / format / big / BigFormat . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / format / big / BigFormat . java 
+ @ @ - 126 , 16 + 126 , 8 @ @ public class BigFormat implements SSTableFormat 
+ static class BigVersion extends Version 
+ { 
+ public static final String current _ version = " la " ; 
+ - public static final String earliest _ supported _ version = " ja " ; 
+ - 
+ - / / ja ( 2 . 0 . 0 ) : super columns are serialized as composites ( note that there is no real format change , 
+ - / / this is mostly a marker to know if we should expect super columns or not . We do need 
+ - / / a major version bump however , because we should not allow streaming of super columns 
+ - / / into this new format ) 
+ - / / tracks max local deletiontime in sstable metadata 
+ - / / records bloom _ filter _ fp _ chance in metadata component 
+ - / / remove data size and column count from data file ( CASSANDRA - 4180 ) 
+ - / / tracks max / min column values ( according to comparator ) 
+ + public static final String earliest _ supported _ version = " jb " ; 
+ + 
+ / / jb ( 2 . 0 . 1 ) : switch from crc32 to adler32 for compression checksums 
+ / / checksum the compressed data 
+ / / ka ( 2 . 1 . 0 ) : new Statistics . db file format 
+ @ @ - 145 , 7 + 137 , 6 @ @ public class BigFormat implements SSTableFormat 
+ / / la ( 3 . 0 . 0 ) : new file name format 
+ 
+ private final boolean isLatestVersion ; 
+ - private final boolean hasPostCompressionAdlerChecksums ; 
+ private final boolean hasSamplingLevel ; 
+ private final boolean newStatsFile ; 
+ private final boolean hasAllAdlerChecksums ; 
+ @ @ - 158 , 7 + 149 , 6 @ @ public class BigFormat implements SSTableFormat 
+ super ( instance , version ) ; 
+ 
+ isLatestVersion = version . compareTo ( current _ version ) = = 0 ; 
+ - hasPostCompressionAdlerChecksums = version . compareTo ( " jb " ) > = 0 ; 
+ hasSamplingLevel = version . compareTo ( " ka " ) > = 0 ; 
+ newStatsFile = version . compareTo ( " ka " ) > = 0 ; 
+ hasAllAdlerChecksums = version . compareTo ( " ka " ) > = 0 ; 
+ @ @ - 174 , 12 + 164 , 6 @ @ public class BigFormat implements SSTableFormat 
+ } 
+ 
+ @ Override 
+ - public boolean hasPostCompressionAdlerChecksums ( ) 
+ - { 
+ - return hasPostCompressionAdlerChecksums ; 
+ - } 
+ - 
+ - @ Override 
+ public boolean hasSamplingLevel ( ) 
+ { 
+ return hasSamplingLevel ; 
+ diff - - git a / src / java / org / apache / cassandra / io / util / FileUtils . java b / src / java / org / apache / cassandra / io / util / FileUtils . java 
+ index 080caa5 . . 837cc6a 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / FileUtils . java 
+ + + + b / src / java / org / apache / cassandra / io / util / FileUtils . java 
+ @ @ - 278 , 9 + 278 , 10 @ @ public class FileUtils 
+ return canCleanDirectBuffers ; 
+ } 
+ 
+ - public static void clean ( MappedByteBuffer buffer ) 
+ + public static void clean ( ByteBuffer buffer ) 
+ { 
+ - ( ( DirectBuffer ) buffer ) . cleaner ( ) . clean ( ) ; 
+ + if ( isCleanerAvailable ( ) & & buffer . isDirect ( ) ) 
+ + ( ( DirectBuffer ) buffer ) . cleaner ( ) . clean ( ) ; 
+ } 
+ 
+ public static void createDirectory ( String directory ) 
+ diff - - git a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ index bf120a3 . . 6f2def0 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ @ @ - 30 , 6 + 30 , 7 @ @ import org . slf4j . LoggerFactory ; 
+ import org . apache . cassandra . io . FSReadError ; 
+ import org . apache . cassandra . io . sstable . format . SSTableWriter ; 
+ import org . apache . cassandra . utils . JVMStabilityInspector ; 
+ + import sun . nio . ch . DirectBuffer ; 
+ 
+ public class MmappedSegmentedFile extends SegmentedFile 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java 
+ index 58205d8 . . 6bff378 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java 
+ + + + b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java 
+ @ @ - 53 , 6 + 53 , 11 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp 
+ 
+ protected RandomAccessReader ( File file , int bufferSize , PoolingSegmentedFile owner ) throws FileNotFoundException 
+ { 
+ + this ( file , bufferSize , false , owner ) ; 
+ + } 
+ + 
+ + protected RandomAccessReader ( File file , int bufferSize , boolean useDirectBuffer , PoolingSegmentedFile owner ) throws FileNotFoundException 
+ + { 
+ this . owner = owner ; 
+ 
+ filePath = file . getAbsolutePath ( ) ; 
+ @ @ - 79 , 13 + 84 , 16 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp 
+ { 
+ throw new FSReadError ( e , filePath ) ; 
+ } 
+ - buffer = allocateBuffer ( bufferSize ) ; 
+ + buffer = allocateBuffer ( bufferSize , useDirectBuffer ) ; 
+ buffer . limit ( 0 ) ; 
+ } 
+ 
+ - protected ByteBuffer allocateBuffer ( int bufferSize ) 
+ + protected ByteBuffer allocateBuffer ( int bufferSize , boolean useDirectBuffer ) 
+ { 
+ - return ByteBuffer . allocate ( ( int ) Math . min ( fileLength , bufferSize ) ) ; 
+ + int size = ( int ) Math . min ( fileLength , bufferSize ) ; 
+ + return useDirectBuffer 
+ + ? ByteBuffer . allocate ( size ) 
+ + : ByteBuffer . allocateDirect ( size ) ; 
+ } 
+ 
+ public static RandomAccessReader open ( File file , PoolingSegmentedFile owner ) 
+ @ @ - 239 , 6 + 247 , 8 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp 
+ public void deallocate ( ) 
+ { 
+ bufferOffset + = buffer . position ( ) ; 
+ + FileUtils . clean ( buffer ) ; 
+ + 
+ buffer = null ; / / makes sure we don ' t use this after it ' s ostensibly closed 
+ 
+ try 
+ diff - - git a / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java b / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java 
+ index 449546f . . 54f6eda 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java 
+ + + + b / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java 
+ @ @ - 62 , 17 + 62 , 15 @ @ public class CompressedInputStream extends InputStream 
+ private static final byte [ ] POISON _ PILL = new byte [ 0 ] ; 
+ 
+ private long totalCompressedBytesRead ; 
+ - private final boolean hasPostCompressionAdlerChecksums ; 
+ 
+ / * * 
+ * @ param source Input source to read compressed data from 
+ * @ param info Compression info 
+ * / 
+ - public CompressedInputStream ( InputStream source , CompressionInfo info , boolean hasPostCompressionAdlerChecksums ) 
+ + public CompressedInputStream ( InputStream source , CompressionInfo info ) 
+ { 
+ this . info = info ; 
+ - this . checksum = hasPostCompressionAdlerChecksums ? new Adler32 ( ) : new CRC32 ( ) ; 
+ - this . hasPostCompressionAdlerChecksums = hasPostCompressionAdlerChecksums ; 
+ + this . checksum = new Adler32 ( ) ; 
+ this . buffer = new byte [ info . parameters . chunkLength ( ) ] ; 
+ / / buffer is limited to store up to 1024 chunks 
+ this . dataBuffer = new ArrayBlockingQueue < byte [ ] > ( Math . min ( info . chunks . length , 1024 ) ) ; 
+ @ @ - 117 , 14 + 115 , 7 @ @ public class CompressedInputStream extends InputStream 
+ / / validate crc randomly 
+ if ( info . parameters . getCrcCheckChance ( ) > ThreadLocalRandom . current ( ) . nextDouble ( ) ) 
+ { 
+ - if ( hasPostCompressionAdlerChecksums ) 
+ - { 
+ - checksum . update ( compressed , 0 , compressed . length - checksumBytes . length ) ; 
+ - } 
+ - else 
+ - { 
+ - checksum . update ( buffer , 0 , validBufferBytes ) ; 
+ - } 
+ + checksum . update ( compressed , 0 , compressed . length - checksumBytes . length ) ; 
+ 
+ System . arraycopy ( compressed , compressed . length - checksumBytes . length , checksumBytes , 0 , checksumBytes . length ) ; 
+ if ( Ints . fromByteArray ( checksumBytes ) ! = ( int ) checksum . getValue ( ) ) 
+ diff - - git a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java 
+ index 0595e0c . . 46f7d4f 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java 
+ + + + b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java 
+ @ @ - 76 , 7 + 76 , 7 @ @ public class CompressedStreamReader extends StreamReader 
+ 
+ SSTableWriter writer = createWriter ( cfs , totalSize , repairedAt , format ) ; 
+ 
+ - CompressedInputStream cis = new CompressedInputStream ( Channels . newInputStream ( channel ) , compressionInfo , inputVersion . hasPostCompressionAdlerChecksums ( ) ) ; 
+ + CompressedInputStream cis = new CompressedInputStream ( Channels . newInputStream ( channel ) , compressionInfo ) ; 
+ BytesReadTracker in = new BytesReadTracker ( new DataInputStream ( cis ) ) ; 
+ try 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / utils / FBUtilities . java b / src / java / org / apache / cassandra / utils / FBUtilities . java 
+ index 0462e5e . . c9024ec 100644 
+ - - - a / src / java / org / apache / cassandra / utils / FBUtilities . java 
+ + + + b / src / java / org / apache / cassandra / utils / FBUtilities . java 
+ @ @ - 19 , 6 + 19 , 8 @ @ package org . apache . cassandra . utils ; 
+ 
+ import java . io . * ; 
+ import java . lang . reflect . Field ; 
+ + import java . lang . reflect . InvocationTargetException ; 
+ + import java . lang . reflect . Method ; 
+ import java . math . BigInteger ; 
+ import java . net . * ; 
+ import java . nio . ByteBuffer ; 
+ @ @ - 26 , 10 + 28 , 12 @ @ import java . security . MessageDigest ; 
+ import java . security . NoSuchAlgorithmException ; 
+ import java . util . * ; 
+ import java . util . concurrent . * ; 
+ + import java . util . zip . Adler32 ; 
+ import java . util . zip . Checksum ; 
+ 
+ import com . google . common . base . Joiner ; 
+ import com . google . common . collect . AbstractIterator ; 
+ + import com . google . common . primitives . Ints ; 
+ import org . apache . commons . lang3 . StringUtils ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 44 , 6 + 48 , 8 @ @ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . exceptions . ConfigurationException ; 
+ import org . apache . cassandra . io . IVersionedSerializer ; 
+ + import org . apache . cassandra . io . compress . CompressedRandomAccessReader ; 
+ + import org . apache . cassandra . io . compress . CompressionParameters ; 
+ import org . apache . cassandra . io . util . DataOutputBuffer ; 
+ import org . apache . cassandra . io . util . FileUtils ; 
+ import org . apache . cassandra . io . util . IAllocator ; 
+ @ @ - 634 , 6 + 640 , 67 @ @ public class FBUtilities 
+ checksum . update ( ( v > > > 0 ) & 0xFF ) ; 
+ } 
+ 
+ + private static Method directUpdate ; 
+ + static 
+ + { 
+ + try 
+ + { 
+ + directUpdate = Adler32 . class . getDeclaredMethod ( " update " , new Class [ ] { ByteBuffer . class } ) ; 
+ + directUpdate . setAccessible ( true ) ; 
+ + } catch ( NoSuchMethodException e ) 
+ + { 
+ + logger . warn ( " JVM doesn ' t support Adler32 byte buffer access " ) ; 
+ + directUpdate = null ; 
+ + } 
+ + } 
+ + 
+ + private static final ThreadLocal < byte [ ] > localDigestBuffer = new ThreadLocal < byte [ ] > ( ) 
+ + { 
+ + @ Override 
+ + protected byte [ ] initialValue ( ) 
+ + { 
+ + return new byte [ CompressionParameters . DEFAULT _ CHUNK _ LENGTH ] ; 
+ + } 
+ + } ; 
+ + 
+ + / / Java 7 has this method but it ' s private till Java 8 . Thanks JDK ! 
+ + public static boolean supportsDirectChecksum ( ) 
+ + { 
+ + return directUpdate ! = null ; 
+ + } 
+ + 
+ + public static void directCheckSum ( Adler32 checksum , ByteBuffer bb ) 
+ + { 
+ + if ( directUpdate ! = null ) 
+ + { 
+ + try 
+ + { 
+ + directUpdate . invoke ( checksum , bb ) ; 
+ + return ; 
+ + } catch ( IllegalAccessException e ) 
+ + { 
+ + directUpdate = null ; 
+ + logger . warn ( " JVM doesn ' t support Adler32 byte buffer access " ) ; 
+ + } 
+ + catch ( InvocationTargetException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + / / Fallback 
+ + byte [ ] buffer = localDigestBuffer . get ( ) ; 
+ + 
+ + int remaining ; 
+ + while ( ( remaining = bb . remaining ( ) ) > 0 ) 
+ + { 
+ + remaining = Math . min ( remaining , buffer . length ) ; 
+ + ByteBufferUtil . arrayCopy ( bb , bb . position ( ) , buffer , 0 , remaining ) ; 
+ + bb . position ( bb . position ( ) + remaining ) ; 
+ + checksum . update ( buffer , 0 , remaining ) ; 
+ + } 
+ + } 
+ + 
+ public static long abs ( long index ) 
+ { 
+ long negbit = index > > 63 ; 
+ diff - - git a / test / unit / org / apache / cassandra / io / compress / CompressedRandomAccessReaderTest . java b / test / unit / org / apache / cassandra / io / compress / CompressedRandomAccessReaderTest . java 
+ index 900abd8 . . 58bf5cb 100644 
+ - - - a / test / unit / org / apache / cassandra / io / compress / CompressedRandomAccessReaderTest . java 
+ + + + b / test / unit / org / apache / cassandra / io / compress / CompressedRandomAccessReaderTest . java 
+ @ @ - 80 , 7 + 80 , 7 @ @ public class CompressedRandomAccessReaderTest 
+ writer . write ( " x " . getBytes ( ) ) ; 
+ writer . close ( ) ; 
+ 
+ - CompressedRandomAccessReader reader = CompressedRandomAccessReader . open ( filename , new CompressionMetadata ( filename + " . metadata " , f . length ( ) , true ) ) ; 
+ + CompressedRandomAccessReader reader = CompressedRandomAccessReader . open ( filename , new CompressionMetadata ( filename + " . metadata " , f . length ( ) ) ) ; 
+ String res = reader . readLine ( ) ; 
+ assertEquals ( res , " xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx " ) ; 
+ assertEquals ( 40 , res . length ( ) ) ; 
+ @ @ - 123 , 7 + 123 , 7 @ @ public class CompressedRandomAccessReaderTest 
+ 
+ assert f . exists ( ) ; 
+ RandomAccessReader reader = compressed 
+ - ? CompressedRandomAccessReader . open ( filename , new CompressionMetadata ( filename + " . metadata " , f . length ( ) , true ) ) 
+ + ? CompressedRandomAccessReader . open ( filename , new CompressionMetadata ( filename + " . metadata " , f . length ( ) ) ) 
+ : RandomAccessReader . open ( f ) ; 
+ String expected = " The quick brown fox jumps over the lazy dog " ; 
+ assertEquals ( expected . length ( ) , reader . length ( ) ) ; 
+ @ @ - 160 , 7 + 160 , 7 @ @ public class CompressedRandomAccessReaderTest 
+ writer . close ( ) ; 
+ 
+ / / open compression metadata and get chunk information 
+ - CompressionMetadata meta = new CompressionMetadata ( metadata . getPath ( ) , file . length ( ) , true ) ; 
+ + CompressionMetadata meta = new CompressionMetadata ( metadata . getPath ( ) , file . length ( ) ) ; 
+ CompressionMetadata . Chunk chunk = meta . chunkFor ( 0 ) ; 
+ 
+ RandomAccessReader reader = CompressedRandomAccessReader . open ( file . getPath ( ) , meta ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / io / compress / CompressorTest . java b / test / unit / org / apache / cassandra / io / compress / CompressorTest . java 
+ new file mode 100644 
+ index 0000000 . . 04396e0 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / io / compress / CompressorTest . java 
+ @ @ - 0 , 0 + 1 , 133 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . io . compress ; 
+ + 
+ + import java . io . * ; 
+ + import java . nio . ByteBuffer ; 
+ + import java . nio . MappedByteBuffer ; 
+ + import java . util . Arrays ; 
+ + import java . util . Collections ; 
+ + import java . util . Random ; 
+ + 
+ + import com . google . common . io . Files ; 
+ + import org . apache . cassandra . io . compress . ICompressor . WrappedArray ; 
+ + 
+ + import org . junit . Assert ; 
+ + import org . junit . Before ; 
+ + import org . junit . Test ; 
+ + 
+ + import static org . junit . Assert . * ; 
+ + 
+ + public class CompressorTest 
+ + { 
+ + ICompressor compressor ; 
+ + 
+ + ICompressor [ ] compressors = new ICompressor [ ] { 
+ + LZ4Compressor . create ( Collections . < String , String > emptyMap ( ) ) , 
+ + DeflateCompressor . create ( Collections . < String , String > emptyMap ( ) ) , 
+ + SnappyCompressor . create ( Collections . < String , String > emptyMap ( ) ) 
+ + } ; 
+ + 
+ + 
+ + @ Test 
+ + public void testAllCompressors ( ) throws IOException 
+ + { 
+ + for ( ICompressor compressor : compressors ) 
+ + { 
+ + this . compressor = compressor ; 
+ + 
+ + testEmptyArray ( ) ; 
+ + testLongArray ( ) ; 
+ + testShortArray ( ) ; 
+ + testMappedFile ( ) ; 
+ + } 
+ + } 
+ + 
+ + 
+ + public void test ( byte [ ] data , int off , int len ) throws IOException 
+ + { 
+ + final int outOffset = 3 ; 
+ + final WrappedArray out = new WrappedArray ( new byte [ outOffset + compressor . initialCompressedBufferLength ( len ) ] ) ; 
+ + new Random ( ) . nextBytes ( out . buffer ) ; 
+ + final int compressedLength = compressor . compress ( data , off , len , out , outOffset ) ; 
+ + final int restoredOffset = 5 ; 
+ + final byte [ ] restored = new byte [ restoredOffset + len ] ; 
+ + new Random ( ) . nextBytes ( restored ) ; 
+ + final int decompressedLength = compressor . uncompress ( out . buffer , outOffset , compressedLength , restored , restoredOffset ) ; 
+ + assertEquals ( decompressedLength , len ) ; 
+ + assertArrayEquals ( Arrays . copyOfRange ( data , off , off + len ) , 
+ + Arrays . copyOfRange ( restored , restoredOffset , restoredOffset + decompressedLength ) ) ; 
+ + } 
+ + 
+ + public void test ( byte [ ] data ) throws IOException 
+ + { 
+ + test ( data , 0 , data . length ) ; 
+ + } 
+ + 
+ + public void testEmptyArray ( ) throws IOException 
+ + { 
+ + test ( new byte [ 0 ] ) ; 
+ + } 
+ + 
+ + public void testShortArray ( ) throws UnsupportedEncodingException , IOException 
+ + { 
+ + test ( " Cassandra " . getBytes ( " UTF - 8 " ) , 1 , 7 ) ; 
+ + } 
+ + 
+ + public void testLongArray ( ) throws UnsupportedEncodingException , IOException 
+ + { 
+ + byte [ ] data = new byte [ 1 < < 20 ] ; 
+ + test ( data , 13 , 1 < < 19 ) ; 
+ + new Random ( 0 ) . nextBytes ( data ) ; 
+ + test ( data , 13 , 1 < < 19 ) ; 
+ + } 
+ + 
+ + public void testMappedFile ( ) throws IOException 
+ + { 
+ + byte [ ] data = new byte [ 1 < < 20 ] ; 
+ + new Random ( ) . nextBytes ( data ) ; 
+ + 
+ + / / create a temp file 
+ + File temp = File . createTempFile ( " tempfile " , " . tmp " ) ; 
+ + temp . deleteOnExit ( ) ; 
+ + 
+ + / / Prepend some random bytes to the output and compress 
+ + final int outOffset = 3 ; 
+ + final WrappedArray out = new WrappedArray ( new byte [ outOffset + compressor . initialCompressedBufferLength ( data . length ) ] ) ; 
+ + new Random ( ) . nextBytes ( out . buffer ) ; 
+ + final int compressedLength = compressor . compress ( data , 0 , data . length , out , outOffset ) ; 
+ + Files . write ( out . buffer , temp ) ; 
+ + 
+ + MappedByteBuffer mappedData = Files . map ( temp ) ; 
+ + mappedData . position ( outOffset ) ; 
+ + mappedData . limit ( compressedLength + outOffset ) ; 
+ + 
+ + 
+ + ByteBuffer result = compressor . useDirectOutputByteBuffers ( ) 
+ + ? ByteBuffer . allocateDirect ( data . length + 100 ) 
+ + : ByteBuffer . allocate ( data . length + 100 ) ; 
+ + 
+ + int length = compressor . uncompress ( mappedData , result ) ; 
+ + 
+ + Assert . assertEquals ( data . length , length ) ; 
+ + for ( int i = 0 ; i < length ; i + + ) 
+ + { 
+ + Assert . assertEquals ( " Decompression mismatch at byte " + i , data [ i ] , result . get ( ) ) ; 
+ + } 
+ + } 
+ + } 
+ diff - - git a / test / unit / org / apache / cassandra / io / compress / LZ4CompressorTest . java b / test / unit / org / apache / cassandra / io / compress / LZ4CompressorTest . java 
+ deleted file mode 100644 
+ index 56ffdf1 . . 0000000 
+ - - - a / test / unit / org / apache / cassandra / io / compress / LZ4CompressorTest . java 
+ + + + / dev / null 
+ @ @ - 1 , 84 + 0 , 0 @ @ 
+ - / * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - package org . apache . cassandra . io . compress ; 
+ - 
+ - import java . io . IOException ; 
+ - import java . io . UnsupportedEncodingException ; 
+ - import java . util . Arrays ; 
+ - import java . util . Collections ; 
+ - import java . util . Random ; 
+ - 
+ - import org . apache . cassandra . io . compress . ICompressor . WrappedArray ; 
+ - 
+ - import org . junit . Before ; 
+ - import org . junit . Test ; 
+ - 
+ - import static org . junit . Assert . * ; 
+ - 
+ - public class LZ4CompressorTest 
+ - { 
+ - 
+ - LZ4Compressor compressor ; 
+ - 
+ - @ Before 
+ - public void setUp ( ) 
+ - { 
+ - compressor = LZ4Compressor . create ( Collections . < String , String > emptyMap ( ) ) ; 
+ - } 
+ - 
+ - public void test ( byte [ ] data , int off , int len ) throws IOException 
+ - { 
+ - final int outOffset = 3 ; 
+ - final WrappedArray out = new WrappedArray ( new byte [ outOffset + compressor . initialCompressedBufferLength ( len ) ] ) ; 
+ - new Random ( ) . nextBytes ( out . buffer ) ; 
+ - final int compressedLength = compressor . compress ( data , off , len , out , outOffset ) ; 
+ - final int restoredOffset = 5 ; 
+ - final byte [ ] restored = new byte [ restoredOffset + len ] ; 
+ - new Random ( ) . nextBytes ( restored ) ; 
+ - final int decompressedLength = compressor . uncompress ( out . buffer , outOffset , compressedLength , restored , restoredOffset ) ; 
+ - assertEquals ( decompressedLength , len ) ; 
+ - assertArrayEquals ( Arrays . copyOfRange ( data , off , off + len ) , 
+ - Arrays . copyOfRange ( restored , restoredOffset , restoredOffset + decompressedLength ) ) ; 
+ - } 
+ - 
+ - public void test ( byte [ ] data ) throws IOException 
+ - { 
+ - test ( data , 0 , data . length ) ; 
+ - } 
+ - 
+ - @ Test 
+ - public void testEmptyArray ( ) throws IOException 
+ - { 
+ - test ( new byte [ 0 ] ) ; 
+ - } 
+ - 
+ - @ Test 
+ - public void testShortArray ( ) throws UnsupportedEncodingException , IOException 
+ - { 
+ - test ( " Cassandra " . getBytes ( " UTF - 8 " ) , 1 , 7 ) ; 
+ - } 
+ - 
+ - @ Test 
+ - public void testLongArray ( ) throws UnsupportedEncodingException , IOException 
+ - { 
+ - byte [ ] data = new byte [ 1 < < 20 ] ; 
+ - test ( data , 13 , 1 < < 19 ) ; 
+ - new Random ( 0 ) . nextBytes ( data ) ; 
+ - test ( data , 13 , 1 < < 19 ) ; 
+ - } 
+ - } 
+ diff - - git a / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java b / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java 
+ index 42a83a0 . . 128ec3c 100644 
+ - - - a / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java 
+ + + + b / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java 
+ @ @ - 111 , 7 + 111 , 7 @ @ public class CompressedInputStreamTest 
+ 
+ / / read buffer using CompressedInputStream 
+ CompressionInfo info = new CompressionInfo ( chunks , param ) ; 
+ - CompressedInputStream input = new CompressedInputStream ( new ByteArrayInputStream ( toRead ) , info , true ) ; 
+ + CompressedInputStream input = new CompressedInputStream ( new ByteArrayInputStream ( toRead ) , info ) ; 
+ DataInputStream in = new DataInputStream ( input ) ; 
+ 
+ for ( int i = 0 ; i < sections . size ( ) ; i + + )
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 270a7ee . . fcfff37 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 1 . 1 . 2 
+ + * skip tombstones during hint replay ( CASSANDRA - 4320 ) 
+ * fix NPE in compactionstats ( CASSANDRA - 4318 ) 
+ * enforce 1m min keycache for auto ( CASSANDRA - 4306 ) 
+ * Have DeletedColumn . isMFD always return true ( CASSANDRA - 4307 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / HintedHandOffManager . java b / src / java / org / apache / cassandra / db / HintedHandOffManager . java 
+ index 2a3e6b1 . . c7b160d 100644 
+ - - - a / src / java / org / apache / cassandra / db / HintedHandOffManager . java 
+ + + + b / src / java / org / apache / cassandra / db / HintedHandOffManager . java 
+ @ @ - 330 , 6 + 330 , 14 @ @ public class HintedHandOffManager implements HintedHandOffManagerMBean 
+ } 
+ } 
+ 
+ + / / Skip tombstones : 
+ + / / if we iterate quickly enough , it ' s possible that we could request a new page in the same millisecond 
+ + / / in which the local deletion timestamp was generated on the last column in the old page , in which 
+ + / / case the hint will have no columns ( since it ' s deleted ) but will still be included in the resultset 
+ + / / since ( even with gcgs = 0 ) it ' s still a " relevant " tombstone . 
+ + if ( ! hint . isLive ( ) ) 
+ + continue ; 
+ + 
+ IColumn versionColumn = hint . getSubColumn ( ByteBufferUtil . bytes ( " version " ) ) ; 
+ IColumn tableColumn = hint . getSubColumn ( ByteBufferUtil . bytes ( " table " ) ) ; 
+ IColumn keyColumn = hint . getSubColumn ( ByteBufferUtil . bytes ( " key " ) ) ;

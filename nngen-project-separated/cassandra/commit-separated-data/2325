@@ -1,0 +1,526 @@
+BLEU SCORE: 0.03283637368030199
+
+TEST MSG: Fix race condition during pending range calculation
+GENERATED MSG: Make calculatePendingRange asynchronous
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index ff0a1c6 . . f2cd844 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 11 , 6 + 11 , 7 @ @ <nl> * Switch external naming of ' column families ' to ' tables ' ( CASSANDRA - 4369 ) <nl> * Shorten SSTable path ( CASSANDRA - 6962 ) <nl> * Use unsafe mutations for most unit tests ( CASSANDRA - 6969 ) <nl> + * Fix race condition during calculation of pending ranges ( CASSANDRA - 7390 ) <nl> <nl> <nl> 2 . 1 . 1 <nl> diff - - git a / src / java / org / apache / cassandra / locator / TokenMetadata . java b / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> index f41b1e7 . . c4e3542 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> + + + b / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> @ @ - 752 , 9 + 752 , 123 @ @ public class TokenMetadata <nl> return ranges ; <nl> } <nl> <nl> - public void setPendingRanges ( String keyspaceName , Multimap < Range < Token > , InetAddress > rangeMap ) <nl> + / * * <nl> + * Calculate pending ranges according to bootsrapping and leaving nodes . Reasoning is : <nl> + * <nl> + * ( 1 ) When in doubt , it is better to write too much to a node than too little . That is , if <nl> + * there are multiple nodes moving , calculate the biggest ranges a node could have . Cleaning <nl> + * up unneeded data afterwards is better than missing writes during movement . <nl> + * ( 2 ) When a node leaves , ranges for other nodes can only grow ( a node might get additional <nl> + * ranges , but it will not lose any of its current ranges as a result of a leave ) . Therefore <nl> + * we will first remove _ all _ leaving tokens for the sake of calculation and then check what <nl> + * ranges would go where if all nodes are to leave . This way we get the biggest possible <nl> + * ranges with regard current leave operations , covering all subsets of possible final range <nl> + * values . <nl> + * ( 3 ) When a node bootstraps , ranges of other nodes can only get smaller . Without doing <nl> + * complex calculations to see if multiple bootstraps overlap , we simply base calculations <nl> + * on the same token ring used before ( reflecting situation after all leave operations have <nl> + * completed ) . Bootstrapping nodes will be added and removed one by one to that metadata and <nl> + * checked what their ranges would be . This will give us the biggest possible ranges the <nl> + * node could have . It might be that other bootstraps make our actual final ranges smaller , <nl> + * but it does not matter as we can clean up the data afterwards . <nl> + * <nl> + * NOTE : This is heavy and ineffective operation . This will be done only once when a node <nl> + * changes state in the cluster , so it should be manageable . <nl> + * / <nl> + public void calculatePendingRanges ( AbstractReplicationStrategy strategy , String keyspaceName ) <nl> { <nl> - pendingRanges . put ( keyspaceName , rangeMap ) ; <nl> + lock . readLock ( ) . lock ( ) ; <nl> + try <nl> + { <nl> + Multimap < Range < Token > , InetAddress > newPendingRanges = HashMultimap . create ( ) ; <nl> + <nl> + if ( bootstrapTokens . isEmpty ( ) & & leavingEndpoints . isEmpty ( ) & & movingEndpoints . isEmpty ( ) & & relocatingTokens . isEmpty ( ) ) <nl> + { <nl> + if ( logger . isDebugEnabled ( ) ) <nl> + logger . debug ( " No bootstrapping , leaving or moving nodes , and no relocating tokens - > empty pending ranges for { } " , keyspaceName ) ; <nl> + <nl> + pendingRanges . put ( keyspaceName , newPendingRanges ) ; <nl> + return ; <nl> + } <nl> + <nl> + Multimap < InetAddress , Range < Token > > addressRanges = strategy . getAddressRanges ( ) ; <nl> + <nl> + / / Copy of metadata reflecting the situation after all leave operations are finished . <nl> + TokenMetadata allLeftMetadata = cloneAfterAllLeft ( ) ; <nl> + <nl> + / / get all ranges that will be affected by leaving nodes <nl> + Set < Range < Token > > affectedRanges = new HashSet < Range < Token > > ( ) ; <nl> + for ( InetAddress endpoint : leavingEndpoints ) <nl> + affectedRanges . addAll ( addressRanges . get ( endpoint ) ) ; <nl> + <nl> + / / for each of those ranges , find what new nodes will be responsible for the range when <nl> + / / all leaving nodes are gone . <nl> + for ( Range < Token > range : affectedRanges ) <nl> + { <nl> + Set < InetAddress > currentEndpoints = ImmutableSet . copyOf ( strategy . calculateNaturalEndpoints ( range . right , cloneOnlyTokenMap ( ) ) ) ; <nl> + Set < InetAddress > newEndpoints = ImmutableSet . copyOf ( strategy . calculateNaturalEndpoints ( range . right , allLeftMetadata ) ) ; <nl> + newPendingRanges . putAll ( range , Sets . difference ( newEndpoints , currentEndpoints ) ) ; <nl> + } <nl> + <nl> + / / At this stage newPendingRanges has been updated according to leave operations . We can <nl> + / / now continue the calculation by checking bootstrapping nodes . <nl> + <nl> + / / For each of the bootstrapping nodes , simply add and remove them one by one to <nl> + / / allLeftMetadata and check in between what their ranges would be . <nl> + Multimap < InetAddress , Token > bootstrapAddresses = bootstrapTokens . inverse ( ) ; <nl> + for ( InetAddress endpoint : bootstrapAddresses . keySet ( ) ) <nl> + { <nl> + Collection < Token > tokens = bootstrapAddresses . get ( endpoint ) ; <nl> + <nl> + allLeftMetadata . updateNormalTokens ( tokens , endpoint ) ; <nl> + for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) <nl> + newPendingRanges . put ( range , endpoint ) ; <nl> + allLeftMetadata . removeEndpoint ( endpoint ) ; <nl> + } <nl> + <nl> + / / At this stage newPendingRanges has been updated according to leaving and bootstrapping nodes . <nl> + / / We can now finish the calculation by checking moving and relocating nodes . <nl> + <nl> + / / For each of the moving nodes , we do the same thing we did for bootstrapping : <nl> + / / simply add and remove them one by one to allLeftMetadata and check in between what their ranges would be . <nl> + for ( Pair < Token , InetAddress > moving : movingEndpoints ) <nl> + { <nl> + InetAddress endpoint = moving . right ; / / address of the moving node <nl> + <nl> + / / moving . left is a new token of the endpoint <nl> + allLeftMetadata . updateNormalToken ( moving . left , endpoint ) ; <nl> + <nl> + for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) <nl> + { <nl> + newPendingRanges . put ( range , endpoint ) ; <nl> + } <nl> + <nl> + allLeftMetadata . removeEndpoint ( endpoint ) ; <nl> + } <nl> + <nl> + / / Ranges being relocated . <nl> + for ( Map . Entry < Token , InetAddress > relocating : relocatingTokens . entrySet ( ) ) <nl> + { <nl> + InetAddress endpoint = relocating . getValue ( ) ; / / address of the moving node <nl> + Token token = relocating . getKey ( ) ; <nl> + <nl> + allLeftMetadata . updateNormalToken ( token , endpoint ) ; <nl> + <nl> + for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) <nl> + newPendingRanges . put ( range , endpoint ) ; <nl> + <nl> + allLeftMetadata . removeEndpoint ( endpoint ) ; <nl> + } <nl> + <nl> + pendingRanges . put ( keyspaceName , newPendingRanges ) ; <nl> + <nl> + if ( logger . isDebugEnabled ( ) ) <nl> + logger . debug ( " Pending ranges : \ n { } " , ( pendingRanges . isEmpty ( ) ? " < empty > " : printPendingRanges ( ) ) ) ; <nl> + } <nl> + finally <nl> + { <nl> + lock . readLock ( ) . unlock ( ) ; <nl> + } <nl> } <nl> <nl> public Token getPredecessor ( Token token ) <nl> @ @ - 906 , 12 + 1020 , 15 @ @ public class TokenMetadata <nl> lock . writeLock ( ) . lock ( ) ; <nl> try <nl> { <nl> - bootstrapTokens . clear ( ) ; <nl> tokenToEndpointMap . clear ( ) ; <nl> - topology . clear ( ) ; <nl> + endpointToHostIdMap . clear ( ) ; <nl> + bootstrapTokens . clear ( ) ; <nl> leavingEndpoints . clear ( ) ; <nl> pendingRanges . clear ( ) ; <nl> - endpointToHostIdMap . clear ( ) ; <nl> + movingEndpoints . clear ( ) ; <nl> + relocatingTokens . clear ( ) ; <nl> + sortedTokens . clear ( ) ; <nl> + topology . clear ( ) ; <nl> invalidateCachedRings ( ) ; <nl> } <nl> finally <nl> @ @ - 978 , 7 + 1095 , 7 @ @ public class TokenMetadata <nl> return sb . toString ( ) ; <nl> } <nl> <nl> - public String printPendingRanges ( ) <nl> + private String printPendingRanges ( ) <nl> { <nl> StringBuilder sb = new StringBuilder ( ) ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / service / PendingRangeCalculatorService . java b / src / java / org / apache / cassandra / service / PendingRangeCalculatorService . java <nl> index 74624d2 . . 2276c4a 100644 <nl> - - - a / src / java / org / apache / cassandra / service / PendingRangeCalculatorService . java <nl> + + + b / src / java / org / apache / cassandra / service / PendingRangeCalculatorService . java <nl> @ @ - 18 , 30 + 18 , 16 @ @ <nl> <nl> package org . apache . cassandra . service ; <nl> <nl> - import org . apache . cassandra . utils . BiMultiValMap ; <nl> - import com . google . common . collect . HashMultimap ; <nl> - import com . google . common . collect . ImmutableSet ; <nl> - import com . google . common . collect . Multimap ; <nl> - import com . google . common . collect . Sets ; <nl> - <nl> import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutor ; <nl> import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> import org . apache . cassandra . config . Schema ; <nl> import org . apache . cassandra . db . Keyspace ; <nl> - import org . apache . cassandra . dht . Range ; <nl> - import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . locator . AbstractReplicationStrategy ; <nl> - import org . apache . cassandra . locator . TokenMetadata ; <nl> - import org . apache . cassandra . utils . Pair ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> - import java . net . InetAddress ; <nl> - import java . util . HashSet ; <nl> - import java . util . Map ; <nl> - import java . util . Set ; <nl> - import java . util . Collection ; <nl> import java . util . concurrent . * ; <nl> + import java . util . concurrent . atomic . AtomicInteger ; <nl> <nl> public class PendingRangeCalculatorService <nl> { <nl> @ @ - 51 , 9 + 37 , 18 @ @ public class PendingRangeCalculatorService <nl> private final JMXEnabledThreadPoolExecutor executor = new JMXEnabledThreadPoolExecutor ( 1 , Integer . MAX _ VALUE , TimeUnit . SECONDS , <nl> new LinkedBlockingQueue < Runnable > ( 1 ) , new NamedThreadFactory ( " PendingRangeCalculator " ) , " internal " ) ; <nl> <nl> + private AtomicInteger updateJobs = new AtomicInteger ( 0 ) ; <nl> + <nl> public PendingRangeCalculatorService ( ) <nl> { <nl> - executor . setRejectedExecutionHandler ( new ThreadPoolExecutor . DiscardPolicy ( ) ) ; <nl> + executor . setRejectedExecutionHandler ( new RejectedExecutionHandler ( ) <nl> + { <nl> + public void rejectedExecution ( Runnable r , ThreadPoolExecutor e ) <nl> + { <nl> + PendingRangeCalculatorService . instance . finishUpdate ( ) ; <nl> + } <nl> + } <nl> + ) ; <nl> } <nl> <nl> private static class PendingRangeTask implements Runnable <nl> @ @ - 65 , 21 + 60 , 27 @ @ public class PendingRangeCalculatorService <nl> { <nl> calculatePendingRanges ( Keyspace . open ( keyspaceName ) . getReplicationStrategy ( ) , keyspaceName ) ; <nl> } <nl> + PendingRangeCalculatorService . instance . finishUpdate ( ) ; <nl> logger . debug ( " finished calculation for { } keyspaces in { } ms " , Schema . instance . getNonSystemKeyspaces ( ) . size ( ) , System . currentTimeMillis ( ) - start ) ; <nl> } <nl> } <nl> <nl> - public Future < ? > update ( ) <nl> + private void finishUpdate ( ) <nl> { <nl> - return executor . submit ( new PendingRangeTask ( ) ) ; <nl> + updateJobs . decrementAndGet ( ) ; <nl> + } <nl> + <nl> + public void update ( ) <nl> + { <nl> + updateJobs . incrementAndGet ( ) ; <nl> + executor . submit ( new PendingRangeTask ( ) ) ; <nl> } <nl> <nl> public void blockUntilFinished ( ) <nl> { <nl> - while ( true ) <nl> + / / We want to be sure the job we ' re blocking for is actually finished and we can ' t trust the TPE ' s active job count <nl> + while ( updateJobs . get ( ) > 0 ) <nl> { <nl> - if ( executor . getActiveCount ( ) + executor . getPendingTasks ( ) = = 0 ) <nl> - break ; <nl> try <nl> { <nl> Thread . sleep ( 100 ) ; <nl> @ @ - 91 , 117 + 92 , 10 @ @ public class PendingRangeCalculatorService <nl> } <nl> } <nl> <nl> - / * * <nl> - * Calculate pending ranges according to bootsrapping and leaving nodes . Reasoning is : <nl> - * <nl> - * ( 1 ) When in doubt , it is better to write too much to a node than too little . That is , if <nl> - * there are multiple nodes moving , calculate the biggest ranges a node could have . Cleaning <nl> - * up unneeded data afterwards is better than missing writes during movement . <nl> - * ( 2 ) When a node leaves , ranges for other nodes can only grow ( a node might get additional <nl> - * ranges , but it will not lose any of its current ranges as a result of a leave ) . Therefore <nl> - * we will first remove _ all _ leaving tokens for the sake of calculation and then check what <nl> - * ranges would go where if all nodes are to leave . This way we get the biggest possible <nl> - * ranges with regard current leave operations , covering all subsets of possible final range <nl> - * values . <nl> - * ( 3 ) When a node bootstraps , ranges of other nodes can only get smaller . Without doing <nl> - * complex calculations to see if multiple bootstraps overlap , we simply base calculations <nl> - * on the same token ring used before ( reflecting situation after all leave operations have <nl> - * completed ) . Bootstrapping nodes will be added and removed one by one to that metadata and <nl> - * checked what their ranges would be . This will give us the biggest possible ranges the <nl> - * node could have . It might be that other bootstraps make our actual final ranges smaller , <nl> - * but it does not matter as we can clean up the data afterwards . <nl> - * <nl> - * NOTE : This is heavy and ineffective operation . This will be done only once when a node <nl> - * changes state in the cluster , so it should be manageable . <nl> - * / <nl> + <nl> / / public & static for testing purposes <nl> public static void calculatePendingRanges ( AbstractReplicationStrategy strategy , String keyspaceName ) <nl> { <nl> - TokenMetadata tm = StorageService . instance . getTokenMetadata ( ) ; <nl> - Multimap < Range < Token > , InetAddress > pendingRanges = HashMultimap . create ( ) ; <nl> - BiMultiValMap < Token , InetAddress > bootstrapTokens = tm . getBootstrapTokens ( ) ; <nl> - Set < InetAddress > leavingEndpoints = tm . getLeavingEndpoints ( ) ; <nl> - <nl> - if ( bootstrapTokens . isEmpty ( ) & & leavingEndpoints . isEmpty ( ) & & tm . getMovingEndpoints ( ) . isEmpty ( ) & & tm . getRelocatingRanges ( ) . isEmpty ( ) ) <nl> - { <nl> - if ( logger . isDebugEnabled ( ) ) <nl> - logger . debug ( " No bootstrapping , leaving or moving nodes , and no relocating tokens - > empty pending ranges for { } " , keyspaceName ) ; <nl> - tm . setPendingRanges ( keyspaceName , pendingRanges ) ; <nl> - return ; <nl> - } <nl> - <nl> - Multimap < InetAddress , Range < Token > > addressRanges = strategy . getAddressRanges ( ) ; <nl> - <nl> - / / Copy of metadata reflecting the situation after all leave operations are finished . <nl> - TokenMetadata allLeftMetadata = tm . cloneAfterAllLeft ( ) ; <nl> - <nl> - / / get all ranges that will be affected by leaving nodes <nl> - Set < Range < Token > > affectedRanges = new HashSet < Range < Token > > ( ) ; <nl> - for ( InetAddress endpoint : leavingEndpoints ) <nl> - affectedRanges . addAll ( addressRanges . get ( endpoint ) ) ; <nl> - <nl> - / / for each of those ranges , find what new nodes will be responsible for the range when <nl> - / / all leaving nodes are gone . <nl> - for ( Range < Token > range : affectedRanges ) <nl> - { <nl> - Set < InetAddress > currentEndpoints = ImmutableSet . copyOf ( strategy . calculateNaturalEndpoints ( range . right , tm . cloneOnlyTokenMap ( ) ) ) ; <nl> - Set < InetAddress > newEndpoints = ImmutableSet . copyOf ( strategy . calculateNaturalEndpoints ( range . right , allLeftMetadata ) ) ; <nl> - pendingRanges . putAll ( range , Sets . difference ( newEndpoints , currentEndpoints ) ) ; <nl> - } <nl> - <nl> - / / At this stage pendingRanges has been updated according to leave operations . We can <nl> - / / now continue the calculation by checking bootstrapping nodes . <nl> - <nl> - / / For each of the bootstrapping nodes , simply add and remove them one by one to <nl> - / / allLeftMetadata and check in between what their ranges would be . <nl> - Multimap < InetAddress , Token > bootstrapAddresses = bootstrapTokens . inverse ( ) ; <nl> - for ( InetAddress endpoint : bootstrapAddresses . keySet ( ) ) <nl> - { <nl> - Collection < Token > tokens = bootstrapAddresses . get ( endpoint ) ; <nl> - <nl> - allLeftMetadata . updateNormalTokens ( tokens , endpoint ) ; <nl> - for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) <nl> - pendingRanges . put ( range , endpoint ) ; <nl> - allLeftMetadata . removeEndpoint ( endpoint ) ; <nl> - } <nl> - <nl> - / / At this stage pendingRanges has been updated according to leaving and bootstrapping nodes . <nl> - / / We can now finish the calculation by checking moving and relocating nodes . <nl> - <nl> - / / For each of the moving nodes , we do the same thing we did for bootstrapping : <nl> - / / simply add and remove them one by one to allLeftMetadata and check in between what their ranges would be . <nl> - for ( Pair < Token , InetAddress > moving : tm . getMovingEndpoints ( ) ) <nl> - { <nl> - InetAddress endpoint = moving . right ; / / address of the moving node <nl> - <nl> - / / moving . left is a new token of the endpoint <nl> - allLeftMetadata . updateNormalToken ( moving . left , endpoint ) ; <nl> - <nl> - for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) <nl> - { <nl> - pendingRanges . put ( range , endpoint ) ; <nl> - } <nl> - <nl> - allLeftMetadata . removeEndpoint ( endpoint ) ; <nl> - } <nl> - <nl> - / / Ranges being relocated . <nl> - for ( Map . Entry < Token , InetAddress > relocating : tm . getRelocatingRanges ( ) . entrySet ( ) ) <nl> - { <nl> - InetAddress endpoint = relocating . getValue ( ) ; / / address of the moving node <nl> - Token token = relocating . getKey ( ) ; <nl> - <nl> - allLeftMetadata . updateNormalToken ( token , endpoint ) ; <nl> - <nl> - for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) <nl> - pendingRanges . put ( range , endpoint ) ; <nl> - <nl> - allLeftMetadata . removeEndpoint ( endpoint ) ; <nl> - } <nl> - <nl> - tm . setPendingRanges ( keyspaceName , pendingRanges ) ; <nl> - <nl> - if ( logger . isDebugEnabled ( ) ) <nl> - logger . debug ( " Pending ranges : \ n { } " , ( pendingRanges . isEmpty ( ) ? " < empty > " : tm . printPendingRanges ( ) ) ) ; <nl> + StorageService . instance . getTokenMetadata ( ) . calculatePendingRanges ( strategy , keyspaceName ) ; <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / service / MoveTest . java b / test / unit / org / apache / cassandra / service / MoveTest . java <nl> index c01f4af . . 1ee71dd 100644 <nl> - - - a / test / unit / org / apache / cassandra / service / MoveTest . java <nl> + + + b / test / unit / org / apache / cassandra / service / MoveTest . java <nl> @ @ - 29 , 6 + 29 , 7 @ @ import static org . junit . Assert . * ; <nl> <nl> import org . apache . cassandra . gms . Gossiper ; <nl> import org . junit . AfterClass ; <nl> + import org . junit . Before ; <nl> import org . junit . BeforeClass ; <nl> import org . junit . Test ; <nl> <nl> @ @ - 73 , 6 + 74 , 13 @ @ public class MoveTest <nl> StorageService . instance . setPartitionerUnsafe ( oldPartitioner ) ; <nl> } <nl> <nl> + @ Before <nl> + public void clearTokenMetadata ( ) <nl> + { <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> + StorageService . instance . getTokenMetadata ( ) . clearUnsafe ( ) ; <nl> + } <nl> + <nl> / * <nl> * Test whether write endpoints is correct when the node is moving . Uses <nl> * StorageService . onChange and does not manipulate token metadata directly . <nl> @ @ - 85 , 7 + 93 , 6 @ @ public class MoveTest <nl> final int MOVING _ NODE = 3 ; / / index of the moving node <nl> <nl> TokenMetadata tmd = ss . getTokenMetadata ( ) ; <nl> - tmd . clearUnsafe ( ) ; <nl> VersionedValue . VersionedValueFactory valueFactory = new VersionedValue . VersionedValueFactory ( partitioner ) ; <nl> <nl> ArrayList < Token > endpointTokens = new ArrayList < Token > ( ) ; <nl> @ @ - 141 , 7 + 148 , 7 @ @ public class MoveTest <nl> 	 numMoved + + ; <nl> } <nl> } <nl> - assertEquals ( " mismatched number of moved token " , numMoved , 1 ) ; <nl> + assertEquals ( " mismatched number of moved token " , 1 , numMoved ) ; <nl> } <nl> <nl> / / moving endpoint back to the normal state <nl> @ @ - 157 , 7 + 164 , 6 @ @ public class MoveTest <nl> StorageService ss = StorageService . instance ; <nl> final int RING _ SIZE = 10 ; <nl> TokenMetadata tmd = ss . getTokenMetadata ( ) ; <nl> - tmd . clearUnsafe ( ) ; <nl> IPartitioner partitioner = new RandomPartitioner ( ) ; <nl> VersionedValue . VersionedValueFactory valueFactory = new VersionedValue . VersionedValueFactory ( partitioner ) ; <nl> <nl> @ @ - 195 , 6 + 201 , 8 @ @ public class MoveTest <nl> ss . onChange ( boot1 , <nl> ApplicationState . STATUS , <nl> valueFactory . bootstrapping ( Collections . < Token > singleton ( keyTokens . get ( 5 ) ) ) ) ; <nl> + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> + <nl> InetAddress boot2 = InetAddress . getByName ( " 127 . 0 . 1 . 2 " ) ; <nl> Gossiper . instance . initializeNodeUnsafe ( boot2 , UUID . randomUUID ( ) , 1 ) ; <nl> Gossiper . instance . injectApplicationState ( boot2 , ApplicationState . TOKENS , valueFactory . tokens ( Collections . singleton ( keyTokens . get ( 7 ) ) ) ) ; <nl> @ @ - 498 , 7 + 506 , 6 @ @ public class MoveTest <nl> { <nl> StorageService ss = StorageService . instance ; <nl> TokenMetadata tmd = ss . getTokenMetadata ( ) ; <nl> - tmd . clearUnsafe ( ) ; <nl> IPartitioner partitioner = new RandomPartitioner ( ) ; <nl> VersionedValue . VersionedValueFactory valueFactory = new VersionedValue . VersionedValueFactory ( partitioner ) ; <nl>
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 6e9ea33 . . ddf3e05 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 14 , 6 + 14 , 7 @ @ <nl> * New CQL - aware SSTableWriter ( CASSANDRA - 5894 ) <nl> * Reject CAS operation when the protocol v1 is used ( CASSANDRA - 6270 ) <nl> * Correctly throw error when frame too large ( CASSANDRA - 5981 ) <nl> + * Fix serialization bug in PagedRange with 2ndary indexes ( CASSANDRA - 6299 ) <nl> Merged from 1 . 2 : <nl> * add non - jamm path for cached statements ( CASSANDRA - 6293 ) <nl> * ( Hadoop ) Require CFRR batchSize to be at least 2 ( CASSANDRA - 6114 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / PagedRangeCommand . java b / src / java / org / apache / cassandra / db / PagedRangeCommand . java <nl> index b1e2c39 . . e152f43 100644 <nl> - - - a / src / java / org / apache / cassandra / db / PagedRangeCommand . java <nl> + + + b / src / java / org / apache / cassandra / db / PagedRangeCommand . java <nl> @ @ - 111 , 6 + 111 , 12 @ @ public class PagedRangeCommand extends AbstractRangeCommand <nl> return cfs . getRangeSlice ( exFilter ) ; <nl> } <nl> <nl> + @ Override <nl> + public String toString ( ) <nl> + { <nl> + return String . format ( " PagedRange ( % s , % s , % d , % s , % s , % s , % s , % s , % d ) " , keyspace , columnFamily , timestamp , keyRange , predicate , start , stop , rowFilter , limit ) ; <nl> + } <nl> + <nl> private static class Serializer implements IVersionedSerializer < PagedRangeCommand > <nl> { <nl> public void serialize ( PagedRangeCommand cmd , DataOutput out , int version ) throws IOException <nl> @ @ - 134 , 7 + 140 , 7 @ @ public class PagedRangeCommand extends AbstractRangeCommand <nl> { <nl> ByteBufferUtil . writeWithShortLength ( expr . column _ name , out ) ; <nl> out . writeInt ( expr . op . getValue ( ) ) ; <nl> - ByteBufferUtil . writeWithLength ( expr . value , out ) ; <nl> + ByteBufferUtil . writeWithShortLength ( expr . value , out ) ; <nl> } <nl> <nl> out . writeInt ( cmd . limit ) ; <nl> @ @ - 179 , 12 + 185 , 15 @ @ public class PagedRangeCommand extends AbstractRangeCommand <nl> <nl> size + = SliceQueryFilter . serializer . serializedSize ( ( SliceQueryFilter ) cmd . predicate , version ) ; <nl> <nl> + size + = TypeSizes . NATIVE . sizeofWithShortLength ( cmd . start ) ; <nl> + size + = TypeSizes . NATIVE . sizeofWithShortLength ( cmd . stop ) ; <nl> + <nl> size + = TypeSizes . NATIVE . sizeof ( cmd . rowFilter . size ( ) ) ; <nl> for ( IndexExpression expr : cmd . rowFilter ) <nl> { <nl> size + = TypeSizes . NATIVE . sizeofWithShortLength ( expr . column _ name ) ; <nl> size + = TypeSizes . NATIVE . sizeof ( expr . op . getValue ( ) ) ; <nl> - size + = TypeSizes . NATIVE . sizeofWithLength ( expr . value ) ; <nl> + size + = TypeSizes . NATIVE . sizeofWithShortLength ( expr . value ) ; <nl> } <nl> <nl> size + = TypeSizes . NATIVE . sizeof ( cmd . limit ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / RangeSliceCommand . java b / src / java / org / apache / cassandra / db / RangeSliceCommand . java <nl> index c0cfb12 . . 4aa1595 100644 <nl> - - - a / src / java / org / apache / cassandra / db / RangeSliceCommand . java <nl> + + + b / src / java / org / apache / cassandra / db / RangeSliceCommand . java <nl> @ @ - 310 , 7 + 310 , 7 @ @ class RangeSliceCommandSerializer implements IVersionedSerializer < RangeSliceComm <nl> { <nl> size + = TypeSizes . NATIVE . sizeofWithShortLength ( expr . column _ name ) ; <nl> size + = TypeSizes . NATIVE . sizeof ( expr . op . getValue ( ) ) ; <nl> - size + = TypeSizes . NATIVE . sizeofWithLength ( expr . value ) ; <nl> + size + = TypeSizes . NATIVE . sizeofWithShortLength ( expr . value ) ; <nl> } <nl> } <nl> size + = AbstractBounds . serializer . serializedSize ( rsc . keyRange , version ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index ff0a1c6 . . f2cd844 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 11 , 6 + 11 , 7 @ @ 
+ * Switch external naming of ' column families ' to ' tables ' ( CASSANDRA - 4369 ) 
+ * Shorten SSTable path ( CASSANDRA - 6962 ) 
+ * Use unsafe mutations for most unit tests ( CASSANDRA - 6969 ) 
+ + * Fix race condition during calculation of pending ranges ( CASSANDRA - 7390 ) 
+ 
+ 
+ 2 . 1 . 1 
+ diff - - git a / src / java / org / apache / cassandra / locator / TokenMetadata . java b / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ index f41b1e7 . . c4e3542 100644 
+ - - - a / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ + + + b / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ @ @ - 752 , 9 + 752 , 123 @ @ public class TokenMetadata 
+ return ranges ; 
+ } 
+ 
+ - public void setPendingRanges ( String keyspaceName , Multimap < Range < Token > , InetAddress > rangeMap ) 
+ + / * * 
+ + * Calculate pending ranges according to bootsrapping and leaving nodes . Reasoning is : 
+ + * 
+ + * ( 1 ) When in doubt , it is better to write too much to a node than too little . That is , if 
+ + * there are multiple nodes moving , calculate the biggest ranges a node could have . Cleaning 
+ + * up unneeded data afterwards is better than missing writes during movement . 
+ + * ( 2 ) When a node leaves , ranges for other nodes can only grow ( a node might get additional 
+ + * ranges , but it will not lose any of its current ranges as a result of a leave ) . Therefore 
+ + * we will first remove _ all _ leaving tokens for the sake of calculation and then check what 
+ + * ranges would go where if all nodes are to leave . This way we get the biggest possible 
+ + * ranges with regard current leave operations , covering all subsets of possible final range 
+ + * values . 
+ + * ( 3 ) When a node bootstraps , ranges of other nodes can only get smaller . Without doing 
+ + * complex calculations to see if multiple bootstraps overlap , we simply base calculations 
+ + * on the same token ring used before ( reflecting situation after all leave operations have 
+ + * completed ) . Bootstrapping nodes will be added and removed one by one to that metadata and 
+ + * checked what their ranges would be . This will give us the biggest possible ranges the 
+ + * node could have . It might be that other bootstraps make our actual final ranges smaller , 
+ + * but it does not matter as we can clean up the data afterwards . 
+ + * 
+ + * NOTE : This is heavy and ineffective operation . This will be done only once when a node 
+ + * changes state in the cluster , so it should be manageable . 
+ + * / 
+ + public void calculatePendingRanges ( AbstractReplicationStrategy strategy , String keyspaceName ) 
+ { 
+ - pendingRanges . put ( keyspaceName , rangeMap ) ; 
+ + lock . readLock ( ) . lock ( ) ; 
+ + try 
+ + { 
+ + Multimap < Range < Token > , InetAddress > newPendingRanges = HashMultimap . create ( ) ; 
+ + 
+ + if ( bootstrapTokens . isEmpty ( ) & & leavingEndpoints . isEmpty ( ) & & movingEndpoints . isEmpty ( ) & & relocatingTokens . isEmpty ( ) ) 
+ + { 
+ + if ( logger . isDebugEnabled ( ) ) 
+ + logger . debug ( " No bootstrapping , leaving or moving nodes , and no relocating tokens - > empty pending ranges for { } " , keyspaceName ) ; 
+ + 
+ + pendingRanges . put ( keyspaceName , newPendingRanges ) ; 
+ + return ; 
+ + } 
+ + 
+ + Multimap < InetAddress , Range < Token > > addressRanges = strategy . getAddressRanges ( ) ; 
+ + 
+ + / / Copy of metadata reflecting the situation after all leave operations are finished . 
+ + TokenMetadata allLeftMetadata = cloneAfterAllLeft ( ) ; 
+ + 
+ + / / get all ranges that will be affected by leaving nodes 
+ + Set < Range < Token > > affectedRanges = new HashSet < Range < Token > > ( ) ; 
+ + for ( InetAddress endpoint : leavingEndpoints ) 
+ + affectedRanges . addAll ( addressRanges . get ( endpoint ) ) ; 
+ + 
+ + / / for each of those ranges , find what new nodes will be responsible for the range when 
+ + / / all leaving nodes are gone . 
+ + for ( Range < Token > range : affectedRanges ) 
+ + { 
+ + Set < InetAddress > currentEndpoints = ImmutableSet . copyOf ( strategy . calculateNaturalEndpoints ( range . right , cloneOnlyTokenMap ( ) ) ) ; 
+ + Set < InetAddress > newEndpoints = ImmutableSet . copyOf ( strategy . calculateNaturalEndpoints ( range . right , allLeftMetadata ) ) ; 
+ + newPendingRanges . putAll ( range , Sets . difference ( newEndpoints , currentEndpoints ) ) ; 
+ + } 
+ + 
+ + / / At this stage newPendingRanges has been updated according to leave operations . We can 
+ + / / now continue the calculation by checking bootstrapping nodes . 
+ + 
+ + / / For each of the bootstrapping nodes , simply add and remove them one by one to 
+ + / / allLeftMetadata and check in between what their ranges would be . 
+ + Multimap < InetAddress , Token > bootstrapAddresses = bootstrapTokens . inverse ( ) ; 
+ + for ( InetAddress endpoint : bootstrapAddresses . keySet ( ) ) 
+ + { 
+ + Collection < Token > tokens = bootstrapAddresses . get ( endpoint ) ; 
+ + 
+ + allLeftMetadata . updateNormalTokens ( tokens , endpoint ) ; 
+ + for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) 
+ + newPendingRanges . put ( range , endpoint ) ; 
+ + allLeftMetadata . removeEndpoint ( endpoint ) ; 
+ + } 
+ + 
+ + / / At this stage newPendingRanges has been updated according to leaving and bootstrapping nodes . 
+ + / / We can now finish the calculation by checking moving and relocating nodes . 
+ + 
+ + / / For each of the moving nodes , we do the same thing we did for bootstrapping : 
+ + / / simply add and remove them one by one to allLeftMetadata and check in between what their ranges would be . 
+ + for ( Pair < Token , InetAddress > moving : movingEndpoints ) 
+ + { 
+ + InetAddress endpoint = moving . right ; / / address of the moving node 
+ + 
+ + / / moving . left is a new token of the endpoint 
+ + allLeftMetadata . updateNormalToken ( moving . left , endpoint ) ; 
+ + 
+ + for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) 
+ + { 
+ + newPendingRanges . put ( range , endpoint ) ; 
+ + } 
+ + 
+ + allLeftMetadata . removeEndpoint ( endpoint ) ; 
+ + } 
+ + 
+ + / / Ranges being relocated . 
+ + for ( Map . Entry < Token , InetAddress > relocating : relocatingTokens . entrySet ( ) ) 
+ + { 
+ + InetAddress endpoint = relocating . getValue ( ) ; / / address of the moving node 
+ + Token token = relocating . getKey ( ) ; 
+ + 
+ + allLeftMetadata . updateNormalToken ( token , endpoint ) ; 
+ + 
+ + for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) 
+ + newPendingRanges . put ( range , endpoint ) ; 
+ + 
+ + allLeftMetadata . removeEndpoint ( endpoint ) ; 
+ + } 
+ + 
+ + pendingRanges . put ( keyspaceName , newPendingRanges ) ; 
+ + 
+ + if ( logger . isDebugEnabled ( ) ) 
+ + logger . debug ( " Pending ranges : \ n { } " , ( pendingRanges . isEmpty ( ) ? " < empty > " : printPendingRanges ( ) ) ) ; 
+ + } 
+ + finally 
+ + { 
+ + lock . readLock ( ) . unlock ( ) ; 
+ + } 
+ } 
+ 
+ public Token getPredecessor ( Token token ) 
+ @ @ - 906 , 12 + 1020 , 15 @ @ public class TokenMetadata 
+ lock . writeLock ( ) . lock ( ) ; 
+ try 
+ { 
+ - bootstrapTokens . clear ( ) ; 
+ tokenToEndpointMap . clear ( ) ; 
+ - topology . clear ( ) ; 
+ + endpointToHostIdMap . clear ( ) ; 
+ + bootstrapTokens . clear ( ) ; 
+ leavingEndpoints . clear ( ) ; 
+ pendingRanges . clear ( ) ; 
+ - endpointToHostIdMap . clear ( ) ; 
+ + movingEndpoints . clear ( ) ; 
+ + relocatingTokens . clear ( ) ; 
+ + sortedTokens . clear ( ) ; 
+ + topology . clear ( ) ; 
+ invalidateCachedRings ( ) ; 
+ } 
+ finally 
+ @ @ - 978 , 7 + 1095 , 7 @ @ public class TokenMetadata 
+ return sb . toString ( ) ; 
+ } 
+ 
+ - public String printPendingRanges ( ) 
+ + private String printPendingRanges ( ) 
+ { 
+ StringBuilder sb = new StringBuilder ( ) ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / service / PendingRangeCalculatorService . java b / src / java / org / apache / cassandra / service / PendingRangeCalculatorService . java 
+ index 74624d2 . . 2276c4a 100644 
+ - - - a / src / java / org / apache / cassandra / service / PendingRangeCalculatorService . java 
+ + + + b / src / java / org / apache / cassandra / service / PendingRangeCalculatorService . java 
+ @ @ - 18 , 30 + 18 , 16 @ @ 
+ 
+ package org . apache . cassandra . service ; 
+ 
+ - import org . apache . cassandra . utils . BiMultiValMap ; 
+ - import com . google . common . collect . HashMultimap ; 
+ - import com . google . common . collect . ImmutableSet ; 
+ - import com . google . common . collect . Multimap ; 
+ - import com . google . common . collect . Sets ; 
+ - 
+ import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutor ; 
+ import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ import org . apache . cassandra . config . Schema ; 
+ import org . apache . cassandra . db . Keyspace ; 
+ - import org . apache . cassandra . dht . Range ; 
+ - import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . locator . AbstractReplicationStrategy ; 
+ - import org . apache . cassandra . locator . TokenMetadata ; 
+ - import org . apache . cassandra . utils . Pair ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ - import java . net . InetAddress ; 
+ - import java . util . HashSet ; 
+ - import java . util . Map ; 
+ - import java . util . Set ; 
+ - import java . util . Collection ; 
+ import java . util . concurrent . * ; 
+ + import java . util . concurrent . atomic . AtomicInteger ; 
+ 
+ public class PendingRangeCalculatorService 
+ { 
+ @ @ - 51 , 9 + 37 , 18 @ @ public class PendingRangeCalculatorService 
+ private final JMXEnabledThreadPoolExecutor executor = new JMXEnabledThreadPoolExecutor ( 1 , Integer . MAX _ VALUE , TimeUnit . SECONDS , 
+ new LinkedBlockingQueue < Runnable > ( 1 ) , new NamedThreadFactory ( " PendingRangeCalculator " ) , " internal " ) ; 
+ 
+ + private AtomicInteger updateJobs = new AtomicInteger ( 0 ) ; 
+ + 
+ public PendingRangeCalculatorService ( ) 
+ { 
+ - executor . setRejectedExecutionHandler ( new ThreadPoolExecutor . DiscardPolicy ( ) ) ; 
+ + executor . setRejectedExecutionHandler ( new RejectedExecutionHandler ( ) 
+ + { 
+ + public void rejectedExecution ( Runnable r , ThreadPoolExecutor e ) 
+ + { 
+ + PendingRangeCalculatorService . instance . finishUpdate ( ) ; 
+ + } 
+ + } 
+ + ) ; 
+ } 
+ 
+ private static class PendingRangeTask implements Runnable 
+ @ @ - 65 , 21 + 60 , 27 @ @ public class PendingRangeCalculatorService 
+ { 
+ calculatePendingRanges ( Keyspace . open ( keyspaceName ) . getReplicationStrategy ( ) , keyspaceName ) ; 
+ } 
+ + PendingRangeCalculatorService . instance . finishUpdate ( ) ; 
+ logger . debug ( " finished calculation for { } keyspaces in { } ms " , Schema . instance . getNonSystemKeyspaces ( ) . size ( ) , System . currentTimeMillis ( ) - start ) ; 
+ } 
+ } 
+ 
+ - public Future < ? > update ( ) 
+ + private void finishUpdate ( ) 
+ { 
+ - return executor . submit ( new PendingRangeTask ( ) ) ; 
+ + updateJobs . decrementAndGet ( ) ; 
+ + } 
+ + 
+ + public void update ( ) 
+ + { 
+ + updateJobs . incrementAndGet ( ) ; 
+ + executor . submit ( new PendingRangeTask ( ) ) ; 
+ } 
+ 
+ public void blockUntilFinished ( ) 
+ { 
+ - while ( true ) 
+ + / / We want to be sure the job we ' re blocking for is actually finished and we can ' t trust the TPE ' s active job count 
+ + while ( updateJobs . get ( ) > 0 ) 
+ { 
+ - if ( executor . getActiveCount ( ) + executor . getPendingTasks ( ) = = 0 ) 
+ - break ; 
+ try 
+ { 
+ Thread . sleep ( 100 ) ; 
+ @ @ - 91 , 117 + 92 , 10 @ @ public class PendingRangeCalculatorService 
+ } 
+ } 
+ 
+ - / * * 
+ - * Calculate pending ranges according to bootsrapping and leaving nodes . Reasoning is : 
+ - * 
+ - * ( 1 ) When in doubt , it is better to write too much to a node than too little . That is , if 
+ - * there are multiple nodes moving , calculate the biggest ranges a node could have . Cleaning 
+ - * up unneeded data afterwards is better than missing writes during movement . 
+ - * ( 2 ) When a node leaves , ranges for other nodes can only grow ( a node might get additional 
+ - * ranges , but it will not lose any of its current ranges as a result of a leave ) . Therefore 
+ - * we will first remove _ all _ leaving tokens for the sake of calculation and then check what 
+ - * ranges would go where if all nodes are to leave . This way we get the biggest possible 
+ - * ranges with regard current leave operations , covering all subsets of possible final range 
+ - * values . 
+ - * ( 3 ) When a node bootstraps , ranges of other nodes can only get smaller . Without doing 
+ - * complex calculations to see if multiple bootstraps overlap , we simply base calculations 
+ - * on the same token ring used before ( reflecting situation after all leave operations have 
+ - * completed ) . Bootstrapping nodes will be added and removed one by one to that metadata and 
+ - * checked what their ranges would be . This will give us the biggest possible ranges the 
+ - * node could have . It might be that other bootstraps make our actual final ranges smaller , 
+ - * but it does not matter as we can clean up the data afterwards . 
+ - * 
+ - * NOTE : This is heavy and ineffective operation . This will be done only once when a node 
+ - * changes state in the cluster , so it should be manageable . 
+ - * / 
+ + 
+ / / public & static for testing purposes 
+ public static void calculatePendingRanges ( AbstractReplicationStrategy strategy , String keyspaceName ) 
+ { 
+ - TokenMetadata tm = StorageService . instance . getTokenMetadata ( ) ; 
+ - Multimap < Range < Token > , InetAddress > pendingRanges = HashMultimap . create ( ) ; 
+ - BiMultiValMap < Token , InetAddress > bootstrapTokens = tm . getBootstrapTokens ( ) ; 
+ - Set < InetAddress > leavingEndpoints = tm . getLeavingEndpoints ( ) ; 
+ - 
+ - if ( bootstrapTokens . isEmpty ( ) & & leavingEndpoints . isEmpty ( ) & & tm . getMovingEndpoints ( ) . isEmpty ( ) & & tm . getRelocatingRanges ( ) . isEmpty ( ) ) 
+ - { 
+ - if ( logger . isDebugEnabled ( ) ) 
+ - logger . debug ( " No bootstrapping , leaving or moving nodes , and no relocating tokens - > empty pending ranges for { } " , keyspaceName ) ; 
+ - tm . setPendingRanges ( keyspaceName , pendingRanges ) ; 
+ - return ; 
+ - } 
+ - 
+ - Multimap < InetAddress , Range < Token > > addressRanges = strategy . getAddressRanges ( ) ; 
+ - 
+ - / / Copy of metadata reflecting the situation after all leave operations are finished . 
+ - TokenMetadata allLeftMetadata = tm . cloneAfterAllLeft ( ) ; 
+ - 
+ - / / get all ranges that will be affected by leaving nodes 
+ - Set < Range < Token > > affectedRanges = new HashSet < Range < Token > > ( ) ; 
+ - for ( InetAddress endpoint : leavingEndpoints ) 
+ - affectedRanges . addAll ( addressRanges . get ( endpoint ) ) ; 
+ - 
+ - / / for each of those ranges , find what new nodes will be responsible for the range when 
+ - / / all leaving nodes are gone . 
+ - for ( Range < Token > range : affectedRanges ) 
+ - { 
+ - Set < InetAddress > currentEndpoints = ImmutableSet . copyOf ( strategy . calculateNaturalEndpoints ( range . right , tm . cloneOnlyTokenMap ( ) ) ) ; 
+ - Set < InetAddress > newEndpoints = ImmutableSet . copyOf ( strategy . calculateNaturalEndpoints ( range . right , allLeftMetadata ) ) ; 
+ - pendingRanges . putAll ( range , Sets . difference ( newEndpoints , currentEndpoints ) ) ; 
+ - } 
+ - 
+ - / / At this stage pendingRanges has been updated according to leave operations . We can 
+ - / / now continue the calculation by checking bootstrapping nodes . 
+ - 
+ - / / For each of the bootstrapping nodes , simply add and remove them one by one to 
+ - / / allLeftMetadata and check in between what their ranges would be . 
+ - Multimap < InetAddress , Token > bootstrapAddresses = bootstrapTokens . inverse ( ) ; 
+ - for ( InetAddress endpoint : bootstrapAddresses . keySet ( ) ) 
+ - { 
+ - Collection < Token > tokens = bootstrapAddresses . get ( endpoint ) ; 
+ - 
+ - allLeftMetadata . updateNormalTokens ( tokens , endpoint ) ; 
+ - for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) 
+ - pendingRanges . put ( range , endpoint ) ; 
+ - allLeftMetadata . removeEndpoint ( endpoint ) ; 
+ - } 
+ - 
+ - / / At this stage pendingRanges has been updated according to leaving and bootstrapping nodes . 
+ - / / We can now finish the calculation by checking moving and relocating nodes . 
+ - 
+ - / / For each of the moving nodes , we do the same thing we did for bootstrapping : 
+ - / / simply add and remove them one by one to allLeftMetadata and check in between what their ranges would be . 
+ - for ( Pair < Token , InetAddress > moving : tm . getMovingEndpoints ( ) ) 
+ - { 
+ - InetAddress endpoint = moving . right ; / / address of the moving node 
+ - 
+ - / / moving . left is a new token of the endpoint 
+ - allLeftMetadata . updateNormalToken ( moving . left , endpoint ) ; 
+ - 
+ - for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) 
+ - { 
+ - pendingRanges . put ( range , endpoint ) ; 
+ - } 
+ - 
+ - allLeftMetadata . removeEndpoint ( endpoint ) ; 
+ - } 
+ - 
+ - / / Ranges being relocated . 
+ - for ( Map . Entry < Token , InetAddress > relocating : tm . getRelocatingRanges ( ) . entrySet ( ) ) 
+ - { 
+ - InetAddress endpoint = relocating . getValue ( ) ; / / address of the moving node 
+ - Token token = relocating . getKey ( ) ; 
+ - 
+ - allLeftMetadata . updateNormalToken ( token , endpoint ) ; 
+ - 
+ - for ( Range < Token > range : strategy . getAddressRanges ( allLeftMetadata ) . get ( endpoint ) ) 
+ - pendingRanges . put ( range , endpoint ) ; 
+ - 
+ - allLeftMetadata . removeEndpoint ( endpoint ) ; 
+ - } 
+ - 
+ - tm . setPendingRanges ( keyspaceName , pendingRanges ) ; 
+ - 
+ - if ( logger . isDebugEnabled ( ) ) 
+ - logger . debug ( " Pending ranges : \ n { } " , ( pendingRanges . isEmpty ( ) ? " < empty > " : tm . printPendingRanges ( ) ) ) ; 
+ + StorageService . instance . getTokenMetadata ( ) . calculatePendingRanges ( strategy , keyspaceName ) ; 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / service / MoveTest . java b / test / unit / org / apache / cassandra / service / MoveTest . java 
+ index c01f4af . . 1ee71dd 100644 
+ - - - a / test / unit / org / apache / cassandra / service / MoveTest . java 
+ + + + b / test / unit / org / apache / cassandra / service / MoveTest . java 
+ @ @ - 29 , 6 + 29 , 7 @ @ import static org . junit . Assert . * ; 
+ 
+ import org . apache . cassandra . gms . Gossiper ; 
+ import org . junit . AfterClass ; 
+ + import org . junit . Before ; 
+ import org . junit . BeforeClass ; 
+ import org . junit . Test ; 
+ 
+ @ @ - 73 , 6 + 74 , 13 @ @ public class MoveTest 
+ StorageService . instance . setPartitionerUnsafe ( oldPartitioner ) ; 
+ } 
+ 
+ + @ Before 
+ + public void clearTokenMetadata ( ) 
+ + { 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ + StorageService . instance . getTokenMetadata ( ) . clearUnsafe ( ) ; 
+ + } 
+ + 
+ / * 
+ * Test whether write endpoints is correct when the node is moving . Uses 
+ * StorageService . onChange and does not manipulate token metadata directly . 
+ @ @ - 85 , 7 + 93 , 6 @ @ public class MoveTest 
+ final int MOVING _ NODE = 3 ; / / index of the moving node 
+ 
+ TokenMetadata tmd = ss . getTokenMetadata ( ) ; 
+ - tmd . clearUnsafe ( ) ; 
+ VersionedValue . VersionedValueFactory valueFactory = new VersionedValue . VersionedValueFactory ( partitioner ) ; 
+ 
+ ArrayList < Token > endpointTokens = new ArrayList < Token > ( ) ; 
+ @ @ - 141 , 7 + 148 , 7 @ @ public class MoveTest 
+ 	 numMoved + + ; 
+ } 
+ } 
+ - assertEquals ( " mismatched number of moved token " , numMoved , 1 ) ; 
+ + assertEquals ( " mismatched number of moved token " , 1 , numMoved ) ; 
+ } 
+ 
+ / / moving endpoint back to the normal state 
+ @ @ - 157 , 7 + 164 , 6 @ @ public class MoveTest 
+ StorageService ss = StorageService . instance ; 
+ final int RING _ SIZE = 10 ; 
+ TokenMetadata tmd = ss . getTokenMetadata ( ) ; 
+ - tmd . clearUnsafe ( ) ; 
+ IPartitioner partitioner = new RandomPartitioner ( ) ; 
+ VersionedValue . VersionedValueFactory valueFactory = new VersionedValue . VersionedValueFactory ( partitioner ) ; 
+ 
+ @ @ - 195 , 6 + 201 , 8 @ @ public class MoveTest 
+ ss . onChange ( boot1 , 
+ ApplicationState . STATUS , 
+ valueFactory . bootstrapping ( Collections . < Token > singleton ( keyTokens . get ( 5 ) ) ) ) ; 
+ + PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ + 
+ InetAddress boot2 = InetAddress . getByName ( " 127 . 0 . 1 . 2 " ) ; 
+ Gossiper . instance . initializeNodeUnsafe ( boot2 , UUID . randomUUID ( ) , 1 ) ; 
+ Gossiper . instance . injectApplicationState ( boot2 , ApplicationState . TOKENS , valueFactory . tokens ( Collections . singleton ( keyTokens . get ( 7 ) ) ) ) ; 
+ @ @ - 498 , 7 + 506 , 6 @ @ public class MoveTest 
+ { 
+ StorageService ss = StorageService . instance ; 
+ TokenMetadata tmd = ss . getTokenMetadata ( ) ; 
+ - tmd . clearUnsafe ( ) ; 
+ IPartitioner partitioner = new RandomPartitioner ( ) ; 
+ VersionedValue . VersionedValueFactory valueFactory = new VersionedValue . VersionedValueFactory ( partitioner ) ; 
+
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 6e9ea33 . . ddf3e05 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 14 , 6 + 14 , 7 @ @ 
+ * New CQL - aware SSTableWriter ( CASSANDRA - 5894 ) 
+ * Reject CAS operation when the protocol v1 is used ( CASSANDRA - 6270 ) 
+ * Correctly throw error when frame too large ( CASSANDRA - 5981 ) 
+ + * Fix serialization bug in PagedRange with 2ndary indexes ( CASSANDRA - 6299 ) 
+ Merged from 1 . 2 : 
+ * add non - jamm path for cached statements ( CASSANDRA - 6293 ) 
+ * ( Hadoop ) Require CFRR batchSize to be at least 2 ( CASSANDRA - 6114 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / PagedRangeCommand . java b / src / java / org / apache / cassandra / db / PagedRangeCommand . java 
+ index b1e2c39 . . e152f43 100644 
+ - - - a / src / java / org / apache / cassandra / db / PagedRangeCommand . java 
+ + + + b / src / java / org / apache / cassandra / db / PagedRangeCommand . java 
+ @ @ - 111 , 6 + 111 , 12 @ @ public class PagedRangeCommand extends AbstractRangeCommand 
+ return cfs . getRangeSlice ( exFilter ) ; 
+ } 
+ 
+ + @ Override 
+ + public String toString ( ) 
+ + { 
+ + return String . format ( " PagedRange ( % s , % s , % d , % s , % s , % s , % s , % s , % d ) " , keyspace , columnFamily , timestamp , keyRange , predicate , start , stop , rowFilter , limit ) ; 
+ + } 
+ + 
+ private static class Serializer implements IVersionedSerializer < PagedRangeCommand > 
+ { 
+ public void serialize ( PagedRangeCommand cmd , DataOutput out , int version ) throws IOException 
+ @ @ - 134 , 7 + 140 , 7 @ @ public class PagedRangeCommand extends AbstractRangeCommand 
+ { 
+ ByteBufferUtil . writeWithShortLength ( expr . column _ name , out ) ; 
+ out . writeInt ( expr . op . getValue ( ) ) ; 
+ - ByteBufferUtil . writeWithLength ( expr . value , out ) ; 
+ + ByteBufferUtil . writeWithShortLength ( expr . value , out ) ; 
+ } 
+ 
+ out . writeInt ( cmd . limit ) ; 
+ @ @ - 179 , 12 + 185 , 15 @ @ public class PagedRangeCommand extends AbstractRangeCommand 
+ 
+ size + = SliceQueryFilter . serializer . serializedSize ( ( SliceQueryFilter ) cmd . predicate , version ) ; 
+ 
+ + size + = TypeSizes . NATIVE . sizeofWithShortLength ( cmd . start ) ; 
+ + size + = TypeSizes . NATIVE . sizeofWithShortLength ( cmd . stop ) ; 
+ + 
+ size + = TypeSizes . NATIVE . sizeof ( cmd . rowFilter . size ( ) ) ; 
+ for ( IndexExpression expr : cmd . rowFilter ) 
+ { 
+ size + = TypeSizes . NATIVE . sizeofWithShortLength ( expr . column _ name ) ; 
+ size + = TypeSizes . NATIVE . sizeof ( expr . op . getValue ( ) ) ; 
+ - size + = TypeSizes . NATIVE . sizeofWithLength ( expr . value ) ; 
+ + size + = TypeSizes . NATIVE . sizeofWithShortLength ( expr . value ) ; 
+ } 
+ 
+ size + = TypeSizes . NATIVE . sizeof ( cmd . limit ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / RangeSliceCommand . java b / src / java / org / apache / cassandra / db / RangeSliceCommand . java 
+ index c0cfb12 . . 4aa1595 100644 
+ - - - a / src / java / org / apache / cassandra / db / RangeSliceCommand . java 
+ + + + b / src / java / org / apache / cassandra / db / RangeSliceCommand . java 
+ @ @ - 310 , 7 + 310 , 7 @ @ class RangeSliceCommandSerializer implements IVersionedSerializer < RangeSliceComm 
+ { 
+ size + = TypeSizes . NATIVE . sizeofWithShortLength ( expr . column _ name ) ; 
+ size + = TypeSizes . NATIVE . sizeof ( expr . op . getValue ( ) ) ; 
+ - size + = TypeSizes . NATIVE . sizeofWithLength ( expr . value ) ; 
+ + size + = TypeSizes . NATIVE . sizeofWithShortLength ( expr . value ) ; 
+ } 
+ } 
+ size + = AbstractBounds . serializer . serializedSize ( rsc . keyRange , version ) ;

@@ -1,0 +1,271 @@
+BLEU SCORE: 1.0
+
+TEST MSG: Count deleted rows scanned during reads for tracing and warning tombstone thresholds .
+GENERATED MSG: Count deleted rows scanned during reads for tracing and warning tombstone thresholds .
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 191caaf . . c7c1b6f 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 186 , 6 + 186 , 7 @ @ <nl> * Switch to client init for sstabledump ( CASSANDRA - 13683 ) <nl> * CQLSH : Don ' t pause when capturing data ( CASSANDRA - 13743 ) <nl> * nodetool clearsnapshot requires - - all to clear all snapshots ( CASSANDRA - 13391 ) <nl> + * Correctly count range tombstones in traces and tombstone thresholds ( CASSANDRA - 8527 ) <nl> <nl> <nl> 3 . 11 . 2 <nl> diff - - git a / src / java / org / apache / cassandra / db / ReadCommand . java b / src / java / org / apache / cassandra / db / ReadCommand . java <nl> index 1d74c16 . . 128f8f3 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ReadCommand . java <nl> + + + b / src / java / org / apache / cassandra / db / ReadCommand . java <nl> @ @ - 433 , 14 + 433 , 26 @ @ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery <nl> @ Override <nl> public Row applyToRow ( Row row ) <nl> { <nl> - if ( row . hasLiveData ( ReadCommand . this . nowInSec ( ) , enforceStrictLiveness ) ) <nl> - + + liveRows ; <nl> - <nl> + boolean hasTombstones = false ; <nl> for ( Cell cell : row . cells ( ) ) <nl> { <nl> if ( ! cell . isLive ( ReadCommand . this . nowInSec ( ) ) ) <nl> + { <nl> countTombstone ( row . clustering ( ) ) ; <nl> + hasTombstones = true ; / / allows to avoid counting an extra tombstone if the whole row expired <nl> + } <nl> } <nl> + <nl> + if ( row . hasLiveData ( ReadCommand . this . nowInSec ( ) , enforceStrictLiveness ) ) <nl> + + + liveRows ; <nl> + else if ( ! row . primaryKeyLivenessInfo ( ) . isLive ( ReadCommand . this . nowInSec ( ) ) <nl> + & & row . hasDeletion ( ReadCommand . this . nowInSec ( ) ) <nl> + & & ! hasTombstones ) <nl> + { <nl> + / / We ' re counting primary key deletions only here . <nl> + countTombstone ( row . clustering ( ) ) ; <nl> + } <nl> + <nl> return row ; <nl> } <nl> <nl> @ @ - 474 , 7 + 486 , 9 @ @ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery <nl> boolean warnTombstones = tombstones > warningThreshold & & respectTombstoneThresholds ; <nl> if ( warnTombstones ) <nl> { <nl> - String msg = String . format ( " Read % d live rows and % d tombstone cells for query % 1 . 512s ( see tombstone _ warn _ threshold ) " , liveRows , tombstones , ReadCommand . this . toCQLString ( ) ) ; <nl> + String msg = String . format ( <nl> + " Read % d live rows and % d tombstone cells for query % 1 . 512s ( see tombstone _ warn _ threshold ) " , <nl> + liveRows , tombstones , ReadCommand . this . toCQLString ( ) ) ; <nl> ClientWarn . instance . warn ( msg ) ; <nl> if ( tombstones < failureThreshold ) <nl> { <nl> @ @ - 484 , 7 + 498 , 9 @ @ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery <nl> logger . warn ( msg ) ; <nl> } <nl> <nl> - Tracing . trace ( " Read { } live and { } tombstone cells { } " , liveRows , tombstones , ( warnTombstones ? " ( see tombstone _ warn _ threshold ) " : " " ) ) ; <nl> + Tracing . trace ( " Read { } live rows and { } tombstone cells { } " , <nl> + liveRows , tombstones , <nl> + ( warnTombstones ? " ( see tombstone _ warn _ threshold ) " : " " ) ) ; <nl> } <nl> } ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / metrics / TableMetrics . java b / src / java / org / apache / cassandra / metrics / TableMetrics . java <nl> index 5c4a849 . . 7ce2f16 100644 <nl> - - - a / src / java / org / apache / cassandra / metrics / TableMetrics . java <nl> + + + b / src / java / org / apache / cassandra / metrics / TableMetrics . java <nl> @ @ - 125 , 7 + 125 , 7 @ @ public class TableMetrics <nl> public final Gauge < Double > keyCacheHitRate ; <nl> / * * Tombstones scanned in queries on this CF * / <nl> public final TableHistogram tombstoneScannedHistogram ; <nl> - / * * Live cells scanned in queries on this CF * / <nl> + / * * Live rows scanned in queries on this CF * / <nl> public final TableHistogram liveScannedHistogram ; <nl> / * * Column update time delta on this CF * / <nl> public final TableHistogram colUpdateTimeDeltaHistogram ; <nl> diff - - git a / test / unit / org / apache / cassandra / db / ReadCommandTest . java b / test / unit / org / apache / cassandra / db / ReadCommandTest . java <nl> index 6bb0a1a . . f646a2f 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / ReadCommandTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / ReadCommandTest . java <nl> @ @ - 344 , 4 + 344 , 173 @ @ public class ReadCommandTest <nl> count + + ; <nl> } <nl> } <nl> + <nl> + @ Test <nl> + public void testCountDeletedRows ( ) throws Exception <nl> + { <nl> + ColumnFamilyStore cfs = Keyspace . open ( KEYSPACE ) . getColumnFamilyStore ( CF3 ) ; <nl> + / / cfs = Mockito . spy ( cfs ) ; <nl> + / / TableMetrics metricsMock = Mockito . mock ( TableMetrics . class ) ; <nl> + / / Mockito . doReturn ( metricsMock ) . when ( cfs ) . metric ; <nl> + <nl> + String [ ] [ ] [ ] groups = new String [ ] [ ] [ ] { <nl> + new String [ ] [ ] { <nl> + new String [ ] { " 1 " , " key1 " , " aa " , " a " } , / / " 1 " indicates to create the data , " - 1 " to delete the <nl> + / / row <nl> + new String [ ] { " 1 " , " key2 " , " bb " , " b " } , <nl> + new String [ ] { " 1 " , " key3 " , " cc " , " c " } <nl> + } , <nl> + new String [ ] [ ] { <nl> + new String [ ] { " 1 " , " key3 " , " dd " , " d " } , <nl> + new String [ ] { " 1 " , " key2 " , " ee " , " e " } , <nl> + new String [ ] { " 1 " , " key1 " , " ff " , " f " } <nl> + } , <nl> + new String [ ] [ ] { <nl> + new String [ ] { " 1 " , " key6 " , " aa " , " a " } , <nl> + new String [ ] { " 1 " , " key5 " , " bb " , " b " } , <nl> + new String [ ] { " 1 " , " key4 " , " cc " , " c " } <nl> + } , <nl> + new String [ ] [ ] { <nl> + new String [ ] { " 1 " , " key2 " , " aa " , " a " } , <nl> + new String [ ] { " 1 " , " key2 " , " cc " , " c " } , <nl> + new String [ ] { " 1 " , " key2 " , " dd " , " d " } <nl> + } , <nl> + new String [ ] [ ] { <nl> + new String [ ] { " - 1 " , " key6 " , " aa " , " a " } , <nl> + new String [ ] { " - 1 " , " key2 " , " bb " , " b " } , <nl> + new String [ ] { " - 1 " , " key2 " , " ee " , " e " } , <nl> + new String [ ] { " - 1 " , " key2 " , " aa " , " a " } , <nl> + new String [ ] { " - 1 " , " key2 " , " cc " , " c " } , <nl> + new String [ ] { " - 1 " , " key2 " , " dd " , " d " } <nl> + } <nl> + } ; <nl> + <nl> + List < ByteBuffer > buffers = new ArrayList < > ( groups . length ) ; <nl> + int nowInSeconds = FBUtilities . nowInSeconds ( ) ; <nl> + ColumnFilter columnFilter = ColumnFilter . allRegularColumnsBuilder ( cfs . metadata ( ) ) . build ( ) ; <nl> + RowFilter rowFilter = RowFilter . create ( ) ; <nl> + Slice slice = Slice . make ( ClusteringBound . BOTTOM , ClusteringBound . TOP ) ; <nl> + ClusteringIndexSliceFilter sliceFilter = new ClusteringIndexSliceFilter ( <nl> + Slices . with ( cfs . metadata ( ) . comparator , slice ) , false ) ; <nl> + <nl> + for ( String [ ] [ ] group : groups ) <nl> + { <nl> + cfs . truncateBlocking ( ) ; <nl> + <nl> + List < SinglePartitionReadCommand > commands = new ArrayList < > ( group . length ) ; <nl> + <nl> + for ( String [ ] data : group ) <nl> + { <nl> + if ( data [ 0 ] . equals ( " 1 " ) ) <nl> + { <nl> + new RowUpdateBuilder ( cfs . metadata ( ) , 0 , ByteBufferUtil . bytes ( data [ 1 ] ) ) <nl> + . clustering ( data [ 2 ] ) <nl> + . add ( data [ 3 ] , ByteBufferUtil . bytes ( " blah " ) ) <nl> + . build ( ) <nl> + . apply ( ) ; <nl> + } <nl> + else <nl> + { <nl> + RowUpdateBuilder . deleteRow ( cfs . metadata ( ) , FBUtilities . timestampMicros ( ) , <nl> + ByteBufferUtil . bytes ( data [ 1 ] ) , data [ 2 ] ) . apply ( ) ; <nl> + } <nl> + commands . add ( SinglePartitionReadCommand . create ( cfs . metadata ( ) , nowInSeconds , columnFilter , rowFilter , <nl> + DataLimits . NONE , Util . dk ( data [ 1 ] ) , sliceFilter ) ) ; <nl> + } <nl> + <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + ReadQuery query = new SinglePartitionReadCommand . Group ( commands , DataLimits . NONE ) ; <nl> + <nl> + try ( ReadExecutionController executionController = query . executionController ( ) ; <nl> + UnfilteredPartitionIterator iter = query . executeLocally ( executionController ) ; <nl> + DataOutputBuffer buffer = new DataOutputBuffer ( ) ) <nl> + { <nl> + UnfilteredPartitionIterators . serializerForIntraNode ( ) . serialize ( iter , <nl> + columnFilter , <nl> + buffer , <nl> + MessagingService . current _ version ) ; <nl> + buffers . add ( buffer . buffer ( ) ) ; <nl> + } <nl> + } <nl> + <nl> + assertEquals ( 5 , cfs . metric . tombstoneScannedHistogram . cf . getSnapshot ( ) . getMax ( ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testCountWithNoDeletedRow ( ) throws Exception <nl> + { <nl> + ColumnFamilyStore cfs = Keyspace . open ( KEYSPACE ) . getColumnFamilyStore ( CF3 ) ; <nl> + <nl> + String [ ] [ ] [ ] groups = new String [ ] [ ] [ ] { <nl> + new String [ ] [ ] { <nl> + new String [ ] { " 1 " , " key1 " , " aa " , " a " } , / / " 1 " indicates to create the data , " - 1 " to delete the <nl> + / / row <nl> + new String [ ] { " 1 " , " key2 " , " bb " , " b " } , <nl> + new String [ ] { " 1 " , " key3 " , " cc " , " c " } <nl> + } , <nl> + new String [ ] [ ] { <nl> + new String [ ] { " 1 " , " key3 " , " dd " , " d " } , <nl> + new String [ ] { " 1 " , " key2 " , " ee " , " e " } , <nl> + new String [ ] { " 1 " , " key1 " , " ff " , " f " } <nl> + } , <nl> + new String [ ] [ ] { <nl> + new String [ ] { " 1 " , " key6 " , " aa " , " a " } , <nl> + new String [ ] { " 1 " , " key5 " , " bb " , " b " } , <nl> + new String [ ] { " 1 " , " key4 " , " cc " , " c " } <nl> + } <nl> + } ; <nl> + <nl> + List < ByteBuffer > buffers = new ArrayList < > ( groups . length ) ; <nl> + int nowInSeconds = FBUtilities . nowInSeconds ( ) ; <nl> + ColumnFilter columnFilter = ColumnFilter . allRegularColumnsBuilder ( cfs . metadata ( ) ) . build ( ) ; <nl> + RowFilter rowFilter = RowFilter . create ( ) ; <nl> + Slice slice = Slice . make ( ClusteringBound . BOTTOM , ClusteringBound . TOP ) ; <nl> + ClusteringIndexSliceFilter sliceFilter = new ClusteringIndexSliceFilter ( <nl> + Slices . with ( cfs . metadata ( ) . comparator , slice ) , false ) ; <nl> + <nl> + for ( String [ ] [ ] group : groups ) <nl> + { <nl> + cfs . truncateBlocking ( ) ; <nl> + <nl> + List < SinglePartitionReadCommand > commands = new ArrayList < > ( group . length ) ; <nl> + <nl> + for ( String [ ] data : group ) <nl> + { <nl> + if ( data [ 0 ] . equals ( " 1 " ) ) <nl> + { <nl> + new RowUpdateBuilder ( cfs . metadata ( ) , 0 , ByteBufferUtil . bytes ( data [ 1 ] ) ) <nl> + . clustering ( data [ 2 ] ) <nl> + . add ( data [ 3 ] , ByteBufferUtil . bytes ( " blah " ) ) <nl> + . build ( ) <nl> + . apply ( ) ; <nl> + } <nl> + else <nl> + { <nl> + RowUpdateBuilder . deleteRow ( cfs . metadata ( ) , FBUtilities . timestampMicros ( ) , <nl> + ByteBufferUtil . bytes ( data [ 1 ] ) , data [ 2 ] ) . apply ( ) ; <nl> + } <nl> + commands . add ( SinglePartitionReadCommand . create ( cfs . metadata ( ) , nowInSeconds , columnFilter , rowFilter , <nl> + DataLimits . NONE , Util . dk ( data [ 1 ] ) , sliceFilter ) ) ; <nl> + } <nl> + <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + ReadQuery query = new SinglePartitionReadCommand . Group ( commands , DataLimits . NONE ) ; <nl> + <nl> + try ( ReadExecutionController executionController = query . executionController ( ) ; <nl> + UnfilteredPartitionIterator iter = query . executeLocally ( executionController ) ; <nl> + DataOutputBuffer buffer = new DataOutputBuffer ( ) ) <nl> + { <nl> + UnfilteredPartitionIterators . serializerForIntraNode ( ) . serialize ( iter , <nl> + columnFilter , <nl> + buffer , <nl> + MessagingService . current _ version ) ; <nl> + buffers . add ( buffer . buffer ( ) ) ; <nl> + } <nl> + } <nl> + <nl> + assertEquals ( 1 , cfs . metric . tombstoneScannedHistogram . cf . getSnapshot ( ) . getMax ( ) ) ; <nl> + } <nl> + <nl> }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 191caaf . . c7c1b6f 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 186 , 6 + 186 , 7 @ @ 
+ * Switch to client init for sstabledump ( CASSANDRA - 13683 ) 
+ * CQLSH : Don ' t pause when capturing data ( CASSANDRA - 13743 ) 
+ * nodetool clearsnapshot requires - - all to clear all snapshots ( CASSANDRA - 13391 ) 
+ + * Correctly count range tombstones in traces and tombstone thresholds ( CASSANDRA - 8527 ) 
+ 
+ 
+ 3 . 11 . 2 
+ diff - - git a / src / java / org / apache / cassandra / db / ReadCommand . java b / src / java / org / apache / cassandra / db / ReadCommand . java 
+ index 1d74c16 . . 128f8f3 100644 
+ - - - a / src / java / org / apache / cassandra / db / ReadCommand . java 
+ + + + b / src / java / org / apache / cassandra / db / ReadCommand . java 
+ @ @ - 433 , 14 + 433 , 26 @ @ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery 
+ @ Override 
+ public Row applyToRow ( Row row ) 
+ { 
+ - if ( row . hasLiveData ( ReadCommand . this . nowInSec ( ) , enforceStrictLiveness ) ) 
+ - + + liveRows ; 
+ - 
+ + boolean hasTombstones = false ; 
+ for ( Cell cell : row . cells ( ) ) 
+ { 
+ if ( ! cell . isLive ( ReadCommand . this . nowInSec ( ) ) ) 
+ + { 
+ countTombstone ( row . clustering ( ) ) ; 
+ + hasTombstones = true ; / / allows to avoid counting an extra tombstone if the whole row expired 
+ + } 
+ } 
+ + 
+ + if ( row . hasLiveData ( ReadCommand . this . nowInSec ( ) , enforceStrictLiveness ) ) 
+ + + + liveRows ; 
+ + else if ( ! row . primaryKeyLivenessInfo ( ) . isLive ( ReadCommand . this . nowInSec ( ) ) 
+ + & & row . hasDeletion ( ReadCommand . this . nowInSec ( ) ) 
+ + & & ! hasTombstones ) 
+ + { 
+ + / / We ' re counting primary key deletions only here . 
+ + countTombstone ( row . clustering ( ) ) ; 
+ + } 
+ + 
+ return row ; 
+ } 
+ 
+ @ @ - 474 , 7 + 486 , 9 @ @ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery 
+ boolean warnTombstones = tombstones > warningThreshold & & respectTombstoneThresholds ; 
+ if ( warnTombstones ) 
+ { 
+ - String msg = String . format ( " Read % d live rows and % d tombstone cells for query % 1 . 512s ( see tombstone _ warn _ threshold ) " , liveRows , tombstones , ReadCommand . this . toCQLString ( ) ) ; 
+ + String msg = String . format ( 
+ + " Read % d live rows and % d tombstone cells for query % 1 . 512s ( see tombstone _ warn _ threshold ) " , 
+ + liveRows , tombstones , ReadCommand . this . toCQLString ( ) ) ; 
+ ClientWarn . instance . warn ( msg ) ; 
+ if ( tombstones < failureThreshold ) 
+ { 
+ @ @ - 484 , 7 + 498 , 9 @ @ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery 
+ logger . warn ( msg ) ; 
+ } 
+ 
+ - Tracing . trace ( " Read { } live and { } tombstone cells { } " , liveRows , tombstones , ( warnTombstones ? " ( see tombstone _ warn _ threshold ) " : " " ) ) ; 
+ + Tracing . trace ( " Read { } live rows and { } tombstone cells { } " , 
+ + liveRows , tombstones , 
+ + ( warnTombstones ? " ( see tombstone _ warn _ threshold ) " : " " ) ) ; 
+ } 
+ } ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / metrics / TableMetrics . java b / src / java / org / apache / cassandra / metrics / TableMetrics . java 
+ index 5c4a849 . . 7ce2f16 100644 
+ - - - a / src / java / org / apache / cassandra / metrics / TableMetrics . java 
+ + + + b / src / java / org / apache / cassandra / metrics / TableMetrics . java 
+ @ @ - 125 , 7 + 125 , 7 @ @ public class TableMetrics 
+ public final Gauge < Double > keyCacheHitRate ; 
+ / * * Tombstones scanned in queries on this CF * / 
+ public final TableHistogram tombstoneScannedHistogram ; 
+ - / * * Live cells scanned in queries on this CF * / 
+ + / * * Live rows scanned in queries on this CF * / 
+ public final TableHistogram liveScannedHistogram ; 
+ / * * Column update time delta on this CF * / 
+ public final TableHistogram colUpdateTimeDeltaHistogram ; 
+ diff - - git a / test / unit / org / apache / cassandra / db / ReadCommandTest . java b / test / unit / org / apache / cassandra / db / ReadCommandTest . java 
+ index 6bb0a1a . . f646a2f 100644 
+ - - - a / test / unit / org / apache / cassandra / db / ReadCommandTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / ReadCommandTest . java 
+ @ @ - 344 , 4 + 344 , 173 @ @ public class ReadCommandTest 
+ count + + ; 
+ } 
+ } 
+ + 
+ + @ Test 
+ + public void testCountDeletedRows ( ) throws Exception 
+ + { 
+ + ColumnFamilyStore cfs = Keyspace . open ( KEYSPACE ) . getColumnFamilyStore ( CF3 ) ; 
+ + / / cfs = Mockito . spy ( cfs ) ; 
+ + / / TableMetrics metricsMock = Mockito . mock ( TableMetrics . class ) ; 
+ + / / Mockito . doReturn ( metricsMock ) . when ( cfs ) . metric ; 
+ + 
+ + String [ ] [ ] [ ] groups = new String [ ] [ ] [ ] { 
+ + new String [ ] [ ] { 
+ + new String [ ] { " 1 " , " key1 " , " aa " , " a " } , / / " 1 " indicates to create the data , " - 1 " to delete the 
+ + / / row 
+ + new String [ ] { " 1 " , " key2 " , " bb " , " b " } , 
+ + new String [ ] { " 1 " , " key3 " , " cc " , " c " } 
+ + } , 
+ + new String [ ] [ ] { 
+ + new String [ ] { " 1 " , " key3 " , " dd " , " d " } , 
+ + new String [ ] { " 1 " , " key2 " , " ee " , " e " } , 
+ + new String [ ] { " 1 " , " key1 " , " ff " , " f " } 
+ + } , 
+ + new String [ ] [ ] { 
+ + new String [ ] { " 1 " , " key6 " , " aa " , " a " } , 
+ + new String [ ] { " 1 " , " key5 " , " bb " , " b " } , 
+ + new String [ ] { " 1 " , " key4 " , " cc " , " c " } 
+ + } , 
+ + new String [ ] [ ] { 
+ + new String [ ] { " 1 " , " key2 " , " aa " , " a " } , 
+ + new String [ ] { " 1 " , " key2 " , " cc " , " c " } , 
+ + new String [ ] { " 1 " , " key2 " , " dd " , " d " } 
+ + } , 
+ + new String [ ] [ ] { 
+ + new String [ ] { " - 1 " , " key6 " , " aa " , " a " } , 
+ + new String [ ] { " - 1 " , " key2 " , " bb " , " b " } , 
+ + new String [ ] { " - 1 " , " key2 " , " ee " , " e " } , 
+ + new String [ ] { " - 1 " , " key2 " , " aa " , " a " } , 
+ + new String [ ] { " - 1 " , " key2 " , " cc " , " c " } , 
+ + new String [ ] { " - 1 " , " key2 " , " dd " , " d " } 
+ + } 
+ + } ; 
+ + 
+ + List < ByteBuffer > buffers = new ArrayList < > ( groups . length ) ; 
+ + int nowInSeconds = FBUtilities . nowInSeconds ( ) ; 
+ + ColumnFilter columnFilter = ColumnFilter . allRegularColumnsBuilder ( cfs . metadata ( ) ) . build ( ) ; 
+ + RowFilter rowFilter = RowFilter . create ( ) ; 
+ + Slice slice = Slice . make ( ClusteringBound . BOTTOM , ClusteringBound . TOP ) ; 
+ + ClusteringIndexSliceFilter sliceFilter = new ClusteringIndexSliceFilter ( 
+ + Slices . with ( cfs . metadata ( ) . comparator , slice ) , false ) ; 
+ + 
+ + for ( String [ ] [ ] group : groups ) 
+ + { 
+ + cfs . truncateBlocking ( ) ; 
+ + 
+ + List < SinglePartitionReadCommand > commands = new ArrayList < > ( group . length ) ; 
+ + 
+ + for ( String [ ] data : group ) 
+ + { 
+ + if ( data [ 0 ] . equals ( " 1 " ) ) 
+ + { 
+ + new RowUpdateBuilder ( cfs . metadata ( ) , 0 , ByteBufferUtil . bytes ( data [ 1 ] ) ) 
+ + . clustering ( data [ 2 ] ) 
+ + . add ( data [ 3 ] , ByteBufferUtil . bytes ( " blah " ) ) 
+ + . build ( ) 
+ + . apply ( ) ; 
+ + } 
+ + else 
+ + { 
+ + RowUpdateBuilder . deleteRow ( cfs . metadata ( ) , FBUtilities . timestampMicros ( ) , 
+ + ByteBufferUtil . bytes ( data [ 1 ] ) , data [ 2 ] ) . apply ( ) ; 
+ + } 
+ + commands . add ( SinglePartitionReadCommand . create ( cfs . metadata ( ) , nowInSeconds , columnFilter , rowFilter , 
+ + DataLimits . NONE , Util . dk ( data [ 1 ] ) , sliceFilter ) ) ; 
+ + } 
+ + 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + ReadQuery query = new SinglePartitionReadCommand . Group ( commands , DataLimits . NONE ) ; 
+ + 
+ + try ( ReadExecutionController executionController = query . executionController ( ) ; 
+ + UnfilteredPartitionIterator iter = query . executeLocally ( executionController ) ; 
+ + DataOutputBuffer buffer = new DataOutputBuffer ( ) ) 
+ + { 
+ + UnfilteredPartitionIterators . serializerForIntraNode ( ) . serialize ( iter , 
+ + columnFilter , 
+ + buffer , 
+ + MessagingService . current _ version ) ; 
+ + buffers . add ( buffer . buffer ( ) ) ; 
+ + } 
+ + } 
+ + 
+ + assertEquals ( 5 , cfs . metric . tombstoneScannedHistogram . cf . getSnapshot ( ) . getMax ( ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testCountWithNoDeletedRow ( ) throws Exception 
+ + { 
+ + ColumnFamilyStore cfs = Keyspace . open ( KEYSPACE ) . getColumnFamilyStore ( CF3 ) ; 
+ + 
+ + String [ ] [ ] [ ] groups = new String [ ] [ ] [ ] { 
+ + new String [ ] [ ] { 
+ + new String [ ] { " 1 " , " key1 " , " aa " , " a " } , / / " 1 " indicates to create the data , " - 1 " to delete the 
+ + / / row 
+ + new String [ ] { " 1 " , " key2 " , " bb " , " b " } , 
+ + new String [ ] { " 1 " , " key3 " , " cc " , " c " } 
+ + } , 
+ + new String [ ] [ ] { 
+ + new String [ ] { " 1 " , " key3 " , " dd " , " d " } , 
+ + new String [ ] { " 1 " , " key2 " , " ee " , " e " } , 
+ + new String [ ] { " 1 " , " key1 " , " ff " , " f " } 
+ + } , 
+ + new String [ ] [ ] { 
+ + new String [ ] { " 1 " , " key6 " , " aa " , " a " } , 
+ + new String [ ] { " 1 " , " key5 " , " bb " , " b " } , 
+ + new String [ ] { " 1 " , " key4 " , " cc " , " c " } 
+ + } 
+ + } ; 
+ + 
+ + List < ByteBuffer > buffers = new ArrayList < > ( groups . length ) ; 
+ + int nowInSeconds = FBUtilities . nowInSeconds ( ) ; 
+ + ColumnFilter columnFilter = ColumnFilter . allRegularColumnsBuilder ( cfs . metadata ( ) ) . build ( ) ; 
+ + RowFilter rowFilter = RowFilter . create ( ) ; 
+ + Slice slice = Slice . make ( ClusteringBound . BOTTOM , ClusteringBound . TOP ) ; 
+ + ClusteringIndexSliceFilter sliceFilter = new ClusteringIndexSliceFilter ( 
+ + Slices . with ( cfs . metadata ( ) . comparator , slice ) , false ) ; 
+ + 
+ + for ( String [ ] [ ] group : groups ) 
+ + { 
+ + cfs . truncateBlocking ( ) ; 
+ + 
+ + List < SinglePartitionReadCommand > commands = new ArrayList < > ( group . length ) ; 
+ + 
+ + for ( String [ ] data : group ) 
+ + { 
+ + if ( data [ 0 ] . equals ( " 1 " ) ) 
+ + { 
+ + new RowUpdateBuilder ( cfs . metadata ( ) , 0 , ByteBufferUtil . bytes ( data [ 1 ] ) ) 
+ + . clustering ( data [ 2 ] ) 
+ + . add ( data [ 3 ] , ByteBufferUtil . bytes ( " blah " ) ) 
+ + . build ( ) 
+ + . apply ( ) ; 
+ + } 
+ + else 
+ + { 
+ + RowUpdateBuilder . deleteRow ( cfs . metadata ( ) , FBUtilities . timestampMicros ( ) , 
+ + ByteBufferUtil . bytes ( data [ 1 ] ) , data [ 2 ] ) . apply ( ) ; 
+ + } 
+ + commands . add ( SinglePartitionReadCommand . create ( cfs . metadata ( ) , nowInSeconds , columnFilter , rowFilter , 
+ + DataLimits . NONE , Util . dk ( data [ 1 ] ) , sliceFilter ) ) ; 
+ + } 
+ + 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + ReadQuery query = new SinglePartitionReadCommand . Group ( commands , DataLimits . NONE ) ; 
+ + 
+ + try ( ReadExecutionController executionController = query . executionController ( ) ; 
+ + UnfilteredPartitionIterator iter = query . executeLocally ( executionController ) ; 
+ + DataOutputBuffer buffer = new DataOutputBuffer ( ) ) 
+ + { 
+ + UnfilteredPartitionIterators . serializerForIntraNode ( ) . serialize ( iter , 
+ + columnFilter , 
+ + buffer , 
+ + MessagingService . current _ version ) ; 
+ + buffers . add ( buffer . buffer ( ) ) ; 
+ + } 
+ + } 
+ + 
+ + assertEquals ( 1 , cfs . metric . tombstoneScannedHistogram . cf . getSnapshot ( ) . getMax ( ) ) ; 
+ + } 
+ + 
+ }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

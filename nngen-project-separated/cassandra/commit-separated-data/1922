@@ -1,0 +1,330 @@
+BLEU SCORE: 0.08116697886877475
+
+TEST MSG: Switch CommitLogSegment from RandomAccessFile to nio
+GENERATED MSG: merge from 1 . 0
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 9f946a3 . . 71ccc58 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 <nl> + * Switch CommitLogSegment from RandomAccessFile to nio ( CASSANDRA - 8308 ) <nl> * Allow mixing token and partition key restrictions ( CASSANDRA - 7016 ) <nl> * Support index key / value entries on map collections ( CASSANDRA - 8473 ) <nl> * Modernize schema tables ( CASSANDRA - 8261 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> index 185f57a . . 3383f1e 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> @ @ - 23 , 6 + 23 , 7 @ @ import java . io . RandomAccessFile ; <nl> import java . nio . ByteBuffer ; <nl> import java . nio . MappedByteBuffer ; <nl> import java . nio . channels . FileChannel ; <nl> + import java . nio . file . StandardOpenOption ; <nl> import java . util . ArrayList ; <nl> import java . util . Collection ; <nl> import java . util . Comparator ; <nl> @ @ - 104 , 7 + 105 , 7 @ @ public class CommitLogSegment <nl> public final long id ; <nl> <nl> private final File logFile ; <nl> - private final RandomAccessFile logFileAccessor ; <nl> + private final FileChannel channel ; <nl> private final int fd ; <nl> <nl> private final MappedByteBuffer buffer ; <nl> @ @ - 134 , 7 + 135 , 6 @ @ public class CommitLogSegment <nl> id = getNextId ( ) ; <nl> descriptor = new CommitLogDescriptor ( id ) ; <nl> logFile = new File ( DatabaseDescriptor . getCommitLogLocation ( ) , descriptor . fileName ( ) ) ; <nl> - boolean isCreating = true ; <nl> <nl> try <nl> { <nl> @ @ - 147 , 25 + 147 , 37 @ @ public class CommitLogSegment <nl> logger . debug ( " Re - using discarded CommitLog segment for { } from { } " , id , filePath ) ; <nl> if ( ! oldFile . renameTo ( logFile ) ) <nl> throw new IOException ( " Rename from " + filePath + " to " + id + " failed " ) ; <nl> - isCreating = false ; <nl> + } <nl> + else <nl> + { <nl> + logger . debug ( " Creating new CommitLog segment : " + logFile ) ; <nl> } <nl> } <nl> <nl> - / / Open the initial the segment file <nl> - logFileAccessor = new RandomAccessFile ( logFile , " rw " ) ; <nl> + / / Extend or truncate the file size to the standard segment size as we may have restarted after a segment <nl> + / / size configuration change , leaving " incorrectly " sized segments on disk . <nl> + / / NOTE : while we ' re using RAF to allow extension of file on disk w / out sparse , we need to avoid using RAF <nl> + / / for grabbing the FileChannel due to FILE _ SHARE _ DELETE flag bug on windows . <nl> + / / See : https : / / bugs . openjdk . java . net / browse / JDK - 6357433 and CASSANDRA - 8308 <nl> + if ( logFile . length ( ) ! = DatabaseDescriptor . getCommitLogSegmentSize ( ) ) <nl> + { <nl> + try ( RandomAccessFile raf = new RandomAccessFile ( logFile , " rw " ) ) <nl> + { <nl> + raf . setLength ( DatabaseDescriptor . getCommitLogSegmentSize ( ) ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new FSWriteError ( e , logFile ) ; <nl> + } <nl> + } <nl> <nl> - if ( isCreating ) <nl> - logger . debug ( " Creating new commit log segment { } " , logFile . getPath ( ) ) ; <nl> + channel = FileChannel . open ( logFile . toPath ( ) , StandardOpenOption . WRITE , StandardOpenOption . READ ) ; <nl> <nl> - / / Map the segment , extending or truncating it to the standard segment size . <nl> - / / ( We may have restarted after a segment size configuration change , leaving " incorrectly " <nl> - / / sized segments on disk . ) <nl> - logFileAccessor . setLength ( DatabaseDescriptor . getCommitLogSegmentSize ( ) ) ; <nl> - fd = CLibrary . getfd ( logFileAccessor . getFD ( ) ) ; <nl> + fd = CLibrary . getfd ( channel ) ; <nl> + buffer = channel . map ( FileChannel . MapMode . READ _ WRITE , 0 , DatabaseDescriptor . getCommitLogSegmentSize ( ) ) ; <nl> <nl> - buffer = logFileAccessor . getChannel ( ) . map ( FileChannel . MapMode . READ _ WRITE , 0 , DatabaseDescriptor . getCommitLogSegmentSize ( ) ) ; <nl> - / / write the header <nl> CommitLogDescriptor . writeHeader ( buffer , descriptor ) ; <nl> + <nl> / / mark the initial sync marker as uninitialised <nl> buffer . putInt ( CommitLogDescriptor . HEADER _ SIZE , 0 ) ; <nl> buffer . putLong ( CommitLogDescriptor . HEADER _ SIZE + 4 , 0 ) ; <nl> @ @ - 415 , 7 + 427 , 7 @ @ public class CommitLogSegment <nl> { <nl> if ( FileUtils . isCleanerAvailable ( ) ) <nl> FileUtils . clean ( buffer ) ; <nl> - logFileAccessor . close ( ) ; <nl> + channel . close ( ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / utils / CLibrary . java b / src / java / org / apache / cassandra / utils / CLibrary . java <nl> index b2595f6 . . 4dbd904 100644 <nl> - - - a / src / java / org / apache / cassandra / utils / CLibrary . java <nl> + + + b / src / java / org / apache / cassandra / utils / CLibrary . java <nl> @ @ - 20 , 6 + 20 , 7 @ @ package org . apache . cassandra . utils ; <nl> import java . io . FileDescriptor ; <nl> import java . io . RandomAccessFile ; <nl> import java . lang . reflect . Field ; <nl> + import java . nio . channels . FileChannel ; <nl> <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 276 , 6 + 277 , 24 @ @ public final class CLibrary <nl> } <nl> } <nl> <nl> + public static int getfd ( FileChannel channel ) <nl> + { <nl> + Field field = FBUtilities . getProtectedField ( channel . getClass ( ) , " fd " ) ; <nl> + <nl> + if ( field = = null ) <nl> + return - 1 ; <nl> + <nl> + try <nl> + { <nl> + return getfd ( ( FileDescriptor ) field . get ( channel ) ) ; <nl> + } <nl> + catch ( IllegalArgumentException | IllegalAccessException e ) <nl> + { <nl> + logger . warn ( " Unable to read fd field from FileChannel " ) ; <nl> + } <nl> + return - 1 ; <nl> + } <nl> + <nl> / * * <nl> * Get system file descriptor from FileDescriptor object . <nl> * @ param descriptor - FileDescriptor objec to get fd from <nl> @ @ - 295 , 7 + 314 , 7 @ @ public final class CLibrary <nl> catch ( Exception e ) <nl> { <nl> JVMStabilityInspector . inspectThrowable ( e ) ; <nl> - logger . warn ( " unable to read fd field from FileDescriptor " ) ; <nl> + logger . warn ( " Unable to read fd field from FileDescriptor " ) ; <nl> } <nl> <nl> return - 1 ; <nl> diff - - git a / test / unit / org / apache / cassandra / SchemaLoader . java b / test / unit / org / apache / cassandra / SchemaLoader . java <nl> index 2fcfd55 . . 2be4cc0 100644 <nl> - - - a / test / unit / org / apache / cassandra / SchemaLoader . java <nl> + + + b / test / unit / org / apache / cassandra / SchemaLoader . java <nl> @ @ - 419 , 6 + 419 , 7 @ @ public class SchemaLoader <nl> <nl> public static void cleanupAndLeaveDirs ( ) <nl> { <nl> + CommitLog . instance . resetUnsafe ( ) ; / / unmap CLS before attempting to delete or Windows complains <nl> mkdirs ( ) ; <nl> cleanup ( ) ; <nl> mkdirs ( ) ; <nl> @ @ - 434 , 7 + 435 , 11 @ @ public class SchemaLoader <nl> File dir = new File ( dirName ) ; <nl> if ( ! dir . exists ( ) ) <nl> throw new RuntimeException ( " No such directory : " + dir . getAbsolutePath ( ) ) ; <nl> - FileUtils . deleteRecursive ( dir ) ; <nl> + <nl> + / / Leave the folder around as Windows will complain about directory deletion w / handles open to children files <nl> + String [ ] children = dir . list ( ) ; <nl> + for ( String child : children ) <nl> + FileUtils . deleteRecursive ( new File ( dir , child ) ) ; <nl> } <nl> <nl> cleanupSavedCaches ( ) ; <nl> @ @ - 445 , 7 + 450 , 9 @ @ public class SchemaLoader <nl> File dir = new File ( dirName ) ; <nl> if ( ! dir . exists ( ) ) <nl> throw new RuntimeException ( " No such directory : " + dir . getAbsolutePath ( ) ) ; <nl> - FileUtils . deleteRecursive ( dir ) ; <nl> + String [ ] children = dir . list ( ) ; <nl> + for ( String child : children ) <nl> + FileUtils . deleteRecursive ( new File ( dir , child ) ) ; <nl> } <nl> } <nl>
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index d518830 . . 52cc2c1 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 29 , 7 + 29 , 7 @ @ <nl> * add scheduler JMX metrics ( CASSANDRA - 2962 ) <nl> * add block level checksum for compressed data ( CASSANDRA - 1717 ) <nl> * make column family backed column map pluggable and introduce unsynchronized <nl> - ArrayList backed one to speedup reads ( CASSANDRA - 2843 ) <nl> + ArrayList backed one to speedup reads ( CASSANDRA - 2843 , 3165 ) <nl> * refactoring of the secondary index api ( CASSANDRA - 2982 ) <nl> * make CL > ONE reads wait for digest reconciliation before returning <nl> ( CASSANDRA - 2494 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> index c316a85 . . 71c7213 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> @ @ - 67 , 6 + 67 , 11 @ @ public class ArrayBackedSortedColumns extends ArrayList < IColumn > implements ISor <nl> this . reversed = reversed ; <nl> } <nl> <nl> + public ISortedColumns . Factory getFactory ( ) <nl> + { <nl> + return factory ( ) ; <nl> + } <nl> + <nl> public AbstractType < ? > getComparator ( ) <nl> { <nl> return comparator ; <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> index 1239d1c . . 38bc0d7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> @ @ - 81 , 14 + 81 , 19 @ @ public class ColumnFamily extends AbstractColumnContainer <nl> this . cfm = cfm ; <nl> } <nl> <nl> - public ColumnFamily cloneMeShallow ( ) <nl> + public ColumnFamily cloneMeShallow ( ISortedColumns . Factory factory ) <nl> { <nl> - ColumnFamily cf = ColumnFamily . create ( cfm ) ; <nl> + ColumnFamily cf = ColumnFamily . create ( cfm , factory ) ; <nl> / / since deletion info is immutable , aliasing it is fine <nl> cf . deletionInfo . set ( deletionInfo . get ( ) ) ; <nl> return cf ; <nl> } <nl> <nl> + public ColumnFamily cloneMeShallow ( ) <nl> + { <nl> + return cloneMeShallow ( columns . getFactory ( ) ) ; <nl> + } <nl> + <nl> public AbstractType getSubComparator ( ) <nl> { <nl> IColumnSerializer s = getColumnSerializer ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 0bfd1c5 . . 552d3e9 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1162 , 8 + 1162 , 11 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> } <nl> } <nl> <nl> - / * * filter a cached row , which will not be modified by the filter , but may be modified by throwing out <nl> - * tombstones that are no longer relevant . * / <nl> + / * * <nl> + * Filter a cached row , which will not be modified by the filter , but may be modified by throwing out <nl> + * tombstones that are no longer relevant . <nl> + * The returned column family won ' t be thread safe . <nl> + * / <nl> ColumnFamily filterColumnFamily ( ColumnFamily cached , QueryFilter filter , int gcBefore ) <nl> { <nl> / / special case slicing the entire row : <nl> @ @ - 1184 , 7 + 1187 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> IColumn sc = cached . getColumn ( filter . path . superColumnName ) ; <nl> if ( sc = = null | | sliceFilter . count > = sc . getSubColumns ( ) . size ( ) ) <nl> { <nl> - ColumnFamily cf = cached . cloneMeShallow ( ) ; <nl> + ColumnFamily cf = cached . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; <nl> if ( sc ! = null ) <nl> cf . addColumn ( sc , HeapAllocator . instance ) ; <nl> return removeDeleted ( cf , gcBefore ) ; <nl> @ @ - 1203 , 7 + 1206 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> } <nl> <nl> IColumnIterator ci = filter . getMemtableColumnIterator ( cached , null , getComparator ( ) ) ; <nl> - ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ) ; <nl> + ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; <nl> filter . collateColumns ( cf , Collections . singletonList ( ci ) , getComparator ( ) , gcBefore ) ; <nl> / / TODO this is necessary because when we collate supercolumns together , we don ' t check <nl> / / their subcolumns for relevance , so we need to do a second prune post facto here . <nl> diff - - git a / src / java / org / apache / cassandra / db / ISortedColumns . java b / src / java / org / apache / cassandra / db / ISortedColumns . java <nl> index 37f5a60 . . 624dec7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ISortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / ISortedColumns . java <nl> @ @ - 42 , 6 + 42 , 11 @ @ public interface ISortedColumns extends IIterableColumns <nl> public ISortedColumns cloneMe ( ) ; <nl> <nl> / * * <nl> + * Returns the factory used for this ISortedColumns implementation . <nl> + * / <nl> + public Factory getFactory ( ) ; <nl> + <nl> + / * * <nl> * Adds a column to this column map . <nl> * If a column with the same name is already present in the map , it will <nl> * be replaced by the newly added column . <nl> diff - - git a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java <nl> index cd2488a . . 13a111a 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java <nl> @ @ - 62 , 6 + 62 , 11 @ @ public class ThreadSafeSortedColumns extends ConcurrentSkipListMap < ByteBuffer , I <nl> super ( columns ) ; <nl> } <nl> <nl> + public ISortedColumns . Factory getFactory ( ) <nl> + { <nl> + return factory ( ) ; <nl> + } <nl> + <nl> public ISortedColumns cloneMe ( ) <nl> { <nl> return new ThreadSafeSortedColumns ( this ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java <nl> index 34e83dc . . 6c3fc42 100644 <nl> - - - a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java <nl> @ @ - 62 , 6 + 62 , 11 @ @ public class TreeMapBackedSortedColumns extends TreeMap < ByteBuffer , IColumn > imp <nl> super ( columns ) ; <nl> } <nl> <nl> + public ISortedColumns . Factory getFactory ( ) <nl> + { <nl> + return factory ( ) ; <nl> + } <nl> + <nl> public ISortedColumns cloneMe ( ) <nl> { <nl> return new TreeMapBackedSortedColumns ( this ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 9f946a3 . . 71ccc58 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 
+ + * Switch CommitLogSegment from RandomAccessFile to nio ( CASSANDRA - 8308 ) 
+ * Allow mixing token and partition key restrictions ( CASSANDRA - 7016 ) 
+ * Support index key / value entries on map collections ( CASSANDRA - 8473 ) 
+ * Modernize schema tables ( CASSANDRA - 8261 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ index 185f57a . . 3383f1e 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ @ @ - 23 , 6 + 23 , 7 @ @ import java . io . RandomAccessFile ; 
+ import java . nio . ByteBuffer ; 
+ import java . nio . MappedByteBuffer ; 
+ import java . nio . channels . FileChannel ; 
+ + import java . nio . file . StandardOpenOption ; 
+ import java . util . ArrayList ; 
+ import java . util . Collection ; 
+ import java . util . Comparator ; 
+ @ @ - 104 , 7 + 105 , 7 @ @ public class CommitLogSegment 
+ public final long id ; 
+ 
+ private final File logFile ; 
+ - private final RandomAccessFile logFileAccessor ; 
+ + private final FileChannel channel ; 
+ private final int fd ; 
+ 
+ private final MappedByteBuffer buffer ; 
+ @ @ - 134 , 7 + 135 , 6 @ @ public class CommitLogSegment 
+ id = getNextId ( ) ; 
+ descriptor = new CommitLogDescriptor ( id ) ; 
+ logFile = new File ( DatabaseDescriptor . getCommitLogLocation ( ) , descriptor . fileName ( ) ) ; 
+ - boolean isCreating = true ; 
+ 
+ try 
+ { 
+ @ @ - 147 , 25 + 147 , 37 @ @ public class CommitLogSegment 
+ logger . debug ( " Re - using discarded CommitLog segment for { } from { } " , id , filePath ) ; 
+ if ( ! oldFile . renameTo ( logFile ) ) 
+ throw new IOException ( " Rename from " + filePath + " to " + id + " failed " ) ; 
+ - isCreating = false ; 
+ + } 
+ + else 
+ + { 
+ + logger . debug ( " Creating new CommitLog segment : " + logFile ) ; 
+ } 
+ } 
+ 
+ - / / Open the initial the segment file 
+ - logFileAccessor = new RandomAccessFile ( logFile , " rw " ) ; 
+ + / / Extend or truncate the file size to the standard segment size as we may have restarted after a segment 
+ + / / size configuration change , leaving " incorrectly " sized segments on disk . 
+ + / / NOTE : while we ' re using RAF to allow extension of file on disk w / out sparse , we need to avoid using RAF 
+ + / / for grabbing the FileChannel due to FILE _ SHARE _ DELETE flag bug on windows . 
+ + / / See : https : / / bugs . openjdk . java . net / browse / JDK - 6357433 and CASSANDRA - 8308 
+ + if ( logFile . length ( ) ! = DatabaseDescriptor . getCommitLogSegmentSize ( ) ) 
+ + { 
+ + try ( RandomAccessFile raf = new RandomAccessFile ( logFile , " rw " ) ) 
+ + { 
+ + raf . setLength ( DatabaseDescriptor . getCommitLogSegmentSize ( ) ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new FSWriteError ( e , logFile ) ; 
+ + } 
+ + } 
+ 
+ - if ( isCreating ) 
+ - logger . debug ( " Creating new commit log segment { } " , logFile . getPath ( ) ) ; 
+ + channel = FileChannel . open ( logFile . toPath ( ) , StandardOpenOption . WRITE , StandardOpenOption . READ ) ; 
+ 
+ - / / Map the segment , extending or truncating it to the standard segment size . 
+ - / / ( We may have restarted after a segment size configuration change , leaving " incorrectly " 
+ - / / sized segments on disk . ) 
+ - logFileAccessor . setLength ( DatabaseDescriptor . getCommitLogSegmentSize ( ) ) ; 
+ - fd = CLibrary . getfd ( logFileAccessor . getFD ( ) ) ; 
+ + fd = CLibrary . getfd ( channel ) ; 
+ + buffer = channel . map ( FileChannel . MapMode . READ _ WRITE , 0 , DatabaseDescriptor . getCommitLogSegmentSize ( ) ) ; 
+ 
+ - buffer = logFileAccessor . getChannel ( ) . map ( FileChannel . MapMode . READ _ WRITE , 0 , DatabaseDescriptor . getCommitLogSegmentSize ( ) ) ; 
+ - / / write the header 
+ CommitLogDescriptor . writeHeader ( buffer , descriptor ) ; 
+ + 
+ / / mark the initial sync marker as uninitialised 
+ buffer . putInt ( CommitLogDescriptor . HEADER _ SIZE , 0 ) ; 
+ buffer . putLong ( CommitLogDescriptor . HEADER _ SIZE + 4 , 0 ) ; 
+ @ @ - 415 , 7 + 427 , 7 @ @ public class CommitLogSegment 
+ { 
+ if ( FileUtils . isCleanerAvailable ( ) ) 
+ FileUtils . clean ( buffer ) ; 
+ - logFileAccessor . close ( ) ; 
+ + channel . close ( ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / utils / CLibrary . java b / src / java / org / apache / cassandra / utils / CLibrary . java 
+ index b2595f6 . . 4dbd904 100644 
+ - - - a / src / java / org / apache / cassandra / utils / CLibrary . java 
+ + + + b / src / java / org / apache / cassandra / utils / CLibrary . java 
+ @ @ - 20 , 6 + 20 , 7 @ @ package org . apache . cassandra . utils ; 
+ import java . io . FileDescriptor ; 
+ import java . io . RandomAccessFile ; 
+ import java . lang . reflect . Field ; 
+ + import java . nio . channels . FileChannel ; 
+ 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 276 , 6 + 277 , 24 @ @ public final class CLibrary 
+ } 
+ } 
+ 
+ + public static int getfd ( FileChannel channel ) 
+ + { 
+ + Field field = FBUtilities . getProtectedField ( channel . getClass ( ) , " fd " ) ; 
+ + 
+ + if ( field = = null ) 
+ + return - 1 ; 
+ + 
+ + try 
+ + { 
+ + return getfd ( ( FileDescriptor ) field . get ( channel ) ) ; 
+ + } 
+ + catch ( IllegalArgumentException | IllegalAccessException e ) 
+ + { 
+ + logger . warn ( " Unable to read fd field from FileChannel " ) ; 
+ + } 
+ + return - 1 ; 
+ + } 
+ + 
+ / * * 
+ * Get system file descriptor from FileDescriptor object . 
+ * @ param descriptor - FileDescriptor objec to get fd from 
+ @ @ - 295 , 7 + 314 , 7 @ @ public final class CLibrary 
+ catch ( Exception e ) 
+ { 
+ JVMStabilityInspector . inspectThrowable ( e ) ; 
+ - logger . warn ( " unable to read fd field from FileDescriptor " ) ; 
+ + logger . warn ( " Unable to read fd field from FileDescriptor " ) ; 
+ } 
+ 
+ return - 1 ; 
+ diff - - git a / test / unit / org / apache / cassandra / SchemaLoader . java b / test / unit / org / apache / cassandra / SchemaLoader . java 
+ index 2fcfd55 . . 2be4cc0 100644 
+ - - - a / test / unit / org / apache / cassandra / SchemaLoader . java 
+ + + + b / test / unit / org / apache / cassandra / SchemaLoader . java 
+ @ @ - 419 , 6 + 419 , 7 @ @ public class SchemaLoader 
+ 
+ public static void cleanupAndLeaveDirs ( ) 
+ { 
+ + CommitLog . instance . resetUnsafe ( ) ; / / unmap CLS before attempting to delete or Windows complains 
+ mkdirs ( ) ; 
+ cleanup ( ) ; 
+ mkdirs ( ) ; 
+ @ @ - 434 , 7 + 435 , 11 @ @ public class SchemaLoader 
+ File dir = new File ( dirName ) ; 
+ if ( ! dir . exists ( ) ) 
+ throw new RuntimeException ( " No such directory : " + dir . getAbsolutePath ( ) ) ; 
+ - FileUtils . deleteRecursive ( dir ) ; 
+ + 
+ + / / Leave the folder around as Windows will complain about directory deletion w / handles open to children files 
+ + String [ ] children = dir . list ( ) ; 
+ + for ( String child : children ) 
+ + FileUtils . deleteRecursive ( new File ( dir , child ) ) ; 
+ } 
+ 
+ cleanupSavedCaches ( ) ; 
+ @ @ - 445 , 7 + 450 , 9 @ @ public class SchemaLoader 
+ File dir = new File ( dirName ) ; 
+ if ( ! dir . exists ( ) ) 
+ throw new RuntimeException ( " No such directory : " + dir . getAbsolutePath ( ) ) ; 
+ - FileUtils . deleteRecursive ( dir ) ; 
+ + String [ ] children = dir . list ( ) ; 
+ + for ( String child : children ) 
+ + FileUtils . deleteRecursive ( new File ( dir , child ) ) ; 
+ } 
+ } 
+
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index d518830 . . 52cc2c1 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 29 , 7 + 29 , 7 @ @ 
+ * add scheduler JMX metrics ( CASSANDRA - 2962 ) 
+ * add block level checksum for compressed data ( CASSANDRA - 1717 ) 
+ * make column family backed column map pluggable and introduce unsynchronized 
+ - ArrayList backed one to speedup reads ( CASSANDRA - 2843 ) 
+ + ArrayList backed one to speedup reads ( CASSANDRA - 2843 , 3165 ) 
+ * refactoring of the secondary index api ( CASSANDRA - 2982 ) 
+ * make CL > ONE reads wait for digest reconciliation before returning 
+ ( CASSANDRA - 2494 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ index c316a85 . . 71c7213 100644 
+ - - - a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ @ @ - 67 , 6 + 67 , 11 @ @ public class ArrayBackedSortedColumns extends ArrayList < IColumn > implements ISor 
+ this . reversed = reversed ; 
+ } 
+ 
+ + public ISortedColumns . Factory getFactory ( ) 
+ + { 
+ + return factory ( ) ; 
+ + } 
+ + 
+ public AbstractType < ? > getComparator ( ) 
+ { 
+ return comparator ; 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ index 1239d1c . . 38bc0d7 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ @ @ - 81 , 14 + 81 , 19 @ @ public class ColumnFamily extends AbstractColumnContainer 
+ this . cfm = cfm ; 
+ } 
+ 
+ - public ColumnFamily cloneMeShallow ( ) 
+ + public ColumnFamily cloneMeShallow ( ISortedColumns . Factory factory ) 
+ { 
+ - ColumnFamily cf = ColumnFamily . create ( cfm ) ; 
+ + ColumnFamily cf = ColumnFamily . create ( cfm , factory ) ; 
+ / / since deletion info is immutable , aliasing it is fine 
+ cf . deletionInfo . set ( deletionInfo . get ( ) ) ; 
+ return cf ; 
+ } 
+ 
+ + public ColumnFamily cloneMeShallow ( ) 
+ + { 
+ + return cloneMeShallow ( columns . getFactory ( ) ) ; 
+ + } 
+ + 
+ public AbstractType getSubComparator ( ) 
+ { 
+ IColumnSerializer s = getColumnSerializer ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 0bfd1c5 . . 552d3e9 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1162 , 8 + 1162 , 11 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ } 
+ } 
+ 
+ - / * * filter a cached row , which will not be modified by the filter , but may be modified by throwing out 
+ - * tombstones that are no longer relevant . * / 
+ + / * * 
+ + * Filter a cached row , which will not be modified by the filter , but may be modified by throwing out 
+ + * tombstones that are no longer relevant . 
+ + * The returned column family won ' t be thread safe . 
+ + * / 
+ ColumnFamily filterColumnFamily ( ColumnFamily cached , QueryFilter filter , int gcBefore ) 
+ { 
+ / / special case slicing the entire row : 
+ @ @ - 1184 , 7 + 1187 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ IColumn sc = cached . getColumn ( filter . path . superColumnName ) ; 
+ if ( sc = = null | | sliceFilter . count > = sc . getSubColumns ( ) . size ( ) ) 
+ { 
+ - ColumnFamily cf = cached . cloneMeShallow ( ) ; 
+ + ColumnFamily cf = cached . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; 
+ if ( sc ! = null ) 
+ cf . addColumn ( sc , HeapAllocator . instance ) ; 
+ return removeDeleted ( cf , gcBefore ) ; 
+ @ @ - 1203 , 7 + 1206 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ } 
+ 
+ IColumnIterator ci = filter . getMemtableColumnIterator ( cached , null , getComparator ( ) ) ; 
+ - ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ) ; 
+ + ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; 
+ filter . collateColumns ( cf , Collections . singletonList ( ci ) , getComparator ( ) , gcBefore ) ; 
+ / / TODO this is necessary because when we collate supercolumns together , we don ' t check 
+ / / their subcolumns for relevance , so we need to do a second prune post facto here . 
+ diff - - git a / src / java / org / apache / cassandra / db / ISortedColumns . java b / src / java / org / apache / cassandra / db / ISortedColumns . java 
+ index 37f5a60 . . 624dec7 100644 
+ - - - a / src / java / org / apache / cassandra / db / ISortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / ISortedColumns . java 
+ @ @ - 42 , 6 + 42 , 11 @ @ public interface ISortedColumns extends IIterableColumns 
+ public ISortedColumns cloneMe ( ) ; 
+ 
+ / * * 
+ + * Returns the factory used for this ISortedColumns implementation . 
+ + * / 
+ + public Factory getFactory ( ) ; 
+ + 
+ + / * * 
+ * Adds a column to this column map . 
+ * If a column with the same name is already present in the map , it will 
+ * be replaced by the newly added column . 
+ diff - - git a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java 
+ index cd2488a . . 13a111a 100644 
+ - - - a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java 
+ @ @ - 62 , 6 + 62 , 11 @ @ public class ThreadSafeSortedColumns extends ConcurrentSkipListMap < ByteBuffer , I 
+ super ( columns ) ; 
+ } 
+ 
+ + public ISortedColumns . Factory getFactory ( ) 
+ + { 
+ + return factory ( ) ; 
+ + } 
+ + 
+ public ISortedColumns cloneMe ( ) 
+ { 
+ return new ThreadSafeSortedColumns ( this ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java 
+ index 34e83dc . . 6c3fc42 100644 
+ - - - a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java 
+ @ @ - 62 , 6 + 62 , 11 @ @ public class TreeMapBackedSortedColumns extends TreeMap < ByteBuffer , IColumn > imp 
+ super ( columns ) ; 
+ } 
+ 
+ + public ISortedColumns . Factory getFactory ( ) 
+ + { 
+ + return factory ( ) ; 
+ + } 
+ + 
+ public ISortedColumns cloneMe ( ) 
+ { 
+ return new TreeMapBackedSortedColumns ( this ) ;

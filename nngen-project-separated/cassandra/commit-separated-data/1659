@@ -1,0 +1,998 @@
+BLEU SCORE: 1.0
+
+TEST MSG: Introduce test - burn ant target
+GENERATED MSG: Introduce test - burn ant target
+
+TEST DIFF (one line): diff - - git a / test / burn / org / apache / cassandra / concurrent / LongOpOrderTest . java b / test / burn / org / apache / cassandra / concurrent / LongOpOrderTest . java <nl> new file mode 100644 <nl> index 0000000 . . d7105df <nl> - - - / dev / null <nl> + + + b / test / burn / org / apache / cassandra / concurrent / LongOpOrderTest . java <nl> @ @ - 0 , 0 + 1 , 240 @ @ <nl> + package org . apache . cassandra . concurrent ; <nl> + / * <nl> + * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * <nl> + * / <nl> + <nl> + <nl> + import java . util . Map ; <nl> + import java . util . concurrent . ExecutorService ; <nl> + import java . util . concurrent . Executors ; <nl> + import java . util . concurrent . ScheduledExecutorService ; <nl> + import java . util . concurrent . ThreadLocalRandom ; <nl> + import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . atomic . AtomicInteger ; <nl> + <nl> + import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; <nl> + import org . junit . Test ; <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> + <nl> + import org . apache . cassandra . utils . concurrent . OpOrder ; <nl> + <nl> + import static org . junit . Assert . assertTrue ; <nl> + <nl> + / / TODO : we don ' t currently test SAFE functionality at all ! <nl> + / / TODO : should also test markBlocking and SyncOrdered <nl> + public class LongOpOrderTest <nl> + { <nl> + <nl> + private static final Logger logger = LoggerFactory . getLogger ( LongOpOrderTest . class ) ; <nl> + <nl> + static final int CONSUMERS = 4 ; <nl> + static final int PRODUCERS = 32 ; <nl> + <nl> + static final long RUNTIME = TimeUnit . MINUTES . toMillis ( 5 ) ; <nl> + static final long REPORT _ INTERVAL = TimeUnit . MINUTES . toMillis ( 1 ) ; <nl> + <nl> + static final Thread . UncaughtExceptionHandler handler = new Thread . UncaughtExceptionHandler ( ) <nl> + { <nl> + @ Override <nl> + public void uncaughtException ( Thread t , Throwable e ) <nl> + { <nl> + System . err . println ( t . getName ( ) + " : " + e . getMessage ( ) ) ; <nl> + e . printStackTrace ( ) ; <nl> + } <nl> + } ; <nl> + <nl> + final OpOrder order = new OpOrder ( ) ; <nl> + final AtomicInteger errors = new AtomicInteger ( ) ; <nl> + <nl> + class TestOrdering implements Runnable <nl> + { <nl> + <nl> + final int [ ] waitNanos = new int [ 1 < < 16 ] ; <nl> + volatile State state = new State ( ) ; <nl> + final ScheduledExecutorService sched ; <nl> + <nl> + TestOrdering ( ExecutorService exec , ScheduledExecutorService sched ) <nl> + { <nl> + this . sched = sched ; <nl> + final ThreadLocalRandom rnd = ThreadLocalRandom . current ( ) ; <nl> + for ( int i = 0 ; i < waitNanos . length ; i + + ) <nl> + waitNanos [ i ] = rnd . nextInt ( 5000 ) ; <nl> + for ( int i = 0 ; i < PRODUCERS / CONSUMERS ; i + + ) <nl> + exec . execute ( new Producer ( ) ) ; <nl> + exec . execute ( this ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void run ( ) <nl> + { <nl> + final long until = System . currentTimeMillis ( ) + RUNTIME ; <nl> + long lastReport = System . currentTimeMillis ( ) ; <nl> + long count = 0 ; <nl> + long opCount = 0 ; <nl> + while ( true ) <nl> + { <nl> + long now = System . currentTimeMillis ( ) ; <nl> + if ( now > until ) <nl> + break ; <nl> + if ( now > lastReport + REPORT _ INTERVAL ) <nl> + { <nl> + lastReport = now ; <nl> + logger . info ( String . format ( " % s : Executed % d barriers with % d operations . % . 0f % % complete . " , <nl> + Thread . currentThread ( ) . getName ( ) , count , opCount , 100 * ( 1 - ( ( until - now ) / ( double ) RUNTIME ) ) ) ) ; <nl> + } <nl> + try <nl> + { <nl> + Thread . sleep ( 0 , waitNanos [ ( ( int ) ( count & ( waitNanos . length - 1 ) ) ) ] ) ; <nl> + } catch ( InterruptedException e ) <nl> + { <nl> + e . printStackTrace ( ) ; <nl> + } <nl> + <nl> + final State s = state ; <nl> + s . barrier = order . newBarrier ( ) ; <nl> + s . replacement = new State ( ) ; <nl> + s . barrier . issue ( ) ; <nl> + s . barrier . await ( ) ; <nl> + s . check ( ) ; <nl> + opCount + = s . totalCount ( ) ; <nl> + state = s . replacement ; <nl> + sched . schedule ( new Runnable ( ) <nl> + { <nl> + @ Override <nl> + public void run ( ) <nl> + { <nl> + s . check ( ) ; <nl> + } <nl> + } , 1 , TimeUnit . SECONDS ) ; <nl> + count + + ; <nl> + } <nl> + } <nl> + <nl> + class State <nl> + { <nl> + <nl> + volatile OpOrder . Barrier barrier ; <nl> + volatile State replacement ; <nl> + final NonBlockingHashMap < OpOrder . Group , AtomicInteger > count = new NonBlockingHashMap < > ( ) ; <nl> + int checkCount = - 1 ; <nl> + <nl> + boolean accept ( OpOrder . Group opGroup ) <nl> + { <nl> + if ( barrier ! = null & & ! barrier . isAfter ( opGroup ) ) <nl> + return false ; <nl> + AtomicInteger c ; <nl> + if ( null = = ( c = count . get ( opGroup ) ) ) <nl> + { <nl> + count . putIfAbsent ( opGroup , new AtomicInteger ( ) ) ; <nl> + c = count . get ( opGroup ) ; <nl> + } <nl> + c . incrementAndGet ( ) ; <nl> + return true ; <nl> + } <nl> + <nl> + int totalCount ( ) <nl> + { <nl> + int c = 0 ; <nl> + for ( AtomicInteger v : count . values ( ) ) <nl> + c + = v . intValue ( ) ; <nl> + return c ; <nl> + } <nl> + <nl> + void check ( ) <nl> + { <nl> + boolean delete ; <nl> + if ( checkCount > = 0 ) <nl> + { <nl> + if ( checkCount ! = totalCount ( ) ) <nl> + { <nl> + errors . incrementAndGet ( ) ; <nl> + logger . error ( " Received size changed after barrier finished : { } vs { } " , checkCount , totalCount ( ) ) ; <nl> + } <nl> + delete = true ; <nl> + } <nl> + else <nl> + { <nl> + checkCount = totalCount ( ) ; <nl> + delete = false ; <nl> + } <nl> + for ( Map . Entry < OpOrder . Group , AtomicInteger > e : count . entrySet ( ) ) <nl> + { <nl> + if ( e . getKey ( ) . compareTo ( barrier . getSyncPoint ( ) ) > 0 ) <nl> + { <nl> + errors . incrementAndGet ( ) ; <nl> + logger . error ( " Received an operation that was created after the barrier was issued . " ) ; <nl> + } <nl> + if ( TestOrdering . this . count . get ( e . getKey ( ) ) . intValue ( ) ! = e . getValue ( ) . intValue ( ) ) <nl> + { <nl> + errors . incrementAndGet ( ) ; <nl> + logger . error ( " Missing registered operations . { } vs { } " , TestOrdering . this . count . get ( e . getKey ( ) ) . intValue ( ) , e . getValue ( ) . intValue ( ) ) ; <nl> + } <nl> + if ( delete ) <nl> + TestOrdering . this . count . remove ( e . getKey ( ) ) ; <nl> + } <nl> + } <nl> + <nl> + } <nl> + <nl> + final NonBlockingHashMap < OpOrder . Group , AtomicInteger > count = new NonBlockingHashMap < > ( ) ; <nl> + <nl> + class Producer implements Runnable <nl> + { <nl> + public void run ( ) <nl> + { <nl> + while ( true ) <nl> + { <nl> + AtomicInteger c ; <nl> + try ( OpOrder . Group opGroup = order . start ( ) ) <nl> + { <nl> + if ( null = = ( c = count . get ( opGroup ) ) ) <nl> + { <nl> + count . putIfAbsent ( opGroup , new AtomicInteger ( ) ) ; <nl> + c = count . get ( opGroup ) ; <nl> + } <nl> + c . incrementAndGet ( ) ; <nl> + State s = state ; <nl> + while ( ! s . accept ( opGroup ) ) <nl> + s = s . replacement ; <nl> + } <nl> + } <nl> + } <nl> + } <nl> + <nl> + } <nl> + <nl> + @ Test <nl> + public void testOrdering ( ) throws InterruptedException <nl> + { <nl> + errors . set ( 0 ) ; <nl> + Thread . setDefaultUncaughtExceptionHandler ( handler ) ; <nl> + final ExecutorService exec = Executors . newCachedThreadPool ( new NamedThreadFactory ( " checker " ) ) ; <nl> + final ScheduledExecutorService checker = Executors . newScheduledThreadPool ( 1 , new NamedThreadFactory ( " checker " ) ) ; <nl> + for ( int i = 0 ; i < CONSUMERS ; i + + ) <nl> + new TestOrdering ( exec , checker ) ; <nl> + exec . shutdown ( ) ; <nl> + exec . awaitTermination ( ( long ) ( RUNTIME * 1 . 1 ) , TimeUnit . MILLISECONDS ) ; <nl> + assertTrue ( exec . isShutdown ( ) ) ; <nl> + assertTrue ( errors . get ( ) = = 0 ) ; <nl> + } <nl> + <nl> + <nl> + } <nl> diff - - git a / test / burn / org / apache / cassandra / concurrent / LongSharedExecutorPoolTest . java b / test / burn / org / apache / cassandra / concurrent / LongSharedExecutorPoolTest . java <nl> new file mode 100644 <nl> index 0000000 . . fe464c7 <nl> - - - / dev / null <nl> + + + b / test / burn / org / apache / cassandra / concurrent / LongSharedExecutorPoolTest . java <nl> @ @ - 0 , 0 + 1 , 226 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . concurrent ; <nl> + <nl> + import java . util . BitSet ; <nl> + import java . util . TreeSet ; <nl> + import java . util . concurrent . ExecutionException ; <nl> + import java . util . concurrent . ExecutorService ; <nl> + import java . util . concurrent . Future ; <nl> + import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . TimeoutException ; <nl> + import java . util . concurrent . locks . LockSupport ; <nl> + <nl> + import com . google . common . util . concurrent . Uninterruptibles ; <nl> + import org . apache . commons . math3 . distribution . WeibullDistribution ; <nl> + import org . junit . Test ; <nl> + <nl> + public class LongSharedExecutorPoolTest <nl> + { <nl> + <nl> + private static final class WaitTask implements Runnable <nl> + { <nl> + final long nanos ; <nl> + <nl> + private WaitTask ( long nanos ) <nl> + { <nl> + this . nanos = nanos ; <nl> + } <nl> + <nl> + public void run ( ) <nl> + { <nl> + LockSupport . parkNanos ( nanos ) ; <nl> + } <nl> + } <nl> + <nl> + private static final class Result implements Comparable < Result > <nl> + { <nl> + final Future < ? > future ; <nl> + final long forecastedCompletion ; <nl> + <nl> + private Result ( Future < ? > future , long forecastedCompletion ) <nl> + { <nl> + this . future = future ; <nl> + this . forecastedCompletion = forecastedCompletion ; <nl> + } <nl> + <nl> + public int compareTo ( Result that ) <nl> + { <nl> + int c = Long . compare ( this . forecastedCompletion , that . forecastedCompletion ) ; <nl> + if ( c ! = 0 ) <nl> + return c ; <nl> + c = Integer . compare ( this . hashCode ( ) , that . hashCode ( ) ) ; <nl> + if ( c ! = 0 ) <nl> + return c ; <nl> + return Integer . compare ( this . future . hashCode ( ) , that . future . hashCode ( ) ) ; <nl> + } <nl> + } <nl> + <nl> + private static final class Batch implements Comparable < Batch > <nl> + { <nl> + final TreeSet < Result > results ; <nl> + final long timeout ; <nl> + final int executorIndex ; <nl> + <nl> + private Batch ( TreeSet < Result > results , long timeout , int executorIndex ) <nl> + { <nl> + this . results = results ; <nl> + this . timeout = timeout ; <nl> + this . executorIndex = executorIndex ; <nl> + } <nl> + <nl> + public int compareTo ( Batch that ) <nl> + { <nl> + int c = Long . compare ( this . timeout , that . timeout ) ; <nl> + if ( c ! = 0 ) <nl> + return c ; <nl> + c = Integer . compare ( this . results . size ( ) , that . results . size ( ) ) ; <nl> + if ( c ! = 0 ) <nl> + return c ; <nl> + return Integer . compare ( this . hashCode ( ) , that . hashCode ( ) ) ; <nl> + } <nl> + } <nl> + <nl> + @ Test <nl> + public void testPromptnessOfExecution ( ) throws InterruptedException , ExecutionException <nl> + { <nl> + testPromptnessOfExecution ( TimeUnit . MINUTES . toNanos ( 2L ) , 0 . 5f ) ; <nl> + } <nl> + <nl> + private void testPromptnessOfExecution ( long intervalNanos , float loadIncrement ) throws InterruptedException , ExecutionException <nl> + { <nl> + final int executorCount = 4 ; <nl> + int threadCount = 8 ; <nl> + int maxQueued = 1024 ; <nl> + final WeibullDistribution workTime = new WeibullDistribution ( 3 , 200000 ) ; <nl> + final long minWorkTime = TimeUnit . MICROSECONDS . toNanos ( 1 ) ; <nl> + final long maxWorkTime = TimeUnit . MILLISECONDS . toNanos ( 1 ) ; <nl> + <nl> + final int [ ] threadCounts = new int [ executorCount ] ; <nl> + final WeibullDistribution [ ] workCount = new WeibullDistribution [ executorCount ] ; <nl> + final ExecutorService [ ] executors = new ExecutorService [ executorCount ] ; <nl> + for ( int i = 0 ; i < executors . length ; i + + ) <nl> + { <nl> + executors [ i ] = SharedExecutorPool . SHARED . newExecutor ( threadCount , maxQueued , " test " + i , " test " + i ) ; <nl> + threadCounts [ i ] = threadCount ; <nl> + workCount [ i ] = new WeibullDistribution ( 2 , maxQueued ) ; <nl> + threadCount * = 2 ; <nl> + maxQueued * = 2 ; <nl> + } <nl> + <nl> + long runs = 0 ; <nl> + long events = 0 ; <nl> + final TreeSet < Batch > pending = new TreeSet < > ( ) ; <nl> + final BitSet executorsWithWork = new BitSet ( executorCount ) ; <nl> + long until = 0 ; <nl> + / / basic idea is to go through different levels of load on the executor service ; initially is all small batches <nl> + / / ( mostly within max queue size ) of very short operations , moving to progressively larger batches <nl> + / / ( beyond max queued size ) , and longer operations <nl> + for ( float multiplier = 0f ; multiplier < 2 . 01f ; ) <nl> + { <nl> + if ( System . nanoTime ( ) > until ) <nl> + { <nl> + System . out . println ( String . format ( " Completed % . 0fK batches with % . 1fM events " , runs * 0 . 001f , events * 0 . 000001f ) ) ; <nl> + events = 0 ; <nl> + until = System . nanoTime ( ) + intervalNanos ; <nl> + multiplier + = loadIncrement ; <nl> + System . out . println ( String . format ( " Running for % ds with load multiplier % . 1f " , TimeUnit . NANOSECONDS . toSeconds ( intervalNanos ) , multiplier ) ) ; <nl> + } <nl> + <nl> + / / wait a random amount of time so we submit new tasks in various stages of <nl> + long timeout ; <nl> + if ( pending . isEmpty ( ) ) timeout = 0 ; <nl> + else if ( Math . random ( ) > 0 . 98 ) timeout = Long . MAX _ VALUE ; <nl> + else if ( pending . size ( ) = = executorCount ) timeout = pending . first ( ) . timeout ; <nl> + else timeout = ( long ) ( Math . random ( ) * pending . last ( ) . timeout ) ; <nl> + <nl> + while ( ! pending . isEmpty ( ) & & timeout > System . nanoTime ( ) ) <nl> + { <nl> + Batch first = pending . first ( ) ; <nl> + boolean complete = false ; <nl> + try <nl> + { <nl> + for ( Result result : first . results . descendingSet ( ) ) <nl> + result . future . get ( timeout - System . nanoTime ( ) , TimeUnit . NANOSECONDS ) ; <nl> + complete = true ; <nl> + } <nl> + catch ( TimeoutException e ) <nl> + { <nl> + } <nl> + if ( ! complete & & System . nanoTime ( ) > first . timeout ) <nl> + { <nl> + for ( Result result : first . results ) <nl> + if ( ! result . future . isDone ( ) ) <nl> + throw new AssertionError ( ) ; <nl> + complete = true ; <nl> + } <nl> + if ( complete ) <nl> + { <nl> + pending . pollFirst ( ) ; <nl> + executorsWithWork . clear ( first . executorIndex ) ; <nl> + } <nl> + } <nl> + <nl> + / / if we ' ve emptied the executors , give all our threads an opportunity to spin down <nl> + if ( timeout = = Long . MAX _ VALUE ) <nl> + Uninterruptibles . sleepUninterruptibly ( 10 , TimeUnit . MILLISECONDS ) ; <nl> + <nl> + / / submit a random batch to the first free executor service <nl> + int executorIndex = executorsWithWork . nextClearBit ( 0 ) ; <nl> + if ( executorIndex > = executorCount ) <nl> + continue ; <nl> + executorsWithWork . set ( executorIndex ) ; <nl> + ExecutorService executor = executors [ executorIndex ] ; <nl> + TreeSet < Result > results = new TreeSet < > ( ) ; <nl> + int count = ( int ) ( workCount [ executorIndex ] . sample ( ) * multiplier ) ; <nl> + long targetTotalElapsed = 0 ; <nl> + long start = System . nanoTime ( ) ; <nl> + long baseTime ; <nl> + if ( Math . random ( ) > 0 . 5 ) baseTime = 2 * ( long ) ( workTime . sample ( ) * multiplier ) ; <nl> + else baseTime = 0 ; <nl> + for ( int j = 0 ; j < count ; j + + ) <nl> + { <nl> + long time ; <nl> + if ( baseTime = = 0 ) time = ( long ) ( workTime . sample ( ) * multiplier ) ; <nl> + else time = ( long ) ( baseTime * Math . random ( ) ) ; <nl> + if ( time < minWorkTime ) <nl> + time = minWorkTime ; <nl> + if ( time > maxWorkTime ) <nl> + time = maxWorkTime ; <nl> + targetTotalElapsed + = time ; <nl> + Future < ? > future = executor . submit ( new WaitTask ( time ) ) ; <nl> + results . add ( new Result ( future , System . nanoTime ( ) + time ) ) ; <nl> + } <nl> + long end = start + ( long ) Math . ceil ( targetTotalElapsed / ( double ) threadCounts [ executorIndex ] ) <nl> + + TimeUnit . MILLISECONDS . toNanos ( 100L ) ; <nl> + long now = System . nanoTime ( ) ; <nl> + if ( runs + + > executorCount & & now > end ) <nl> + throw new AssertionError ( ) ; <nl> + events + = results . size ( ) ; <nl> + pending . add ( new Batch ( results , end , executorIndex ) ) ; <nl> + / / System . out . println ( String . format ( " Submitted batch to executor % d with % d items and % d permitted millis " , executorIndex , count , TimeUnit . NANOSECONDS . toMillis ( end - start ) ) ) ; <nl> + } <nl> + } <nl> + <nl> + public static void main ( String [ ] args ) throws InterruptedException , ExecutionException <nl> + { <nl> + / / do longer test <nl> + new LongSharedExecutorPoolTest ( ) . testPromptnessOfExecution ( TimeUnit . MINUTES . toNanos ( 10L ) , 0 . 1f ) ; <nl> + } <nl> + <nl> + } <nl> diff - - git a / test / burn / org / apache / cassandra / utils / LongBTreeTest . java b / test / burn / org / apache / cassandra / utils / LongBTreeTest . java <nl> new file mode 100644 <nl> index 0000000 . . 9641930 <nl> - - - / dev / null <nl> + + + b / test / burn / org / apache / cassandra / utils / LongBTreeTest . java <nl> @ @ - 0 , 0 + 1 , 502 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , <nl> + * software distributed under the License is distributed on an <nl> + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY <nl> + * KIND , either express or implied . See the License for the <nl> + * specific language governing permissions and limitations <nl> + * under the License . <nl> + * / <nl> + package org . apache . cassandra . utils ; <nl> + <nl> + import java . util . ArrayList ; <nl> + import java . util . Arrays ; <nl> + import java . util . Comparator ; <nl> + import java . util . Iterator ; <nl> + import java . util . List ; <nl> + import java . util . NavigableMap ; <nl> + import java . util . NavigableSet ; <nl> + import java . util . Random ; <nl> + import java . util . TreeMap ; <nl> + import java . util . TreeSet ; <nl> + import java . util . concurrent . Callable ; <nl> + import java . util . concurrent . CountDownLatch ; <nl> + import java . util . concurrent . ExecutionException ; <nl> + import java . util . concurrent . ExecutorService ; <nl> + import java . util . concurrent . Executors ; <nl> + import java . util . concurrent . ThreadLocalRandom ; <nl> + import java . util . concurrent . TimeUnit ; <nl> + import java . util . concurrent . atomic . AtomicLong ; <nl> + <nl> + import com . google . common . base . Function ; <nl> + import com . google . common . base . Predicate ; <nl> + import com . google . common . collect . Iterables ; <nl> + import com . google . common . util . concurrent . Futures ; <nl> + import com . google . common . util . concurrent . ListenableFuture ; <nl> + import com . google . common . util . concurrent . ListenableFutureTask ; <nl> + import org . junit . Assert ; <nl> + import org . junit . Test ; <nl> + <nl> + <nl> + import com . codahale . metrics . MetricRegistry ; <nl> + import com . codahale . metrics . Snapshot ; <nl> + import com . codahale . metrics . Timer ; <nl> + import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> + import org . apache . cassandra . utils . btree . BTree ; <nl> + import org . apache . cassandra . utils . btree . BTreeSearchIterator ; <nl> + import org . apache . cassandra . utils . btree . BTreeSet ; <nl> + import org . apache . cassandra . utils . btree . UpdateFunction ; <nl> + <nl> + / / TODO : should probably lower fan - factor for tests to make them more intensive <nl> + public class LongBTreeTest <nl> + { <nl> + <nl> + private static final MetricRegistry metrics = new MetricRegistry ( ) ; <nl> + private static final Timer BTREE _ TIMER = metrics . timer ( MetricRegistry . name ( BTree . class , " BTREE " ) ) ; <nl> + private static final Timer TREE _ TIMER = metrics . timer ( MetricRegistry . name ( BTree . class , " TREE " ) ) ; <nl> + private static final ExecutorService MODIFY = Executors . newFixedThreadPool ( Runtime . getRuntime ( ) . availableProcessors ( ) , new NamedThreadFactory ( " MODIFY " ) ) ; <nl> + private static final ExecutorService COMPARE = Executors . newFixedThreadPool ( Runtime . getRuntime ( ) . availableProcessors ( ) , new NamedThreadFactory ( " COMPARE " ) ) ; <nl> + private static final RandomAbort < Integer > SPORADIC _ ABORT = new RandomAbort < > ( new Random ( ) , 0 . 0001f ) ; <nl> + <nl> + static <nl> + { <nl> + System . setProperty ( " cassandra . btree . fanfactor " , " 4 " ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testOversizedMiddleInsert ( ) <nl> + { <nl> + TreeSet < Integer > canon = new TreeSet < > ( ) ; <nl> + for ( int i = 0 ; i < 10000000 ; i + + ) <nl> + canon . add ( i ) ; <nl> + Object [ ] btree = BTree . build ( Arrays . asList ( Integer . MIN _ VALUE , Integer . MAX _ VALUE ) , ICMP , true , null ) ; <nl> + btree = BTree . update ( btree , ICMP , canon , true ) ; <nl> + canon . add ( Integer . MIN _ VALUE ) ; <nl> + canon . add ( Integer . MAX _ VALUE ) ; <nl> + Assert . assertTrue ( BTree . isWellFormed ( btree , ICMP ) ) ; <nl> + testEqual ( " Oversize " , BTree . < Integer > slice ( btree , true ) , canon . iterator ( ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testIndividualInsertsSmallOverlappingRange ( ) throws ExecutionException , InterruptedException <nl> + { <nl> + testInsertions ( 10000000 , 50 , 1 , 1 , true ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testBatchesSmallOverlappingRange ( ) throws ExecutionException , InterruptedException <nl> + { <nl> + testInsertions ( 10000000 , 50 , 1 , 5 , true ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testIndividualInsertsMediumSparseRange ( ) throws ExecutionException , InterruptedException <nl> + { <nl> + testInsertions ( 10000000 , 500 , 10 , 1 , true ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testBatchesMediumSparseRange ( ) throws ExecutionException , InterruptedException <nl> + { <nl> + testInsertions ( 10000000 , 500 , 10 , 10 , true ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testLargeBatchesLargeRange ( ) throws ExecutionException , InterruptedException <nl> + { <nl> + testInsertions ( 100000000 , 5000 , 3 , 100 , true ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testSlicingSmallRandomTrees ( ) throws ExecutionException , InterruptedException <nl> + { <nl> + testInsertions ( 10000 , 50 , 10 , 10 , false ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testSearchIterator ( ) throws InterruptedException <nl> + { <nl> + int threads = Runtime . getRuntime ( ) . availableProcessors ( ) ; <nl> + final CountDownLatch latch = new CountDownLatch ( threads ) ; <nl> + final AtomicLong errors = new AtomicLong ( ) ; <nl> + final AtomicLong count = new AtomicLong ( ) ; <nl> + final int perThreadTrees = 100 ; <nl> + final int perTreeSelections = 100 ; <nl> + final long totalCount = threads * perThreadTrees * perTreeSelections ; <nl> + for ( int t = 0 ; t < threads ; t + + ) <nl> + { <nl> + MODIFY . execute ( new Runnable ( ) <nl> + { <nl> + public void run ( ) <nl> + { <nl> + ThreadLocalRandom random = ThreadLocalRandom . current ( ) ; <nl> + for ( int i = 0 ; i < perThreadTrees ; i + + ) <nl> + { <nl> + Object [ ] tree = randomTree ( 10000 , random ) ; <nl> + for ( int j = 0 ; j < perTreeSelections ; j + + ) <nl> + { <nl> + BTreeSearchIterator < Integer , Integer , Integer > searchIterator = new BTreeSearchIterator < > ( tree , ICMP ) ; <nl> + for ( Integer key : randomSelection ( tree , random ) ) <nl> + if ( key ! = searchIterator . next ( key ) ) <nl> + errors . incrementAndGet ( ) ; <nl> + searchIterator = new BTreeSearchIterator < Integer , Integer , Integer > ( tree , ICMP ) ; <nl> + for ( Integer key : randomMix ( tree , random ) ) <nl> + if ( key ! = searchIterator . next ( key ) ) <nl> + if ( BTree . find ( tree , ICMP , key ) = = key ) <nl> + errors . incrementAndGet ( ) ; <nl> + count . incrementAndGet ( ) ; <nl> + } <nl> + } <nl> + latch . countDown ( ) ; <nl> + } <nl> + } ) ; <nl> + } <nl> + while ( latch . getCount ( ) > 0 ) <nl> + { <nl> + latch . await ( 10L , TimeUnit . SECONDS ) ; <nl> + System . out . println ( String . format ( " % . 0f % % complete % s " , 100 * count . get ( ) / ( double ) totalCount , errors . get ( ) > 0 ? ( " Errors : " + errors . get ( ) ) : " " ) ) ; <nl> + assert errors . get ( ) = = 0 ; <nl> + } <nl> + } <nl> + <nl> + private static void testInsertions ( int totalCount , int perTestCount , int testKeyRatio , int modificationBatchSize , boolean quickEquality ) throws ExecutionException , InterruptedException <nl> + { <nl> + int batchesPerTest = perTestCount / modificationBatchSize ; <nl> + int maximumRunLength = 100 ; <nl> + int testKeyRange = perTestCount * testKeyRatio ; <nl> + int tests = totalCount / perTestCount ; <nl> + System . out . println ( String . format ( " Performing % d tests of % d operations , with % . 2f max size / key - range ratio in batches of ~ % d ops " , <nl> + tests , perTestCount , 1 / ( float ) testKeyRatio , modificationBatchSize ) ) ; <nl> + <nl> + / / if we ' re not doing quick - equality , we can spam with garbage for all the checks we perform , so we ' ll split the work into smaller chunks <nl> + int chunkSize = quickEquality ? tests : ( int ) ( 100000 / Math . pow ( perTestCount , 2 ) ) ; <nl> + for ( int chunk = 0 ; chunk < tests ; chunk + = chunkSize ) <nl> + { <nl> + final List < ListenableFutureTask < List < ListenableFuture < ? > > > > outer = new ArrayList < > ( ) ; <nl> + for ( int i = 0 ; i < chunkSize ; i + + ) <nl> + { <nl> + outer . add ( doOneTestInsertions ( testKeyRange , maximumRunLength , modificationBatchSize , batchesPerTest , quickEquality ) ) ; <nl> + } <nl> + <nl> + final List < ListenableFuture < ? > > inner = new ArrayList < > ( ) ; <nl> + int complete = 0 ; <nl> + int reportInterval = totalCount / 100 ; <nl> + int lastReportAt = 0 ; <nl> + for ( ListenableFutureTask < List < ListenableFuture < ? > > > f : outer ) <nl> + { <nl> + inner . addAll ( f . get ( ) ) ; <nl> + complete + = perTestCount ; <nl> + if ( complete - lastReportAt > = reportInterval ) <nl> + { <nl> + System . out . println ( String . format ( " Completed % d of % d operations " , ( chunk * perTestCount ) + complete , totalCount ) ) ; <nl> + lastReportAt = complete ; <nl> + } <nl> + } <nl> + Futures . allAsList ( inner ) . get ( ) ; <nl> + } <nl> + Snapshot snap = BTREE _ TIMER . getSnapshot ( ) ; <nl> + System . out . println ( String . format ( " btree : % . 2fns , % . 2fns , % . 2fns " , snap . getMedian ( ) , snap . get95thPercentile ( ) , snap . get999thPercentile ( ) ) ) ; <nl> + snap = TREE _ TIMER . getSnapshot ( ) ; <nl> + System . out . println ( String . format ( " snaptree : % . 2fns , % . 2fns , % . 2fns " , snap . getMedian ( ) , snap . get95thPercentile ( ) , snap . get999thPercentile ( ) ) ) ; <nl> + System . out . println ( " Done " ) ; <nl> + } <nl> + <nl> + private static ListenableFutureTask < List < ListenableFuture < ? > > > doOneTestInsertions ( final int upperBound , final int maxRunLength , final int averageModsPerIteration , final int iterations , final boolean quickEquality ) <nl> + { <nl> + ListenableFutureTask < List < ListenableFuture < ? > > > f = ListenableFutureTask . create ( new Callable < List < ListenableFuture < ? > > > ( ) <nl> + { <nl> + @ Override <nl> + public List < ListenableFuture < ? > > call ( ) <nl> + { <nl> + final List < ListenableFuture < ? > > r = new ArrayList < > ( ) ; <nl> + NavigableMap < Integer , Integer > canon = new TreeMap < > ( ) ; <nl> + Object [ ] btree = BTree . empty ( ) ; <nl> + final TreeMap < Integer , Integer > buffer = new TreeMap < > ( ) ; <nl> + final Random rnd = new Random ( ) ; <nl> + for ( int i = 0 ; i < iterations ; i + + ) <nl> + { <nl> + buffer . clear ( ) ; <nl> + int mods = ( averageModsPerIteration > > 1 ) + 1 + rnd . nextInt ( averageModsPerIteration ) ; <nl> + while ( mods > 0 ) <nl> + { <nl> + int v = rnd . nextInt ( upperBound ) ; <nl> + int rc = Math . max ( 0 , Math . min ( mods , maxRunLength ) - 1 ) ; <nl> + int c = 1 + ( rc < = 0 ? 0 : rnd . nextInt ( rc ) ) ; <nl> + for ( int j = 0 ; j < c ; j + + ) <nl> + { <nl> + buffer . put ( v , v ) ; <nl> + v + + ; <nl> + } <nl> + mods - = c ; <nl> + } <nl> + Timer . Context ctxt ; <nl> + ctxt = TREE _ TIMER . time ( ) ; <nl> + canon . putAll ( buffer ) ; <nl> + ctxt . stop ( ) ; <nl> + ctxt = BTREE _ TIMER . time ( ) ; <nl> + Object [ ] next = null ; <nl> + while ( next = = null ) <nl> + next = BTree . update ( btree , ICMP , buffer . keySet ( ) , true , SPORADIC _ ABORT ) ; <nl> + btree = next ; <nl> + ctxt . stop ( ) ; <nl> + <nl> + if ( ! BTree . isWellFormed ( btree , ICMP ) ) <nl> + { <nl> + System . out . println ( " ERROR : Not well formed " ) ; <nl> + throw new AssertionError ( " Not well formed ! " ) ; <nl> + } <nl> + if ( quickEquality ) <nl> + testEqual ( " " , BTree . < Integer > slice ( btree , true ) , canon . keySet ( ) . iterator ( ) ) ; <nl> + else <nl> + r . addAll ( testAllSlices ( " RND " , btree , new TreeSet < > ( canon . keySet ( ) ) ) ) ; <nl> + } <nl> + return r ; <nl> + } <nl> + } ) ; <nl> + MODIFY . execute ( f ) ; <nl> + return f ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testSlicingAllSmallTrees ( ) throws ExecutionException , InterruptedException <nl> + { <nl> + Object [ ] cur = BTree . empty ( ) ; <nl> + TreeSet < Integer > canon = new TreeSet < > ( ) ; <nl> + / / we set FAN _ FACTOR to 4 , so 128 items is four levels deep , three fully populated <nl> + for ( int i = 0 ; i < 128 ; i + + ) <nl> + { <nl> + String id = String . format ( " [ 0 . . % d ) " , canon . size ( ) ) ; <nl> + System . out . println ( " Testing " + id ) ; <nl> + Futures . allAsList ( testAllSlices ( id , cur , canon ) ) . get ( ) ; <nl> + Object [ ] next = null ; <nl> + while ( next = = null ) <nl> + next = BTree . update ( cur , ICMP , Arrays . asList ( i ) , true , SPORADIC _ ABORT ) ; <nl> + cur = next ; <nl> + canon . add ( i ) ; <nl> + } <nl> + } <nl> + <nl> + static final Comparator < Integer > ICMP = new Comparator < Integer > ( ) <nl> + { <nl> + @ Override <nl> + public int compare ( Integer o1 , Integer o2 ) <nl> + { <nl> + return Integer . compare ( o1 , o2 ) ; <nl> + } <nl> + } ; <nl> + <nl> + private static List < ListenableFuture < ? > > testAllSlices ( String id , Object [ ] btree , NavigableSet < Integer > canon ) <nl> + { <nl> + List < ListenableFuture < ? > > waitFor = new ArrayList < > ( ) ; <nl> + testAllSlices ( id + " ASC " , new BTreeSet < > ( btree , ICMP ) , canon , true , waitFor ) ; <nl> + testAllSlices ( id + " DSC " , new BTreeSet < > ( btree , ICMP ) . descendingSet ( ) , canon . descendingSet ( ) , false , waitFor ) ; <nl> + return waitFor ; <nl> + } <nl> + <nl> + private static void testAllSlices ( String id , NavigableSet < Integer > btree , NavigableSet < Integer > canon , boolean ascending , List < ListenableFuture < ? > > results ) <nl> + { <nl> + testOneSlice ( id , btree , canon , results ) ; <nl> + for ( Integer lb : range ( canon . size ( ) , Integer . MIN _ VALUE , ascending ) ) <nl> + { <nl> + / / test head / tail sets <nl> + testOneSlice ( String . format ( " % s - > [ % d . . ) " , id , lb ) , btree . headSet ( lb , true ) , canon . headSet ( lb , true ) , results ) ; <nl> + testOneSlice ( String . format ( " % s - > ( % d . . ) " , id , lb ) , btree . headSet ( lb , false ) , canon . headSet ( lb , false ) , results ) ; <nl> + testOneSlice ( String . format ( " % s - > ( . . % d ] " , id , lb ) , btree . tailSet ( lb , true ) , canon . tailSet ( lb , true ) , results ) ; <nl> + testOneSlice ( String . format ( " % s - > ( . . % d ] " , id , lb ) , btree . tailSet ( lb , false ) , canon . tailSet ( lb , false ) , results ) ; <nl> + for ( Integer ub : range ( canon . size ( ) , lb , ascending ) ) <nl> + { <nl> + / / test subsets <nl> + testOneSlice ( String . format ( " % s - > [ % d . . % d ] " , id , lb , ub ) , btree . subSet ( lb , true , ub , true ) , canon . subSet ( lb , true , ub , true ) , results ) ; <nl> + testOneSlice ( String . format ( " % s - > ( % d . . % d ] " , id , lb , ub ) , btree . subSet ( lb , false , ub , true ) , canon . subSet ( lb , false , ub , true ) , results ) ; <nl> + testOneSlice ( String . format ( " % s - > [ % d . . % d ) " , id , lb , ub ) , btree . subSet ( lb , true , ub , false ) , canon . subSet ( lb , true , ub , false ) , results ) ; <nl> + testOneSlice ( String . format ( " % s - > ( % d . . % d ) " , id , lb , ub ) , btree . subSet ( lb , false , ub , false ) , canon . subSet ( lb , false , ub , false ) , results ) ; <nl> + } <nl> + } <nl> + } <nl> + <nl> + private static void testOneSlice ( final String id , final NavigableSet < Integer > test , final NavigableSet < Integer > canon , List < ListenableFuture < ? > > results ) <nl> + { <nl> + ListenableFutureTask < ? > f = ListenableFutureTask . create ( new Runnable ( ) <nl> + { <nl> + <nl> + @ Override <nl> + public void run ( ) <nl> + { <nl> + test ( id + " Count " , test . size ( ) , canon . size ( ) ) ; <nl> + testEqual ( id , test . iterator ( ) , canon . iterator ( ) ) ; <nl> + testEqual ( id + " - > DSCI " , test . descendingIterator ( ) , canon . descendingIterator ( ) ) ; <nl> + testEqual ( id + " - > DSCS " , test . descendingSet ( ) . iterator ( ) , canon . descendingSet ( ) . iterator ( ) ) ; <nl> + testEqual ( id + " - > DSCS - > DSCI " , test . descendingSet ( ) . descendingIterator ( ) , canon . descendingSet ( ) . descendingIterator ( ) ) ; <nl> + } <nl> + } , null ) ; <nl> + results . add ( f ) ; <nl> + COMPARE . execute ( f ) ; <nl> + } <nl> + <nl> + private static void test ( String id , int test , int expect ) <nl> + { <nl> + if ( test ! = expect ) <nl> + { <nl> + System . out . println ( String . format ( " % s : Expected % d , Got % d " , id , expect , test ) ) ; <nl> + } <nl> + } <nl> + <nl> + private static < V > void testEqual ( String id , Iterator < V > btree , Iterator < V > canon ) <nl> + { <nl> + boolean equal = true ; <nl> + while ( btree . hasNext ( ) & & canon . hasNext ( ) ) <nl> + { <nl> + Object i = btree . next ( ) ; <nl> + Object j = canon . next ( ) ; <nl> + if ( ! i . equals ( j ) ) <nl> + { <nl> + System . out . println ( String . format ( " % s : Expected % d , Got % d " , id , j , i ) ) ; <nl> + equal = false ; <nl> + } <nl> + } <nl> + while ( btree . hasNext ( ) ) <nl> + { <nl> + System . out . println ( String . format ( " % s : Expected < Nil > , Got % d " , id , btree . next ( ) ) ) ; <nl> + equal = false ; <nl> + } <nl> + while ( canon . hasNext ( ) ) <nl> + { <nl> + System . out . println ( String . format ( " % s : Expected % d , Got Nil " , id , canon . next ( ) ) ) ; <nl> + equal = false ; <nl> + } <nl> + if ( ! equal ) <nl> + throw new AssertionError ( " Not equal " ) ; <nl> + } <nl> + <nl> + / / should only be called on sets that range from 0 - > N or N - > 0 <nl> + private static final Iterable < Integer > range ( final int size , final int from , final boolean ascending ) <nl> + { <nl> + return new Iterable < Integer > ( ) <nl> + { <nl> + int cur ; <nl> + int delta ; <nl> + int end ; <nl> + { <nl> + if ( ascending ) <nl> + { <nl> + end = size + 1 ; <nl> + cur = from = = Integer . MIN _ VALUE ? - 1 : from ; <nl> + delta = 1 ; <nl> + } <nl> + else <nl> + { <nl> + end = - 2 ; <nl> + cur = from = = Integer . MIN _ VALUE ? size : from ; <nl> + delta = - 1 ; <nl> + } <nl> + } <nl> + @ Override <nl> + public Iterator < Integer > iterator ( ) <nl> + { <nl> + return new Iterator < Integer > ( ) <nl> + { <nl> + @ Override <nl> + public boolean hasNext ( ) <nl> + { <nl> + return cur ! = end ; <nl> + } <nl> + <nl> + @ Override <nl> + public Integer next ( ) <nl> + { <nl> + Integer r = cur ; <nl> + cur + = delta ; <nl> + return r ; <nl> + } <nl> + <nl> + @ Override <nl> + public void remove ( ) <nl> + { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + } ; <nl> + } <nl> + } ; <nl> + } <nl> + <nl> + private static Object [ ] randomTree ( int maxSize , Random random ) <nl> + { <nl> + TreeSet < Integer > build = new TreeSet < > ( ) ; <nl> + int size = random . nextInt ( maxSize ) ; <nl> + for ( int i = 0 ; i < size ; i + + ) <nl> + { <nl> + build . add ( random . nextInt ( ) ) ; <nl> + } <nl> + return BTree . build ( build , ICMP , true , UpdateFunction . NoOp . < Integer > instance ( ) ) ; <nl> + } <nl> + <nl> + private static Iterable < Integer > randomSelection ( Object [ ] iter , final Random rnd ) <nl> + { <nl> + final float proportion = rnd . nextFloat ( ) ; <nl> + return Iterables . filter ( new BTreeSet < > ( iter , ICMP ) , new Predicate < Integer > ( ) <nl> + { <nl> + public boolean apply ( Integer integer ) <nl> + { <nl> + return rnd . nextFloat ( ) < proportion ; <nl> + } <nl> + } ) ; <nl> + } <nl> + <nl> + private static Iterable < Integer > randomMix ( Object [ ] iter , final Random rnd ) <nl> + { <nl> + final float proportion = rnd . nextFloat ( ) ; <nl> + return Iterables . transform ( new BTreeSet < > ( iter , ICMP ) , new Function < Integer , Integer > ( ) <nl> + { <nl> + long last = Integer . MIN _ VALUE ; <nl> + <nl> + public Integer apply ( Integer v ) <nl> + { <nl> + long last = this . last ; <nl> + this . last = v ; <nl> + if ( rnd . nextFloat ( ) < proportion ) <nl> + return v ; <nl> + return ( int ) ( ( v - last ) / 2 ) ; <nl> + } <nl> + } ) ; <nl> + } <nl> + <nl> + private static final class RandomAbort < V > implements UpdateFunction < V > <nl> + { <nl> + final Random rnd ; <nl> + final float chance ; <nl> + private RandomAbort ( Random rnd , float chance ) <nl> + { <nl> + this . rnd = rnd ; <nl> + this . chance = chance ; <nl> + } <nl> + <nl> + public V apply ( V replacing , V update ) <nl> + { <nl> + return update ; <nl> + } <nl> + <nl> + public boolean abortEarly ( ) <nl> + { <nl> + return rnd . nextFloat ( ) < chance ; <nl> + } <nl> + <nl> + public void allocated ( long heapSize ) <nl> + { <nl> + <nl> + } <nl> + <nl> + public V apply ( V v ) <nl> + { <nl> + return v ; <nl> + } <nl> + } <nl> + }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / test / burn / org / apache / cassandra / concurrent / LongOpOrderTest . java b / test / burn / org / apache / cassandra / concurrent / LongOpOrderTest . java 
+ new file mode 100644 
+ index 0000000 . . d7105df 
+ - - - / dev / null 
+ + + + b / test / burn / org / apache / cassandra / concurrent / LongOpOrderTest . java 
+ @ @ - 0 , 0 + 1 , 240 @ @ 
+ + package org . apache . cassandra . concurrent ; 
+ + / * 
+ + * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * 
+ + * / 
+ + 
+ + 
+ + import java . util . Map ; 
+ + import java . util . concurrent . ExecutorService ; 
+ + import java . util . concurrent . Executors ; 
+ + import java . util . concurrent . ScheduledExecutorService ; 
+ + import java . util . concurrent . ThreadLocalRandom ; 
+ + import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . atomic . AtomicInteger ; 
+ + 
+ + import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; 
+ + import org . junit . Test ; 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ + 
+ + import org . apache . cassandra . utils . concurrent . OpOrder ; 
+ + 
+ + import static org . junit . Assert . assertTrue ; 
+ + 
+ + / / TODO : we don ' t currently test SAFE functionality at all ! 
+ + / / TODO : should also test markBlocking and SyncOrdered 
+ + public class LongOpOrderTest 
+ + { 
+ + 
+ + private static final Logger logger = LoggerFactory . getLogger ( LongOpOrderTest . class ) ; 
+ + 
+ + static final int CONSUMERS = 4 ; 
+ + static final int PRODUCERS = 32 ; 
+ + 
+ + static final long RUNTIME = TimeUnit . MINUTES . toMillis ( 5 ) ; 
+ + static final long REPORT _ INTERVAL = TimeUnit . MINUTES . toMillis ( 1 ) ; 
+ + 
+ + static final Thread . UncaughtExceptionHandler handler = new Thread . UncaughtExceptionHandler ( ) 
+ + { 
+ + @ Override 
+ + public void uncaughtException ( Thread t , Throwable e ) 
+ + { 
+ + System . err . println ( t . getName ( ) + " : " + e . getMessage ( ) ) ; 
+ + e . printStackTrace ( ) ; 
+ + } 
+ + } ; 
+ + 
+ + final OpOrder order = new OpOrder ( ) ; 
+ + final AtomicInteger errors = new AtomicInteger ( ) ; 
+ + 
+ + class TestOrdering implements Runnable 
+ + { 
+ + 
+ + final int [ ] waitNanos = new int [ 1 < < 16 ] ; 
+ + volatile State state = new State ( ) ; 
+ + final ScheduledExecutorService sched ; 
+ + 
+ + TestOrdering ( ExecutorService exec , ScheduledExecutorService sched ) 
+ + { 
+ + this . sched = sched ; 
+ + final ThreadLocalRandom rnd = ThreadLocalRandom . current ( ) ; 
+ + for ( int i = 0 ; i < waitNanos . length ; i + + ) 
+ + waitNanos [ i ] = rnd . nextInt ( 5000 ) ; 
+ + for ( int i = 0 ; i < PRODUCERS / CONSUMERS ; i + + ) 
+ + exec . execute ( new Producer ( ) ) ; 
+ + exec . execute ( this ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void run ( ) 
+ + { 
+ + final long until = System . currentTimeMillis ( ) + RUNTIME ; 
+ + long lastReport = System . currentTimeMillis ( ) ; 
+ + long count = 0 ; 
+ + long opCount = 0 ; 
+ + while ( true ) 
+ + { 
+ + long now = System . currentTimeMillis ( ) ; 
+ + if ( now > until ) 
+ + break ; 
+ + if ( now > lastReport + REPORT _ INTERVAL ) 
+ + { 
+ + lastReport = now ; 
+ + logger . info ( String . format ( " % s : Executed % d barriers with % d operations . % . 0f % % complete . " , 
+ + Thread . currentThread ( ) . getName ( ) , count , opCount , 100 * ( 1 - ( ( until - now ) / ( double ) RUNTIME ) ) ) ) ; 
+ + } 
+ + try 
+ + { 
+ + Thread . sleep ( 0 , waitNanos [ ( ( int ) ( count & ( waitNanos . length - 1 ) ) ) ] ) ; 
+ + } catch ( InterruptedException e ) 
+ + { 
+ + e . printStackTrace ( ) ; 
+ + } 
+ + 
+ + final State s = state ; 
+ + s . barrier = order . newBarrier ( ) ; 
+ + s . replacement = new State ( ) ; 
+ + s . barrier . issue ( ) ; 
+ + s . barrier . await ( ) ; 
+ + s . check ( ) ; 
+ + opCount + = s . totalCount ( ) ; 
+ + state = s . replacement ; 
+ + sched . schedule ( new Runnable ( ) 
+ + { 
+ + @ Override 
+ + public void run ( ) 
+ + { 
+ + s . check ( ) ; 
+ + } 
+ + } , 1 , TimeUnit . SECONDS ) ; 
+ + count + + ; 
+ + } 
+ + } 
+ + 
+ + class State 
+ + { 
+ + 
+ + volatile OpOrder . Barrier barrier ; 
+ + volatile State replacement ; 
+ + final NonBlockingHashMap < OpOrder . Group , AtomicInteger > count = new NonBlockingHashMap < > ( ) ; 
+ + int checkCount = - 1 ; 
+ + 
+ + boolean accept ( OpOrder . Group opGroup ) 
+ + { 
+ + if ( barrier ! = null & & ! barrier . isAfter ( opGroup ) ) 
+ + return false ; 
+ + AtomicInteger c ; 
+ + if ( null = = ( c = count . get ( opGroup ) ) ) 
+ + { 
+ + count . putIfAbsent ( opGroup , new AtomicInteger ( ) ) ; 
+ + c = count . get ( opGroup ) ; 
+ + } 
+ + c . incrementAndGet ( ) ; 
+ + return true ; 
+ + } 
+ + 
+ + int totalCount ( ) 
+ + { 
+ + int c = 0 ; 
+ + for ( AtomicInteger v : count . values ( ) ) 
+ + c + = v . intValue ( ) ; 
+ + return c ; 
+ + } 
+ + 
+ + void check ( ) 
+ + { 
+ + boolean delete ; 
+ + if ( checkCount > = 0 ) 
+ + { 
+ + if ( checkCount ! = totalCount ( ) ) 
+ + { 
+ + errors . incrementAndGet ( ) ; 
+ + logger . error ( " Received size changed after barrier finished : { } vs { } " , checkCount , totalCount ( ) ) ; 
+ + } 
+ + delete = true ; 
+ + } 
+ + else 
+ + { 
+ + checkCount = totalCount ( ) ; 
+ + delete = false ; 
+ + } 
+ + for ( Map . Entry < OpOrder . Group , AtomicInteger > e : count . entrySet ( ) ) 
+ + { 
+ + if ( e . getKey ( ) . compareTo ( barrier . getSyncPoint ( ) ) > 0 ) 
+ + { 
+ + errors . incrementAndGet ( ) ; 
+ + logger . error ( " Received an operation that was created after the barrier was issued . " ) ; 
+ + } 
+ + if ( TestOrdering . this . count . get ( e . getKey ( ) ) . intValue ( ) ! = e . getValue ( ) . intValue ( ) ) 
+ + { 
+ + errors . incrementAndGet ( ) ; 
+ + logger . error ( " Missing registered operations . { } vs { } " , TestOrdering . this . count . get ( e . getKey ( ) ) . intValue ( ) , e . getValue ( ) . intValue ( ) ) ; 
+ + } 
+ + if ( delete ) 
+ + TestOrdering . this . count . remove ( e . getKey ( ) ) ; 
+ + } 
+ + } 
+ + 
+ + } 
+ + 
+ + final NonBlockingHashMap < OpOrder . Group , AtomicInteger > count = new NonBlockingHashMap < > ( ) ; 
+ + 
+ + class Producer implements Runnable 
+ + { 
+ + public void run ( ) 
+ + { 
+ + while ( true ) 
+ + { 
+ + AtomicInteger c ; 
+ + try ( OpOrder . Group opGroup = order . start ( ) ) 
+ + { 
+ + if ( null = = ( c = count . get ( opGroup ) ) ) 
+ + { 
+ + count . putIfAbsent ( opGroup , new AtomicInteger ( ) ) ; 
+ + c = count . get ( opGroup ) ; 
+ + } 
+ + c . incrementAndGet ( ) ; 
+ + State s = state ; 
+ + while ( ! s . accept ( opGroup ) ) 
+ + s = s . replacement ; 
+ + } 
+ + } 
+ + } 
+ + } 
+ + 
+ + } 
+ + 
+ + @ Test 
+ + public void testOrdering ( ) throws InterruptedException 
+ + { 
+ + errors . set ( 0 ) ; 
+ + Thread . setDefaultUncaughtExceptionHandler ( handler ) ; 
+ + final ExecutorService exec = Executors . newCachedThreadPool ( new NamedThreadFactory ( " checker " ) ) ; 
+ + final ScheduledExecutorService checker = Executors . newScheduledThreadPool ( 1 , new NamedThreadFactory ( " checker " ) ) ; 
+ + for ( int i = 0 ; i < CONSUMERS ; i + + ) 
+ + new TestOrdering ( exec , checker ) ; 
+ + exec . shutdown ( ) ; 
+ + exec . awaitTermination ( ( long ) ( RUNTIME * 1 . 1 ) , TimeUnit . MILLISECONDS ) ; 
+ + assertTrue ( exec . isShutdown ( ) ) ; 
+ + assertTrue ( errors . get ( ) = = 0 ) ; 
+ + } 
+ + 
+ + 
+ + } 
+ diff - - git a / test / burn / org / apache / cassandra / concurrent / LongSharedExecutorPoolTest . java b / test / burn / org / apache / cassandra / concurrent / LongSharedExecutorPoolTest . java 
+ new file mode 100644 
+ index 0000000 . . fe464c7 
+ - - - / dev / null 
+ + + + b / test / burn / org / apache / cassandra / concurrent / LongSharedExecutorPoolTest . java 
+ @ @ - 0 , 0 + 1 , 226 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . concurrent ; 
+ + 
+ + import java . util . BitSet ; 
+ + import java . util . TreeSet ; 
+ + import java . util . concurrent . ExecutionException ; 
+ + import java . util . concurrent . ExecutorService ; 
+ + import java . util . concurrent . Future ; 
+ + import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . TimeoutException ; 
+ + import java . util . concurrent . locks . LockSupport ; 
+ + 
+ + import com . google . common . util . concurrent . Uninterruptibles ; 
+ + import org . apache . commons . math3 . distribution . WeibullDistribution ; 
+ + import org . junit . Test ; 
+ + 
+ + public class LongSharedExecutorPoolTest 
+ + { 
+ + 
+ + private static final class WaitTask implements Runnable 
+ + { 
+ + final long nanos ; 
+ + 
+ + private WaitTask ( long nanos ) 
+ + { 
+ + this . nanos = nanos ; 
+ + } 
+ + 
+ + public void run ( ) 
+ + { 
+ + LockSupport . parkNanos ( nanos ) ; 
+ + } 
+ + } 
+ + 
+ + private static final class Result implements Comparable < Result > 
+ + { 
+ + final Future < ? > future ; 
+ + final long forecastedCompletion ; 
+ + 
+ + private Result ( Future < ? > future , long forecastedCompletion ) 
+ + { 
+ + this . future = future ; 
+ + this . forecastedCompletion = forecastedCompletion ; 
+ + } 
+ + 
+ + public int compareTo ( Result that ) 
+ + { 
+ + int c = Long . compare ( this . forecastedCompletion , that . forecastedCompletion ) ; 
+ + if ( c ! = 0 ) 
+ + return c ; 
+ + c = Integer . compare ( this . hashCode ( ) , that . hashCode ( ) ) ; 
+ + if ( c ! = 0 ) 
+ + return c ; 
+ + return Integer . compare ( this . future . hashCode ( ) , that . future . hashCode ( ) ) ; 
+ + } 
+ + } 
+ + 
+ + private static final class Batch implements Comparable < Batch > 
+ + { 
+ + final TreeSet < Result > results ; 
+ + final long timeout ; 
+ + final int executorIndex ; 
+ + 
+ + private Batch ( TreeSet < Result > results , long timeout , int executorIndex ) 
+ + { 
+ + this . results = results ; 
+ + this . timeout = timeout ; 
+ + this . executorIndex = executorIndex ; 
+ + } 
+ + 
+ + public int compareTo ( Batch that ) 
+ + { 
+ + int c = Long . compare ( this . timeout , that . timeout ) ; 
+ + if ( c ! = 0 ) 
+ + return c ; 
+ + c = Integer . compare ( this . results . size ( ) , that . results . size ( ) ) ; 
+ + if ( c ! = 0 ) 
+ + return c ; 
+ + return Integer . compare ( this . hashCode ( ) , that . hashCode ( ) ) ; 
+ + } 
+ + } 
+ + 
+ + @ Test 
+ + public void testPromptnessOfExecution ( ) throws InterruptedException , ExecutionException 
+ + { 
+ + testPromptnessOfExecution ( TimeUnit . MINUTES . toNanos ( 2L ) , 0 . 5f ) ; 
+ + } 
+ + 
+ + private void testPromptnessOfExecution ( long intervalNanos , float loadIncrement ) throws InterruptedException , ExecutionException 
+ + { 
+ + final int executorCount = 4 ; 
+ + int threadCount = 8 ; 
+ + int maxQueued = 1024 ; 
+ + final WeibullDistribution workTime = new WeibullDistribution ( 3 , 200000 ) ; 
+ + final long minWorkTime = TimeUnit . MICROSECONDS . toNanos ( 1 ) ; 
+ + final long maxWorkTime = TimeUnit . MILLISECONDS . toNanos ( 1 ) ; 
+ + 
+ + final int [ ] threadCounts = new int [ executorCount ] ; 
+ + final WeibullDistribution [ ] workCount = new WeibullDistribution [ executorCount ] ; 
+ + final ExecutorService [ ] executors = new ExecutorService [ executorCount ] ; 
+ + for ( int i = 0 ; i < executors . length ; i + + ) 
+ + { 
+ + executors [ i ] = SharedExecutorPool . SHARED . newExecutor ( threadCount , maxQueued , " test " + i , " test " + i ) ; 
+ + threadCounts [ i ] = threadCount ; 
+ + workCount [ i ] = new WeibullDistribution ( 2 , maxQueued ) ; 
+ + threadCount * = 2 ; 
+ + maxQueued * = 2 ; 
+ + } 
+ + 
+ + long runs = 0 ; 
+ + long events = 0 ; 
+ + final TreeSet < Batch > pending = new TreeSet < > ( ) ; 
+ + final BitSet executorsWithWork = new BitSet ( executorCount ) ; 
+ + long until = 0 ; 
+ + / / basic idea is to go through different levels of load on the executor service ; initially is all small batches 
+ + / / ( mostly within max queue size ) of very short operations , moving to progressively larger batches 
+ + / / ( beyond max queued size ) , and longer operations 
+ + for ( float multiplier = 0f ; multiplier < 2 . 01f ; ) 
+ + { 
+ + if ( System . nanoTime ( ) > until ) 
+ + { 
+ + System . out . println ( String . format ( " Completed % . 0fK batches with % . 1fM events " , runs * 0 . 001f , events * 0 . 000001f ) ) ; 
+ + events = 0 ; 
+ + until = System . nanoTime ( ) + intervalNanos ; 
+ + multiplier + = loadIncrement ; 
+ + System . out . println ( String . format ( " Running for % ds with load multiplier % . 1f " , TimeUnit . NANOSECONDS . toSeconds ( intervalNanos ) , multiplier ) ) ; 
+ + } 
+ + 
+ + / / wait a random amount of time so we submit new tasks in various stages of 
+ + long timeout ; 
+ + if ( pending . isEmpty ( ) ) timeout = 0 ; 
+ + else if ( Math . random ( ) > 0 . 98 ) timeout = Long . MAX _ VALUE ; 
+ + else if ( pending . size ( ) = = executorCount ) timeout = pending . first ( ) . timeout ; 
+ + else timeout = ( long ) ( Math . random ( ) * pending . last ( ) . timeout ) ; 
+ + 
+ + while ( ! pending . isEmpty ( ) & & timeout > System . nanoTime ( ) ) 
+ + { 
+ + Batch first = pending . first ( ) ; 
+ + boolean complete = false ; 
+ + try 
+ + { 
+ + for ( Result result : first . results . descendingSet ( ) ) 
+ + result . future . get ( timeout - System . nanoTime ( ) , TimeUnit . NANOSECONDS ) ; 
+ + complete = true ; 
+ + } 
+ + catch ( TimeoutException e ) 
+ + { 
+ + } 
+ + if ( ! complete & & System . nanoTime ( ) > first . timeout ) 
+ + { 
+ + for ( Result result : first . results ) 
+ + if ( ! result . future . isDone ( ) ) 
+ + throw new AssertionError ( ) ; 
+ + complete = true ; 
+ + } 
+ + if ( complete ) 
+ + { 
+ + pending . pollFirst ( ) ; 
+ + executorsWithWork . clear ( first . executorIndex ) ; 
+ + } 
+ + } 
+ + 
+ + / / if we ' ve emptied the executors , give all our threads an opportunity to spin down 
+ + if ( timeout = = Long . MAX _ VALUE ) 
+ + Uninterruptibles . sleepUninterruptibly ( 10 , TimeUnit . MILLISECONDS ) ; 
+ + 
+ + / / submit a random batch to the first free executor service 
+ + int executorIndex = executorsWithWork . nextClearBit ( 0 ) ; 
+ + if ( executorIndex > = executorCount ) 
+ + continue ; 
+ + executorsWithWork . set ( executorIndex ) ; 
+ + ExecutorService executor = executors [ executorIndex ] ; 
+ + TreeSet < Result > results = new TreeSet < > ( ) ; 
+ + int count = ( int ) ( workCount [ executorIndex ] . sample ( ) * multiplier ) ; 
+ + long targetTotalElapsed = 0 ; 
+ + long start = System . nanoTime ( ) ; 
+ + long baseTime ; 
+ + if ( Math . random ( ) > 0 . 5 ) baseTime = 2 * ( long ) ( workTime . sample ( ) * multiplier ) ; 
+ + else baseTime = 0 ; 
+ + for ( int j = 0 ; j < count ; j + + ) 
+ + { 
+ + long time ; 
+ + if ( baseTime = = 0 ) time = ( long ) ( workTime . sample ( ) * multiplier ) ; 
+ + else time = ( long ) ( baseTime * Math . random ( ) ) ; 
+ + if ( time < minWorkTime ) 
+ + time = minWorkTime ; 
+ + if ( time > maxWorkTime ) 
+ + time = maxWorkTime ; 
+ + targetTotalElapsed + = time ; 
+ + Future < ? > future = executor . submit ( new WaitTask ( time ) ) ; 
+ + results . add ( new Result ( future , System . nanoTime ( ) + time ) ) ; 
+ + } 
+ + long end = start + ( long ) Math . ceil ( targetTotalElapsed / ( double ) threadCounts [ executorIndex ] ) 
+ + + TimeUnit . MILLISECONDS . toNanos ( 100L ) ; 
+ + long now = System . nanoTime ( ) ; 
+ + if ( runs + + > executorCount & & now > end ) 
+ + throw new AssertionError ( ) ; 
+ + events + = results . size ( ) ; 
+ + pending . add ( new Batch ( results , end , executorIndex ) ) ; 
+ + / / System . out . println ( String . format ( " Submitted batch to executor % d with % d items and % d permitted millis " , executorIndex , count , TimeUnit . NANOSECONDS . toMillis ( end - start ) ) ) ; 
+ + } 
+ + } 
+ + 
+ + public static void main ( String [ ] args ) throws InterruptedException , ExecutionException 
+ + { 
+ + / / do longer test 
+ + new LongSharedExecutorPoolTest ( ) . testPromptnessOfExecution ( TimeUnit . MINUTES . toNanos ( 10L ) , 0 . 1f ) ; 
+ + } 
+ + 
+ + } 
+ diff - - git a / test / burn / org / apache / cassandra / utils / LongBTreeTest . java b / test / burn / org / apache / cassandra / utils / LongBTreeTest . java 
+ new file mode 100644 
+ index 0000000 . . 9641930 
+ - - - / dev / null 
+ + + + b / test / burn / org / apache / cassandra / utils / LongBTreeTest . java 
+ @ @ - 0 , 0 + 1 , 502 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , 
+ + * software distributed under the License is distributed on an 
+ + * " AS IS " BASIS , WITHOUT WARRANTIES OR CONDITIONS OF ANY 
+ + * KIND , either express or implied . See the License for the 
+ + * specific language governing permissions and limitations 
+ + * under the License . 
+ + * / 
+ + package org . apache . cassandra . utils ; 
+ + 
+ + import java . util . ArrayList ; 
+ + import java . util . Arrays ; 
+ + import java . util . Comparator ; 
+ + import java . util . Iterator ; 
+ + import java . util . List ; 
+ + import java . util . NavigableMap ; 
+ + import java . util . NavigableSet ; 
+ + import java . util . Random ; 
+ + import java . util . TreeMap ; 
+ + import java . util . TreeSet ; 
+ + import java . util . concurrent . Callable ; 
+ + import java . util . concurrent . CountDownLatch ; 
+ + import java . util . concurrent . ExecutionException ; 
+ + import java . util . concurrent . ExecutorService ; 
+ + import java . util . concurrent . Executors ; 
+ + import java . util . concurrent . ThreadLocalRandom ; 
+ + import java . util . concurrent . TimeUnit ; 
+ + import java . util . concurrent . atomic . AtomicLong ; 
+ + 
+ + import com . google . common . base . Function ; 
+ + import com . google . common . base . Predicate ; 
+ + import com . google . common . collect . Iterables ; 
+ + import com . google . common . util . concurrent . Futures ; 
+ + import com . google . common . util . concurrent . ListenableFuture ; 
+ + import com . google . common . util . concurrent . ListenableFutureTask ; 
+ + import org . junit . Assert ; 
+ + import org . junit . Test ; 
+ + 
+ + 
+ + import com . codahale . metrics . MetricRegistry ; 
+ + import com . codahale . metrics . Snapshot ; 
+ + import com . codahale . metrics . Timer ; 
+ + import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ + import org . apache . cassandra . utils . btree . BTree ; 
+ + import org . apache . cassandra . utils . btree . BTreeSearchIterator ; 
+ + import org . apache . cassandra . utils . btree . BTreeSet ; 
+ + import org . apache . cassandra . utils . btree . UpdateFunction ; 
+ + 
+ + / / TODO : should probably lower fan - factor for tests to make them more intensive 
+ + public class LongBTreeTest 
+ + { 
+ + 
+ + private static final MetricRegistry metrics = new MetricRegistry ( ) ; 
+ + private static final Timer BTREE _ TIMER = metrics . timer ( MetricRegistry . name ( BTree . class , " BTREE " ) ) ; 
+ + private static final Timer TREE _ TIMER = metrics . timer ( MetricRegistry . name ( BTree . class , " TREE " ) ) ; 
+ + private static final ExecutorService MODIFY = Executors . newFixedThreadPool ( Runtime . getRuntime ( ) . availableProcessors ( ) , new NamedThreadFactory ( " MODIFY " ) ) ; 
+ + private static final ExecutorService COMPARE = Executors . newFixedThreadPool ( Runtime . getRuntime ( ) . availableProcessors ( ) , new NamedThreadFactory ( " COMPARE " ) ) ; 
+ + private static final RandomAbort < Integer > SPORADIC _ ABORT = new RandomAbort < > ( new Random ( ) , 0 . 0001f ) ; 
+ + 
+ + static 
+ + { 
+ + System . setProperty ( " cassandra . btree . fanfactor " , " 4 " ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testOversizedMiddleInsert ( ) 
+ + { 
+ + TreeSet < Integer > canon = new TreeSet < > ( ) ; 
+ + for ( int i = 0 ; i < 10000000 ; i + + ) 
+ + canon . add ( i ) ; 
+ + Object [ ] btree = BTree . build ( Arrays . asList ( Integer . MIN _ VALUE , Integer . MAX _ VALUE ) , ICMP , true , null ) ; 
+ + btree = BTree . update ( btree , ICMP , canon , true ) ; 
+ + canon . add ( Integer . MIN _ VALUE ) ; 
+ + canon . add ( Integer . MAX _ VALUE ) ; 
+ + Assert . assertTrue ( BTree . isWellFormed ( btree , ICMP ) ) ; 
+ + testEqual ( " Oversize " , BTree . < Integer > slice ( btree , true ) , canon . iterator ( ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testIndividualInsertsSmallOverlappingRange ( ) throws ExecutionException , InterruptedException 
+ + { 
+ + testInsertions ( 10000000 , 50 , 1 , 1 , true ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testBatchesSmallOverlappingRange ( ) throws ExecutionException , InterruptedException 
+ + { 
+ + testInsertions ( 10000000 , 50 , 1 , 5 , true ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testIndividualInsertsMediumSparseRange ( ) throws ExecutionException , InterruptedException 
+ + { 
+ + testInsertions ( 10000000 , 500 , 10 , 1 , true ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testBatchesMediumSparseRange ( ) throws ExecutionException , InterruptedException 
+ + { 
+ + testInsertions ( 10000000 , 500 , 10 , 10 , true ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testLargeBatchesLargeRange ( ) throws ExecutionException , InterruptedException 
+ + { 
+ + testInsertions ( 100000000 , 5000 , 3 , 100 , true ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testSlicingSmallRandomTrees ( ) throws ExecutionException , InterruptedException 
+ + { 
+ + testInsertions ( 10000 , 50 , 10 , 10 , false ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testSearchIterator ( ) throws InterruptedException 
+ + { 
+ + int threads = Runtime . getRuntime ( ) . availableProcessors ( ) ; 
+ + final CountDownLatch latch = new CountDownLatch ( threads ) ; 
+ + final AtomicLong errors = new AtomicLong ( ) ; 
+ + final AtomicLong count = new AtomicLong ( ) ; 
+ + final int perThreadTrees = 100 ; 
+ + final int perTreeSelections = 100 ; 
+ + final long totalCount = threads * perThreadTrees * perTreeSelections ; 
+ + for ( int t = 0 ; t < threads ; t + + ) 
+ + { 
+ + MODIFY . execute ( new Runnable ( ) 
+ + { 
+ + public void run ( ) 
+ + { 
+ + ThreadLocalRandom random = ThreadLocalRandom . current ( ) ; 
+ + for ( int i = 0 ; i < perThreadTrees ; i + + ) 
+ + { 
+ + Object [ ] tree = randomTree ( 10000 , random ) ; 
+ + for ( int j = 0 ; j < perTreeSelections ; j + + ) 
+ + { 
+ + BTreeSearchIterator < Integer , Integer , Integer > searchIterator = new BTreeSearchIterator < > ( tree , ICMP ) ; 
+ + for ( Integer key : randomSelection ( tree , random ) ) 
+ + if ( key ! = searchIterator . next ( key ) ) 
+ + errors . incrementAndGet ( ) ; 
+ + searchIterator = new BTreeSearchIterator < Integer , Integer , Integer > ( tree , ICMP ) ; 
+ + for ( Integer key : randomMix ( tree , random ) ) 
+ + if ( key ! = searchIterator . next ( key ) ) 
+ + if ( BTree . find ( tree , ICMP , key ) = = key ) 
+ + errors . incrementAndGet ( ) ; 
+ + count . incrementAndGet ( ) ; 
+ + } 
+ + } 
+ + latch . countDown ( ) ; 
+ + } 
+ + } ) ; 
+ + } 
+ + while ( latch . getCount ( ) > 0 ) 
+ + { 
+ + latch . await ( 10L , TimeUnit . SECONDS ) ; 
+ + System . out . println ( String . format ( " % . 0f % % complete % s " , 100 * count . get ( ) / ( double ) totalCount , errors . get ( ) > 0 ? ( " Errors : " + errors . get ( ) ) : " " ) ) ; 
+ + assert errors . get ( ) = = 0 ; 
+ + } 
+ + } 
+ + 
+ + private static void testInsertions ( int totalCount , int perTestCount , int testKeyRatio , int modificationBatchSize , boolean quickEquality ) throws ExecutionException , InterruptedException 
+ + { 
+ + int batchesPerTest = perTestCount / modificationBatchSize ; 
+ + int maximumRunLength = 100 ; 
+ + int testKeyRange = perTestCount * testKeyRatio ; 
+ + int tests = totalCount / perTestCount ; 
+ + System . out . println ( String . format ( " Performing % d tests of % d operations , with % . 2f max size / key - range ratio in batches of ~ % d ops " , 
+ + tests , perTestCount , 1 / ( float ) testKeyRatio , modificationBatchSize ) ) ; 
+ + 
+ + / / if we ' re not doing quick - equality , we can spam with garbage for all the checks we perform , so we ' ll split the work into smaller chunks 
+ + int chunkSize = quickEquality ? tests : ( int ) ( 100000 / Math . pow ( perTestCount , 2 ) ) ; 
+ + for ( int chunk = 0 ; chunk < tests ; chunk + = chunkSize ) 
+ + { 
+ + final List < ListenableFutureTask < List < ListenableFuture < ? > > > > outer = new ArrayList < > ( ) ; 
+ + for ( int i = 0 ; i < chunkSize ; i + + ) 
+ + { 
+ + outer . add ( doOneTestInsertions ( testKeyRange , maximumRunLength , modificationBatchSize , batchesPerTest , quickEquality ) ) ; 
+ + } 
+ + 
+ + final List < ListenableFuture < ? > > inner = new ArrayList < > ( ) ; 
+ + int complete = 0 ; 
+ + int reportInterval = totalCount / 100 ; 
+ + int lastReportAt = 0 ; 
+ + for ( ListenableFutureTask < List < ListenableFuture < ? > > > f : outer ) 
+ + { 
+ + inner . addAll ( f . get ( ) ) ; 
+ + complete + = perTestCount ; 
+ + if ( complete - lastReportAt > = reportInterval ) 
+ + { 
+ + System . out . println ( String . format ( " Completed % d of % d operations " , ( chunk * perTestCount ) + complete , totalCount ) ) ; 
+ + lastReportAt = complete ; 
+ + } 
+ + } 
+ + Futures . allAsList ( inner ) . get ( ) ; 
+ + } 
+ + Snapshot snap = BTREE _ TIMER . getSnapshot ( ) ; 
+ + System . out . println ( String . format ( " btree : % . 2fns , % . 2fns , % . 2fns " , snap . getMedian ( ) , snap . get95thPercentile ( ) , snap . get999thPercentile ( ) ) ) ; 
+ + snap = TREE _ TIMER . getSnapshot ( ) ; 
+ + System . out . println ( String . format ( " snaptree : % . 2fns , % . 2fns , % . 2fns " , snap . getMedian ( ) , snap . get95thPercentile ( ) , snap . get999thPercentile ( ) ) ) ; 
+ + System . out . println ( " Done " ) ; 
+ + } 
+ + 
+ + private static ListenableFutureTask < List < ListenableFuture < ? > > > doOneTestInsertions ( final int upperBound , final int maxRunLength , final int averageModsPerIteration , final int iterations , final boolean quickEquality ) 
+ + { 
+ + ListenableFutureTask < List < ListenableFuture < ? > > > f = ListenableFutureTask . create ( new Callable < List < ListenableFuture < ? > > > ( ) 
+ + { 
+ + @ Override 
+ + public List < ListenableFuture < ? > > call ( ) 
+ + { 
+ + final List < ListenableFuture < ? > > r = new ArrayList < > ( ) ; 
+ + NavigableMap < Integer , Integer > canon = new TreeMap < > ( ) ; 
+ + Object [ ] btree = BTree . empty ( ) ; 
+ + final TreeMap < Integer , Integer > buffer = new TreeMap < > ( ) ; 
+ + final Random rnd = new Random ( ) ; 
+ + for ( int i = 0 ; i < iterations ; i + + ) 
+ + { 
+ + buffer . clear ( ) ; 
+ + int mods = ( averageModsPerIteration > > 1 ) + 1 + rnd . nextInt ( averageModsPerIteration ) ; 
+ + while ( mods > 0 ) 
+ + { 
+ + int v = rnd . nextInt ( upperBound ) ; 
+ + int rc = Math . max ( 0 , Math . min ( mods , maxRunLength ) - 1 ) ; 
+ + int c = 1 + ( rc < = 0 ? 0 : rnd . nextInt ( rc ) ) ; 
+ + for ( int j = 0 ; j < c ; j + + ) 
+ + { 
+ + buffer . put ( v , v ) ; 
+ + v + + ; 
+ + } 
+ + mods - = c ; 
+ + } 
+ + Timer . Context ctxt ; 
+ + ctxt = TREE _ TIMER . time ( ) ; 
+ + canon . putAll ( buffer ) ; 
+ + ctxt . stop ( ) ; 
+ + ctxt = BTREE _ TIMER . time ( ) ; 
+ + Object [ ] next = null ; 
+ + while ( next = = null ) 
+ + next = BTree . update ( btree , ICMP , buffer . keySet ( ) , true , SPORADIC _ ABORT ) ; 
+ + btree = next ; 
+ + ctxt . stop ( ) ; 
+ + 
+ + if ( ! BTree . isWellFormed ( btree , ICMP ) ) 
+ + { 
+ + System . out . println ( " ERROR : Not well formed " ) ; 
+ + throw new AssertionError ( " Not well formed ! " ) ; 
+ + } 
+ + if ( quickEquality ) 
+ + testEqual ( " " , BTree . < Integer > slice ( btree , true ) , canon . keySet ( ) . iterator ( ) ) ; 
+ + else 
+ + r . addAll ( testAllSlices ( " RND " , btree , new TreeSet < > ( canon . keySet ( ) ) ) ) ; 
+ + } 
+ + return r ; 
+ + } 
+ + } ) ; 
+ + MODIFY . execute ( f ) ; 
+ + return f ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testSlicingAllSmallTrees ( ) throws ExecutionException , InterruptedException 
+ + { 
+ + Object [ ] cur = BTree . empty ( ) ; 
+ + TreeSet < Integer > canon = new TreeSet < > ( ) ; 
+ + / / we set FAN _ FACTOR to 4 , so 128 items is four levels deep , three fully populated 
+ + for ( int i = 0 ; i < 128 ; i + + ) 
+ + { 
+ + String id = String . format ( " [ 0 . . % d ) " , canon . size ( ) ) ; 
+ + System . out . println ( " Testing " + id ) ; 
+ + Futures . allAsList ( testAllSlices ( id , cur , canon ) ) . get ( ) ; 
+ + Object [ ] next = null ; 
+ + while ( next = = null ) 
+ + next = BTree . update ( cur , ICMP , Arrays . asList ( i ) , true , SPORADIC _ ABORT ) ; 
+ + cur = next ; 
+ + canon . add ( i ) ; 
+ + } 
+ + } 
+ + 
+ + static final Comparator < Integer > ICMP = new Comparator < Integer > ( ) 
+ + { 
+ + @ Override 
+ + public int compare ( Integer o1 , Integer o2 ) 
+ + { 
+ + return Integer . compare ( o1 , o2 ) ; 
+ + } 
+ + } ; 
+ + 
+ + private static List < ListenableFuture < ? > > testAllSlices ( String id , Object [ ] btree , NavigableSet < Integer > canon ) 
+ + { 
+ + List < ListenableFuture < ? > > waitFor = new ArrayList < > ( ) ; 
+ + testAllSlices ( id + " ASC " , new BTreeSet < > ( btree , ICMP ) , canon , true , waitFor ) ; 
+ + testAllSlices ( id + " DSC " , new BTreeSet < > ( btree , ICMP ) . descendingSet ( ) , canon . descendingSet ( ) , false , waitFor ) ; 
+ + return waitFor ; 
+ + } 
+ + 
+ + private static void testAllSlices ( String id , NavigableSet < Integer > btree , NavigableSet < Integer > canon , boolean ascending , List < ListenableFuture < ? > > results ) 
+ + { 
+ + testOneSlice ( id , btree , canon , results ) ; 
+ + for ( Integer lb : range ( canon . size ( ) , Integer . MIN _ VALUE , ascending ) ) 
+ + { 
+ + / / test head / tail sets 
+ + testOneSlice ( String . format ( " % s - > [ % d . . ) " , id , lb ) , btree . headSet ( lb , true ) , canon . headSet ( lb , true ) , results ) ; 
+ + testOneSlice ( String . format ( " % s - > ( % d . . ) " , id , lb ) , btree . headSet ( lb , false ) , canon . headSet ( lb , false ) , results ) ; 
+ + testOneSlice ( String . format ( " % s - > ( . . % d ] " , id , lb ) , btree . tailSet ( lb , true ) , canon . tailSet ( lb , true ) , results ) ; 
+ + testOneSlice ( String . format ( " % s - > ( . . % d ] " , id , lb ) , btree . tailSet ( lb , false ) , canon . tailSet ( lb , false ) , results ) ; 
+ + for ( Integer ub : range ( canon . size ( ) , lb , ascending ) ) 
+ + { 
+ + / / test subsets 
+ + testOneSlice ( String . format ( " % s - > [ % d . . % d ] " , id , lb , ub ) , btree . subSet ( lb , true , ub , true ) , canon . subSet ( lb , true , ub , true ) , results ) ; 
+ + testOneSlice ( String . format ( " % s - > ( % d . . % d ] " , id , lb , ub ) , btree . subSet ( lb , false , ub , true ) , canon . subSet ( lb , false , ub , true ) , results ) ; 
+ + testOneSlice ( String . format ( " % s - > [ % d . . % d ) " , id , lb , ub ) , btree . subSet ( lb , true , ub , false ) , canon . subSet ( lb , true , ub , false ) , results ) ; 
+ + testOneSlice ( String . format ( " % s - > ( % d . . % d ) " , id , lb , ub ) , btree . subSet ( lb , false , ub , false ) , canon . subSet ( lb , false , ub , false ) , results ) ; 
+ + } 
+ + } 
+ + } 
+ + 
+ + private static void testOneSlice ( final String id , final NavigableSet < Integer > test , final NavigableSet < Integer > canon , List < ListenableFuture < ? > > results ) 
+ + { 
+ + ListenableFutureTask < ? > f = ListenableFutureTask . create ( new Runnable ( ) 
+ + { 
+ + 
+ + @ Override 
+ + public void run ( ) 
+ + { 
+ + test ( id + " Count " , test . size ( ) , canon . size ( ) ) ; 
+ + testEqual ( id , test . iterator ( ) , canon . iterator ( ) ) ; 
+ + testEqual ( id + " - > DSCI " , test . descendingIterator ( ) , canon . descendingIterator ( ) ) ; 
+ + testEqual ( id + " - > DSCS " , test . descendingSet ( ) . iterator ( ) , canon . descendingSet ( ) . iterator ( ) ) ; 
+ + testEqual ( id + " - > DSCS - > DSCI " , test . descendingSet ( ) . descendingIterator ( ) , canon . descendingSet ( ) . descendingIterator ( ) ) ; 
+ + } 
+ + } , null ) ; 
+ + results . add ( f ) ; 
+ + COMPARE . execute ( f ) ; 
+ + } 
+ + 
+ + private static void test ( String id , int test , int expect ) 
+ + { 
+ + if ( test ! = expect ) 
+ + { 
+ + System . out . println ( String . format ( " % s : Expected % d , Got % d " , id , expect , test ) ) ; 
+ + } 
+ + } 
+ + 
+ + private static < V > void testEqual ( String id , Iterator < V > btree , Iterator < V > canon ) 
+ + { 
+ + boolean equal = true ; 
+ + while ( btree . hasNext ( ) & & canon . hasNext ( ) ) 
+ + { 
+ + Object i = btree . next ( ) ; 
+ + Object j = canon . next ( ) ; 
+ + if ( ! i . equals ( j ) ) 
+ + { 
+ + System . out . println ( String . format ( " % s : Expected % d , Got % d " , id , j , i ) ) ; 
+ + equal = false ; 
+ + } 
+ + } 
+ + while ( btree . hasNext ( ) ) 
+ + { 
+ + System . out . println ( String . format ( " % s : Expected < Nil > , Got % d " , id , btree . next ( ) ) ) ; 
+ + equal = false ; 
+ + } 
+ + while ( canon . hasNext ( ) ) 
+ + { 
+ + System . out . println ( String . format ( " % s : Expected % d , Got Nil " , id , canon . next ( ) ) ) ; 
+ + equal = false ; 
+ + } 
+ + if ( ! equal ) 
+ + throw new AssertionError ( " Not equal " ) ; 
+ + } 
+ + 
+ + / / should only be called on sets that range from 0 - > N or N - > 0 
+ + private static final Iterable < Integer > range ( final int size , final int from , final boolean ascending ) 
+ + { 
+ + return new Iterable < Integer > ( ) 
+ + { 
+ + int cur ; 
+ + int delta ; 
+ + int end ; 
+ + { 
+ + if ( ascending ) 
+ + { 
+ + end = size + 1 ; 
+ + cur = from = = Integer . MIN _ VALUE ? - 1 : from ; 
+ + delta = 1 ; 
+ + } 
+ + else 
+ + { 
+ + end = - 2 ; 
+ + cur = from = = Integer . MIN _ VALUE ? size : from ; 
+ + delta = - 1 ; 
+ + } 
+ + } 
+ + @ Override 
+ + public Iterator < Integer > iterator ( ) 
+ + { 
+ + return new Iterator < Integer > ( ) 
+ + { 
+ + @ Override 
+ + public boolean hasNext ( ) 
+ + { 
+ + return cur ! = end ; 
+ + } 
+ + 
+ + @ Override 
+ + public Integer next ( ) 
+ + { 
+ + Integer r = cur ; 
+ + cur + = delta ; 
+ + return r ; 
+ + } 
+ + 
+ + @ Override 
+ + public void remove ( ) 
+ + { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + } ; 
+ + } 
+ + } ; 
+ + } 
+ + 
+ + private static Object [ ] randomTree ( int maxSize , Random random ) 
+ + { 
+ + TreeSet < Integer > build = new TreeSet < > ( ) ; 
+ + int size = random . nextInt ( maxSize ) ; 
+ + for ( int i = 0 ; i < size ; i + + ) 
+ + { 
+ + build . add ( random . nextInt ( ) ) ; 
+ + } 
+ + return BTree . build ( build , ICMP , true , UpdateFunction . NoOp . < Integer > instance ( ) ) ; 
+ + } 
+ + 
+ + private static Iterable < Integer > randomSelection ( Object [ ] iter , final Random rnd ) 
+ + { 
+ + final float proportion = rnd . nextFloat ( ) ; 
+ + return Iterables . filter ( new BTreeSet < > ( iter , ICMP ) , new Predicate < Integer > ( ) 
+ + { 
+ + public boolean apply ( Integer integer ) 
+ + { 
+ + return rnd . nextFloat ( ) < proportion ; 
+ + } 
+ + } ) ; 
+ + } 
+ + 
+ + private static Iterable < Integer > randomMix ( Object [ ] iter , final Random rnd ) 
+ + { 
+ + final float proportion = rnd . nextFloat ( ) ; 
+ + return Iterables . transform ( new BTreeSet < > ( iter , ICMP ) , new Function < Integer , Integer > ( ) 
+ + { 
+ + long last = Integer . MIN _ VALUE ; 
+ + 
+ + public Integer apply ( Integer v ) 
+ + { 
+ + long last = this . last ; 
+ + this . last = v ; 
+ + if ( rnd . nextFloat ( ) < proportion ) 
+ + return v ; 
+ + return ( int ) ( ( v - last ) / 2 ) ; 
+ + } 
+ + } ) ; 
+ + } 
+ + 
+ + private static final class RandomAbort < V > implements UpdateFunction < V > 
+ + { 
+ + final Random rnd ; 
+ + final float chance ; 
+ + private RandomAbort ( Random rnd , float chance ) 
+ + { 
+ + this . rnd = rnd ; 
+ + this . chance = chance ; 
+ + } 
+ + 
+ + public V apply ( V replacing , V update ) 
+ + { 
+ + return update ; 
+ + } 
+ + 
+ + public boolean abortEarly ( ) 
+ + { 
+ + return rnd . nextFloat ( ) < chance ; 
+ + } 
+ + 
+ + public void allocated ( long heapSize ) 
+ + { 
+ + 
+ + } 
+ + 
+ + public V apply ( V v ) 
+ + { 
+ + return v ; 
+ + } 
+ + } 
+ + }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

@@ -1,0 +1,836 @@
+BLEU SCORE: 0.11156508007421491
+
+TEST MSG: Add DateTieredCompactionStrategy
+GENERATED MSG: merge from 2 . 0
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 158a48b . . cd4b6bb 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 2 , 6 + 2 , 7 @ @ <nl> * Fix hint replay with many accumulated expired hints ( CASSANDRA - 6998 ) <nl> * Fix duplicate results in DISTINCT queries on static columns with query <nl> paging ( CASSANDRA - 8108 ) <nl> + * Add DateTieredCompactionStrategy ( CASSANDRA - 6602 ) <nl> * Properly validate ascii and utf8 string literals in CQL queries ( CASSANDRA - 8101 ) <nl> * ( cqlsh ) Fix autocompletion for alter keyspace ( CASSANDRA - 8021 ) <nl> * Create backup directories for commitlog archiving during startup ( CASSANDRA - 8111 ) <nl> diff - - git a / NEWS . txt b / NEWS . txt <nl> index 7fa8be9 . . 102a87b 100644 <nl> - - - a / NEWS . txt <nl> + + + b / NEWS . txt <nl> @ @ - 13 , 6 + 13 , 14 @ @ restore snapshots created with the previous major version using the <nl> ' sstableloader ' tool . You can upgrade the file format of your snapshots <nl> using the provided ' sstableupgrade ' tool . <nl> <nl> + 2 . 0 . 11 <nl> + = = = = = = <nl> + New features <nl> + - - - - - - - - - - - - <nl> + - DateTieredCompactionStrategy added , optimized for time series data and groups <nl> + data that is written closely in time ( CASSANDRA - 6602 for details ) . Consider <nl> + this experimental for now . <nl> + <nl> 2 . 0 . 10 <nl> = = = = = = <nl> New features <nl> diff - - git a / pylib / cqlshlib / cql3handling . py b / pylib / cqlshlib / cql3handling . py <nl> index c08088a . . 0b7863c 100644 <nl> - - - a / pylib / cqlshlib / cql3handling . py <nl> + + + b / pylib / cqlshlib / cql3handling . py <nl> @ @ - 479 , 6 + 479 , 10 @ @ def cf _ prop _ val _ mapkey _ completer ( ctxt , cass ) : <nl> opts . add ( ' cold _ reads _ to _ omit ' ) <nl> elif csc = = ' LeveledCompactionStrategy ' : <nl> opts . add ( ' sstable _ size _ in _ mb ' ) <nl> + elif csc = = ' DateTieredCompactionStrategy ' : <nl> + opts . add ( ' base _ time _ seconds ' ) <nl> + opts . add ( ' max _ sstable _ age _ days ' ) <nl> + opts . add ( ' timestamp _ resolution ' ) <nl> return map ( escape _ value , opts ) <nl> return ( ) <nl> <nl> diff - - git a / pylib / cqlshlib / cqlhandling . py b / pylib / cqlshlib / cqlhandling . py <nl> index 86abf02 . . 0d54630 100644 <nl> - - - a / pylib / cqlshlib / cqlhandling . py <nl> + + + b / pylib / cqlshlib / cqlhandling . py <nl> @ @ - 35 , 7 + 35 , 8 @ @ class CqlParsingRuleSet ( pylexotron . ParsingRuleSet ) : <nl> <nl> available _ compaction _ classes = ( <nl> ' LeveledCompactionStrategy ' , <nl> - ' SizeTieredCompactionStrategy ' <nl> + ' SizeTieredCompactionStrategy ' , <nl> + ' DateTieredCompactionStrategy ' <nl> ) <nl> <nl> replication _ strategies = ( <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java <nl> new file mode 100644 <nl> index 0000000 . . 9c708db <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java <nl> @ @ - 0 , 0 + 1 , 374 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . db . compaction ; <nl> + <nl> + import java . util . * ; <nl> + <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> + import com . google . common . base . Predicate ; <nl> + import com . google . common . collect . * ; <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> + <nl> + import org . apache . cassandra . cql3 . statements . CFPropDefs ; <nl> + import org . apache . cassandra . db . ColumnFamilyStore ; <nl> + import org . apache . cassandra . exceptions . ConfigurationException ; <nl> + import org . apache . cassandra . io . sstable . SSTableReader ; <nl> + import org . apache . cassandra . utils . Pair ; <nl> + <nl> + public class DateTieredCompactionStrategy extends AbstractCompactionStrategy <nl> + { <nl> + private static final Logger logger = LoggerFactory . getLogger ( DateTieredCompactionStrategy . class ) ; <nl> + <nl> + protected DateTieredCompactionStrategyOptions options ; <nl> + protected volatile int estimatedRemainingTasks ; <nl> + <nl> + public DateTieredCompactionStrategy ( ColumnFamilyStore cfs , Map < String , String > options ) <nl> + { <nl> + super ( cfs , options ) ; <nl> + this . estimatedRemainingTasks = 0 ; <nl> + this . options = new DateTieredCompactionStrategyOptions ( options ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public synchronized AbstractCompactionTask getNextBackgroundTask ( int gcBefore ) <nl> + { <nl> + if ( ! isEnabled ( ) ) <nl> + return null ; <nl> + <nl> + while ( true ) <nl> + { <nl> + List < SSTableReader > latestBucket = getNextBackgroundSStables ( gcBefore ) ; <nl> + <nl> + if ( latestBucket . isEmpty ( ) ) <nl> + return null ; <nl> + <nl> + if ( cfs . getDataTracker ( ) . markCompacting ( latestBucket ) ) <nl> + return new CompactionTask ( cfs , latestBucket , gcBefore ) ; <nl> + } <nl> + } <nl> + <nl> + / * * <nl> + * <nl> + * @ param gcBefore <nl> + * @ return <nl> + * / <nl> + private List < SSTableReader > getNextBackgroundSStables ( final int gcBefore ) <nl> + { <nl> + if ( ! isEnabled ( ) | | cfs . getSSTables ( ) . isEmpty ( ) ) <nl> + return Collections . emptyList ( ) ; <nl> + <nl> + int base = cfs . getMinimumCompactionThreshold ( ) ; <nl> + long now = getNow ( ) ; <nl> + <nl> + Iterable < SSTableReader > candidates = filterSuspectSSTables ( cfs . getUncompactingSSTables ( ) ) ; <nl> + <nl> + List < SSTableReader > mostInteresting = getCompactionCandidates ( candidates , now , base ) ; <nl> + if ( mostInteresting ! = null ) <nl> + return mostInteresting ; <nl> + <nl> + / / if there is no sstable to compact in standard way , try compacting single sstable whose droppable tombstone <nl> + / / ratio is greater than threshold . <nl> + List < SSTableReader > sstablesWithTombstones = Lists . newArrayList ( ) ; <nl> + for ( SSTableReader sstable : candidates ) <nl> + { <nl> + if ( worthDroppingTombstones ( sstable , gcBefore ) ) <nl> + sstablesWithTombstones . add ( sstable ) ; <nl> + } <nl> + if ( sstablesWithTombstones . isEmpty ( ) ) <nl> + return Collections . emptyList ( ) ; <nl> + <nl> + return Collections . singletonList ( Collections . min ( sstablesWithTombstones , new SSTableReader . SizeComparator ( ) ) ) ; <nl> + } <nl> + <nl> + private List < SSTableReader > getCompactionCandidates ( Iterable < SSTableReader > candidateSSTables , long now , int base ) <nl> + { <nl> + Iterable < SSTableReader > candidates = filterOldSSTables ( Lists . newArrayList ( candidateSSTables ) , options . maxSSTableAge , now ) ; <nl> + <nl> + List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndMinTimestampPairs ( candidates ) , options . baseTime , base , now ) ; <nl> + logger . debug ( " Compaction buckets are { } " , buckets ) ; <nl> + updateEstimatedCompactionsByTasks ( buckets ) ; <nl> + List < SSTableReader > mostInteresting = newestBucket ( buckets , cfs . getMinimumCompactionThreshold ( ) , cfs . getMaximumCompactionThreshold ( ) ) ; <nl> + if ( ! mostInteresting . isEmpty ( ) ) <nl> + return mostInteresting ; <nl> + return null ; <nl> + } <nl> + <nl> + / * * <nl> + * Gets the timestamp that DateTieredCompactionStrategy considers to be the " current time " . <nl> + * @ return the maximum timestamp across all SSTables . <nl> + * @ throws java . util . NoSuchElementException if there are no SSTables . <nl> + * / <nl> + private long getNow ( ) <nl> + { <nl> + return Collections . max ( cfs . getSSTables ( ) , new Comparator < SSTableReader > ( ) <nl> + { <nl> + public int compare ( SSTableReader o1 , SSTableReader o2 ) <nl> + { <nl> + return Long . compare ( o1 . getMaxTimestamp ( ) , o2 . getMaxTimestamp ( ) ) ; <nl> + } <nl> + } ) . getMaxTimestamp ( ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Removes all sstables with max timestamp older than maxSSTableAge . <nl> + * @ param sstables all sstables to consider <nl> + * @ param maxSSTableAge the age in milliseconds when an SSTable stops participating in compactions <nl> + * @ param now current time . SSTables with max timestamp less than ( now - maxSSTableAge ) are filtered . <nl> + * @ return a list of sstables with the oldest sstables excluded <nl> + * / <nl> + @ VisibleForTesting <nl> + static Iterable < SSTableReader > filterOldSSTables ( List < SSTableReader > sstables , long maxSSTableAge , long now ) <nl> + { <nl> + if ( maxSSTableAge = = 0 ) <nl> + return sstables ; <nl> + final long cutoff = now - maxSSTableAge ; <nl> + return Iterables . filter ( sstables , new Predicate < SSTableReader > ( ) <nl> + { <nl> + @ Override <nl> + public boolean apply ( SSTableReader sstable ) <nl> + { <nl> + return sstable . getMaxTimestamp ( ) > = cutoff ; <nl> + } <nl> + } ) ; <nl> + } <nl> + <nl> + / * * <nl> + * <nl> + * @ param sstables <nl> + * @ return <nl> + * / <nl> + public static List < Pair < SSTableReader , Long > > createSSTableAndMinTimestampPairs ( Iterable < SSTableReader > sstables ) <nl> + { <nl> + List < Pair < SSTableReader , Long > > sstableMinTimestampPairs = Lists . newArrayListWithCapacity ( Iterables . size ( sstables ) ) ; <nl> + for ( SSTableReader sstable : sstables ) <nl> + sstableMinTimestampPairs . add ( Pair . create ( sstable , sstable . getMinTimestamp ( ) ) ) ; <nl> + return sstableMinTimestampPairs ; <nl> + } <nl> + <nl> + <nl> + / * * <nl> + * A target time span used for bucketing SSTables based on timestamps . <nl> + * / <nl> + private static class Target <nl> + { <nl> + / / How big a range of timestamps fit inside the target . <nl> + public final long size ; <nl> + / / A timestamp t hits the target iff t / size = = divPosition . <nl> + public final long divPosition ; <nl> + <nl> + public Target ( long size , long divPosition ) <nl> + { <nl> + this . size = size ; <nl> + this . divPosition = divPosition ; <nl> + } <nl> + <nl> + / * * <nl> + * Compares the target to a timestamp . <nl> + * @ param timestamp the timestamp to compare . <nl> + * @ return a negative integer , zero , or a positive integer as the target lies before , covering , or after than the timestamp . <nl> + * / <nl> + public int compareToTimestamp ( long timestamp ) <nl> + { <nl> + return Long . compare ( divPosition , timestamp / size ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Tells if the timestamp hits the target . <nl> + * @ param timestamp the timestamp to test . <nl> + * @ return < code > true < / code > iff timestamp / size = = divPosition . <nl> + * / <nl> + public boolean onTarget ( long timestamp ) <nl> + { <nl> + return compareToTimestamp ( timestamp ) = = 0 ; <nl> + } <nl> + <nl> + / * * <nl> + * Gets the next target , which represents an earlier time span . <nl> + * @ param base The number of contiguous targets that will have the same size . Targets following those will be < code > base < / code > times as big . <nl> + * @ return <nl> + * / <nl> + public Target nextTarget ( int base ) <nl> + { <nl> + if ( divPosition % base > 0 ) <nl> + return new Target ( size , divPosition - 1 ) ; <nl> + else <nl> + return new Target ( size * base , divPosition / base - 1 ) ; <nl> + } <nl> + } <nl> + <nl> + <nl> + / * * <nl> + * Group files with similar min timestamp into buckets . Files with recent min timestamps are grouped together into <nl> + * buckets designated to short timespans while files with older timestamps are grouped into buckets representing <nl> + * longer timespans . <nl> + * @ param files pairs consisting of a file and its min timestamp <nl> + * @ param timeUnit <nl> + * @ param base <nl> + * @ param now <nl> + * @ return a list of buckets of files . The list is ordered such that the files with newest timestamps come first . <nl> + * Each bucket is also a list of files ordered from newest to oldest . <nl> + * / <nl> + @ VisibleForTesting <nl> + static < T > List < List < T > > getBuckets ( Collection < Pair < T , Long > > files , long timeUnit , int base , long now ) <nl> + { <nl> + / / Sort files by age . Newest first . <nl> + final List < Pair < T , Long > > sortedFiles = Lists . newArrayList ( files ) ; <nl> + Collections . sort ( sortedFiles , Collections . reverseOrder ( new Comparator < Pair < T , Long > > ( ) <nl> + { <nl> + public int compare ( Pair < T , Long > p1 , Pair < T , Long > p2 ) <nl> + { <nl> + return p1 . right . compareTo ( p2 . right ) ; <nl> + } <nl> + } ) ) ; <nl> + <nl> + List < List < T > > buckets = Lists . newArrayList ( ) ; <nl> + Target target = getInitialTarget ( now , timeUnit ) ; <nl> + PeekingIterator < Pair < T , Long > > it = Iterators . peekingIterator ( sortedFiles . iterator ( ) ) ; <nl> + <nl> + outerLoop : <nl> + while ( it . hasNext ( ) ) <nl> + { <nl> + while ( ! target . onTarget ( it . peek ( ) . right ) ) <nl> + { <nl> + / / If the file is too new for the target , skip it . <nl> + if ( target . compareToTimestamp ( it . peek ( ) . right ) < 0 ) <nl> + { <nl> + it . next ( ) ; <nl> + <nl> + if ( ! it . hasNext ( ) ) <nl> + break outerLoop ; <nl> + } <nl> + else / / If the file is too old for the target , switch targets . <nl> + target = target . nextTarget ( base ) ; <nl> + } <nl> + <nl> + List < T > bucket = Lists . newArrayList ( ) ; <nl> + while ( target . onTarget ( it . peek ( ) . right ) ) <nl> + { <nl> + bucket . add ( it . next ( ) . left ) ; <nl> + <nl> + if ( ! it . hasNext ( ) ) <nl> + break ; <nl> + } <nl> + buckets . add ( bucket ) ; <nl> + } <nl> + <nl> + return buckets ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + static Target getInitialTarget ( long now , long timeUnit ) <nl> + { <nl> + return new Target ( timeUnit , now / timeUnit ) ; <nl> + } <nl> + <nl> + <nl> + private void updateEstimatedCompactionsByTasks ( List < List < SSTableReader > > tasks ) <nl> + { <nl> + int n = 0 ; <nl> + for ( List < SSTableReader > bucket : tasks ) <nl> + { <nl> + if ( bucket . size ( ) > = cfs . getMinimumCompactionThreshold ( ) ) <nl> + n + = Math . ceil ( ( double ) bucket . size ( ) / cfs . getMaximumCompactionThreshold ( ) ) ; <nl> + } <nl> + estimatedRemainingTasks = n ; <nl> + } <nl> + <nl> + <nl> + / * * <nl> + * @ param buckets list of buckets , sorted from newest to oldest , from which to return the newest bucket within thresholds . <nl> + * @ param minThreshold minimum number of sstables in a bucket to qualify . <nl> + * @ param maxThreshold maximum number of sstables to compact at once ( the returned bucket will be trimmed down to this ) . <nl> + * @ return a bucket ( list ) of sstables to compact . <nl> + * / <nl> + @ VisibleForTesting <nl> + static List < SSTableReader > newestBucket ( List < List < SSTableReader > > buckets , int minThreshold , int maxThreshold ) <nl> + { <nl> + / / Skip buckets containing less than minThreshold sstables , and limit other buckets to maxThreshold sstables . <nl> + for ( List < SSTableReader > bucket : buckets ) <nl> + if ( bucket . size ( ) > = minThreshold ) <nl> + return trimToThreshold ( bucket , maxThreshold ) ; <nl> + return Collections . emptyList ( ) ; <nl> + } <nl> + <nl> + / * * <nl> + * @ param bucket list of sstables , ordered from newest to oldest by getMinTimestamp ( ) . <nl> + * @ param maxThreshold maximum number of sstables in a single compaction task . <nl> + * @ return A bucket trimmed to the < code > maxThreshold < / code > newest sstables . <nl> + * / <nl> + @ VisibleForTesting <nl> + static List < SSTableReader > trimToThreshold ( List < SSTableReader > bucket , int maxThreshold ) <nl> + { <nl> + / / Trim the oldest sstables off the end to meet the maxThreshold <nl> + return bucket . subList ( 0 , Math . min ( bucket . size ( ) , maxThreshold ) ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public synchronized AbstractCompactionTask getMaximalTask ( int gcBefore ) <nl> + { <nl> + Iterable < SSTableReader > sstables = cfs . markAllCompacting ( ) ; <nl> + if ( sstables = = null ) <nl> + return null ; <nl> + <nl> + return new CompactionTask ( cfs , sstables , gcBefore ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public synchronized AbstractCompactionTask getUserDefinedTask ( Collection < SSTableReader > sstables , int gcBefore ) <nl> + { <nl> + assert ! sstables . isEmpty ( ) ; / / checked for by CM . submitUserDefined <nl> + <nl> + if ( ! cfs . getDataTracker ( ) . markCompacting ( sstables ) ) <nl> + { <nl> + logger . debug ( " Unable to mark { } for compaction ; probably a background compaction got to it first . You can disable background compactions temporarily if this is a problem " , sstables ) ; <nl> + return null ; <nl> + } <nl> + <nl> + return new CompactionTask ( cfs , sstables , gcBefore ) . setUserDefined ( true ) ; <nl> + } <nl> + <nl> + public int getEstimatedRemainingTasks ( ) <nl> + { <nl> + return estimatedRemainingTasks ; <nl> + } <nl> + <nl> + public long getMaxSSTableBytes ( ) <nl> + { <nl> + return Long . MAX _ VALUE ; <nl> + } <nl> + <nl> + <nl> + public static Map < String , String > validateOptions ( Map < String , String > options ) throws ConfigurationException <nl> + { <nl> + Map < String , String > uncheckedOptions = AbstractCompactionStrategy . validateOptions ( options ) ; <nl> + uncheckedOptions = DateTieredCompactionStrategyOptions . validateOptions ( options , uncheckedOptions ) ; <nl> + <nl> + uncheckedOptions . remove ( CFPropDefs . KW _ MINCOMPACTIONTHRESHOLD ) ; <nl> + uncheckedOptions . remove ( CFPropDefs . KW _ MAXCOMPACTIONTHRESHOLD ) ; <nl> + <nl> + return uncheckedOptions ; <nl> + } <nl> + <nl> + public String toString ( ) <nl> + { <nl> + return String . format ( " DateTieredCompactionStrategy [ % s / % s ] " , <nl> + cfs . getMinimumCompactionThreshold ( ) , <nl> + cfs . getMaximumCompactionThreshold ( ) ) ; <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyOptions . java b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyOptions . java <nl> new file mode 100644 <nl> index 0000000 . . 9fed3e0 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyOptions . java <nl> @ @ - 0 , 0 + 1 , 100 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . db . compaction ; <nl> + <nl> + import java . util . Map ; <nl> + import java . util . concurrent . TimeUnit ; <nl> + <nl> + import org . apache . cassandra . exceptions . ConfigurationException ; <nl> + <nl> + public final class DateTieredCompactionStrategyOptions <nl> + { <nl> + protected static final TimeUnit DEFAULT _ TIMESTAMP _ RESOLUTION = TimeUnit . MICROSECONDS ; <nl> + protected static final long DEFAULT _ MAX _ SSTABLE _ AGE _ DAYS = 365 ; <nl> + protected static final long DEFAULT _ BASE _ TIME _ SECONDS = 60 * 60 ; <nl> + protected static final String TIMESTAMP _ RESOLUTION _ KEY = " timestamp _ resolution " ; <nl> + protected static final String MAX _ SSTABLE _ AGE _ KEY = " max _ sstable _ age _ days " ; <nl> + protected static final String BASE _ TIME _ KEY = " base _ time _ seconds " ; <nl> + <nl> + protected final long maxSSTableAge ; <nl> + protected final long baseTime ; <nl> + <nl> + public DateTieredCompactionStrategyOptions ( Map < String , String > options ) <nl> + { <nl> + String optionValue = options . get ( TIMESTAMP _ RESOLUTION _ KEY ) ; <nl> + TimeUnit timestampResolution = optionValue = = null ? DEFAULT _ TIMESTAMP _ RESOLUTION : TimeUnit . valueOf ( optionValue ) ; <nl> + optionValue = options . get ( MAX _ SSTABLE _ AGE _ KEY ) ; <nl> + maxSSTableAge = timestampResolution . convert ( optionValue = = null ? DEFAULT _ MAX _ SSTABLE _ AGE _ DAYS : Long . parseLong ( optionValue ) , TimeUnit . DAYS ) ; <nl> + optionValue = options . get ( BASE _ TIME _ KEY ) ; <nl> + baseTime = timestampResolution . convert ( optionValue = = null ? DEFAULT _ BASE _ TIME _ SECONDS : Long . parseLong ( optionValue ) , TimeUnit . SECONDS ) ; <nl> + } <nl> + <nl> + public DateTieredCompactionStrategyOptions ( ) <nl> + { <nl> + maxSSTableAge = DEFAULT _ TIMESTAMP _ RESOLUTION . convert ( DEFAULT _ MAX _ SSTABLE _ AGE _ DAYS , TimeUnit . DAYS ) ; <nl> + baseTime = DEFAULT _ TIMESTAMP _ RESOLUTION . convert ( DEFAULT _ BASE _ TIME _ SECONDS , TimeUnit . SECONDS ) ; <nl> + } <nl> + <nl> + public static Map < String , String > validateOptions ( Map < String , String > options , Map < String , String > uncheckedOptions ) throws ConfigurationException <nl> + { <nl> + String optionValue = options . get ( TIMESTAMP _ RESOLUTION _ KEY ) ; <nl> + try <nl> + { <nl> + if ( optionValue ! = null ) <nl> + TimeUnit . valueOf ( optionValue ) ; <nl> + } <nl> + catch ( IllegalArgumentException e ) <nl> + { <nl> + throw new ConfigurationException ( String . format ( " timestamp _ resolution % s is not valid " , optionValue ) ) ; <nl> + } <nl> + <nl> + optionValue = options . get ( MAX _ SSTABLE _ AGE _ KEY ) ; <nl> + try <nl> + { <nl> + long maxSStableAge = optionValue = = null ? DEFAULT _ MAX _ SSTABLE _ AGE _ DAYS : Long . parseLong ( optionValue ) ; <nl> + if ( maxSStableAge < 0 ) <nl> + { <nl> + throw new ConfigurationException ( String . format ( " % s must be non - negative : % d " , MAX _ SSTABLE _ AGE _ KEY , maxSStableAge ) ) ; <nl> + } <nl> + } <nl> + catch ( NumberFormatException e ) <nl> + { <nl> + throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , MAX _ SSTABLE _ AGE _ KEY ) , e ) ; <nl> + } <nl> + <nl> + optionValue = options . get ( BASE _ TIME _ KEY ) ; <nl> + try <nl> + { <nl> + long baseTime = optionValue = = null ? DEFAULT _ BASE _ TIME _ SECONDS : Long . parseLong ( optionValue ) ; <nl> + if ( baseTime < = 0 ) <nl> + { <nl> + throw new ConfigurationException ( String . format ( " % s must be greater than 0 , but was % d " , BASE _ TIME _ KEY , baseTime ) ) ; <nl> + } <nl> + } <nl> + catch ( NumberFormatException e ) <nl> + { <nl> + throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , BASE _ TIME _ KEY ) , e ) ; <nl> + } <nl> + <nl> + uncheckedOptions . remove ( MAX _ SSTABLE _ AGE _ KEY ) ; <nl> + uncheckedOptions . remove ( BASE _ TIME _ KEY ) ; <nl> + uncheckedOptions . remove ( TIMESTAMP _ RESOLUTION _ KEY ) ; <nl> + <nl> + return uncheckedOptions ; <nl> + } <nl> + } <nl> diff - - git a / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java <nl> new file mode 100644 <nl> index 0000000 . . 299e1af <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java <nl> @ @ - 0 , 0 + 1 , 242 @ @ <nl> + / * * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . db . compaction ; <nl> + <nl> + import java . nio . ByteBuffer ; <nl> + import java . util . * ; <nl> + <nl> + import org . junit . Test ; <nl> + <nl> + import com . google . common . collect . Iterables ; <nl> + import com . google . common . collect . Lists ; <nl> + <nl> + import org . apache . cassandra . SchemaLoader ; <nl> + import org . apache . cassandra . Util ; <nl> + import org . apache . cassandra . db . ColumnFamilyStore ; <nl> + import org . apache . cassandra . db . DecoratedKey ; <nl> + import org . apache . cassandra . db . Keyspace ; <nl> + import org . apache . cassandra . db . RowMutation ; <nl> + import org . apache . cassandra . exceptions . ConfigurationException ; <nl> + import org . apache . cassandra . io . sstable . SSTableReader ; <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> + import org . apache . cassandra . utils . Pair ; <nl> + <nl> + import static org . apache . cassandra . db . compaction . DateTieredCompactionStrategy . getBuckets ; <nl> + import static org . apache . cassandra . db . compaction . DateTieredCompactionStrategy . newestBucket ; <nl> + import static org . apache . cassandra . db . compaction . DateTieredCompactionStrategy . trimToThreshold ; <nl> + import static org . apache . cassandra . db . compaction . DateTieredCompactionStrategy . filterOldSSTables ; <nl> + import static org . apache . cassandra . db . compaction . DateTieredCompactionStrategy . validateOptions ; <nl> + <nl> + import static org . junit . Assert . * ; <nl> + <nl> + public class DateTieredCompactionStrategyTest extends SchemaLoader <nl> + { <nl> + public static final String KEYSPACE1 = " Keyspace1 " ; <nl> + private static final String CF _ STANDARD1 = " Standard1 " ; <nl> + <nl> + @ Test <nl> + public void testOptionsValidation ( ) throws ConfigurationException <nl> + { <nl> + Map < String , String > options = new HashMap < > ( ) ; <nl> + options . put ( DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY , " 30 " ) ; <nl> + options . put ( DateTieredCompactionStrategyOptions . MAX _ SSTABLE _ AGE _ KEY , " 1825 " ) ; <nl> + Map < String , String > unvalidated = validateOptions ( options ) ; <nl> + assertTrue ( unvalidated . isEmpty ( ) ) ; <nl> + <nl> + try <nl> + { <nl> + options . put ( DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY , " 0 " ) ; <nl> + validateOptions ( options ) ; <nl> + fail ( String . format ( " % s = = 0 should be rejected " , DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY ) ) ; <nl> + } <nl> + catch ( ConfigurationException e ) { } <nl> + <nl> + try <nl> + { <nl> + options . put ( DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY , " - 1337 " ) ; <nl> + validateOptions ( options ) ; <nl> + fail ( String . format ( " % Negative % s should be rejected " , DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY ) ) ; <nl> + } <nl> + catch ( ConfigurationException e ) <nl> + { <nl> + options . put ( DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY , " 1 " ) ; <nl> + } <nl> + <nl> + try <nl> + { <nl> + options . put ( DateTieredCompactionStrategyOptions . MAX _ SSTABLE _ AGE _ KEY , " - 1337 " ) ; <nl> + validateOptions ( options ) ; <nl> + fail ( String . format ( " % Negative % s should be rejected " , DateTieredCompactionStrategyOptions . MAX _ SSTABLE _ AGE _ KEY ) ) ; <nl> + } <nl> + catch ( ConfigurationException e ) <nl> + { <nl> + options . put ( DateTieredCompactionStrategyOptions . MAX _ SSTABLE _ AGE _ KEY , " 0 " ) ; <nl> + } <nl> + <nl> + options . put ( " bad _ option " , " 1 . 0 " ) ; <nl> + unvalidated = validateOptions ( options ) ; <nl> + assertTrue ( unvalidated . containsKey ( " bad _ option " ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testGetBuckets ( ) <nl> + { <nl> + List < Pair < String , Long > > pairs = Lists . newArrayList ( <nl> + Pair . create ( " a " , 199L ) , <nl> + Pair . create ( " b " , 299L ) , <nl> + Pair . create ( " a " , 1L ) , <nl> + Pair . create ( " b " , 201L ) <nl> + ) ; <nl> + List < List < String > > buckets = getBuckets ( pairs , 100L , 2 , 200L ) ; <nl> + assertEquals ( 2 , buckets . size ( ) ) ; <nl> + <nl> + for ( List < String > bucket : buckets ) <nl> + { <nl> + assertEquals ( 2 , bucket . size ( ) ) ; <nl> + assertEquals ( bucket . get ( 0 ) , bucket . get ( 1 ) ) ; <nl> + } <nl> + <nl> + <nl> + pairs = Lists . newArrayList ( <nl> + Pair . create ( " a " , 2000L ) , <nl> + Pair . create ( " b " , 3600L ) , <nl> + Pair . create ( " a " , 200L ) , <nl> + Pair . create ( " c " , 3950L ) , <nl> + Pair . create ( " too new " , 4125L ) , <nl> + Pair . create ( " b " , 3899L ) , <nl> + Pair . create ( " c " , 3900L ) <nl> + ) ; <nl> + buckets = getBuckets ( pairs , 100L , 3 , 4050L ) ; <nl> + / / targets ( divPosition , size ) : ( 40 , 100 ) , ( 39 , 100 ) , ( 12 , 300 ) , ( 3 , 900 ) , ( 0 , 2700 ) <nl> + / / in other words : 0 - 2699 , 2700 - 3599 , 3600 - 3899 , 3900 - 3999 , 4000 - 4099 <nl> + assertEquals ( 3 , buckets . size ( ) ) ; <nl> + <nl> + for ( List < String > bucket : buckets ) <nl> + { <nl> + assertEquals ( 2 , bucket . size ( ) ) ; <nl> + assertEquals ( bucket . get ( 0 ) , bucket . get ( 1 ) ) ; <nl> + } <nl> + <nl> + <nl> + / / Test base 1 . <nl> + pairs = Lists . newArrayList ( <nl> + Pair . create ( " a " , 200L ) , <nl> + Pair . create ( " a " , 299L ) , <nl> + Pair . create ( " b " , 2000L ) , <nl> + Pair . create ( " b " , 2014L ) , <nl> + Pair . create ( " c " , 3610L ) , <nl> + Pair . create ( " c " , 3690L ) , <nl> + Pair . create ( " d " , 3898L ) , <nl> + Pair . create ( " d " , 3899L ) , <nl> + Pair . create ( " e " , 3900L ) , <nl> + Pair . create ( " e " , 3950L ) , <nl> + Pair . create ( " too new " , 4125L ) <nl> + ) ; <nl> + buckets = getBuckets ( pairs , 100L , 1 , 4050L ) ; <nl> + <nl> + assertEquals ( 5 , buckets . size ( ) ) ; <nl> + <nl> + for ( List < String > bucket : buckets ) <nl> + { <nl> + assertEquals ( 2 , bucket . size ( ) ) ; <nl> + assertEquals ( bucket . get ( 0 ) , bucket . get ( 1 ) ) ; <nl> + } <nl> + } <nl> + <nl> + @ Test <nl> + public void testPrepBucket ( ) <nl> + { <nl> + Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( CF _ STANDARD1 ) ; <nl> + cfs . truncateBlocking ( ) ; <nl> + cfs . disableAutoCompaction ( ) ; <nl> + <nl> + ByteBuffer value = ByteBuffer . wrap ( new byte [ 100 ] ) ; <nl> + <nl> + / / create 3 sstables <nl> + int numSSTables = 3 ; <nl> + for ( int r = 0 ; r < numSSTables ; r + + ) <nl> + { <nl> + DecoratedKey key = Util . dk ( String . valueOf ( r ) ) ; <nl> + RowMutation rm = new RowMutation ( KEYSPACE1 , key . key ) ; <nl> + rm . add ( CF _ STANDARD1 , ByteBufferUtil . bytes ( " column " ) , value , r ) ; <nl> + rm . apply ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + } <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + List < SSTableReader > sstrs = new ArrayList < > ( cfs . getSSTables ( ) ) ; <nl> + <nl> + List < SSTableReader > newBucket = newestBucket ( Collections . singletonList ( sstrs . subList ( 0 , 2 ) ) , 4 , 32 ) ; <nl> + assertTrue ( " nothing should be returned when all buckets are below the min threshold " , newBucket . isEmpty ( ) ) ; <nl> + <nl> + assertEquals ( " an sstable with a single value should have equal min / max timestamps " , sstrs . get ( 0 ) . getMinTimestamp ( ) , sstrs . get ( 0 ) . getMaxTimestamp ( ) ) ; <nl> + assertEquals ( " an sstable with a single value should have equal min / max timestamps " , sstrs . get ( 1 ) . getMinTimestamp ( ) , sstrs . get ( 1 ) . getMaxTimestamp ( ) ) ; <nl> + assertEquals ( " an sstable with a single value should have equal min / max timestamps " , sstrs . get ( 2 ) . getMinTimestamp ( ) , sstrs . get ( 2 ) . getMaxTimestamp ( ) ) ; <nl> + <nl> + / / if we have more than the max threshold , the oldest should be dropped <nl> + Collections . sort ( sstrs , Collections . reverseOrder ( new Comparator < SSTableReader > ( ) { <nl> + public int compare ( SSTableReader o1 , SSTableReader o2 ) { <nl> + return Long . compare ( o1 . getMinTimestamp ( ) , o2 . getMinTimestamp ( ) ) ; <nl> + } <nl> + } ) ) ; <nl> + <nl> + List < SSTableReader > bucket = trimToThreshold ( sstrs , 2 ) ; <nl> + assertEquals ( " one bucket should have been dropped " , 2 , bucket . size ( ) ) ; <nl> + for ( SSTableReader sstr : bucket ) <nl> + assertFalse ( " the oldest sstable should be dropped " , sstr . getMinTimestamp ( ) = = 0 ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testFilterOldSSTables ( ) <nl> + { <nl> + Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( CF _ STANDARD1 ) ; <nl> + cfs . truncateBlocking ( ) ; <nl> + cfs . disableAutoCompaction ( ) ; <nl> + <nl> + ByteBuffer value = ByteBuffer . wrap ( new byte [ 100 ] ) ; <nl> + <nl> + / / create 3 sstables <nl> + int numSSTables = 3 ; <nl> + for ( int r = 0 ; r < numSSTables ; r + + ) <nl> + { <nl> + DecoratedKey key = Util . dk ( String . valueOf ( r ) ) ; <nl> + RowMutation rm = new RowMutation ( KEYSPACE1 , key . key ) ; <nl> + rm . add ( CF _ STANDARD1 , ByteBufferUtil . bytes ( " column " ) , value , r ) ; <nl> + rm . apply ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + } <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + Iterable < SSTableReader > filtered ; <nl> + List < SSTableReader > sstrs = new ArrayList < > ( cfs . getSSTables ( ) ) ; <nl> + <nl> + filtered = filterOldSSTables ( sstrs , 0 , 2 ) ; <nl> + assertEquals ( " when maxSSTableAge is zero , no sstables should be filtered " , sstrs . size ( ) , Iterables . size ( filtered ) ) ; <nl> + <nl> + filtered = filterOldSSTables ( sstrs , 1 , 2 ) ; <nl> + assertEquals ( " only the newest 2 sstables should remain " , 2 , Iterables . size ( filtered ) ) ; <nl> + <nl> + filtered = filterOldSSTables ( sstrs , 1 , 3 ) ; <nl> + assertEquals ( " only the newest sstable should remain " , 1 , Iterables . size ( filtered ) ) ; <nl> + <nl> + filtered = filterOldSSTables ( sstrs , 1 , 4 ) ; <nl> + assertEquals ( " no sstables should remain when all are too old " , 0 , Iterables . size ( filtered ) ) ; <nl> + } <nl> + }
+NEAREST DIFF (one line): diff - - git a / build . xml b / build . xml <nl> index 4d8ae14 . . 254cc2d 100644 <nl> - - - a / build . xml <nl> + + + b / build . xml <nl> @ @ - 340 , 7 + 340 , 7 @ @ <nl> < dependency groupId = " com . google . guava " artifactId = " guava " version = " 13 . 0 . 1 " / > <nl> < dependency groupId = " commons - cli " artifactId = " commons - cli " version = " 1 . 1 " / > <nl> < dependency groupId = " commons - codec " artifactId = " commons - codec " version = " 1 . 2 " / > <nl> - < dependency groupId = " commons - lang " artifactId = " commons - lang " version = " 3 . 1 " / > <nl> + < dependency groupId = " org . apache . commons " artifactId = " commons - lang3 " version = " 3 . 1 " / > <nl> < dependency groupId = " com . googlecode . concurrentlinkedhashmap " artifactId = " concurrentlinkedhashmap - lru " version = " 1 . 3 " / > <nl> < dependency groupId = " org . antlr " artifactId = " antlr " version = " 3 . 2 " / > <nl> < dependency groupId = " org . slf4j " artifactId = " slf4j - api " version = " 1 . 7 . 2 " / > <nl> @ @ - 438 , 7 + 438 , 7 @ @ <nl> < dependency groupId = " com . google . guava " artifactId = " guava " / > <nl> < dependency groupId = " commons - cli " artifactId = " commons - cli " / > <nl> < dependency groupId = " commons - codec " artifactId = " commons - codec " / > <nl> - < dependency groupId = " commons - lang " artifactId = " commons - lang " / > <nl> + < dependency groupId = " org . apache . commons " artifactId = " commons - lang3 " / > <nl> < dependency groupId = " com . googlecode . concurrentlinkedhashmap " artifactId = " concurrentlinkedhashmap - lru " / > <nl> < dependency groupId = " org . antlr " artifactId = " antlr " / > <nl> < dependency groupId = " org . slf4j " artifactId = " slf4j - api " / > <nl> @ @ - 479 , 7 + 479 , 7 @ @ <nl> artifactId = " cassandra - parent " <nl> version = " $ { version } " / > <nl> < scm connection = " $ { scm . connection } " developerConnection = " $ { scm . developerConnection } " url = " $ { scm . url } " / > <nl> - < dependency groupId = " commons - lang " artifactId = " commons - lang " / > <nl> + < dependency groupId = " org . apache . commons " artifactId = " commons - lang3 " / > <nl> < dependency groupId = " org . slf4j " artifactId = " slf4j - api " / > <nl> < dependency groupId = " org . apache . thrift " artifactId = " libthrift " / > <nl> < / artifact : pom >
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 158a48b . . cd4b6bb 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 2 , 6 + 2 , 7 @ @ 
+ * Fix hint replay with many accumulated expired hints ( CASSANDRA - 6998 ) 
+ * Fix duplicate results in DISTINCT queries on static columns with query 
+ paging ( CASSANDRA - 8108 ) 
+ + * Add DateTieredCompactionStrategy ( CASSANDRA - 6602 ) 
+ * Properly validate ascii and utf8 string literals in CQL queries ( CASSANDRA - 8101 ) 
+ * ( cqlsh ) Fix autocompletion for alter keyspace ( CASSANDRA - 8021 ) 
+ * Create backup directories for commitlog archiving during startup ( CASSANDRA - 8111 ) 
+ diff - - git a / NEWS . txt b / NEWS . txt 
+ index 7fa8be9 . . 102a87b 100644 
+ - - - a / NEWS . txt 
+ + + + b / NEWS . txt 
+ @ @ - 13 , 6 + 13 , 14 @ @ restore snapshots created with the previous major version using the 
+ ' sstableloader ' tool . You can upgrade the file format of your snapshots 
+ using the provided ' sstableupgrade ' tool . 
+ 
+ + 2 . 0 . 11 
+ + = = = = = = 
+ + New features 
+ + - - - - - - - - - - - - 
+ + - DateTieredCompactionStrategy added , optimized for time series data and groups 
+ + data that is written closely in time ( CASSANDRA - 6602 for details ) . Consider 
+ + this experimental for now . 
+ + 
+ 2 . 0 . 10 
+ = = = = = = 
+ New features 
+ diff - - git a / pylib / cqlshlib / cql3handling . py b / pylib / cqlshlib / cql3handling . py 
+ index c08088a . . 0b7863c 100644 
+ - - - a / pylib / cqlshlib / cql3handling . py 
+ + + + b / pylib / cqlshlib / cql3handling . py 
+ @ @ - 479 , 6 + 479 , 10 @ @ def cf _ prop _ val _ mapkey _ completer ( ctxt , cass ) : 
+ opts . add ( ' cold _ reads _ to _ omit ' ) 
+ elif csc = = ' LeveledCompactionStrategy ' : 
+ opts . add ( ' sstable _ size _ in _ mb ' ) 
+ + elif csc = = ' DateTieredCompactionStrategy ' : 
+ + opts . add ( ' base _ time _ seconds ' ) 
+ + opts . add ( ' max _ sstable _ age _ days ' ) 
+ + opts . add ( ' timestamp _ resolution ' ) 
+ return map ( escape _ value , opts ) 
+ return ( ) 
+ 
+ diff - - git a / pylib / cqlshlib / cqlhandling . py b / pylib / cqlshlib / cqlhandling . py 
+ index 86abf02 . . 0d54630 100644 
+ - - - a / pylib / cqlshlib / cqlhandling . py 
+ + + + b / pylib / cqlshlib / cqlhandling . py 
+ @ @ - 35 , 7 + 35 , 8 @ @ class CqlParsingRuleSet ( pylexotron . ParsingRuleSet ) : 
+ 
+ available _ compaction _ classes = ( 
+ ' LeveledCompactionStrategy ' , 
+ - ' SizeTieredCompactionStrategy ' 
+ + ' SizeTieredCompactionStrategy ' , 
+ + ' DateTieredCompactionStrategy ' 
+ ) 
+ 
+ replication _ strategies = ( 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java 
+ new file mode 100644 
+ index 0000000 . . 9c708db 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategy . java 
+ @ @ - 0 , 0 + 1 , 374 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . db . compaction ; 
+ + 
+ + import java . util . * ; 
+ + 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ + import com . google . common . base . Predicate ; 
+ + import com . google . common . collect . * ; 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ + 
+ + import org . apache . cassandra . cql3 . statements . CFPropDefs ; 
+ + import org . apache . cassandra . db . ColumnFamilyStore ; 
+ + import org . apache . cassandra . exceptions . ConfigurationException ; 
+ + import org . apache . cassandra . io . sstable . SSTableReader ; 
+ + import org . apache . cassandra . utils . Pair ; 
+ + 
+ + public class DateTieredCompactionStrategy extends AbstractCompactionStrategy 
+ + { 
+ + private static final Logger logger = LoggerFactory . getLogger ( DateTieredCompactionStrategy . class ) ; 
+ + 
+ + protected DateTieredCompactionStrategyOptions options ; 
+ + protected volatile int estimatedRemainingTasks ; 
+ + 
+ + public DateTieredCompactionStrategy ( ColumnFamilyStore cfs , Map < String , String > options ) 
+ + { 
+ + super ( cfs , options ) ; 
+ + this . estimatedRemainingTasks = 0 ; 
+ + this . options = new DateTieredCompactionStrategyOptions ( options ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public synchronized AbstractCompactionTask getNextBackgroundTask ( int gcBefore ) 
+ + { 
+ + if ( ! isEnabled ( ) ) 
+ + return null ; 
+ + 
+ + while ( true ) 
+ + { 
+ + List < SSTableReader > latestBucket = getNextBackgroundSStables ( gcBefore ) ; 
+ + 
+ + if ( latestBucket . isEmpty ( ) ) 
+ + return null ; 
+ + 
+ + if ( cfs . getDataTracker ( ) . markCompacting ( latestBucket ) ) 
+ + return new CompactionTask ( cfs , latestBucket , gcBefore ) ; 
+ + } 
+ + } 
+ + 
+ + / * * 
+ + * 
+ + * @ param gcBefore 
+ + * @ return 
+ + * / 
+ + private List < SSTableReader > getNextBackgroundSStables ( final int gcBefore ) 
+ + { 
+ + if ( ! isEnabled ( ) | | cfs . getSSTables ( ) . isEmpty ( ) ) 
+ + return Collections . emptyList ( ) ; 
+ + 
+ + int base = cfs . getMinimumCompactionThreshold ( ) ; 
+ + long now = getNow ( ) ; 
+ + 
+ + Iterable < SSTableReader > candidates = filterSuspectSSTables ( cfs . getUncompactingSSTables ( ) ) ; 
+ + 
+ + List < SSTableReader > mostInteresting = getCompactionCandidates ( candidates , now , base ) ; 
+ + if ( mostInteresting ! = null ) 
+ + return mostInteresting ; 
+ + 
+ + / / if there is no sstable to compact in standard way , try compacting single sstable whose droppable tombstone 
+ + / / ratio is greater than threshold . 
+ + List < SSTableReader > sstablesWithTombstones = Lists . newArrayList ( ) ; 
+ + for ( SSTableReader sstable : candidates ) 
+ + { 
+ + if ( worthDroppingTombstones ( sstable , gcBefore ) ) 
+ + sstablesWithTombstones . add ( sstable ) ; 
+ + } 
+ + if ( sstablesWithTombstones . isEmpty ( ) ) 
+ + return Collections . emptyList ( ) ; 
+ + 
+ + return Collections . singletonList ( Collections . min ( sstablesWithTombstones , new SSTableReader . SizeComparator ( ) ) ) ; 
+ + } 
+ + 
+ + private List < SSTableReader > getCompactionCandidates ( Iterable < SSTableReader > candidateSSTables , long now , int base ) 
+ + { 
+ + Iterable < SSTableReader > candidates = filterOldSSTables ( Lists . newArrayList ( candidateSSTables ) , options . maxSSTableAge , now ) ; 
+ + 
+ + List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndMinTimestampPairs ( candidates ) , options . baseTime , base , now ) ; 
+ + logger . debug ( " Compaction buckets are { } " , buckets ) ; 
+ + updateEstimatedCompactionsByTasks ( buckets ) ; 
+ + List < SSTableReader > mostInteresting = newestBucket ( buckets , cfs . getMinimumCompactionThreshold ( ) , cfs . getMaximumCompactionThreshold ( ) ) ; 
+ + if ( ! mostInteresting . isEmpty ( ) ) 
+ + return mostInteresting ; 
+ + return null ; 
+ + } 
+ + 
+ + / * * 
+ + * Gets the timestamp that DateTieredCompactionStrategy considers to be the " current time " . 
+ + * @ return the maximum timestamp across all SSTables . 
+ + * @ throws java . util . NoSuchElementException if there are no SSTables . 
+ + * / 
+ + private long getNow ( ) 
+ + { 
+ + return Collections . max ( cfs . getSSTables ( ) , new Comparator < SSTableReader > ( ) 
+ + { 
+ + public int compare ( SSTableReader o1 , SSTableReader o2 ) 
+ + { 
+ + return Long . compare ( o1 . getMaxTimestamp ( ) , o2 . getMaxTimestamp ( ) ) ; 
+ + } 
+ + } ) . getMaxTimestamp ( ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Removes all sstables with max timestamp older than maxSSTableAge . 
+ + * @ param sstables all sstables to consider 
+ + * @ param maxSSTableAge the age in milliseconds when an SSTable stops participating in compactions 
+ + * @ param now current time . SSTables with max timestamp less than ( now - maxSSTableAge ) are filtered . 
+ + * @ return a list of sstables with the oldest sstables excluded 
+ + * / 
+ + @ VisibleForTesting 
+ + static Iterable < SSTableReader > filterOldSSTables ( List < SSTableReader > sstables , long maxSSTableAge , long now ) 
+ + { 
+ + if ( maxSSTableAge = = 0 ) 
+ + return sstables ; 
+ + final long cutoff = now - maxSSTableAge ; 
+ + return Iterables . filter ( sstables , new Predicate < SSTableReader > ( ) 
+ + { 
+ + @ Override 
+ + public boolean apply ( SSTableReader sstable ) 
+ + { 
+ + return sstable . getMaxTimestamp ( ) > = cutoff ; 
+ + } 
+ + } ) ; 
+ + } 
+ + 
+ + / * * 
+ + * 
+ + * @ param sstables 
+ + * @ return 
+ + * / 
+ + public static List < Pair < SSTableReader , Long > > createSSTableAndMinTimestampPairs ( Iterable < SSTableReader > sstables ) 
+ + { 
+ + List < Pair < SSTableReader , Long > > sstableMinTimestampPairs = Lists . newArrayListWithCapacity ( Iterables . size ( sstables ) ) ; 
+ + for ( SSTableReader sstable : sstables ) 
+ + sstableMinTimestampPairs . add ( Pair . create ( sstable , sstable . getMinTimestamp ( ) ) ) ; 
+ + return sstableMinTimestampPairs ; 
+ + } 
+ + 
+ + 
+ + / * * 
+ + * A target time span used for bucketing SSTables based on timestamps . 
+ + * / 
+ + private static class Target 
+ + { 
+ + / / How big a range of timestamps fit inside the target . 
+ + public final long size ; 
+ + / / A timestamp t hits the target iff t / size = = divPosition . 
+ + public final long divPosition ; 
+ + 
+ + public Target ( long size , long divPosition ) 
+ + { 
+ + this . size = size ; 
+ + this . divPosition = divPosition ; 
+ + } 
+ + 
+ + / * * 
+ + * Compares the target to a timestamp . 
+ + * @ param timestamp the timestamp to compare . 
+ + * @ return a negative integer , zero , or a positive integer as the target lies before , covering , or after than the timestamp . 
+ + * / 
+ + public int compareToTimestamp ( long timestamp ) 
+ + { 
+ + return Long . compare ( divPosition , timestamp / size ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Tells if the timestamp hits the target . 
+ + * @ param timestamp the timestamp to test . 
+ + * @ return < code > true < / code > iff timestamp / size = = divPosition . 
+ + * / 
+ + public boolean onTarget ( long timestamp ) 
+ + { 
+ + return compareToTimestamp ( timestamp ) = = 0 ; 
+ + } 
+ + 
+ + / * * 
+ + * Gets the next target , which represents an earlier time span . 
+ + * @ param base The number of contiguous targets that will have the same size . Targets following those will be < code > base < / code > times as big . 
+ + * @ return 
+ + * / 
+ + public Target nextTarget ( int base ) 
+ + { 
+ + if ( divPosition % base > 0 ) 
+ + return new Target ( size , divPosition - 1 ) ; 
+ + else 
+ + return new Target ( size * base , divPosition / base - 1 ) ; 
+ + } 
+ + } 
+ + 
+ + 
+ + / * * 
+ + * Group files with similar min timestamp into buckets . Files with recent min timestamps are grouped together into 
+ + * buckets designated to short timespans while files with older timestamps are grouped into buckets representing 
+ + * longer timespans . 
+ + * @ param files pairs consisting of a file and its min timestamp 
+ + * @ param timeUnit 
+ + * @ param base 
+ + * @ param now 
+ + * @ return a list of buckets of files . The list is ordered such that the files with newest timestamps come first . 
+ + * Each bucket is also a list of files ordered from newest to oldest . 
+ + * / 
+ + @ VisibleForTesting 
+ + static < T > List < List < T > > getBuckets ( Collection < Pair < T , Long > > files , long timeUnit , int base , long now ) 
+ + { 
+ + / / Sort files by age . Newest first . 
+ + final List < Pair < T , Long > > sortedFiles = Lists . newArrayList ( files ) ; 
+ + Collections . sort ( sortedFiles , Collections . reverseOrder ( new Comparator < Pair < T , Long > > ( ) 
+ + { 
+ + public int compare ( Pair < T , Long > p1 , Pair < T , Long > p2 ) 
+ + { 
+ + return p1 . right . compareTo ( p2 . right ) ; 
+ + } 
+ + } ) ) ; 
+ + 
+ + List < List < T > > buckets = Lists . newArrayList ( ) ; 
+ + Target target = getInitialTarget ( now , timeUnit ) ; 
+ + PeekingIterator < Pair < T , Long > > it = Iterators . peekingIterator ( sortedFiles . iterator ( ) ) ; 
+ + 
+ + outerLoop : 
+ + while ( it . hasNext ( ) ) 
+ + { 
+ + while ( ! target . onTarget ( it . peek ( ) . right ) ) 
+ + { 
+ + / / If the file is too new for the target , skip it . 
+ + if ( target . compareToTimestamp ( it . peek ( ) . right ) < 0 ) 
+ + { 
+ + it . next ( ) ; 
+ + 
+ + if ( ! it . hasNext ( ) ) 
+ + break outerLoop ; 
+ + } 
+ + else / / If the file is too old for the target , switch targets . 
+ + target = target . nextTarget ( base ) ; 
+ + } 
+ + 
+ + List < T > bucket = Lists . newArrayList ( ) ; 
+ + while ( target . onTarget ( it . peek ( ) . right ) ) 
+ + { 
+ + bucket . add ( it . next ( ) . left ) ; 
+ + 
+ + if ( ! it . hasNext ( ) ) 
+ + break ; 
+ + } 
+ + buckets . add ( bucket ) ; 
+ + } 
+ + 
+ + return buckets ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + static Target getInitialTarget ( long now , long timeUnit ) 
+ + { 
+ + return new Target ( timeUnit , now / timeUnit ) ; 
+ + } 
+ + 
+ + 
+ + private void updateEstimatedCompactionsByTasks ( List < List < SSTableReader > > tasks ) 
+ + { 
+ + int n = 0 ; 
+ + for ( List < SSTableReader > bucket : tasks ) 
+ + { 
+ + if ( bucket . size ( ) > = cfs . getMinimumCompactionThreshold ( ) ) 
+ + n + = Math . ceil ( ( double ) bucket . size ( ) / cfs . getMaximumCompactionThreshold ( ) ) ; 
+ + } 
+ + estimatedRemainingTasks = n ; 
+ + } 
+ + 
+ + 
+ + / * * 
+ + * @ param buckets list of buckets , sorted from newest to oldest , from which to return the newest bucket within thresholds . 
+ + * @ param minThreshold minimum number of sstables in a bucket to qualify . 
+ + * @ param maxThreshold maximum number of sstables to compact at once ( the returned bucket will be trimmed down to this ) . 
+ + * @ return a bucket ( list ) of sstables to compact . 
+ + * / 
+ + @ VisibleForTesting 
+ + static List < SSTableReader > newestBucket ( List < List < SSTableReader > > buckets , int minThreshold , int maxThreshold ) 
+ + { 
+ + / / Skip buckets containing less than minThreshold sstables , and limit other buckets to maxThreshold sstables . 
+ + for ( List < SSTableReader > bucket : buckets ) 
+ + if ( bucket . size ( ) > = minThreshold ) 
+ + return trimToThreshold ( bucket , maxThreshold ) ; 
+ + return Collections . emptyList ( ) ; 
+ + } 
+ + 
+ + / * * 
+ + * @ param bucket list of sstables , ordered from newest to oldest by getMinTimestamp ( ) . 
+ + * @ param maxThreshold maximum number of sstables in a single compaction task . 
+ + * @ return A bucket trimmed to the < code > maxThreshold < / code > newest sstables . 
+ + * / 
+ + @ VisibleForTesting 
+ + static List < SSTableReader > trimToThreshold ( List < SSTableReader > bucket , int maxThreshold ) 
+ + { 
+ + / / Trim the oldest sstables off the end to meet the maxThreshold 
+ + return bucket . subList ( 0 , Math . min ( bucket . size ( ) , maxThreshold ) ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public synchronized AbstractCompactionTask getMaximalTask ( int gcBefore ) 
+ + { 
+ + Iterable < SSTableReader > sstables = cfs . markAllCompacting ( ) ; 
+ + if ( sstables = = null ) 
+ + return null ; 
+ + 
+ + return new CompactionTask ( cfs , sstables , gcBefore ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public synchronized AbstractCompactionTask getUserDefinedTask ( Collection < SSTableReader > sstables , int gcBefore ) 
+ + { 
+ + assert ! sstables . isEmpty ( ) ; / / checked for by CM . submitUserDefined 
+ + 
+ + if ( ! cfs . getDataTracker ( ) . markCompacting ( sstables ) ) 
+ + { 
+ + logger . debug ( " Unable to mark { } for compaction ; probably a background compaction got to it first . You can disable background compactions temporarily if this is a problem " , sstables ) ; 
+ + return null ; 
+ + } 
+ + 
+ + return new CompactionTask ( cfs , sstables , gcBefore ) . setUserDefined ( true ) ; 
+ + } 
+ + 
+ + public int getEstimatedRemainingTasks ( ) 
+ + { 
+ + return estimatedRemainingTasks ; 
+ + } 
+ + 
+ + public long getMaxSSTableBytes ( ) 
+ + { 
+ + return Long . MAX _ VALUE ; 
+ + } 
+ + 
+ + 
+ + public static Map < String , String > validateOptions ( Map < String , String > options ) throws ConfigurationException 
+ + { 
+ + Map < String , String > uncheckedOptions = AbstractCompactionStrategy . validateOptions ( options ) ; 
+ + uncheckedOptions = DateTieredCompactionStrategyOptions . validateOptions ( options , uncheckedOptions ) ; 
+ + 
+ + uncheckedOptions . remove ( CFPropDefs . KW _ MINCOMPACTIONTHRESHOLD ) ; 
+ + uncheckedOptions . remove ( CFPropDefs . KW _ MAXCOMPACTIONTHRESHOLD ) ; 
+ + 
+ + return uncheckedOptions ; 
+ + } 
+ + 
+ + public String toString ( ) 
+ + { 
+ + return String . format ( " DateTieredCompactionStrategy [ % s / % s ] " , 
+ + cfs . getMinimumCompactionThreshold ( ) , 
+ + cfs . getMaximumCompactionThreshold ( ) ) ; 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyOptions . java b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyOptions . java 
+ new file mode 100644 
+ index 0000000 . . 9fed3e0 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyOptions . java 
+ @ @ - 0 , 0 + 1 , 100 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . db . compaction ; 
+ + 
+ + import java . util . Map ; 
+ + import java . util . concurrent . TimeUnit ; 
+ + 
+ + import org . apache . cassandra . exceptions . ConfigurationException ; 
+ + 
+ + public final class DateTieredCompactionStrategyOptions 
+ + { 
+ + protected static final TimeUnit DEFAULT _ TIMESTAMP _ RESOLUTION = TimeUnit . MICROSECONDS ; 
+ + protected static final long DEFAULT _ MAX _ SSTABLE _ AGE _ DAYS = 365 ; 
+ + protected static final long DEFAULT _ BASE _ TIME _ SECONDS = 60 * 60 ; 
+ + protected static final String TIMESTAMP _ RESOLUTION _ KEY = " timestamp _ resolution " ; 
+ + protected static final String MAX _ SSTABLE _ AGE _ KEY = " max _ sstable _ age _ days " ; 
+ + protected static final String BASE _ TIME _ KEY = " base _ time _ seconds " ; 
+ + 
+ + protected final long maxSSTableAge ; 
+ + protected final long baseTime ; 
+ + 
+ + public DateTieredCompactionStrategyOptions ( Map < String , String > options ) 
+ + { 
+ + String optionValue = options . get ( TIMESTAMP _ RESOLUTION _ KEY ) ; 
+ + TimeUnit timestampResolution = optionValue = = null ? DEFAULT _ TIMESTAMP _ RESOLUTION : TimeUnit . valueOf ( optionValue ) ; 
+ + optionValue = options . get ( MAX _ SSTABLE _ AGE _ KEY ) ; 
+ + maxSSTableAge = timestampResolution . convert ( optionValue = = null ? DEFAULT _ MAX _ SSTABLE _ AGE _ DAYS : Long . parseLong ( optionValue ) , TimeUnit . DAYS ) ; 
+ + optionValue = options . get ( BASE _ TIME _ KEY ) ; 
+ + baseTime = timestampResolution . convert ( optionValue = = null ? DEFAULT _ BASE _ TIME _ SECONDS : Long . parseLong ( optionValue ) , TimeUnit . SECONDS ) ; 
+ + } 
+ + 
+ + public DateTieredCompactionStrategyOptions ( ) 
+ + { 
+ + maxSSTableAge = DEFAULT _ TIMESTAMP _ RESOLUTION . convert ( DEFAULT _ MAX _ SSTABLE _ AGE _ DAYS , TimeUnit . DAYS ) ; 
+ + baseTime = DEFAULT _ TIMESTAMP _ RESOLUTION . convert ( DEFAULT _ BASE _ TIME _ SECONDS , TimeUnit . SECONDS ) ; 
+ + } 
+ + 
+ + public static Map < String , String > validateOptions ( Map < String , String > options , Map < String , String > uncheckedOptions ) throws ConfigurationException 
+ + { 
+ + String optionValue = options . get ( TIMESTAMP _ RESOLUTION _ KEY ) ; 
+ + try 
+ + { 
+ + if ( optionValue ! = null ) 
+ + TimeUnit . valueOf ( optionValue ) ; 
+ + } 
+ + catch ( IllegalArgumentException e ) 
+ + { 
+ + throw new ConfigurationException ( String . format ( " timestamp _ resolution % s is not valid " , optionValue ) ) ; 
+ + } 
+ + 
+ + optionValue = options . get ( MAX _ SSTABLE _ AGE _ KEY ) ; 
+ + try 
+ + { 
+ + long maxSStableAge = optionValue = = null ? DEFAULT _ MAX _ SSTABLE _ AGE _ DAYS : Long . parseLong ( optionValue ) ; 
+ + if ( maxSStableAge < 0 ) 
+ + { 
+ + throw new ConfigurationException ( String . format ( " % s must be non - negative : % d " , MAX _ SSTABLE _ AGE _ KEY , maxSStableAge ) ) ; 
+ + } 
+ + } 
+ + catch ( NumberFormatException e ) 
+ + { 
+ + throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , MAX _ SSTABLE _ AGE _ KEY ) , e ) ; 
+ + } 
+ + 
+ + optionValue = options . get ( BASE _ TIME _ KEY ) ; 
+ + try 
+ + { 
+ + long baseTime = optionValue = = null ? DEFAULT _ BASE _ TIME _ SECONDS : Long . parseLong ( optionValue ) ; 
+ + if ( baseTime < = 0 ) 
+ + { 
+ + throw new ConfigurationException ( String . format ( " % s must be greater than 0 , but was % d " , BASE _ TIME _ KEY , baseTime ) ) ; 
+ + } 
+ + } 
+ + catch ( NumberFormatException e ) 
+ + { 
+ + throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , BASE _ TIME _ KEY ) , e ) ; 
+ + } 
+ + 
+ + uncheckedOptions . remove ( MAX _ SSTABLE _ AGE _ KEY ) ; 
+ + uncheckedOptions . remove ( BASE _ TIME _ KEY ) ; 
+ + uncheckedOptions . remove ( TIMESTAMP _ RESOLUTION _ KEY ) ; 
+ + 
+ + return uncheckedOptions ; 
+ + } 
+ + } 
+ diff - - git a / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java 
+ new file mode 100644 
+ index 0000000 . . 299e1af 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / db / compaction / DateTieredCompactionStrategyTest . java 
+ @ @ - 0 , 0 + 1 , 242 @ @ 
+ + / * * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . db . compaction ; 
+ + 
+ + import java . nio . ByteBuffer ; 
+ + import java . util . * ; 
+ + 
+ + import org . junit . Test ; 
+ + 
+ + import com . google . common . collect . Iterables ; 
+ + import com . google . common . collect . Lists ; 
+ + 
+ + import org . apache . cassandra . SchemaLoader ; 
+ + import org . apache . cassandra . Util ; 
+ + import org . apache . cassandra . db . ColumnFamilyStore ; 
+ + import org . apache . cassandra . db . DecoratedKey ; 
+ + import org . apache . cassandra . db . Keyspace ; 
+ + import org . apache . cassandra . db . RowMutation ; 
+ + import org . apache . cassandra . exceptions . ConfigurationException ; 
+ + import org . apache . cassandra . io . sstable . SSTableReader ; 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ + import org . apache . cassandra . utils . Pair ; 
+ + 
+ + import static org . apache . cassandra . db . compaction . DateTieredCompactionStrategy . getBuckets ; 
+ + import static org . apache . cassandra . db . compaction . DateTieredCompactionStrategy . newestBucket ; 
+ + import static org . apache . cassandra . db . compaction . DateTieredCompactionStrategy . trimToThreshold ; 
+ + import static org . apache . cassandra . db . compaction . DateTieredCompactionStrategy . filterOldSSTables ; 
+ + import static org . apache . cassandra . db . compaction . DateTieredCompactionStrategy . validateOptions ; 
+ + 
+ + import static org . junit . Assert . * ; 
+ + 
+ + public class DateTieredCompactionStrategyTest extends SchemaLoader 
+ + { 
+ + public static final String KEYSPACE1 = " Keyspace1 " ; 
+ + private static final String CF _ STANDARD1 = " Standard1 " ; 
+ + 
+ + @ Test 
+ + public void testOptionsValidation ( ) throws ConfigurationException 
+ + { 
+ + Map < String , String > options = new HashMap < > ( ) ; 
+ + options . put ( DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY , " 30 " ) ; 
+ + options . put ( DateTieredCompactionStrategyOptions . MAX _ SSTABLE _ AGE _ KEY , " 1825 " ) ; 
+ + Map < String , String > unvalidated = validateOptions ( options ) ; 
+ + assertTrue ( unvalidated . isEmpty ( ) ) ; 
+ + 
+ + try 
+ + { 
+ + options . put ( DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY , " 0 " ) ; 
+ + validateOptions ( options ) ; 
+ + fail ( String . format ( " % s = = 0 should be rejected " , DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY ) ) ; 
+ + } 
+ + catch ( ConfigurationException e ) { } 
+ + 
+ + try 
+ + { 
+ + options . put ( DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY , " - 1337 " ) ; 
+ + validateOptions ( options ) ; 
+ + fail ( String . format ( " % Negative % s should be rejected " , DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY ) ) ; 
+ + } 
+ + catch ( ConfigurationException e ) 
+ + { 
+ + options . put ( DateTieredCompactionStrategyOptions . BASE _ TIME _ KEY , " 1 " ) ; 
+ + } 
+ + 
+ + try 
+ + { 
+ + options . put ( DateTieredCompactionStrategyOptions . MAX _ SSTABLE _ AGE _ KEY , " - 1337 " ) ; 
+ + validateOptions ( options ) ; 
+ + fail ( String . format ( " % Negative % s should be rejected " , DateTieredCompactionStrategyOptions . MAX _ SSTABLE _ AGE _ KEY ) ) ; 
+ + } 
+ + catch ( ConfigurationException e ) 
+ + { 
+ + options . put ( DateTieredCompactionStrategyOptions . MAX _ SSTABLE _ AGE _ KEY , " 0 " ) ; 
+ + } 
+ + 
+ + options . put ( " bad _ option " , " 1 . 0 " ) ; 
+ + unvalidated = validateOptions ( options ) ; 
+ + assertTrue ( unvalidated . containsKey ( " bad _ option " ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testGetBuckets ( ) 
+ + { 
+ + List < Pair < String , Long > > pairs = Lists . newArrayList ( 
+ + Pair . create ( " a " , 199L ) , 
+ + Pair . create ( " b " , 299L ) , 
+ + Pair . create ( " a " , 1L ) , 
+ + Pair . create ( " b " , 201L ) 
+ + ) ; 
+ + List < List < String > > buckets = getBuckets ( pairs , 100L , 2 , 200L ) ; 
+ + assertEquals ( 2 , buckets . size ( ) ) ; 
+ + 
+ + for ( List < String > bucket : buckets ) 
+ + { 
+ + assertEquals ( 2 , bucket . size ( ) ) ; 
+ + assertEquals ( bucket . get ( 0 ) , bucket . get ( 1 ) ) ; 
+ + } 
+ + 
+ + 
+ + pairs = Lists . newArrayList ( 
+ + Pair . create ( " a " , 2000L ) , 
+ + Pair . create ( " b " , 3600L ) , 
+ + Pair . create ( " a " , 200L ) , 
+ + Pair . create ( " c " , 3950L ) , 
+ + Pair . create ( " too new " , 4125L ) , 
+ + Pair . create ( " b " , 3899L ) , 
+ + Pair . create ( " c " , 3900L ) 
+ + ) ; 
+ + buckets = getBuckets ( pairs , 100L , 3 , 4050L ) ; 
+ + / / targets ( divPosition , size ) : ( 40 , 100 ) , ( 39 , 100 ) , ( 12 , 300 ) , ( 3 , 900 ) , ( 0 , 2700 ) 
+ + / / in other words : 0 - 2699 , 2700 - 3599 , 3600 - 3899 , 3900 - 3999 , 4000 - 4099 
+ + assertEquals ( 3 , buckets . size ( ) ) ; 
+ + 
+ + for ( List < String > bucket : buckets ) 
+ + { 
+ + assertEquals ( 2 , bucket . size ( ) ) ; 
+ + assertEquals ( bucket . get ( 0 ) , bucket . get ( 1 ) ) ; 
+ + } 
+ + 
+ + 
+ + / / Test base 1 . 
+ + pairs = Lists . newArrayList ( 
+ + Pair . create ( " a " , 200L ) , 
+ + Pair . create ( " a " , 299L ) , 
+ + Pair . create ( " b " , 2000L ) , 
+ + Pair . create ( " b " , 2014L ) , 
+ + Pair . create ( " c " , 3610L ) , 
+ + Pair . create ( " c " , 3690L ) , 
+ + Pair . create ( " d " , 3898L ) , 
+ + Pair . create ( " d " , 3899L ) , 
+ + Pair . create ( " e " , 3900L ) , 
+ + Pair . create ( " e " , 3950L ) , 
+ + Pair . create ( " too new " , 4125L ) 
+ + ) ; 
+ + buckets = getBuckets ( pairs , 100L , 1 , 4050L ) ; 
+ + 
+ + assertEquals ( 5 , buckets . size ( ) ) ; 
+ + 
+ + for ( List < String > bucket : buckets ) 
+ + { 
+ + assertEquals ( 2 , bucket . size ( ) ) ; 
+ + assertEquals ( bucket . get ( 0 ) , bucket . get ( 1 ) ) ; 
+ + } 
+ + } 
+ + 
+ + @ Test 
+ + public void testPrepBucket ( ) 
+ + { 
+ + Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( CF _ STANDARD1 ) ; 
+ + cfs . truncateBlocking ( ) ; 
+ + cfs . disableAutoCompaction ( ) ; 
+ + 
+ + ByteBuffer value = ByteBuffer . wrap ( new byte [ 100 ] ) ; 
+ + 
+ + / / create 3 sstables 
+ + int numSSTables = 3 ; 
+ + for ( int r = 0 ; r < numSSTables ; r + + ) 
+ + { 
+ + DecoratedKey key = Util . dk ( String . valueOf ( r ) ) ; 
+ + RowMutation rm = new RowMutation ( KEYSPACE1 , key . key ) ; 
+ + rm . add ( CF _ STANDARD1 , ByteBufferUtil . bytes ( " column " ) , value , r ) ; 
+ + rm . apply ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + } 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + List < SSTableReader > sstrs = new ArrayList < > ( cfs . getSSTables ( ) ) ; 
+ + 
+ + List < SSTableReader > newBucket = newestBucket ( Collections . singletonList ( sstrs . subList ( 0 , 2 ) ) , 4 , 32 ) ; 
+ + assertTrue ( " nothing should be returned when all buckets are below the min threshold " , newBucket . isEmpty ( ) ) ; 
+ + 
+ + assertEquals ( " an sstable with a single value should have equal min / max timestamps " , sstrs . get ( 0 ) . getMinTimestamp ( ) , sstrs . get ( 0 ) . getMaxTimestamp ( ) ) ; 
+ + assertEquals ( " an sstable with a single value should have equal min / max timestamps " , sstrs . get ( 1 ) . getMinTimestamp ( ) , sstrs . get ( 1 ) . getMaxTimestamp ( ) ) ; 
+ + assertEquals ( " an sstable with a single value should have equal min / max timestamps " , sstrs . get ( 2 ) . getMinTimestamp ( ) , sstrs . get ( 2 ) . getMaxTimestamp ( ) ) ; 
+ + 
+ + / / if we have more than the max threshold , the oldest should be dropped 
+ + Collections . sort ( sstrs , Collections . reverseOrder ( new Comparator < SSTableReader > ( ) { 
+ + public int compare ( SSTableReader o1 , SSTableReader o2 ) { 
+ + return Long . compare ( o1 . getMinTimestamp ( ) , o2 . getMinTimestamp ( ) ) ; 
+ + } 
+ + } ) ) ; 
+ + 
+ + List < SSTableReader > bucket = trimToThreshold ( sstrs , 2 ) ; 
+ + assertEquals ( " one bucket should have been dropped " , 2 , bucket . size ( ) ) ; 
+ + for ( SSTableReader sstr : bucket ) 
+ + assertFalse ( " the oldest sstable should be dropped " , sstr . getMinTimestamp ( ) = = 0 ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testFilterOldSSTables ( ) 
+ + { 
+ + Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( CF _ STANDARD1 ) ; 
+ + cfs . truncateBlocking ( ) ; 
+ + cfs . disableAutoCompaction ( ) ; 
+ + 
+ + ByteBuffer value = ByteBuffer . wrap ( new byte [ 100 ] ) ; 
+ + 
+ + / / create 3 sstables 
+ + int numSSTables = 3 ; 
+ + for ( int r = 0 ; r < numSSTables ; r + + ) 
+ + { 
+ + DecoratedKey key = Util . dk ( String . valueOf ( r ) ) ; 
+ + RowMutation rm = new RowMutation ( KEYSPACE1 , key . key ) ; 
+ + rm . add ( CF _ STANDARD1 , ByteBufferUtil . bytes ( " column " ) , value , r ) ; 
+ + rm . apply ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + } 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + Iterable < SSTableReader > filtered ; 
+ + List < SSTableReader > sstrs = new ArrayList < > ( cfs . getSSTables ( ) ) ; 
+ + 
+ + filtered = filterOldSSTables ( sstrs , 0 , 2 ) ; 
+ + assertEquals ( " when maxSSTableAge is zero , no sstables should be filtered " , sstrs . size ( ) , Iterables . size ( filtered ) ) ; 
+ + 
+ + filtered = filterOldSSTables ( sstrs , 1 , 2 ) ; 
+ + assertEquals ( " only the newest 2 sstables should remain " , 2 , Iterables . size ( filtered ) ) ; 
+ + 
+ + filtered = filterOldSSTables ( sstrs , 1 , 3 ) ; 
+ + assertEquals ( " only the newest sstable should remain " , 1 , Iterables . size ( filtered ) ) ; 
+ + 
+ + filtered = filterOldSSTables ( sstrs , 1 , 4 ) ; 
+ + assertEquals ( " no sstables should remain when all are too old " , 0 , Iterables . size ( filtered ) ) ; 
+ + } 
+ + }
+
+NEAREST DIFF:
+diff - - git a / build . xml b / build . xml 
+ index 4d8ae14 . . 254cc2d 100644 
+ - - - a / build . xml 
+ + + + b / build . xml 
+ @ @ - 340 , 7 + 340 , 7 @ @ 
+ < dependency groupId = " com . google . guava " artifactId = " guava " version = " 13 . 0 . 1 " / > 
+ < dependency groupId = " commons - cli " artifactId = " commons - cli " version = " 1 . 1 " / > 
+ < dependency groupId = " commons - codec " artifactId = " commons - codec " version = " 1 . 2 " / > 
+ - < dependency groupId = " commons - lang " artifactId = " commons - lang " version = " 3 . 1 " / > 
+ + < dependency groupId = " org . apache . commons " artifactId = " commons - lang3 " version = " 3 . 1 " / > 
+ < dependency groupId = " com . googlecode . concurrentlinkedhashmap " artifactId = " concurrentlinkedhashmap - lru " version = " 1 . 3 " / > 
+ < dependency groupId = " org . antlr " artifactId = " antlr " version = " 3 . 2 " / > 
+ < dependency groupId = " org . slf4j " artifactId = " slf4j - api " version = " 1 . 7 . 2 " / > 
+ @ @ - 438 , 7 + 438 , 7 @ @ 
+ < dependency groupId = " com . google . guava " artifactId = " guava " / > 
+ < dependency groupId = " commons - cli " artifactId = " commons - cli " / > 
+ < dependency groupId = " commons - codec " artifactId = " commons - codec " / > 
+ - < dependency groupId = " commons - lang " artifactId = " commons - lang " / > 
+ + < dependency groupId = " org . apache . commons " artifactId = " commons - lang3 " / > 
+ < dependency groupId = " com . googlecode . concurrentlinkedhashmap " artifactId = " concurrentlinkedhashmap - lru " / > 
+ < dependency groupId = " org . antlr " artifactId = " antlr " / > 
+ < dependency groupId = " org . slf4j " artifactId = " slf4j - api " / > 
+ @ @ - 479 , 7 + 479 , 7 @ @ 
+ artifactId = " cassandra - parent " 
+ version = " $ { version } " / > 
+ < scm connection = " $ { scm . connection } " developerConnection = " $ { scm . developerConnection } " url = " $ { scm . url } " / > 
+ - < dependency groupId = " commons - lang " artifactId = " commons - lang " / > 
+ + < dependency groupId = " org . apache . commons " artifactId = " commons - lang3 " / > 
+ < dependency groupId = " org . slf4j " artifactId = " slf4j - api " / > 
+ < dependency groupId = " org . apache . thrift " artifactId = " libthrift " / > 
+ < / artifact : pom >

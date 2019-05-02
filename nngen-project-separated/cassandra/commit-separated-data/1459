@@ -1,0 +1,570 @@
+BLEU SCORE: 0.016932492841722675
+
+TEST MSG: Log when messages are dropped due to cross _ node _ timeout
+GENERATED MSG: merge from 0 . 7
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index f1e855e . . 12af151 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 0 . 17 <nl> + * Log when messages are dropped due to cross _ node _ timeout ( CASSANDRA - 9793 ) <nl> * checkForEndpointCollision fails for legitimate collisions ( CASSANDRA - 9765 ) <nl> * Complete CASSANDRA - 8448 fix ( CASSANDRA - 9519 ) <nl> * Don ' t include auth credentials in debug log ( CASSANDRA - 9682 ) <nl> diff - - git a / src / java / org / apache / cassandra / net / IncomingTcpConnection . java b / src / java / org / apache / cassandra / net / IncomingTcpConnection . java <nl> index 4817c75 . . 16ca121 100644 <nl> - - - a / src / java / org / apache / cassandra / net / IncomingTcpConnection . java <nl> + + + b / src / java / org / apache / cassandra / net / IncomingTcpConnection . java <nl> @ @ - 158 , 10 + 158 , 15 @ @ public class IncomingTcpConnection extends Thread implements Closeable <nl> id = input . readInt ( ) ; <nl> <nl> long timestamp = System . currentTimeMillis ( ) ; <nl> + boolean isCrossNodeTimestamp = false ; <nl> / / make sure to readInt , even if cross _ node _ to is not enabled <nl> int partial = input . readInt ( ) ; <nl> if ( DatabaseDescriptor . hasCrossNodeTimeout ( ) ) <nl> - timestamp = ( timestamp & 0xFFFFFFFF00000000L ) | ( ( ( partial & 0xFFFFFFFFL ) < < 2 ) > > 2 ) ; <nl> + { <nl> + long crossNodeTimestamp = ( timestamp & 0xFFFFFFFF00000000L ) | ( ( ( partial & 0xFFFFFFFFL ) < < 2 ) > > 2 ) ; <nl> + isCrossNodeTimestamp = ( timestamp ! = crossNodeTimestamp ) ; <nl> + timestamp = crossNodeTimestamp ; <nl> + } <nl> <nl> MessageIn message = MessageIn . read ( input , version , id ) ; <nl> if ( message = = null ) <nl> @ @ - 171 , 7 + 176 , 7 @ @ public class IncomingTcpConnection extends Thread implements Closeable <nl> } <nl> if ( version < = MessagingService . current _ version ) <nl> { <nl> - MessagingService . instance ( ) . receive ( message , id , timestamp ) ; <nl> + MessagingService . instance ( ) . receive ( message , id , timestamp , isCrossNodeTimestamp ) ; <nl> } <nl> else <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / net / MessageDeliveryTask . java b / src / java / org / apache / cassandra / net / MessageDeliveryTask . java <nl> index 982f17e . . 06caf94 100644 <nl> - - - a / src / java / org / apache / cassandra / net / MessageDeliveryTask . java <nl> + + + b / src / java / org / apache / cassandra / net / MessageDeliveryTask . java <nl> @ @ - 29 , 15 + 29 , 17 @ @ public class MessageDeliveryTask implements Runnable <nl> private static final Logger logger = LoggerFactory . getLogger ( MessageDeliveryTask . class ) ; <nl> <nl> private final MessageIn message ; <nl> - private final long constructionTime ; <nl> private final int id ; <nl> + private final long constructionTime ; <nl> + private final boolean isCrossNodeTimestamp ; <nl> <nl> - public MessageDeliveryTask ( MessageIn message , int id , long timestamp ) <nl> + public MessageDeliveryTask ( MessageIn message , int id , long timestamp , boolean isCrossNodeTimestamp ) <nl> { <nl> assert message ! = null ; <nl> this . message = message ; <nl> this . id = id ; <nl> - constructionTime = timestamp ; <nl> + this . constructionTime = timestamp ; <nl> + this . isCrossNodeTimestamp = isCrossNodeTimestamp ; <nl> } <nl> <nl> public void run ( ) <nl> @ @ - 46 , 7 + 48 , 7 @ @ public class MessageDeliveryTask implements Runnable <nl> if ( MessagingService . DROPPABLE _ VERBS . contains ( verb ) <nl> & & System . currentTimeMillis ( ) > constructionTime + message . getTimeout ( ) ) <nl> { <nl> - MessagingService . instance ( ) . incrementDroppedMessages ( verb ) ; <nl> + MessagingService . instance ( ) . incrementDroppedMessages ( verb , isCrossNodeTimestamp ) ; <nl> return ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java <nl> index ee6b87b . . b02680d 100644 <nl> - - - a / src / java / org / apache / cassandra / net / MessagingService . java <nl> + + + b / src / java / org / apache / cassandra / net / MessagingService . java <nl> @ @ - 31 , 6 + 31 , 7 @ @ import java . util . concurrent . atomic . AtomicInteger ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . ObjectName ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . base . Function ; <nl> import com . google . common . collect . Lists ; <nl> import com . google . common . collect . Sets ; <nl> @ @ - 118 , 7 + 119 , 7 @ @ public final class MessagingService implements MessagingServiceMBean <nl> SNAPSHOT , / / Similar to nt snapshot <nl> MIGRATION _ REQUEST , <nl> GOSSIP _ SHUTDOWN , <nl> - _ TRACE , / / dummy verb so we can use MS . droppedMessages <nl> + _ TRACE , / / dummy verb so we can use MS . droppedMessagesMap <nl> ECHO , <nl> REPAIR _ MESSAGE , <nl> / / use as padding for backwards compatability where a previous version needs to validate a verb from the future . <nl> @ @ - 291 , 10 + 292 , 23 @ @ public final class MessagingService implements MessagingServiceMBean <nl> Verb . PAGED _ RANGE , <nl> Verb . REQUEST _ RESPONSE ) ; <nl> <nl> + <nl> + private static final class DroppedMessages <nl> + { <nl> + final DroppedMessageMetrics metrics ; <nl> + final AtomicInteger droppedInternalTimeout ; <nl> + final AtomicInteger droppedCrossNodeTimeout ; <nl> + <nl> + DroppedMessages ( Verb verb ) <nl> + { <nl> + this . metrics = new DroppedMessageMetrics ( verb ) ; <nl> + this . droppedInternalTimeout = new AtomicInteger ( 0 ) ; <nl> + this . droppedCrossNodeTimeout = new AtomicInteger ( 0 ) ; <nl> + } <nl> + <nl> + } <nl> / / total dropped message counts for server lifetime <nl> - private final Map < Verb , DroppedMessageMetrics > droppedMessages = new EnumMap < Verb , DroppedMessageMetrics > ( Verb . class ) ; <nl> - / / dropped count when last requested for the Recent api . high concurrency isn ' t necessary here . <nl> - private final Map < Verb , Integer > lastDroppedInternal = new EnumMap < Verb , Integer > ( Verb . class ) ; <nl> + private final Map < Verb , DroppedMessages > droppedMessagesMap = new EnumMap < > ( Verb . class ) ; <nl> <nl> private final List < ILatencySubscriber > subscribers = new ArrayList < ILatencySubscriber > ( ) ; <nl> <nl> @ @ - 303 , 31 + 317 , 43 @ @ public final class MessagingService implements MessagingServiceMBean <nl> <nl> private static class MSHandle <nl> { <nl> - public static final MessagingService instance = new MessagingService ( ) ; <nl> + public static final MessagingService instance = new MessagingService ( false ) ; <nl> } <nl> + <nl> public static MessagingService instance ( ) <nl> { <nl> return MSHandle . instance ; <nl> } <nl> <nl> - private MessagingService ( ) <nl> + private static class MSTestHandle <nl> + { <nl> + public static final MessagingService instance = new MessagingService ( true ) ; <nl> + } <nl> + <nl> + static MessagingService test ( ) <nl> + { <nl> + return MSTestHandle . instance ; <nl> + } <nl> + <nl> + private MessagingService ( boolean testOnly ) <nl> { <nl> for ( Verb verb : DROPPABLE _ VERBS ) <nl> - { <nl> - droppedMessages . put ( verb , new DroppedMessageMetrics ( verb ) ) ; <nl> - lastDroppedInternal . put ( verb , 0 ) ; <nl> - } <nl> + droppedMessagesMap . put ( verb , new DroppedMessages ( verb ) ) ; <nl> <nl> listenGate = new SimpleCondition ( ) ; <nl> - verbHandlers = new EnumMap < Verb , IVerbHandler > ( Verb . class ) ; <nl> - Runnable logDropped = new Runnable ( ) <nl> + verbHandlers = new EnumMap < > ( Verb . class ) ; <nl> + <nl> + if ( ! testOnly ) <nl> { <nl> - public void run ( ) <nl> + Runnable logDropped = new Runnable ( ) <nl> { <nl> - logDroppedMessages ( ) ; <nl> - } <nl> - } ; <nl> - StorageService . scheduledTasks . scheduleWithFixedDelay ( logDropped , LOG _ DROPPED _ INTERVAL _ IN _ MS , LOG _ DROPPED _ INTERVAL _ IN _ MS , TimeUnit . MILLISECONDS ) ; <nl> + public void run ( ) <nl> + { <nl> + logDroppedMessages ( ) ; <nl> + } <nl> + } ; <nl> + StorageService . scheduledTasks . scheduleWithFixedDelay ( logDropped , LOG _ DROPPED _ INTERVAL _ IN _ MS , LOG _ DROPPED _ INTERVAL _ IN _ MS , TimeUnit . MILLISECONDS ) ; <nl> + } <nl> <nl> Function < Pair < Integer , ExpiringMap . CacheableObject < CallbackInfo > > , ? > timeoutReporter = new Function < Pair < Integer , ExpiringMap . CacheableObject < CallbackInfo > > , Object > ( ) <nl> { <nl> @ @ - 357 , 16 + 383 , 19 @ @ public final class MessagingService implements MessagingServiceMBean <nl> } <nl> } ; <nl> <nl> - callbacks = new ExpiringMap < Integer , CallbackInfo > ( DatabaseDescriptor . getMinRpcTimeout ( ) , timeoutReporter ) ; <nl> + callbacks = new ExpiringMap < > ( DatabaseDescriptor . getMinRpcTimeout ( ) , timeoutReporter ) ; <nl> <nl> - MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; <nl> - try <nl> + if ( ! testOnly ) <nl> { <nl> - mbs . registerMBean ( this , new ObjectName ( MBEAN _ NAME ) ) ; <nl> - } <nl> - catch ( Exception e ) <nl> - { <nl> - throw new RuntimeException ( e ) ; <nl> + MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; <nl> + try <nl> + { <nl> + mbs . registerMBean ( this , new ObjectName ( MBEAN _ NAME ) ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> } <nl> } <nl> <nl> @ @ - 718 , 7 + 747 , 7 @ @ public final class MessagingService implements MessagingServiceMBean <nl> } <nl> } <nl> <nl> - public void receive ( MessageIn message , int id , long timestamp ) <nl> + public void receive ( MessageIn message , int id , long timestamp , boolean isCrossNodeTimestamp ) <nl> { <nl> TraceState state = Tracing . instance . initializeFromMessage ( message ) ; <nl> if ( state ! = null ) <nl> @ @ - 732 , 7 + 761 , 7 @ @ public final class MessagingService implements MessagingServiceMBean <nl> return ; <nl> } <nl> <nl> - Runnable runnable = new MessageDeliveryTask ( message , id , timestamp ) ; <nl> + Runnable runnable = new MessageDeliveryTask ( message , id , timestamp , isCrossNodeTimestamp ) ; <nl> TracingAwareExecutorService stage = StageManager . getStage ( message . getMessageType ( ) ) ; <nl> assert stage ! = null : " No stage for message type " + message . verb ; <nl> <nl> @ @ - 844 , 8 + 873 , 13 @ @ public final class MessagingService implements MessagingServiceMBean <nl> <nl> public void incrementDroppedMessages ( Verb verb ) <nl> { <nl> + incrementDroppedMessages ( verb , false ) ; <nl> + } <nl> + <nl> + public void incrementDroppedMessages ( Verb verb , boolean isCrossNodeTimeout ) <nl> + { <nl> assert DROPPABLE _ VERBS . contains ( verb ) : " Verb " + verb + " should not legally be dropped " ; <nl> - droppedMessages . get ( verb ) . dropped . mark ( ) ; <nl> + incrementDroppedMessages ( droppedMessagesMap . get ( verb ) , isCrossNodeTimeout ) ; <nl> } <nl> <nl> / * * <nl> @ @ - 853 , 34 + 887 , 55 @ @ public final class MessagingService implements MessagingServiceMBean <nl> * / <nl> private void incrementRejectedMessages ( Verb verb ) <nl> { <nl> - DroppedMessageMetrics metrics = droppedMessages . get ( verb ) ; <nl> - if ( metrics = = null ) <nl> + DroppedMessages droppedMessages = droppedMessagesMap . get ( verb ) ; <nl> + if ( droppedMessages = = null ) <nl> { <nl> - metrics = new DroppedMessageMetrics ( verb ) ; <nl> - droppedMessages . put ( verb , metrics ) ; <nl> + droppedMessages = new DroppedMessages ( verb ) ; <nl> + droppedMessagesMap . put ( verb , droppedMessages ) ; <nl> } <nl> - metrics . dropped . mark ( ) ; <nl> + incrementDroppedMessages ( droppedMessagesMap . get ( verb ) , false ) ; <nl> + } <nl> + <nl> + private void incrementDroppedMessages ( DroppedMessages droppedMessages , boolean isCrossNodeTimeout ) <nl> + { <nl> + droppedMessages . metrics . dropped . mark ( ) ; <nl> + if ( isCrossNodeTimeout ) <nl> + droppedMessages . droppedCrossNodeTimeout . incrementAndGet ( ) ; <nl> + else <nl> + droppedMessages . droppedInternalTimeout . incrementAndGet ( ) ; <nl> } <nl> <nl> private void logDroppedMessages ( ) <nl> { <nl> - boolean logTpstats = false ; <nl> - for ( Map . Entry < Verb , DroppedMessageMetrics > entry : droppedMessages . entrySet ( ) ) <nl> + List < String > logs = getDroppedMessagesLogs ( ) ; <nl> + for ( String log : logs ) <nl> + logger . error ( log ) ; <nl> + <nl> + if ( logs . size ( ) > 0 ) <nl> + StatusLogger . log ( ) ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + List < String > getDroppedMessagesLogs ( ) <nl> + { <nl> + List < String > ret = new ArrayList < > ( ) ; <nl> + for ( Map . Entry < Verb , DroppedMessages > entry : droppedMessagesMap . entrySet ( ) ) <nl> { <nl> - int dropped = ( int ) entry . getValue ( ) . dropped . count ( ) ; <nl> Verb verb = entry . getKey ( ) ; <nl> - int recent = dropped - lastDroppedInternal . get ( verb ) ; <nl> - if ( recent > 0 ) <nl> + DroppedMessages droppedMessages = entry . getValue ( ) ; <nl> + <nl> + int droppedInternalTimeout = droppedMessages . droppedInternalTimeout . getAndSet ( 0 ) ; <nl> + int droppedCrossNodeTimeout = droppedMessages . droppedCrossNodeTimeout . getAndSet ( 0 ) ; <nl> + if ( droppedInternalTimeout > 0 | | droppedCrossNodeTimeout > 0 ) <nl> { <nl> - logTpstats = true ; <nl> - logger . info ( " { } { } messages dropped in last { } ms " , <nl> - new Object [ ] { recent , verb , LOG _ DROPPED _ INTERVAL _ IN _ MS } ) ; <nl> - lastDroppedInternal . put ( verb , dropped ) ; <nl> + ret . add ( String . format ( " % s messages were dropped in last % d ms : % d for internal timeout and % d for cross node timeout " , <nl> + verb , <nl> + LOG _ DROPPED _ INTERVAL _ IN _ MS , <nl> + droppedInternalTimeout , <nl> + droppedCrossNodeTimeout ) ) ; <nl> } <nl> } <nl> - <nl> - if ( logTpstats ) <nl> - StatusLogger . log ( ) ; <nl> + return ret ; <nl> } <nl> <nl> private static class SocketThread extends Thread <nl> @ @ - 1011 , 16 + 1066 , 16 @ @ public final class MessagingService implements MessagingServiceMBean <nl> public Map < String , Integer > getDroppedMessages ( ) <nl> { <nl> Map < String , Integer > map = new HashMap < String , Integer > ( ) ; <nl> - for ( Map . Entry < Verb , DroppedMessageMetrics > entry : droppedMessages . entrySet ( ) ) <nl> - map . put ( entry . getKey ( ) . toString ( ) , ( int ) entry . getValue ( ) . dropped . count ( ) ) ; <nl> + for ( Map . Entry < Verb , DroppedMessages > entry : droppedMessagesMap . entrySet ( ) ) <nl> + map . put ( entry . getKey ( ) . toString ( ) , ( int ) entry . getValue ( ) . metrics . dropped . count ( ) ) ; <nl> return map ; <nl> } <nl> <nl> public Map < String , Integer > getRecentlyDroppedMessages ( ) <nl> { <nl> Map < String , Integer > map = new HashMap < String , Integer > ( ) ; <nl> - for ( Map . Entry < Verb , DroppedMessageMetrics > entry : droppedMessages . entrySet ( ) ) <nl> - map . put ( entry . getKey ( ) . toString ( ) , entry . getValue ( ) . getRecentlyDropped ( ) ) ; <nl> + for ( Map . Entry < Verb , DroppedMessages > entry : droppedMessagesMap . entrySet ( ) ) <nl> + map . put ( entry . getKey ( ) . toString ( ) , entry . getValue ( ) . metrics . getRecentlyDropped ( ) ) ; <nl> return map ; <nl> } <nl> <nl> diff - - git a / test / unit / org / apache / cassandra / net / MessagingServiceTest . java b / test / unit / org / apache / cassandra / net / MessagingServiceTest . java <nl> new file mode 100644 <nl> index 0000000 . . 04dacf3 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / net / MessagingServiceTest . java <nl> @ @ - 0 , 0 + 1 , 39 @ @ <nl> + package org . apache . cassandra . net ; <nl> + <nl> + import java . util . List ; <nl> + <nl> + import org . junit . Test ; <nl> + <nl> + import static org . junit . Assert . assertEquals ; <nl> + <nl> + public class MessagingServiceTest <nl> + { <nl> + private final MessagingService messagingService = MessagingService . test ( ) ; <nl> + <nl> + @ Test <nl> + public void testDroppedMessages ( ) <nl> + { <nl> + MessagingService . Verb verb = MessagingService . Verb . READ ; <nl> + <nl> + for ( int i = 0 ; i < 5000 ; i + + ) <nl> + messagingService . incrementDroppedMessages ( verb , i % 2 = = 0 ) ; <nl> + <nl> + List < String > logs = messagingService . getDroppedMessagesLogs ( ) ; <nl> + assertEquals ( 1 , logs . size ( ) ) ; <nl> + assertEquals ( " READ messages were dropped in last 5000 ms : 2500 for internal timeout and 2500 for cross node timeout " , logs . get ( 0 ) ) ; <nl> + assertEquals ( 5000 , ( int ) messagingService . getDroppedMessages ( ) . get ( verb . toString ( ) ) ) ; <nl> + assertEquals ( 5000 , ( int ) messagingService . getRecentlyDroppedMessages ( ) . get ( verb . toString ( ) ) ) ; <nl> + <nl> + logs = messagingService . getDroppedMessagesLogs ( ) ; <nl> + assertEquals ( 0 , logs . size ( ) ) ; <nl> + <nl> + for ( int i = 0 ; i < 2500 ; i + + ) <nl> + messagingService . incrementDroppedMessages ( verb , i % 2 = = 0 ) ; <nl> + <nl> + logs = messagingService . getDroppedMessagesLogs ( ) ; <nl> + assertEquals ( " READ messages were dropped in last 5000 ms : 1250 for internal timeout and 1250 for cross node timeout " , logs . get ( 0 ) ) ; <nl> + assertEquals ( 7500 , ( int ) messagingService . getDroppedMessages ( ) . get ( verb . toString ( ) ) ) ; <nl> + assertEquals ( 2500 , ( int ) messagingService . getRecentlyDroppedMessages ( ) . get ( verb . toString ( ) ) ) ; <nl> + } <nl> + <nl> + }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index eec904a . . 982454c 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 59 , 6 + 59 , 8 @ @ <nl> the old ones ( CASSANDRA - 1644 ) <nl> * upgrade to Thrift 0 . 5 ( CASSANDRA - 1367 ) <nl> * renamed CL . DCQUORUM to LOCAL _ QUORUM and DCQUORUMSYNC to EACH _ QUORUM <nl> + * cli truncate support ( CASSANDRA - 1653 ) <nl> + * update GC settings in cassandra . bat ( CASSANDRA - 1636 ) <nl> <nl> <nl> 0 . 7 - beta2 <nl> diff - - git a / src / java / org / apache / cassandra / cli / Cli . g b / src / java / org / apache / cassandra / cli / Cli . g <nl> index e59c608 . . a9229ee 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / Cli . g <nl> + + + b / src / java / org / apache / cassandra / cli / Cli . g <nl> @ @ - 55 , 6 + 55 , 7 @ @ tokens { <nl> NODE _ UPDATE _ KEYSPACE ; <nl> NODE _ UPDATE _ COLUMN _ FAMILY ; <nl> NODE _ LIST ; <nl> + NODE _ TRUNCATE ; <nl> <nl> / / Internal Nodes . <nl> NODE _ COLUMN _ ACCESS ; <nl> @ @ - 123 , 6 + 124 , 7 @ @ statement <nl> | setStatement <nl> | showStatement <nl> | listStatement <nl> + | truncateStatement <nl> | - > ^ ( NODE _ NO _ OP ) <nl> ; <nl> <nl> @ @ - 174 , 6 + 176 , 8 @ @ helpStatement <nl> - > ^ ( NODE _ HELP NODE _ THRIFT _ COUNT ) <nl> | K _ HELP K _ LIST <nl> - > ^ ( NODE _ HELP NODE _ LIST ) <nl> + | K _ HELP K _ TRUNCATE <nl> + - > ^ ( NODE _ HELP NODE _ TRUNCATE ) <nl> | K _ HELP <nl> - > ^ ( NODE _ HELP ) <nl> | ' ? ' <nl> @ @ - 231 , 6 + 235 , 11 @ @ listStatement <nl> - > ^ ( NODE _ LIST columnFamily keyRangeExpr ? ^ ( NODE _ LIMIT $ limit ) ? ) <nl> ; <nl> <nl> + truncateStatement <nl> + : K _ TRUNCATE columnFamily <nl> + - > ^ ( NODE _ TRUNCATE columnFamily ) <nl> + ; <nl> + <nl> showClusterName <nl> : K _ SHOW K _ CLUSTER K _ NAME <nl> - > ^ ( NODE _ SHOW _ CLUSTER _ NAME ) <nl> @ @ - 430 , 6 + 439 , 7 @ @ K _ AND : ' AND ' ; <nl> K _ UPDATE : ' UPDATE ' ; <nl> K _ LIST : ' LIST ' ; <nl> K _ LIMIT : ' LIMIT ' ; <nl> + K _ TRUNCATE : ' TRUNCATE ' ; <nl> <nl> / / private syntactic rules <nl> fragment <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliClient . java b / src / java / org / apache / cassandra / cli / CliClient . java <nl> index b6ace98 . . b63105a 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliClient . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliClient . java <nl> @ @ - 171 , 6 + 171 , 9 @ @ public class CliClient extends CliUserHelp <nl> case CliParser . NODE _ LIST : <nl> executeList ( tree ) ; <nl> break ; <nl> + case CliParser . NODE _ TRUNCATE : <nl> + executeTruncate ( tree . getChild ( 0 ) . getText ( ) ) ; <nl> + break ; <nl> case CliParser . NODE _ NO _ OP : <nl> / / comment lines come here ; they are treated as no ops . <nl> break ; <nl> @ @ - 943 , 6 + 946 , 30 @ @ public class CliClient extends CliUserHelp <nl> printSliceList ( columnFamilyDef , keySlices ) ; <nl> } <nl> <nl> + / / TRUNCATE < columnFamily > <nl> + private void executeTruncate ( String columnFamily ) <nl> + { <nl> + if ( ! CliMain . isConnected ( ) | | ! hasKeySpace ( ) ) <nl> + return ; <nl> + <nl> + / / getting CfDef , it will fail if there is no such column family in current keySpace . <nl> + CfDef cfDef = getCfDef ( columnFamily ) ; <nl> + <nl> + try <nl> + { <nl> + thriftClient . truncate ( cfDef . getName ( ) ) ; <nl> + sessionState . out . println ( columnFamily + " truncated . " ) ; <nl> + } <nl> + catch ( InvalidRequestException e ) <nl> + { <nl> + throw new RuntimeException ( e . getWhy ( ) ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new RuntimeException ( e . getMessage ( ) ) ; <nl> + } <nl> + } <nl> + <nl> / / SHOW API VERSION <nl> private void executeShowVersion ( ) throws TException <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliCompleter . java b / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> index f541fe5 . . b033d8f 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> @ @ - 55 , 12 + 55 , 16 @ @ public class CliCompleter extends SimpleCompletor <nl> " help set " , <nl> " help del " , <nl> " help count " , <nl> + " help list " , <nl> + " help truncate " <nl> } ; <nl> private static String [ ] keyspaceCommands = { <nl> " get " , <nl> " set " , <nl> " count " , <nl> - " del " <nl> + " del " , <nl> + " list " , <nl> + " truncate " <nl> } ; <nl> <nl> public CliCompleter ( ) <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliUserHelp . java b / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> index 7c512e2 . . db6a779 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> @ @ - 281 , 6 + 281 , 13 @ @ public class CliUserHelp { <nl> state . out . println ( " list Users [ j : ] limit 40 " ) ; <nl> break ; <nl> <nl> + case CliParser . NODE _ TRUNCATE : <nl> + state . out . println ( " truncate < column _ family > " ) ; <nl> + state . out . println ( " Truncate specified column family . \ n " ) ; <nl> + state . out . println ( " example : " ) ; <nl> + state . out . println ( " truncate Category " ) ; <nl> + break ; <nl> + <nl> default : <nl> state . out . println ( " ? " ) ; <nl> break ; <nl> @ @ - 324 , 7 + 331 , 8 @ @ public class CliUserHelp { <nl> state . out . println ( " del < cf > [ ' < key > ' ] [ ' < super > ' ] [ ' < col > ' ] Delete sub column . " ) ; <nl> state . out . println ( " count < cf > [ ' < key > ' ] Count columns in record . " ) ; <nl> state . out . println ( " count < cf > [ ' < key > ' ] [ ' < super > ' ] Count columns in a super column . " ) ; <nl> - state . out . println ( " list < cf > List all rows in the column family . " ) ; <nl> + state . out . println ( " truncate < column _ family > Truncate specified column family . " ) ; <nl> + state . out . println ( " list < cf > List all rows in the column family . " ) ; <nl> state . out . println ( " list < cf > [ < startKey > : ] " ) ; <nl> state . out . println ( " List rows in the column family beginning with < startKey > . " ) ; <nl> state . out . println ( " list < cf > [ < startKey > : < endKey > ] " ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / cli / CliTest . java b / test / unit / org / apache / cassandra / cli / CliTest . java <nl> index 24a3de0 . . eddcafd 100644 <nl> - - - a / test / unit / org / apache / cassandra / cli / CliTest . java <nl> + + + b / test / unit / org / apache / cassandra / cli / CliTest . java <nl> @ @ - 52 , 6 + 52 , 7 @ @ public class CliTest extends TestCase <nl> " list CF3 [ h : ] " , <nl> " list CF3 limit 10 " , <nl> " list CF3 [ h : g ] limit 10 " , <nl> + " truncate CF1 " , <nl> " update keyspace TestKeySpace with placement _ strategy = ' org . apache . cassandra . locator . LocalStrategy ' " , <nl> " update keyspace TestKeySpace with replication _ factor = 1 and strategy _ options = [ { DC1 : 3 , DC2 : 4 , DC5 : 1 } ] " <nl> } ; <nl> @ @ - 101 , 6 + 102 , 10 @ @ public class CliTest extends TestCase <nl> assertTrue ( result . startsWith ( " = > ( column = " ) ) ; <nl> } <nl> } <nl> + else if ( statement . startsWith ( " truncate " ) ) <nl> + { <nl> + assertTrue ( result . contains ( " truncated . " ) ) ; <nl> + } <nl> <nl> outStream . reset ( ) ; / / reset stream so we have only output from next statement all the time <nl> errStream . reset ( ) ; / / no errors to the end user .
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index f1e855e . . 12af151 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 0 . 17 
+ + * Log when messages are dropped due to cross _ node _ timeout ( CASSANDRA - 9793 ) 
+ * checkForEndpointCollision fails for legitimate collisions ( CASSANDRA - 9765 ) 
+ * Complete CASSANDRA - 8448 fix ( CASSANDRA - 9519 ) 
+ * Don ' t include auth credentials in debug log ( CASSANDRA - 9682 ) 
+ diff - - git a / src / java / org / apache / cassandra / net / IncomingTcpConnection . java b / src / java / org / apache / cassandra / net / IncomingTcpConnection . java 
+ index 4817c75 . . 16ca121 100644 
+ - - - a / src / java / org / apache / cassandra / net / IncomingTcpConnection . java 
+ + + + b / src / java / org / apache / cassandra / net / IncomingTcpConnection . java 
+ @ @ - 158 , 10 + 158 , 15 @ @ public class IncomingTcpConnection extends Thread implements Closeable 
+ id = input . readInt ( ) ; 
+ 
+ long timestamp = System . currentTimeMillis ( ) ; 
+ + boolean isCrossNodeTimestamp = false ; 
+ / / make sure to readInt , even if cross _ node _ to is not enabled 
+ int partial = input . readInt ( ) ; 
+ if ( DatabaseDescriptor . hasCrossNodeTimeout ( ) ) 
+ - timestamp = ( timestamp & 0xFFFFFFFF00000000L ) | ( ( ( partial & 0xFFFFFFFFL ) < < 2 ) > > 2 ) ; 
+ + { 
+ + long crossNodeTimestamp = ( timestamp & 0xFFFFFFFF00000000L ) | ( ( ( partial & 0xFFFFFFFFL ) < < 2 ) > > 2 ) ; 
+ + isCrossNodeTimestamp = ( timestamp ! = crossNodeTimestamp ) ; 
+ + timestamp = crossNodeTimestamp ; 
+ + } 
+ 
+ MessageIn message = MessageIn . read ( input , version , id ) ; 
+ if ( message = = null ) 
+ @ @ - 171 , 7 + 176 , 7 @ @ public class IncomingTcpConnection extends Thread implements Closeable 
+ } 
+ if ( version < = MessagingService . current _ version ) 
+ { 
+ - MessagingService . instance ( ) . receive ( message , id , timestamp ) ; 
+ + MessagingService . instance ( ) . receive ( message , id , timestamp , isCrossNodeTimestamp ) ; 
+ } 
+ else 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / net / MessageDeliveryTask . java b / src / java / org / apache / cassandra / net / MessageDeliveryTask . java 
+ index 982f17e . . 06caf94 100644 
+ - - - a / src / java / org / apache / cassandra / net / MessageDeliveryTask . java 
+ + + + b / src / java / org / apache / cassandra / net / MessageDeliveryTask . java 
+ @ @ - 29 , 15 + 29 , 17 @ @ public class MessageDeliveryTask implements Runnable 
+ private static final Logger logger = LoggerFactory . getLogger ( MessageDeliveryTask . class ) ; 
+ 
+ private final MessageIn message ; 
+ - private final long constructionTime ; 
+ private final int id ; 
+ + private final long constructionTime ; 
+ + private final boolean isCrossNodeTimestamp ; 
+ 
+ - public MessageDeliveryTask ( MessageIn message , int id , long timestamp ) 
+ + public MessageDeliveryTask ( MessageIn message , int id , long timestamp , boolean isCrossNodeTimestamp ) 
+ { 
+ assert message ! = null ; 
+ this . message = message ; 
+ this . id = id ; 
+ - constructionTime = timestamp ; 
+ + this . constructionTime = timestamp ; 
+ + this . isCrossNodeTimestamp = isCrossNodeTimestamp ; 
+ } 
+ 
+ public void run ( ) 
+ @ @ - 46 , 7 + 48 , 7 @ @ public class MessageDeliveryTask implements Runnable 
+ if ( MessagingService . DROPPABLE _ VERBS . contains ( verb ) 
+ & & System . currentTimeMillis ( ) > constructionTime + message . getTimeout ( ) ) 
+ { 
+ - MessagingService . instance ( ) . incrementDroppedMessages ( verb ) ; 
+ + MessagingService . instance ( ) . incrementDroppedMessages ( verb , isCrossNodeTimestamp ) ; 
+ return ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java 
+ index ee6b87b . . b02680d 100644 
+ - - - a / src / java / org / apache / cassandra / net / MessagingService . java 
+ + + + b / src / java / org / apache / cassandra / net / MessagingService . java 
+ @ @ - 31 , 6 + 31 , 7 @ @ import java . util . concurrent . atomic . AtomicInteger ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . ObjectName ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . base . Function ; 
+ import com . google . common . collect . Lists ; 
+ import com . google . common . collect . Sets ; 
+ @ @ - 118 , 7 + 119 , 7 @ @ public final class MessagingService implements MessagingServiceMBean 
+ SNAPSHOT , / / Similar to nt snapshot 
+ MIGRATION _ REQUEST , 
+ GOSSIP _ SHUTDOWN , 
+ - _ TRACE , / / dummy verb so we can use MS . droppedMessages 
+ + _ TRACE , / / dummy verb so we can use MS . droppedMessagesMap 
+ ECHO , 
+ REPAIR _ MESSAGE , 
+ / / use as padding for backwards compatability where a previous version needs to validate a verb from the future . 
+ @ @ - 291 , 10 + 292 , 23 @ @ public final class MessagingService implements MessagingServiceMBean 
+ Verb . PAGED _ RANGE , 
+ Verb . REQUEST _ RESPONSE ) ; 
+ 
+ + 
+ + private static final class DroppedMessages 
+ + { 
+ + final DroppedMessageMetrics metrics ; 
+ + final AtomicInteger droppedInternalTimeout ; 
+ + final AtomicInteger droppedCrossNodeTimeout ; 
+ + 
+ + DroppedMessages ( Verb verb ) 
+ + { 
+ + this . metrics = new DroppedMessageMetrics ( verb ) ; 
+ + this . droppedInternalTimeout = new AtomicInteger ( 0 ) ; 
+ + this . droppedCrossNodeTimeout = new AtomicInteger ( 0 ) ; 
+ + } 
+ + 
+ + } 
+ / / total dropped message counts for server lifetime 
+ - private final Map < Verb , DroppedMessageMetrics > droppedMessages = new EnumMap < Verb , DroppedMessageMetrics > ( Verb . class ) ; 
+ - / / dropped count when last requested for the Recent api . high concurrency isn ' t necessary here . 
+ - private final Map < Verb , Integer > lastDroppedInternal = new EnumMap < Verb , Integer > ( Verb . class ) ; 
+ + private final Map < Verb , DroppedMessages > droppedMessagesMap = new EnumMap < > ( Verb . class ) ; 
+ 
+ private final List < ILatencySubscriber > subscribers = new ArrayList < ILatencySubscriber > ( ) ; 
+ 
+ @ @ - 303 , 31 + 317 , 43 @ @ public final class MessagingService implements MessagingServiceMBean 
+ 
+ private static class MSHandle 
+ { 
+ - public static final MessagingService instance = new MessagingService ( ) ; 
+ + public static final MessagingService instance = new MessagingService ( false ) ; 
+ } 
+ + 
+ public static MessagingService instance ( ) 
+ { 
+ return MSHandle . instance ; 
+ } 
+ 
+ - private MessagingService ( ) 
+ + private static class MSTestHandle 
+ + { 
+ + public static final MessagingService instance = new MessagingService ( true ) ; 
+ + } 
+ + 
+ + static MessagingService test ( ) 
+ + { 
+ + return MSTestHandle . instance ; 
+ + } 
+ + 
+ + private MessagingService ( boolean testOnly ) 
+ { 
+ for ( Verb verb : DROPPABLE _ VERBS ) 
+ - { 
+ - droppedMessages . put ( verb , new DroppedMessageMetrics ( verb ) ) ; 
+ - lastDroppedInternal . put ( verb , 0 ) ; 
+ - } 
+ + droppedMessagesMap . put ( verb , new DroppedMessages ( verb ) ) ; 
+ 
+ listenGate = new SimpleCondition ( ) ; 
+ - verbHandlers = new EnumMap < Verb , IVerbHandler > ( Verb . class ) ; 
+ - Runnable logDropped = new Runnable ( ) 
+ + verbHandlers = new EnumMap < > ( Verb . class ) ; 
+ + 
+ + if ( ! testOnly ) 
+ { 
+ - public void run ( ) 
+ + Runnable logDropped = new Runnable ( ) 
+ { 
+ - logDroppedMessages ( ) ; 
+ - } 
+ - } ; 
+ - StorageService . scheduledTasks . scheduleWithFixedDelay ( logDropped , LOG _ DROPPED _ INTERVAL _ IN _ MS , LOG _ DROPPED _ INTERVAL _ IN _ MS , TimeUnit . MILLISECONDS ) ; 
+ + public void run ( ) 
+ + { 
+ + logDroppedMessages ( ) ; 
+ + } 
+ + } ; 
+ + StorageService . scheduledTasks . scheduleWithFixedDelay ( logDropped , LOG _ DROPPED _ INTERVAL _ IN _ MS , LOG _ DROPPED _ INTERVAL _ IN _ MS , TimeUnit . MILLISECONDS ) ; 
+ + } 
+ 
+ Function < Pair < Integer , ExpiringMap . CacheableObject < CallbackInfo > > , ? > timeoutReporter = new Function < Pair < Integer , ExpiringMap . CacheableObject < CallbackInfo > > , Object > ( ) 
+ { 
+ @ @ - 357 , 16 + 383 , 19 @ @ public final class MessagingService implements MessagingServiceMBean 
+ } 
+ } ; 
+ 
+ - callbacks = new ExpiringMap < Integer , CallbackInfo > ( DatabaseDescriptor . getMinRpcTimeout ( ) , timeoutReporter ) ; 
+ + callbacks = new ExpiringMap < > ( DatabaseDescriptor . getMinRpcTimeout ( ) , timeoutReporter ) ; 
+ 
+ - MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; 
+ - try 
+ + if ( ! testOnly ) 
+ { 
+ - mbs . registerMBean ( this , new ObjectName ( MBEAN _ NAME ) ) ; 
+ - } 
+ - catch ( Exception e ) 
+ - { 
+ - throw new RuntimeException ( e ) ; 
+ + MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; 
+ + try 
+ + { 
+ + mbs . registerMBean ( this , new ObjectName ( MBEAN _ NAME ) ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ } 
+ } 
+ 
+ @ @ - 718 , 7 + 747 , 7 @ @ public final class MessagingService implements MessagingServiceMBean 
+ } 
+ } 
+ 
+ - public void receive ( MessageIn message , int id , long timestamp ) 
+ + public void receive ( MessageIn message , int id , long timestamp , boolean isCrossNodeTimestamp ) 
+ { 
+ TraceState state = Tracing . instance . initializeFromMessage ( message ) ; 
+ if ( state ! = null ) 
+ @ @ - 732 , 7 + 761 , 7 @ @ public final class MessagingService implements MessagingServiceMBean 
+ return ; 
+ } 
+ 
+ - Runnable runnable = new MessageDeliveryTask ( message , id , timestamp ) ; 
+ + Runnable runnable = new MessageDeliveryTask ( message , id , timestamp , isCrossNodeTimestamp ) ; 
+ TracingAwareExecutorService stage = StageManager . getStage ( message . getMessageType ( ) ) ; 
+ assert stage ! = null : " No stage for message type " + message . verb ; 
+ 
+ @ @ - 844 , 8 + 873 , 13 @ @ public final class MessagingService implements MessagingServiceMBean 
+ 
+ public void incrementDroppedMessages ( Verb verb ) 
+ { 
+ + incrementDroppedMessages ( verb , false ) ; 
+ + } 
+ + 
+ + public void incrementDroppedMessages ( Verb verb , boolean isCrossNodeTimeout ) 
+ + { 
+ assert DROPPABLE _ VERBS . contains ( verb ) : " Verb " + verb + " should not legally be dropped " ; 
+ - droppedMessages . get ( verb ) . dropped . mark ( ) ; 
+ + incrementDroppedMessages ( droppedMessagesMap . get ( verb ) , isCrossNodeTimeout ) ; 
+ } 
+ 
+ / * * 
+ @ @ - 853 , 34 + 887 , 55 @ @ public final class MessagingService implements MessagingServiceMBean 
+ * / 
+ private void incrementRejectedMessages ( Verb verb ) 
+ { 
+ - DroppedMessageMetrics metrics = droppedMessages . get ( verb ) ; 
+ - if ( metrics = = null ) 
+ + DroppedMessages droppedMessages = droppedMessagesMap . get ( verb ) ; 
+ + if ( droppedMessages = = null ) 
+ { 
+ - metrics = new DroppedMessageMetrics ( verb ) ; 
+ - droppedMessages . put ( verb , metrics ) ; 
+ + droppedMessages = new DroppedMessages ( verb ) ; 
+ + droppedMessagesMap . put ( verb , droppedMessages ) ; 
+ } 
+ - metrics . dropped . mark ( ) ; 
+ + incrementDroppedMessages ( droppedMessagesMap . get ( verb ) , false ) ; 
+ + } 
+ + 
+ + private void incrementDroppedMessages ( DroppedMessages droppedMessages , boolean isCrossNodeTimeout ) 
+ + { 
+ + droppedMessages . metrics . dropped . mark ( ) ; 
+ + if ( isCrossNodeTimeout ) 
+ + droppedMessages . droppedCrossNodeTimeout . incrementAndGet ( ) ; 
+ + else 
+ + droppedMessages . droppedInternalTimeout . incrementAndGet ( ) ; 
+ } 
+ 
+ private void logDroppedMessages ( ) 
+ { 
+ - boolean logTpstats = false ; 
+ - for ( Map . Entry < Verb , DroppedMessageMetrics > entry : droppedMessages . entrySet ( ) ) 
+ + List < String > logs = getDroppedMessagesLogs ( ) ; 
+ + for ( String log : logs ) 
+ + logger . error ( log ) ; 
+ + 
+ + if ( logs . size ( ) > 0 ) 
+ + StatusLogger . log ( ) ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + List < String > getDroppedMessagesLogs ( ) 
+ + { 
+ + List < String > ret = new ArrayList < > ( ) ; 
+ + for ( Map . Entry < Verb , DroppedMessages > entry : droppedMessagesMap . entrySet ( ) ) 
+ { 
+ - int dropped = ( int ) entry . getValue ( ) . dropped . count ( ) ; 
+ Verb verb = entry . getKey ( ) ; 
+ - int recent = dropped - lastDroppedInternal . get ( verb ) ; 
+ - if ( recent > 0 ) 
+ + DroppedMessages droppedMessages = entry . getValue ( ) ; 
+ + 
+ + int droppedInternalTimeout = droppedMessages . droppedInternalTimeout . getAndSet ( 0 ) ; 
+ + int droppedCrossNodeTimeout = droppedMessages . droppedCrossNodeTimeout . getAndSet ( 0 ) ; 
+ + if ( droppedInternalTimeout > 0 | | droppedCrossNodeTimeout > 0 ) 
+ { 
+ - logTpstats = true ; 
+ - logger . info ( " { } { } messages dropped in last { } ms " , 
+ - new Object [ ] { recent , verb , LOG _ DROPPED _ INTERVAL _ IN _ MS } ) ; 
+ - lastDroppedInternal . put ( verb , dropped ) ; 
+ + ret . add ( String . format ( " % s messages were dropped in last % d ms : % d for internal timeout and % d for cross node timeout " , 
+ + verb , 
+ + LOG _ DROPPED _ INTERVAL _ IN _ MS , 
+ + droppedInternalTimeout , 
+ + droppedCrossNodeTimeout ) ) ; 
+ } 
+ } 
+ - 
+ - if ( logTpstats ) 
+ - StatusLogger . log ( ) ; 
+ + return ret ; 
+ } 
+ 
+ private static class SocketThread extends Thread 
+ @ @ - 1011 , 16 + 1066 , 16 @ @ public final class MessagingService implements MessagingServiceMBean 
+ public Map < String , Integer > getDroppedMessages ( ) 
+ { 
+ Map < String , Integer > map = new HashMap < String , Integer > ( ) ; 
+ - for ( Map . Entry < Verb , DroppedMessageMetrics > entry : droppedMessages . entrySet ( ) ) 
+ - map . put ( entry . getKey ( ) . toString ( ) , ( int ) entry . getValue ( ) . dropped . count ( ) ) ; 
+ + for ( Map . Entry < Verb , DroppedMessages > entry : droppedMessagesMap . entrySet ( ) ) 
+ + map . put ( entry . getKey ( ) . toString ( ) , ( int ) entry . getValue ( ) . metrics . dropped . count ( ) ) ; 
+ return map ; 
+ } 
+ 
+ public Map < String , Integer > getRecentlyDroppedMessages ( ) 
+ { 
+ Map < String , Integer > map = new HashMap < String , Integer > ( ) ; 
+ - for ( Map . Entry < Verb , DroppedMessageMetrics > entry : droppedMessages . entrySet ( ) ) 
+ - map . put ( entry . getKey ( ) . toString ( ) , entry . getValue ( ) . getRecentlyDropped ( ) ) ; 
+ + for ( Map . Entry < Verb , DroppedMessages > entry : droppedMessagesMap . entrySet ( ) ) 
+ + map . put ( entry . getKey ( ) . toString ( ) , entry . getValue ( ) . metrics . getRecentlyDropped ( ) ) ; 
+ return map ; 
+ } 
+ 
+ diff - - git a / test / unit / org / apache / cassandra / net / MessagingServiceTest . java b / test / unit / org / apache / cassandra / net / MessagingServiceTest . java 
+ new file mode 100644 
+ index 0000000 . . 04dacf3 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / net / MessagingServiceTest . java 
+ @ @ - 0 , 0 + 1 , 39 @ @ 
+ + package org . apache . cassandra . net ; 
+ + 
+ + import java . util . List ; 
+ + 
+ + import org . junit . Test ; 
+ + 
+ + import static org . junit . Assert . assertEquals ; 
+ + 
+ + public class MessagingServiceTest 
+ + { 
+ + private final MessagingService messagingService = MessagingService . test ( ) ; 
+ + 
+ + @ Test 
+ + public void testDroppedMessages ( ) 
+ + { 
+ + MessagingService . Verb verb = MessagingService . Verb . READ ; 
+ + 
+ + for ( int i = 0 ; i < 5000 ; i + + ) 
+ + messagingService . incrementDroppedMessages ( verb , i % 2 = = 0 ) ; 
+ + 
+ + List < String > logs = messagingService . getDroppedMessagesLogs ( ) ; 
+ + assertEquals ( 1 , logs . size ( ) ) ; 
+ + assertEquals ( " READ messages were dropped in last 5000 ms : 2500 for internal timeout and 2500 for cross node timeout " , logs . get ( 0 ) ) ; 
+ + assertEquals ( 5000 , ( int ) messagingService . getDroppedMessages ( ) . get ( verb . toString ( ) ) ) ; 
+ + assertEquals ( 5000 , ( int ) messagingService . getRecentlyDroppedMessages ( ) . get ( verb . toString ( ) ) ) ; 
+ + 
+ + logs = messagingService . getDroppedMessagesLogs ( ) ; 
+ + assertEquals ( 0 , logs . size ( ) ) ; 
+ + 
+ + for ( int i = 0 ; i < 2500 ; i + + ) 
+ + messagingService . incrementDroppedMessages ( verb , i % 2 = = 0 ) ; 
+ + 
+ + logs = messagingService . getDroppedMessagesLogs ( ) ; 
+ + assertEquals ( " READ messages were dropped in last 5000 ms : 1250 for internal timeout and 1250 for cross node timeout " , logs . get ( 0 ) ) ; 
+ + assertEquals ( 7500 , ( int ) messagingService . getDroppedMessages ( ) . get ( verb . toString ( ) ) ) ; 
+ + assertEquals ( 2500 , ( int ) messagingService . getRecentlyDroppedMessages ( ) . get ( verb . toString ( ) ) ) ; 
+ + } 
+ + 
+ + }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index eec904a . . 982454c 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 59 , 6 + 59 , 8 @ @ 
+ the old ones ( CASSANDRA - 1644 ) 
+ * upgrade to Thrift 0 . 5 ( CASSANDRA - 1367 ) 
+ * renamed CL . DCQUORUM to LOCAL _ QUORUM and DCQUORUMSYNC to EACH _ QUORUM 
+ + * cli truncate support ( CASSANDRA - 1653 ) 
+ + * update GC settings in cassandra . bat ( CASSANDRA - 1636 ) 
+ 
+ 
+ 0 . 7 - beta2 
+ diff - - git a / src / java / org / apache / cassandra / cli / Cli . g b / src / java / org / apache / cassandra / cli / Cli . g 
+ index e59c608 . . a9229ee 100644 
+ - - - a / src / java / org / apache / cassandra / cli / Cli . g 
+ + + + b / src / java / org / apache / cassandra / cli / Cli . g 
+ @ @ - 55 , 6 + 55 , 7 @ @ tokens { 
+ NODE _ UPDATE _ KEYSPACE ; 
+ NODE _ UPDATE _ COLUMN _ FAMILY ; 
+ NODE _ LIST ; 
+ + NODE _ TRUNCATE ; 
+ 
+ / / Internal Nodes . 
+ NODE _ COLUMN _ ACCESS ; 
+ @ @ - 123 , 6 + 124 , 7 @ @ statement 
+ | setStatement 
+ | showStatement 
+ | listStatement 
+ + | truncateStatement 
+ | - > ^ ( NODE _ NO _ OP ) 
+ ; 
+ 
+ @ @ - 174 , 6 + 176 , 8 @ @ helpStatement 
+ - > ^ ( NODE _ HELP NODE _ THRIFT _ COUNT ) 
+ | K _ HELP K _ LIST 
+ - > ^ ( NODE _ HELP NODE _ LIST ) 
+ + | K _ HELP K _ TRUNCATE 
+ + - > ^ ( NODE _ HELP NODE _ TRUNCATE ) 
+ | K _ HELP 
+ - > ^ ( NODE _ HELP ) 
+ | ' ? ' 
+ @ @ - 231 , 6 + 235 , 11 @ @ listStatement 
+ - > ^ ( NODE _ LIST columnFamily keyRangeExpr ? ^ ( NODE _ LIMIT $ limit ) ? ) 
+ ; 
+ 
+ + truncateStatement 
+ + : K _ TRUNCATE columnFamily 
+ + - > ^ ( NODE _ TRUNCATE columnFamily ) 
+ + ; 
+ + 
+ showClusterName 
+ : K _ SHOW K _ CLUSTER K _ NAME 
+ - > ^ ( NODE _ SHOW _ CLUSTER _ NAME ) 
+ @ @ - 430 , 6 + 439 , 7 @ @ K _ AND : ' AND ' ; 
+ K _ UPDATE : ' UPDATE ' ; 
+ K _ LIST : ' LIST ' ; 
+ K _ LIMIT : ' LIMIT ' ; 
+ + K _ TRUNCATE : ' TRUNCATE ' ; 
+ 
+ / / private syntactic rules 
+ fragment 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliClient . java b / src / java / org / apache / cassandra / cli / CliClient . java 
+ index b6ace98 . . b63105a 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliClient . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliClient . java 
+ @ @ - 171 , 6 + 171 , 9 @ @ public class CliClient extends CliUserHelp 
+ case CliParser . NODE _ LIST : 
+ executeList ( tree ) ; 
+ break ; 
+ + case CliParser . NODE _ TRUNCATE : 
+ + executeTruncate ( tree . getChild ( 0 ) . getText ( ) ) ; 
+ + break ; 
+ case CliParser . NODE _ NO _ OP : 
+ / / comment lines come here ; they are treated as no ops . 
+ break ; 
+ @ @ - 943 , 6 + 946 , 30 @ @ public class CliClient extends CliUserHelp 
+ printSliceList ( columnFamilyDef , keySlices ) ; 
+ } 
+ 
+ + / / TRUNCATE < columnFamily > 
+ + private void executeTruncate ( String columnFamily ) 
+ + { 
+ + if ( ! CliMain . isConnected ( ) | | ! hasKeySpace ( ) ) 
+ + return ; 
+ + 
+ + / / getting CfDef , it will fail if there is no such column family in current keySpace . 
+ + CfDef cfDef = getCfDef ( columnFamily ) ; 
+ + 
+ + try 
+ + { 
+ + thriftClient . truncate ( cfDef . getName ( ) ) ; 
+ + sessionState . out . println ( columnFamily + " truncated . " ) ; 
+ + } 
+ + catch ( InvalidRequestException e ) 
+ + { 
+ + throw new RuntimeException ( e . getWhy ( ) ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new RuntimeException ( e . getMessage ( ) ) ; 
+ + } 
+ + } 
+ + 
+ / / SHOW API VERSION 
+ private void executeShowVersion ( ) throws TException 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliCompleter . java b / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ index f541fe5 . . b033d8f 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ @ @ - 55 , 12 + 55 , 16 @ @ public class CliCompleter extends SimpleCompletor 
+ " help set " , 
+ " help del " , 
+ " help count " , 
+ + " help list " , 
+ + " help truncate " 
+ } ; 
+ private static String [ ] keyspaceCommands = { 
+ " get " , 
+ " set " , 
+ " count " , 
+ - " del " 
+ + " del " , 
+ + " list " , 
+ + " truncate " 
+ } ; 
+ 
+ public CliCompleter ( ) 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliUserHelp . java b / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ index 7c512e2 . . db6a779 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ @ @ - 281 , 6 + 281 , 13 @ @ public class CliUserHelp { 
+ state . out . println ( " list Users [ j : ] limit 40 " ) ; 
+ break ; 
+ 
+ + case CliParser . NODE _ TRUNCATE : 
+ + state . out . println ( " truncate < column _ family > " ) ; 
+ + state . out . println ( " Truncate specified column family . \ n " ) ; 
+ + state . out . println ( " example : " ) ; 
+ + state . out . println ( " truncate Category " ) ; 
+ + break ; 
+ + 
+ default : 
+ state . out . println ( " ? " ) ; 
+ break ; 
+ @ @ - 324 , 7 + 331 , 8 @ @ public class CliUserHelp { 
+ state . out . println ( " del < cf > [ ' < key > ' ] [ ' < super > ' ] [ ' < col > ' ] Delete sub column . " ) ; 
+ state . out . println ( " count < cf > [ ' < key > ' ] Count columns in record . " ) ; 
+ state . out . println ( " count < cf > [ ' < key > ' ] [ ' < super > ' ] Count columns in a super column . " ) ; 
+ - state . out . println ( " list < cf > List all rows in the column family . " ) ; 
+ + state . out . println ( " truncate < column _ family > Truncate specified column family . " ) ; 
+ + state . out . println ( " list < cf > List all rows in the column family . " ) ; 
+ state . out . println ( " list < cf > [ < startKey > : ] " ) ; 
+ state . out . println ( " List rows in the column family beginning with < startKey > . " ) ; 
+ state . out . println ( " list < cf > [ < startKey > : < endKey > ] " ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / cli / CliTest . java b / test / unit / org / apache / cassandra / cli / CliTest . java 
+ index 24a3de0 . . eddcafd 100644 
+ - - - a / test / unit / org / apache / cassandra / cli / CliTest . java 
+ + + + b / test / unit / org / apache / cassandra / cli / CliTest . java 
+ @ @ - 52 , 6 + 52 , 7 @ @ public class CliTest extends TestCase 
+ " list CF3 [ h : ] " , 
+ " list CF3 limit 10 " , 
+ " list CF3 [ h : g ] limit 10 " , 
+ + " truncate CF1 " , 
+ " update keyspace TestKeySpace with placement _ strategy = ' org . apache . cassandra . locator . LocalStrategy ' " , 
+ " update keyspace TestKeySpace with replication _ factor = 1 and strategy _ options = [ { DC1 : 3 , DC2 : 4 , DC5 : 1 } ] " 
+ } ; 
+ @ @ - 101 , 6 + 102 , 10 @ @ public class CliTest extends TestCase 
+ assertTrue ( result . startsWith ( " = > ( column = " ) ) ; 
+ } 
+ } 
+ + else if ( statement . startsWith ( " truncate " ) ) 
+ + { 
+ + assertTrue ( result . contains ( " truncated . " ) ) ; 
+ + } 
+ 
+ outStream . reset ( ) ; / / reset stream so we have only output from next statement all the time 
+ errStream . reset ( ) ; / / no errors to the end user .

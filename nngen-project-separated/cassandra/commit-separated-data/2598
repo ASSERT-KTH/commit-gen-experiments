@@ -1,0 +1,124 @@
+BLEU SCORE: 0.02383853510228548
+
+TEST MSG: 2 . 0 compatibility modifications for CASSANDRA - 6931
+GENERATED MSG: Add ability to throttle batchlog replay
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / config / CFMetaData . java b / src / java / org / apache / cassandra / config / CFMetaData . java <nl> index ff40e65 . . 1f25cea 100644 <nl> - - - a / src / java / org / apache / cassandra / config / CFMetaData . java <nl> + + + b / src / java / org / apache / cassandra / config / CFMetaData . java <nl> @ @ - 233 , 7 + 233 , 8 @ @ public final class CFMetaData <nl> public static final CFMetaData BatchlogCf = compile ( " CREATE TABLE " + SystemKeyspace . BATCHLOG _ CF + " ( " <nl> + " id uuid PRIMARY KEY , " <nl> + " written _ at timestamp , " <nl> - + " data blob " <nl> + + " data blob , " <nl> + + " version int , " <nl> + " ) WITH COMMENT = ' uncommited batches ' AND gc _ grace _ seconds = 0 " <nl> + " AND COMPACTION = { ' class ' : ' SizeTieredCompactionStrategy ' , ' min _ threshold ' : 2 } " ) ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / BatchlogManager . java b / src / java / org / apache / cassandra / db / BatchlogManager . java <nl> index 23cacca . . 2e09285 100644 <nl> - - - a / src / java / org / apache / cassandra / db / BatchlogManager . java <nl> + + + b / src / java / org / apache / cassandra / db / BatchlogManager . java <nl> @ @ - 66 , 7 + 66 , 6 @ @ import org . apache . cassandra . utils . WrappedRunnable ; <nl> public class BatchlogManager implements BatchlogManagerMBean <nl> { <nl> private static final String MBEAN _ NAME = " org . apache . cassandra . db : type = BatchlogManager " ; <nl> - private static final int VERSION = MessagingService . VERSION _ 12 ; <nl> private static final long REPLAY _ INTERVAL = 60 * 1000 ; / / milliseconds <nl> private static final int PAGE _ SIZE = 128 ; / / same as HHOM , for now , w / out using any heuristics . TODO : set based on avg batch size . <nl> <nl> @ @ - 151 , 7 + 150 , 7 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> { <nl> out . writeInt ( mutations . size ( ) ) ; <nl> for ( RowMutation rm : mutations ) <nl> - RowMutation . serializer . serialize ( rm , out , VERSION ) ; <nl> + RowMutation . serializer . serialize ( rm , out , MessagingService . VERSION _ 12 ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> @ @ - 176 , 7 + 175 , 7 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> <nl> try <nl> { <nl> - UntypedResultSet page = process ( " SELECT id , data , written _ at FROM % s . % s LIMIT % d " , <nl> + UntypedResultSet page = process ( " SELECT id , data , written _ at , version FROM % s . % s LIMIT % d " , <nl> Keyspace . SYSTEM _ KS , <nl> SystemKeyspace . BATCHLOG _ CF , <nl> PAGE _ SIZE ) ; <nl> @ @ - 188 , 7 + 187 , 7 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> if ( page . size ( ) < PAGE _ SIZE ) <nl> break ; / / we ' ve exhausted the batchlog , next query would be empty . <nl> <nl> - page = process ( " SELECT id , data , written _ at FROM % s . % s WHERE token ( id ) > token ( % s ) LIMIT % d " , <nl> + page = process ( " SELECT id , data , written _ at , version FROM % s . % s WHERE token ( id ) > token ( % s ) LIMIT % d " , <nl> Keyspace . SYSTEM _ KS , <nl> SystemKeyspace . BATCHLOG _ CF , <nl> id , <nl> @ @ - 213 , 22 + 212 , 23 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> { <nl> id = row . getUUID ( " id " ) ; <nl> long writtenAt = row . getLong ( " written _ at " ) ; <nl> + int version = row . has ( " version " ) ? row . getInt ( " version " ) : MessagingService . VERSION _ 12 ; <nl> / / enough time for the actual write + batchlog entry mutation delivery ( two separate requests ) . <nl> long timeout = DatabaseDescriptor . getWriteRpcTimeout ( ) * 2 ; / / enough time for the actual write + BM removal mutation <nl> if ( System . currentTimeMillis ( ) < writtenAt + timeout ) <nl> continue ; / / not ready to replay yet , might still get a deletion . <nl> - replayBatch ( id , row . getBytes ( " data " ) , writtenAt , rateLimiter ) ; <nl> + replayBatch ( id , row . getBytes ( " data " ) , writtenAt , version , rateLimiter ) ; <nl> } <nl> return id ; <nl> } <nl> <nl> - private void replayBatch ( UUID id , ByteBuffer data , long writtenAt , RateLimiter rateLimiter ) <nl> + private void replayBatch ( UUID id , ByteBuffer data , long writtenAt , int version , RateLimiter rateLimiter ) <nl> { <nl> logger . debug ( " Replaying batch { } " , id ) ; <nl> <nl> try <nl> { <nl> - replaySerializedMutations ( data , writtenAt , rateLimiter ) ; <nl> + replaySerializedMutations ( data , writtenAt , version , rateLimiter ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> @ @ - 247 , 19 + 247 , 19 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> mutation . apply ( ) ; <nl> } <nl> <nl> - private void replaySerializedMutations ( ByteBuffer data , long writtenAt , RateLimiter rateLimiter ) throws IOException <nl> + private void replaySerializedMutations ( ByteBuffer data , long writtenAt , int version , RateLimiter rateLimiter ) throws IOException <nl> { <nl> DataInputStream in = new DataInputStream ( ByteBufferUtil . inputStream ( data ) ) ; <nl> int size = in . readInt ( ) ; <nl> for ( int i = 0 ; i < size ; i + + ) <nl> - replaySerializedMutation ( RowMutation . serializer . deserialize ( in , VERSION ) , writtenAt , rateLimiter ) ; <nl> + replaySerializedMutation ( RowMutation . serializer . deserialize ( in , version ) , writtenAt , version , rateLimiter ) ; <nl> } <nl> <nl> / * <nl> * We try to deliver the mutations to the replicas ourselves if they are alive and only resort to writing hints <nl> * when a replica is down or a write request times out . <nl> * / <nl> - private void replaySerializedMutation ( RowMutation mutation , long writtenAt , RateLimiter rateLimiter ) <nl> + private void replaySerializedMutation ( RowMutation mutation , long writtenAt , int version , RateLimiter rateLimiter ) <nl> { <nl> int ttl = calculateHintTTL ( mutation , writtenAt ) ; <nl> if ( ttl < = 0 ) <nl> @ @ - 268 , 7 + 268 , 7 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> Set < InetAddress > liveEndpoints = new HashSet < > ( ) ; <nl> String ks = mutation . getKeyspaceName ( ) ; <nl> Token < ? > tk = StorageService . getPartitioner ( ) . getToken ( mutation . key ( ) ) ; <nl> - int mutationSize = ( int ) RowMutation . serializer . serializedSize ( mutation , VERSION ) ; <nl> + int mutationSize = ( int ) RowMutation . serializer . serializedSize ( mutation , version ) ; <nl> <nl> for ( InetAddress endpoint : Iterables . concat ( StorageService . instance . getNaturalEndpoints ( ks , tk ) , <nl> StorageService . instance . getTokenMetadata ( ) . pendingEndpointsFor ( tk , ks ) ) )
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / config / CFMetaData . java b / src / java / org / apache / cassandra / config / CFMetaData . java 
+ index ff40e65 . . 1f25cea 100644 
+ - - - a / src / java / org / apache / cassandra / config / CFMetaData . java 
+ + + + b / src / java / org / apache / cassandra / config / CFMetaData . java 
+ @ @ - 233 , 7 + 233 , 8 @ @ public final class CFMetaData 
+ public static final CFMetaData BatchlogCf = compile ( " CREATE TABLE " + SystemKeyspace . BATCHLOG _ CF + " ( " 
+ + " id uuid PRIMARY KEY , " 
+ + " written _ at timestamp , " 
+ - + " data blob " 
+ + + " data blob , " 
+ + + " version int , " 
+ + " ) WITH COMMENT = ' uncommited batches ' AND gc _ grace _ seconds = 0 " 
+ + " AND COMPACTION = { ' class ' : ' SizeTieredCompactionStrategy ' , ' min _ threshold ' : 2 } " ) ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / BatchlogManager . java b / src / java / org / apache / cassandra / db / BatchlogManager . java 
+ index 23cacca . . 2e09285 100644 
+ - - - a / src / java / org / apache / cassandra / db / BatchlogManager . java 
+ + + + b / src / java / org / apache / cassandra / db / BatchlogManager . java 
+ @ @ - 66 , 7 + 66 , 6 @ @ import org . apache . cassandra . utils . WrappedRunnable ; 
+ public class BatchlogManager implements BatchlogManagerMBean 
+ { 
+ private static final String MBEAN _ NAME = " org . apache . cassandra . db : type = BatchlogManager " ; 
+ - private static final int VERSION = MessagingService . VERSION _ 12 ; 
+ private static final long REPLAY _ INTERVAL = 60 * 1000 ; / / milliseconds 
+ private static final int PAGE _ SIZE = 128 ; / / same as HHOM , for now , w / out using any heuristics . TODO : set based on avg batch size . 
+ 
+ @ @ - 151 , 7 + 150 , 7 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ { 
+ out . writeInt ( mutations . size ( ) ) ; 
+ for ( RowMutation rm : mutations ) 
+ - RowMutation . serializer . serialize ( rm , out , VERSION ) ; 
+ + RowMutation . serializer . serialize ( rm , out , MessagingService . VERSION _ 12 ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ @ @ - 176 , 7 + 175 , 7 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ 
+ try 
+ { 
+ - UntypedResultSet page = process ( " SELECT id , data , written _ at FROM % s . % s LIMIT % d " , 
+ + UntypedResultSet page = process ( " SELECT id , data , written _ at , version FROM % s . % s LIMIT % d " , 
+ Keyspace . SYSTEM _ KS , 
+ SystemKeyspace . BATCHLOG _ CF , 
+ PAGE _ SIZE ) ; 
+ @ @ - 188 , 7 + 187 , 7 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ if ( page . size ( ) < PAGE _ SIZE ) 
+ break ; / / we ' ve exhausted the batchlog , next query would be empty . 
+ 
+ - page = process ( " SELECT id , data , written _ at FROM % s . % s WHERE token ( id ) > token ( % s ) LIMIT % d " , 
+ + page = process ( " SELECT id , data , written _ at , version FROM % s . % s WHERE token ( id ) > token ( % s ) LIMIT % d " , 
+ Keyspace . SYSTEM _ KS , 
+ SystemKeyspace . BATCHLOG _ CF , 
+ id , 
+ @ @ - 213 , 22 + 212 , 23 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ { 
+ id = row . getUUID ( " id " ) ; 
+ long writtenAt = row . getLong ( " written _ at " ) ; 
+ + int version = row . has ( " version " ) ? row . getInt ( " version " ) : MessagingService . VERSION _ 12 ; 
+ / / enough time for the actual write + batchlog entry mutation delivery ( two separate requests ) . 
+ long timeout = DatabaseDescriptor . getWriteRpcTimeout ( ) * 2 ; / / enough time for the actual write + BM removal mutation 
+ if ( System . currentTimeMillis ( ) < writtenAt + timeout ) 
+ continue ; / / not ready to replay yet , might still get a deletion . 
+ - replayBatch ( id , row . getBytes ( " data " ) , writtenAt , rateLimiter ) ; 
+ + replayBatch ( id , row . getBytes ( " data " ) , writtenAt , version , rateLimiter ) ; 
+ } 
+ return id ; 
+ } 
+ 
+ - private void replayBatch ( UUID id , ByteBuffer data , long writtenAt , RateLimiter rateLimiter ) 
+ + private void replayBatch ( UUID id , ByteBuffer data , long writtenAt , int version , RateLimiter rateLimiter ) 
+ { 
+ logger . debug ( " Replaying batch { } " , id ) ; 
+ 
+ try 
+ { 
+ - replaySerializedMutations ( data , writtenAt , rateLimiter ) ; 
+ + replaySerializedMutations ( data , writtenAt , version , rateLimiter ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ @ @ - 247 , 19 + 247 , 19 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ mutation . apply ( ) ; 
+ } 
+ 
+ - private void replaySerializedMutations ( ByteBuffer data , long writtenAt , RateLimiter rateLimiter ) throws IOException 
+ + private void replaySerializedMutations ( ByteBuffer data , long writtenAt , int version , RateLimiter rateLimiter ) throws IOException 
+ { 
+ DataInputStream in = new DataInputStream ( ByteBufferUtil . inputStream ( data ) ) ; 
+ int size = in . readInt ( ) ; 
+ for ( int i = 0 ; i < size ; i + + ) 
+ - replaySerializedMutation ( RowMutation . serializer . deserialize ( in , VERSION ) , writtenAt , rateLimiter ) ; 
+ + replaySerializedMutation ( RowMutation . serializer . deserialize ( in , version ) , writtenAt , version , rateLimiter ) ; 
+ } 
+ 
+ / * 
+ * We try to deliver the mutations to the replicas ourselves if they are alive and only resort to writing hints 
+ * when a replica is down or a write request times out . 
+ * / 
+ - private void replaySerializedMutation ( RowMutation mutation , long writtenAt , RateLimiter rateLimiter ) 
+ + private void replaySerializedMutation ( RowMutation mutation , long writtenAt , int version , RateLimiter rateLimiter ) 
+ { 
+ int ttl = calculateHintTTL ( mutation , writtenAt ) ; 
+ if ( ttl < = 0 ) 
+ @ @ - 268 , 7 + 268 , 7 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ Set < InetAddress > liveEndpoints = new HashSet < > ( ) ; 
+ String ks = mutation . getKeyspaceName ( ) ; 
+ Token < ? > tk = StorageService . getPartitioner ( ) . getToken ( mutation . key ( ) ) ; 
+ - int mutationSize = ( int ) RowMutation . serializer . serializedSize ( mutation , VERSION ) ; 
+ + int mutationSize = ( int ) RowMutation . serializer . serializedSize ( mutation , version ) ; 
+ 
+ for ( InetAddress endpoint : Iterables . concat ( StorageService . instance . getNaturalEndpoints ( ks , tk ) , 
+ StorageService . instance . getTokenMetadata ( ) . pendingEndpointsFor ( tk , ks ) ) )
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

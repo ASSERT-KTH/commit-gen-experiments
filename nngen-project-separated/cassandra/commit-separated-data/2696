@@ -1,0 +1,653 @@
+BLEU SCORE: 0.0032977817961883623
+
+TEST MSG: Improve handling of range tomsbstones for wide partitions
+GENERATED MSG: apply rows atomically , rather than one - column - at - a - time . this avoids exposing the bug in time - sorted
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java b / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java <nl> index 5cc43d9 . . 80e2995 100644 <nl> - - - a / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java <nl> @ @ - 33 , 6 + 33 , 8 @ @ import com . google . common . collect . * ; <nl> import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . db . composites . CellName ; <nl> import org . apache . cassandra . db . composites . CellNameType ; <nl> + import org . apache . cassandra . db . composites . Composite ; <nl> + import org . apache . cassandra . db . index . SecondaryIndexManager ; <nl> import org . apache . cassandra . db . filter . ColumnSlice ; <nl> import org . apache . cassandra . utils . ObjectSizes ; <nl> import org . apache . cassandra . utils . btree . BTree ; <nl> @ @ - 75 , 6 + 77 , 8 @ @ public class AtomicBTreeColumns extends ColumnFamily <nl> } ; <nl> <nl> private static final DeletionInfo LIVE = DeletionInfo . live ( ) ; <nl> + / / This is a small optimization : DeletionInfo is mutable , but we know that we will always copy it in that class , <nl> + / / so we can safely alias one DeletionInfo . live ( ) reference and avoid some allocations . <nl> private static final Holder EMPTY = new Holder ( BTree . empty ( ) , LIVE ) ; <nl> <nl> private volatile Holder ref ; <nl> @ @ - 126 , 7 + 130 , 8 @ @ public class AtomicBTreeColumns extends ColumnFamily <nl> while ( true ) <nl> { <nl> Holder current = ref ; <nl> - DeletionInfo newDelInfo = current . deletionInfo . copy ( ) . add ( info ) ; <nl> + DeletionInfo curDelInfo = current . deletionInfo ; <nl> + DeletionInfo newDelInfo = info . mayModify ( curDelInfo ) ? curDelInfo . copy ( ) . add ( info ) : curDelInfo ; <nl> if ( refUpdater . compareAndSet ( this , current , current . with ( newDelInfo ) ) ) <nl> break ; <nl> } <nl> @ @ - 233 , 15 + 238 , 17 @ @ public class AtomicBTreeColumns extends ColumnFamily <nl> DeletionInfo deletionInfo ; <nl> if ( cm . deletionInfo ( ) . mayModify ( current . deletionInfo ) ) <nl> { <nl> - if ( cm . deletionInfo ( ) . hasRanges ( ) ) <nl> + if ( indexer ! = SecondaryIndexManager . nullUpdater & & cm . deletionInfo ( ) . hasRanges ( ) ) <nl> { <nl> - for ( Iterator < Cell > iter : new Iterator [ ] { insert . iterator ( ) , BTree . < Cell > slice ( current . tree , true ) } ) <nl> + for ( Iterator < RangeTombstone > rangeIterator = cm . deletionInfo ( ) . rangeIterator ( ) ; rangeIterator . hasNext ( ) ; ) <nl> { <nl> - while ( iter . hasNext ( ) ) <nl> + RangeTombstone rt = rangeIterator . next ( ) ; <nl> + long deleteAt = rt . maxTimestamp ( ) ; <nl> + for ( Iterator < Cell > iter = current . cellRange ( getComparator ( ) . columnComparator ( ) , rt . min , rt . max ) ; iter . hasNext ( ) ; ) <nl> { <nl> - Cell col = iter . next ( ) ; <nl> - if ( cm . deletionInfo ( ) . isDeleted ( col ) ) <nl> - indexer . remove ( col ) ; <nl> + Cell c = iter . next ( ) ; <nl> + if ( deleteAt > = c . timestamp ( ) ) <nl> + indexer . remove ( c ) ; <nl> } <nl> } <nl> } <nl> @ @ - 361 , 8 + 368 , 6 @ @ public class AtomicBTreeColumns extends ColumnFamily <nl> <nl> private static class Holder <nl> { <nl> - / / This is a small optimization : DeletionInfo is mutable , but we know that we will always copy it in that class , <nl> - / / so we can safely alias one DeletionInfo . live ( ) reference and avoid some allocations . <nl> final DeletionInfo deletionInfo ; <nl> / / the btree of columns <nl> final Object [ ] tree ; <nl> @ @ - 377 , 6 + 382 , 11 @ @ public class AtomicBTreeColumns extends ColumnFamily <nl> { <nl> return new Holder ( this . tree , info ) ; <nl> } <nl> + <nl> + private Iterator < Cell > cellRange ( Comparator < Cell > comparator , Composite start , Composite finish ) <nl> + { <nl> + return new ColumnSlice . NavigableSetIterator ( new BTreeSet < > ( tree , comparator ) , new ColumnSlice [ ] { new ColumnSlice ( start , finish ) } ) ; <nl> + } <nl> } <nl> <nl> / / TODO : create a stack - allocation - friendly list to help optimise garbage for updates to rows with few columns <nl> diff - - git a / src / java / org / apache / cassandra / db / CollationController . java b / src / java / org / apache / cassandra / db / CollationController . java <nl> index e5d3495 . . 0df3619 100644 <nl> - - - a / src / java / org / apache / cassandra / db / CollationController . java <nl> + + + b / src / java / org / apache / cassandra / db / CollationController . java <nl> @ @ - 75 , 7 + 75 , 7 @ @ public class CollationController <nl> if ( iter ! = null ) <nl> { <nl> iterators . add ( iter ) ; <nl> - container . delete ( iter . getColumnFamily ( ) ) ; <nl> + filter . delete ( container . deletionInfo ( ) , iter . getColumnFamily ( ) ) ; <nl> while ( iter . hasNext ( ) ) <nl> container . addAtom ( iter . next ( ) ) ; <nl> } <nl> @ @ - 179 , 7 + 179 , 7 @ @ public class CollationController <nl> ColumnFamilyStore . ViewFragment view = cfs . markReferenced ( filter . key ) ; <nl> List < OnDiskAtomIterator > iterators = new ArrayList < > ( Iterables . size ( view . memtables ) + view . sstables . size ( ) ) ; <nl> ColumnFamily returnCF = ArrayBackedSortedColumns . factory . create ( cfs . metadata , filter . filter . isReversed ( ) ) ; <nl> - <nl> + DeletionInfo returnDeletionInfo = returnCF . deletionInfo ( ) ; <nl> try <nl> { <nl> Tracing . trace ( " Merging memtable tombstones " ) ; <nl> @ @ - 188 , 7 + 188 , 7 @ @ public class CollationController <nl> OnDiskAtomIterator iter = filter . getMemtableColumnIterator ( memtable ) ; <nl> if ( iter ! = null ) <nl> { <nl> - returnCF . delete ( iter . getColumnFamily ( ) ) ; <nl> + filter . delete ( returnDeletionInfo , iter . getColumnFamily ( ) ) ; <nl> iterators . add ( iter ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / DeletionInfo . java b / src / java / org / apache / cassandra / db / DeletionInfo . java <nl> index 7e587f3 . . 3a74d52 100644 <nl> - - - a / src / java / org / apache / cassandra / db / DeletionInfo . java <nl> + + + b / src / java / org / apache / cassandra / db / DeletionInfo . java <nl> @ @ - 252 , 7 + 252 , 17 @ @ public class DeletionInfo implements IMeasurableMemory <nl> return ranges = = null ? Iterators . < RangeTombstone > emptyIterator ( ) : ranges . iterator ( ) ; <nl> } <nl> <nl> - public DeletionTime rangeCovering ( Composite name ) <nl> + public Iterator < RangeTombstone > rangeIterator ( Composite start , Composite finish ) <nl> + { <nl> + return ranges = = null ? Iterators . < RangeTombstone > emptyIterator ( ) : ranges . iterator ( start , finish ) ; <nl> + } <nl> + <nl> + public DeletionTime deletionTimeFor ( Composite name ) <nl> + { <nl> + return ranges = = null ? null : ranges . searchDeletionTime ( name ) ; <nl> + } <nl> + <nl> + public RangeTombstone rangeCovering ( Composite name ) <nl> { <nl> return ranges = = null ? null : ranges . search ( name ) ; <nl> } <nl> @ @ - 278 , 8 + 288 , 7 @ @ public class DeletionInfo implements IMeasurableMemory <nl> * / <nl> public boolean mayModify ( DeletionInfo delInfo ) <nl> { <nl> - return topLevel . markedForDeleteAt > delInfo . topLevel . markedForDeleteAt <nl> - | | hasRanges ( ) ; <nl> + return topLevel . compareTo ( delInfo . topLevel ) > 0 | | hasRanges ( ) ; <nl> } <nl> <nl> @ Override <nl> diff - - git a / src / java / org / apache / cassandra / db / RangeTombstone . java b / src / java / org / apache / cassandra / db / RangeTombstone . java <nl> index c10349a . . 097a835 100644 <nl> - - - a / src / java / org / apache / cassandra / db / RangeTombstone . java <nl> + + + b / src / java / org / apache / cassandra / db / RangeTombstone . java <nl> @ @ - 98 , 6 + 98 , 11 @ @ public class RangeTombstone extends Interval < Composite , DeletionTime > implements <nl> return comparator . compare ( min , rt . min ) < = 0 & & comparator . compare ( max , rt . max ) > = 0 ; <nl> } <nl> <nl> + public boolean includes ( Comparator < Composite > comparator , Composite name ) <nl> + { <nl> + return comparator . compare ( name , min ) > = 0 & & comparator . compare ( name , max ) < = 0 ; <nl> + } <nl> + <nl> public static class Tracker <nl> { <nl> private final Comparator < Composite > comparator ; <nl> diff - - git a / src / java / org / apache / cassandra / db / RangeTombstoneList . java b / src / java / org / apache / cassandra / db / RangeTombstoneList . java <nl> index 1158e20 . . 344c098 100644 <nl> - - - a / src / java / org / apache / cassandra / db / RangeTombstoneList . java <nl> + + + b / src / java / org / apache / cassandra / db / RangeTombstoneList . java <nl> @ @ - 25 , 6 + 25 , 7 @ @ import java . util . Comparator ; <nl> import java . util . Iterator ; <nl> <nl> import com . google . common . collect . AbstractIterator ; <nl> + import com . google . common . collect . Iterators ; <nl> <nl> import org . apache . cassandra . cache . IMeasurableMemory ; <nl> import org . apache . cassandra . db . composites . CType ; <nl> @ @ - 212 , 7 + 213 , 7 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable <nl> * / <nl> public boolean isDeleted ( Composite name , long timestamp ) <nl> { <nl> - int idx = searchInternal ( name ) ; <nl> + int idx = searchInternal ( name , 0 ) ; <nl> return idx > = 0 & & markedAts [ idx ] > = timestamp ; <nl> } <nl> <nl> @ @ - 228 , 17 + 229 , 28 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable <nl> * Returns the DeletionTime for the tombstone overlapping { @ code name } ( there can ' t be more than one ) , <nl> * or null if { @ code name } is not covered by any tombstone . <nl> * / <nl> - public DeletionTime search ( Composite name ) { <nl> - int idx = searchInternal ( name ) ; <nl> + public DeletionTime searchDeletionTime ( Composite name ) <nl> + { <nl> + int idx = searchInternal ( name , 0 ) ; <nl> return idx < 0 ? null : new DeletionTime ( markedAts [ idx ] , delTimes [ idx ] ) ; <nl> } <nl> <nl> - private int searchInternal ( Composite name ) <nl> + public RangeTombstone search ( Composite name ) <nl> + { <nl> + int idx = searchInternal ( name , 0 ) ; <nl> + return idx < 0 ? null : rangeTombstone ( idx ) ; <nl> + } <nl> + <nl> + / * <nl> + * Return is the index of the range covering name if name is covered . If the return idx is negative , <nl> + * no range cover name and - idx - 1 is the index of the first range whose start is greater than name . <nl> + * / <nl> + private int searchInternal ( Composite name , int startIdx ) <nl> { <nl> if ( isEmpty ( ) ) <nl> return - 1 ; <nl> <nl> - int pos = Arrays . binarySearch ( starts , 0 , size , name , comparator ) ; <nl> + int pos = Arrays . binarySearch ( starts , startIdx , size , name , comparator ) ; <nl> if ( pos > = 0 ) <nl> { <nl> / / We ' re exactly on an interval start . The one subtility is that we need to check if <nl> @ @ - 255 , 7 + 267 , 7 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable <nl> if ( idx < 0 ) <nl> return - 1 ; <nl> <nl> - return comparator . compare ( name , ends [ idx ] ) < = 0 ? idx : - 1 ; <nl> + return comparator . compare ( name , ends [ idx ] ) < = 0 ? idx : - idx - 2 ; <nl> } <nl> } <nl> <nl> @ @ - 320 , 6 + 332 , 11 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable <nl> return false ; <nl> } <nl> <nl> + private RangeTombstone rangeTombstone ( int idx ) <nl> + { <nl> + return new RangeTombstone ( starts [ idx ] , ends [ idx ] , markedAts [ idx ] , delTimes [ idx ] ) ; <nl> + } <nl> + <nl> public Iterator < RangeTombstone > iterator ( ) <nl> { <nl> return new AbstractIterator < RangeTombstone > ( ) <nl> @ @ - 331 , 9 + 348 , 39 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable <nl> if ( idx > = size ) <nl> return endOfData ( ) ; <nl> <nl> - RangeTombstone t = new RangeTombstone ( starts [ idx ] , ends [ idx ] , markedAts [ idx ] , delTimes [ idx ] ) ; <nl> - idx + + ; <nl> - return t ; <nl> + return rangeTombstone ( idx + + ) ; <nl> + } <nl> + } ; <nl> + } <nl> + <nl> + public Iterator < RangeTombstone > iterator ( Composite from , Composite till ) <nl> + { <nl> + int startIdx = from . isEmpty ( ) ? 0 : searchInternal ( from , 0 ) ; <nl> + final int start = startIdx < 0 ? - startIdx - 1 : startIdx ; <nl> + <nl> + if ( start > = size ) <nl> + return Iterators . < RangeTombstone > emptyIterator ( ) ; <nl> + <nl> + int finishIdx = till . isEmpty ( ) ? size : searchInternal ( till , start ) ; <nl> + / / if stopIdx is the first range after ' till ' we care only until the previous range <nl> + final int finish = finishIdx < 0 ? - finishIdx - 2 : finishIdx ; <nl> + <nl> + / / Note : the following is true because we know ' from ' is before ' till ' in sorted order . <nl> + if ( start > finish ) <nl> + return Iterators . < RangeTombstone > emptyIterator ( ) ; <nl> + else if ( start = = finish ) <nl> + return Iterators . < RangeTombstone > singletonIterator ( rangeTombstone ( start ) ) ; <nl> + <nl> + return new AbstractIterator < RangeTombstone > ( ) <nl> + { <nl> + private int idx = start ; <nl> + <nl> + protected RangeTombstone computeNext ( ) <nl> + { <nl> + if ( idx > = size | | idx > finish ) <nl> + return endOfData ( ) ; <nl> + <nl> + return rangeTombstone ( idx + + ) ; <nl> } <nl> } ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / filter / IDiskAtomFilter . java b / src / java / org / apache / cassandra / db / filter / IDiskAtomFilter . java <nl> index 17967a8 . . 8142304 100644 <nl> - - - a / src / java / org / apache / cassandra / db / filter / IDiskAtomFilter . java <nl> + + + b / src / java / org / apache / cassandra / db / filter / IDiskAtomFilter . java <nl> @ @ - 139 , 4 + 139 , 6 @ @ public interface IDiskAtomFilter <nl> return size ; <nl> } <nl> } <nl> + <nl> + public Iterator < RangeTombstone > getRangeTombstoneIterator ( ColumnFamily source ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / filter / NamesQueryFilter . java b / src / java / org / apache / cassandra / db / filter / NamesQueryFilter . java <nl> index 208bbdf . . b1745c3 100644 <nl> - - - a / src / java / org / apache / cassandra / db / filter / NamesQueryFilter . java <nl> + + + b / src / java / org / apache / cassandra / db / filter / NamesQueryFilter . java <nl> @ @ - 27 , 6 + 27 , 7 @ @ import java . util . TreeSet ; <nl> <nl> import org . apache . commons . lang3 . StringUtils ; <nl> import com . google . common . collect . AbstractIterator ; <nl> + import com . google . common . collect . Iterators ; <nl> <nl> import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . db . columniterator . OnDiskAtomIterator ; <nl> @ @ - 258 , 4 + 259 , 33 @ @ public class NamesQueryFilter implements IDiskAtomFilter <nl> return size ; <nl> } <nl> } <nl> + <nl> + public Iterator < RangeTombstone > getRangeTombstoneIterator ( final ColumnFamily source ) <nl> + { <nl> + if ( ! source . deletionInfo ( ) . hasRanges ( ) ) <nl> + return Iterators . < RangeTombstone > emptyIterator ( ) ; <nl> + <nl> + return new AbstractIterator < RangeTombstone > ( ) <nl> + { <nl> + private final Iterator < CellName > names = columns . iterator ( ) ; <nl> + private RangeTombstone lastFindRange ; <nl> + <nl> + protected RangeTombstone computeNext ( ) <nl> + { <nl> + while ( names . hasNext ( ) ) <nl> + { <nl> + CellName next = names . next ( ) ; <nl> + if ( lastFindRange ! = null & & lastFindRange . includes ( source . getComparator ( ) , next ) ) <nl> + return lastFindRange ; <nl> + <nl> + / / We keep the last range around as since names are in sort order , it ' s <nl> + / / possible it will match the next name too . <nl> + lastFindRange = source . deletionInfo ( ) . rangeCovering ( next ) ; <nl> + if ( lastFindRange ! = null ) <nl> + return lastFindRange ; <nl> + } <nl> + return endOfData ( ) ; <nl> + } <nl> + } ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / filter / QueryFilter . java b / src / java / org / apache / cassandra / db / filter / QueryFilter . java <nl> index 53a2180 . . 9c3cc49 100644 <nl> - - - a / src / java / org / apache / cassandra / db / filter / QueryFilter . java <nl> + + + b / src / java / org / apache / cassandra / db / filter / QueryFilter . java <nl> @ @ - 234 , 4 + 234 , 13 @ @ public class QueryFilter <nl> { <nl> return filter . shouldInclude ( sstable ) ; <nl> } <nl> + <nl> + public void delete ( DeletionInfo target , ColumnFamily source ) <nl> + { <nl> + target . add ( source . deletionInfo ( ) . getTopLevelDeletion ( ) ) ; <nl> + / / source is the CF currently in the memtable , and it can be large compared to what the filter selects , <nl> + / / so only consider those range tombstones that the filter do select . <nl> + for ( Iterator < RangeTombstone > iter = filter . getRangeTombstoneIterator ( source ) ; iter . hasNext ( ) ; ) <nl> + target . add ( iter . next ( ) , source . getComparator ( ) ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / filter / SliceQueryFilter . java b / src / java / org / apache / cassandra / db / filter / SliceQueryFilter . java <nl> index 26f6d9d . . f448db9 100644 <nl> - - - a / src / java / org / apache / cassandra / db / filter / SliceQueryFilter . java <nl> + + + b / src / java / org / apache / cassandra / db / filter / SliceQueryFilter . java <nl> @ @ - 23 , 6 + 23 , 8 @ @ import java . io . DataOutput ; <nl> import java . io . IOException ; <nl> import java . util . * ; <nl> <nl> + import com . google . common . collect . AbstractIterator ; <nl> + import com . google . common . collect . Iterators ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 426 , 4 + 428 , 43 @ @ public class SliceQueryFilter implements IDiskAtomFilter <nl> return size ; <nl> } <nl> } <nl> + <nl> + public Iterator < RangeTombstone > getRangeTombstoneIterator ( final ColumnFamily source ) <nl> + { <nl> + final DeletionInfo delInfo = source . deletionInfo ( ) ; <nl> + if ( ! delInfo . hasRanges ( ) | | slices . length = = 0 ) <nl> + return Iterators . < RangeTombstone > emptyIterator ( ) ; <nl> + <nl> + return new AbstractIterator < RangeTombstone > ( ) <nl> + { <nl> + private int sliceIdx = 0 ; <nl> + private Iterator < RangeTombstone > sliceIter = currentRangeIter ( ) ; <nl> + <nl> + protected RangeTombstone computeNext ( ) <nl> + { <nl> + while ( true ) <nl> + { <nl> + if ( sliceIter . hasNext ( ) ) <nl> + return sliceIter . next ( ) ; <nl> + <nl> + if ( ! nextSlice ( ) ) <nl> + return endOfData ( ) ; <nl> + <nl> + sliceIter = currentRangeIter ( ) ; <nl> + } <nl> + } <nl> + <nl> + private Iterator < RangeTombstone > currentRangeIter ( ) <nl> + { <nl> + ColumnSlice slice = slices [ reversed ? ( slices . length - 1 - sliceIdx ) : sliceIdx ] ; <nl> + return reversed ? delInfo . rangeIterator ( slice . finish , slice . start ) <nl> + : delInfo . rangeIterator ( slice . start , slice . finish ) ; <nl> + } <nl> + <nl> + private boolean nextSlice ( ) <nl> + { <nl> + return + + sliceIdx < slices . length ; <nl> + } <nl> + } ; <nl> + } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / db / RangeTombstoneListTest . java b / test / unit / org / apache / cassandra / db / RangeTombstoneListTest . java <nl> index d739372 . . faa15f0 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / RangeTombstoneListTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / RangeTombstoneListTest . java <nl> @ @ - 112 , 7 + 112 , 7 @ @ public class RangeTombstoneListTest <nl> l2 . add ( rt ( 4 , 10 , 12L ) ) ; <nl> l2 . add ( rt ( 0 , 8 , 25L ) ) ; <nl> <nl> - assertEquals ( 25L , l2 . search ( b ( 8 ) ) . markedForDeleteAt ) ; <nl> + assertEquals ( 25L , l2 . searchDeletionTime ( b ( 8 ) ) . markedForDeleteAt ) ; <nl> } <nl> <nl> @ Test <nl> @ @ - 159 , 9 + 159 , 9 @ @ public class RangeTombstoneListTest <nl> l . add ( rt ( 1 , 4 , 2 ) ) ; <nl> l . add ( rt ( 4 , 10 , 5 ) ) ; <nl> <nl> - assertEquals ( 2 , l . search ( b ( 3 ) ) . markedForDeleteAt ) ; <nl> - assertEquals ( 5 , l . search ( b ( 4 ) ) . markedForDeleteAt ) ; <nl> - assertEquals ( 5 , l . search ( b ( 8 ) ) . markedForDeleteAt ) ; <nl> + assertEquals ( 2 , l . searchDeletionTime ( b ( 3 ) ) . markedForDeleteAt ) ; <nl> + assertEquals ( 5 , l . searchDeletionTime ( b ( 4 ) ) . markedForDeleteAt ) ; <nl> + assertEquals ( 5 , l . searchDeletionTime ( b ( 8 ) ) . markedForDeleteAt ) ; <nl> assertEquals ( 3 , l . size ( ) ) ; <nl> } <nl> <nl> @ @ - 175 , 20 + 175 , 20 @ @ public class RangeTombstoneListTest <nl> l . add ( rt ( 14 , 15 , 3 ) ) ; <nl> l . add ( rt ( 15 , 17 , 6 ) ) ; <nl> <nl> - assertEquals ( null , l . search ( b ( - 1 ) ) ) ; <nl> + assertEquals ( null , l . searchDeletionTime ( b ( - 1 ) ) ) ; <nl> <nl> - assertEquals ( 5 , l . search ( b ( 0 ) ) . markedForDeleteAt ) ; <nl> - assertEquals ( 5 , l . search ( b ( 3 ) ) . markedForDeleteAt ) ; <nl> - assertEquals ( 5 , l . search ( b ( 4 ) ) . markedForDeleteAt ) ; <nl> + assertEquals ( 5 , l . searchDeletionTime ( b ( 0 ) ) . markedForDeleteAt ) ; <nl> + assertEquals ( 5 , l . searchDeletionTime ( b ( 3 ) ) . markedForDeleteAt ) ; <nl> + assertEquals ( 5 , l . searchDeletionTime ( b ( 4 ) ) . markedForDeleteAt ) ; <nl> <nl> - assertEquals ( 2 , l . search ( b ( 5 ) ) . markedForDeleteAt ) ; <nl> + assertEquals ( 2 , l . searchDeletionTime ( b ( 5 ) ) . markedForDeleteAt ) ; <nl> <nl> - assertEquals ( null , l . search ( b ( 7 ) ) ) ; <nl> + assertEquals ( null , l . searchDeletionTime ( b ( 7 ) ) ) ; <nl> <nl> - assertEquals ( 3 , l . search ( b ( 14 ) ) . markedForDeleteAt ) ; <nl> + assertEquals ( 3 , l . searchDeletionTime ( b ( 14 ) ) . markedForDeleteAt ) ; <nl> <nl> - assertEquals ( 6 , l . search ( b ( 15 ) ) . markedForDeleteAt ) ; <nl> - assertEquals ( null , l . search ( b ( 18 ) ) ) ; <nl> + assertEquals ( 6 , l . searchDeletionTime ( b ( 15 ) ) . markedForDeleteAt ) ; <nl> + assertEquals ( null , l . searchDeletionTime ( b ( 18 ) ) ) ; <nl> } <nl> <nl> @ Test <nl> diff - - git a / test / unit / org / apache / cassandra / db / RangeTombstoneTest . java b / test / unit / org / apache / cassandra / db / RangeTombstoneTest . java <nl> index 1885716 . . a307485 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / RangeTombstoneTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / RangeTombstoneTest . java <nl> @ @ - 26 , 6 + 26 , 7 @ @ import org . apache . cassandra . utils . memory . AbstractAllocator ; <nl> import org . junit . Test ; <nl> <nl> import com . google . common . collect . ImmutableMap ; <nl> + import org . apache . commons . collections . CollectionUtils ; <nl> <nl> import org . apache . cassandra . SchemaLoader ; <nl> import org . apache . cassandra . config . ColumnDefinition ; <nl> @ @ - 112 , 6 + 113 , 107 @ @ public class RangeTombstoneTest extends SchemaLoader <nl> } <nl> <nl> @ Test <nl> + public void rangeTombstoneFilteringTest ( ) throws Exception <nl> + { <nl> + CompactionManager . instance . disableAutoCompaction ( ) ; <nl> + Keyspace keyspace = Keyspace . open ( KSNAME ) ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( CFNAME ) ; <nl> + <nl> + / / Inserting data <nl> + String key = " k111 " ; <nl> + RowMutation rm ; <nl> + ColumnFamily cf ; <nl> + <nl> + rm = new RowMutation ( KSNAME , ByteBufferUtil . bytes ( key ) ) ; <nl> + for ( int i = 0 ; i < 40 ; i + = 2 ) <nl> + add ( rm , i , 0 ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + rm = new RowMutation ( KSNAME , ByteBufferUtil . bytes ( key ) ) ; <nl> + cf = rm . addOrGet ( CFNAME ) ; <nl> + delete ( cf , 5 , 10 , 1 ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + rm = new RowMutation ( KSNAME , ByteBufferUtil . bytes ( key ) ) ; <nl> + cf = rm . addOrGet ( CFNAME ) ; <nl> + delete ( cf , 15 , 20 , 2 ) ; <nl> + rm . apply ( ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 11 ) , b ( 14 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + Collection < RangeTombstone > rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 0 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 11 ) , b ( 15 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 1 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 20 ) , b ( 25 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 1 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 12 ) , b ( 25 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 1 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 25 ) , b ( 35 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 0 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 1 ) , b ( 40 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 2 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 7 ) , b ( 17 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 2 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 5 ) , b ( 20 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 2 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 5 ) , b ( 15 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 2 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 1 ) , b ( 2 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 0 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 1 ) , b ( 5 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 1 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 1 ) , b ( 10 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 1 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 5 ) , b ( 6 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 1 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 17 ) , b ( 20 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 1 , rt . size ( ) ) ; <nl> + <nl> + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 17 ) , b ( 18 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 1 , rt . size ( ) ) ; <nl> + <nl> + ColumnSlice [ ] slices = new ColumnSlice [ ] { new ColumnSlice ( b ( 1 ) , b ( 10 ) ) , new ColumnSlice ( b ( 16 ) , b ( 20 ) ) } ; <nl> + IDiskAtomFilter sqf = new SliceQueryFilter ( slices , false , Integer . MAX _ VALUE ) ; <nl> + cf = cfs . getColumnFamily ( new QueryFilter ( dk ( key ) , CFNAME , sqf , System . currentTimeMillis ( ) ) ) ; <nl> + rt = rangeTombstones ( cf ) ; <nl> + assertEquals ( 2 , rt . size ( ) ) ; <nl> + } <nl> + <nl> + private Collection < RangeTombstone > rangeTombstones ( ColumnFamily cf ) <nl> + { <nl> + List < RangeTombstone > res = new ArrayList < RangeTombstone > ( ) ; <nl> + CollectionUtils . addAll ( res , cf . deletionInfo ( ) . rangeIterator ( ) ) ; <nl> + return res ; <nl> + } <nl> + <nl> + @ Test <nl> public void overlappingRangeTest ( ) throws Exception <nl> { <nl> CompactionManager . instance . disableAutoCompaction ( ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / tools / SSTableImportTest . java b / test / unit / org / apache / cassandra / tools / SSTableImportTest . java <nl> index 6434143 . . 3576005 100644 <nl> - - - a / test / unit / org / apache / cassandra / tools / SSTableImportTest . java <nl> + + + b / test / unit / org / apache / cassandra / tools / SSTableImportTest . java <nl> @ @ - 109 , 7 + 109 , 7 @ @ public class SSTableImportTest extends SchemaLoader <nl> ColumnFamily cf = cloneForAdditions ( qf . getSSTableColumnIterator ( reader ) ) ; <nl> qf . collateOnDiskAtom ( cf , qf . getSSTableColumnIterator ( reader ) , Integer . MIN _ VALUE ) ; <nl> <nl> - DeletionTime delTime = cf . deletionInfo ( ) . rangeCovering ( cf . getComparator ( ) . make ( ByteBufferUtil . bytes ( " superA " ) ) ) ; <nl> + DeletionTime delTime = cf . deletionInfo ( ) . deletionTimeFor ( cf . getComparator ( ) . make ( ByteBufferUtil . bytes ( " superA " ) ) ) ; <nl> assertEquals ( " supercolumn deletion time did not match the expected time " , new DeletionInfo ( 0 , 0 ) , new DeletionInfo ( delTime ) ) ; <nl> Cell subCell = cf . getColumn ( Util . cellname ( " superA " , " 636f6c4141 " ) ) ; <nl> assert subCell . value ( ) . equals ( hexToBytes ( " 76616c75654141 " ) ) ;
+NEAREST DIFF (one line): diff - - git a / test / unit / org / apache / cassandra / db / TimeSortTest . java b / test / unit / org / apache / cassandra / db / TimeSortTest . java <nl> index c96d1d5 . . 3731d28 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / TimeSortTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / TimeSortTest . java <nl> @ @ - 38 , 14 + 38 , 13 @ @ public class TimeSortTest extends CleanupHelper <nl> for ( int i = 900 ; i < 1000 ; + + i ) <nl> { <nl> String key = Integer . toString ( i ) ; <nl> - RowMutation rm ; <nl> + RowMutation rm = new RowMutation ( " Table1 " , key ) ; <nl> for ( int j = 0 ; j < 8 ; + + j ) <nl> { <nl> byte [ ] bytes = j % 2 = = 0 ? " a " . getBytes ( ) : " b " . getBytes ( ) ; <nl> - rm = new RowMutation ( " Table1 " , key ) ; <nl> rm . add ( " StandardByTime1 : " + " Column - " + j , bytes , j * 2 ) ; <nl> - rm . apply ( ) ; <nl> } <nl> + rm . apply ( ) ; <nl> } <nl> <nl> validateTimeSort ( table ) ; <nl> @ @ - 55 , 20 + 54 , 19 @ @ public class TimeSortTest extends CleanupHelper <nl> <nl> / / interleave some new data to test memtable + sstable <nl> String key = " 900 " ; <nl> - RowMutation rm ; <nl> + RowMutation rm = new RowMutation ( " Table1 " , key ) ; <nl> for ( int j = 0 ; j < 4 ; + + j ) <nl> { <nl> - rm = new RowMutation ( " Table1 " , key ) ; <nl> rm . add ( " StandardByTime1 : " + " Column + " + j , ArrayUtils . EMPTY _ BYTE _ ARRAY , j * 2 + 1 ) ; <nl> - rm . apply ( ) ; <nl> } <nl> + rm . apply ( ) ; <nl> / / and some overwrites <nl> + rm = new RowMutation ( " Table1 " , key ) ; <nl> for ( int j = 4 ; j < 8 ; + + j ) <nl> { <nl> - rm = new RowMutation ( " Table1 " , key ) ; <nl> rm . add ( " StandardByTime1 : " + " Column - " + j , ArrayUtils . EMPTY _ BYTE _ ARRAY , j * 3 ) ; <nl> - rm . apply ( ) ; <nl> } <nl> + rm . apply ( ) ; <nl> / / verify <nl> ColumnFamily cf = table . getRow ( key , " StandardByTime1 " , 0 ) . getColumnFamilies ( ) . iterator ( ) . next ( ) ; <nl> SortedSet < IColumn > columns = cf . getAllColumns ( ) ;
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java b / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java 
+ index 5cc43d9 . . 80e2995 100644 
+ - - - a / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java 
+ @ @ - 33 , 6 + 33 , 8 @ @ import com . google . common . collect . * ; 
+ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . db . composites . CellName ; 
+ import org . apache . cassandra . db . composites . CellNameType ; 
+ + import org . apache . cassandra . db . composites . Composite ; 
+ + import org . apache . cassandra . db . index . SecondaryIndexManager ; 
+ import org . apache . cassandra . db . filter . ColumnSlice ; 
+ import org . apache . cassandra . utils . ObjectSizes ; 
+ import org . apache . cassandra . utils . btree . BTree ; 
+ @ @ - 75 , 6 + 77 , 8 @ @ public class AtomicBTreeColumns extends ColumnFamily 
+ } ; 
+ 
+ private static final DeletionInfo LIVE = DeletionInfo . live ( ) ; 
+ + / / This is a small optimization : DeletionInfo is mutable , but we know that we will always copy it in that class , 
+ + / / so we can safely alias one DeletionInfo . live ( ) reference and avoid some allocations . 
+ private static final Holder EMPTY = new Holder ( BTree . empty ( ) , LIVE ) ; 
+ 
+ private volatile Holder ref ; 
+ @ @ - 126 , 7 + 130 , 8 @ @ public class AtomicBTreeColumns extends ColumnFamily 
+ while ( true ) 
+ { 
+ Holder current = ref ; 
+ - DeletionInfo newDelInfo = current . deletionInfo . copy ( ) . add ( info ) ; 
+ + DeletionInfo curDelInfo = current . deletionInfo ; 
+ + DeletionInfo newDelInfo = info . mayModify ( curDelInfo ) ? curDelInfo . copy ( ) . add ( info ) : curDelInfo ; 
+ if ( refUpdater . compareAndSet ( this , current , current . with ( newDelInfo ) ) ) 
+ break ; 
+ } 
+ @ @ - 233 , 15 + 238 , 17 @ @ public class AtomicBTreeColumns extends ColumnFamily 
+ DeletionInfo deletionInfo ; 
+ if ( cm . deletionInfo ( ) . mayModify ( current . deletionInfo ) ) 
+ { 
+ - if ( cm . deletionInfo ( ) . hasRanges ( ) ) 
+ + if ( indexer ! = SecondaryIndexManager . nullUpdater & & cm . deletionInfo ( ) . hasRanges ( ) ) 
+ { 
+ - for ( Iterator < Cell > iter : new Iterator [ ] { insert . iterator ( ) , BTree . < Cell > slice ( current . tree , true ) } ) 
+ + for ( Iterator < RangeTombstone > rangeIterator = cm . deletionInfo ( ) . rangeIterator ( ) ; rangeIterator . hasNext ( ) ; ) 
+ { 
+ - while ( iter . hasNext ( ) ) 
+ + RangeTombstone rt = rangeIterator . next ( ) ; 
+ + long deleteAt = rt . maxTimestamp ( ) ; 
+ + for ( Iterator < Cell > iter = current . cellRange ( getComparator ( ) . columnComparator ( ) , rt . min , rt . max ) ; iter . hasNext ( ) ; ) 
+ { 
+ - Cell col = iter . next ( ) ; 
+ - if ( cm . deletionInfo ( ) . isDeleted ( col ) ) 
+ - indexer . remove ( col ) ; 
+ + Cell c = iter . next ( ) ; 
+ + if ( deleteAt > = c . timestamp ( ) ) 
+ + indexer . remove ( c ) ; 
+ } 
+ } 
+ } 
+ @ @ - 361 , 8 + 368 , 6 @ @ public class AtomicBTreeColumns extends ColumnFamily 
+ 
+ private static class Holder 
+ { 
+ - / / This is a small optimization : DeletionInfo is mutable , but we know that we will always copy it in that class , 
+ - / / so we can safely alias one DeletionInfo . live ( ) reference and avoid some allocations . 
+ final DeletionInfo deletionInfo ; 
+ / / the btree of columns 
+ final Object [ ] tree ; 
+ @ @ - 377 , 6 + 382 , 11 @ @ public class AtomicBTreeColumns extends ColumnFamily 
+ { 
+ return new Holder ( this . tree , info ) ; 
+ } 
+ + 
+ + private Iterator < Cell > cellRange ( Comparator < Cell > comparator , Composite start , Composite finish ) 
+ + { 
+ + return new ColumnSlice . NavigableSetIterator ( new BTreeSet < > ( tree , comparator ) , new ColumnSlice [ ] { new ColumnSlice ( start , finish ) } ) ; 
+ + } 
+ } 
+ 
+ / / TODO : create a stack - allocation - friendly list to help optimise garbage for updates to rows with few columns 
+ diff - - git a / src / java / org / apache / cassandra / db / CollationController . java b / src / java / org / apache / cassandra / db / CollationController . java 
+ index e5d3495 . . 0df3619 100644 
+ - - - a / src / java / org / apache / cassandra / db / CollationController . java 
+ + + + b / src / java / org / apache / cassandra / db / CollationController . java 
+ @ @ - 75 , 7 + 75 , 7 @ @ public class CollationController 
+ if ( iter ! = null ) 
+ { 
+ iterators . add ( iter ) ; 
+ - container . delete ( iter . getColumnFamily ( ) ) ; 
+ + filter . delete ( container . deletionInfo ( ) , iter . getColumnFamily ( ) ) ; 
+ while ( iter . hasNext ( ) ) 
+ container . addAtom ( iter . next ( ) ) ; 
+ } 
+ @ @ - 179 , 7 + 179 , 7 @ @ public class CollationController 
+ ColumnFamilyStore . ViewFragment view = cfs . markReferenced ( filter . key ) ; 
+ List < OnDiskAtomIterator > iterators = new ArrayList < > ( Iterables . size ( view . memtables ) + view . sstables . size ( ) ) ; 
+ ColumnFamily returnCF = ArrayBackedSortedColumns . factory . create ( cfs . metadata , filter . filter . isReversed ( ) ) ; 
+ - 
+ + DeletionInfo returnDeletionInfo = returnCF . deletionInfo ( ) ; 
+ try 
+ { 
+ Tracing . trace ( " Merging memtable tombstones " ) ; 
+ @ @ - 188 , 7 + 188 , 7 @ @ public class CollationController 
+ OnDiskAtomIterator iter = filter . getMemtableColumnIterator ( memtable ) ; 
+ if ( iter ! = null ) 
+ { 
+ - returnCF . delete ( iter . getColumnFamily ( ) ) ; 
+ + filter . delete ( returnDeletionInfo , iter . getColumnFamily ( ) ) ; 
+ iterators . add ( iter ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / DeletionInfo . java b / src / java / org / apache / cassandra / db / DeletionInfo . java 
+ index 7e587f3 . . 3a74d52 100644 
+ - - - a / src / java / org / apache / cassandra / db / DeletionInfo . java 
+ + + + b / src / java / org / apache / cassandra / db / DeletionInfo . java 
+ @ @ - 252 , 7 + 252 , 17 @ @ public class DeletionInfo implements IMeasurableMemory 
+ return ranges = = null ? Iterators . < RangeTombstone > emptyIterator ( ) : ranges . iterator ( ) ; 
+ } 
+ 
+ - public DeletionTime rangeCovering ( Composite name ) 
+ + public Iterator < RangeTombstone > rangeIterator ( Composite start , Composite finish ) 
+ + { 
+ + return ranges = = null ? Iterators . < RangeTombstone > emptyIterator ( ) : ranges . iterator ( start , finish ) ; 
+ + } 
+ + 
+ + public DeletionTime deletionTimeFor ( Composite name ) 
+ + { 
+ + return ranges = = null ? null : ranges . searchDeletionTime ( name ) ; 
+ + } 
+ + 
+ + public RangeTombstone rangeCovering ( Composite name ) 
+ { 
+ return ranges = = null ? null : ranges . search ( name ) ; 
+ } 
+ @ @ - 278 , 8 + 288 , 7 @ @ public class DeletionInfo implements IMeasurableMemory 
+ * / 
+ public boolean mayModify ( DeletionInfo delInfo ) 
+ { 
+ - return topLevel . markedForDeleteAt > delInfo . topLevel . markedForDeleteAt 
+ - | | hasRanges ( ) ; 
+ + return topLevel . compareTo ( delInfo . topLevel ) > 0 | | hasRanges ( ) ; 
+ } 
+ 
+ @ Override 
+ diff - - git a / src / java / org / apache / cassandra / db / RangeTombstone . java b / src / java / org / apache / cassandra / db / RangeTombstone . java 
+ index c10349a . . 097a835 100644 
+ - - - a / src / java / org / apache / cassandra / db / RangeTombstone . java 
+ + + + b / src / java / org / apache / cassandra / db / RangeTombstone . java 
+ @ @ - 98 , 6 + 98 , 11 @ @ public class RangeTombstone extends Interval < Composite , DeletionTime > implements 
+ return comparator . compare ( min , rt . min ) < = 0 & & comparator . compare ( max , rt . max ) > = 0 ; 
+ } 
+ 
+ + public boolean includes ( Comparator < Composite > comparator , Composite name ) 
+ + { 
+ + return comparator . compare ( name , min ) > = 0 & & comparator . compare ( name , max ) < = 0 ; 
+ + } 
+ + 
+ public static class Tracker 
+ { 
+ private final Comparator < Composite > comparator ; 
+ diff - - git a / src / java / org / apache / cassandra / db / RangeTombstoneList . java b / src / java / org / apache / cassandra / db / RangeTombstoneList . java 
+ index 1158e20 . . 344c098 100644 
+ - - - a / src / java / org / apache / cassandra / db / RangeTombstoneList . java 
+ + + + b / src / java / org / apache / cassandra / db / RangeTombstoneList . java 
+ @ @ - 25 , 6 + 25 , 7 @ @ import java . util . Comparator ; 
+ import java . util . Iterator ; 
+ 
+ import com . google . common . collect . AbstractIterator ; 
+ + import com . google . common . collect . Iterators ; 
+ 
+ import org . apache . cassandra . cache . IMeasurableMemory ; 
+ import org . apache . cassandra . db . composites . CType ; 
+ @ @ - 212 , 7 + 213 , 7 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable 
+ * / 
+ public boolean isDeleted ( Composite name , long timestamp ) 
+ { 
+ - int idx = searchInternal ( name ) ; 
+ + int idx = searchInternal ( name , 0 ) ; 
+ return idx > = 0 & & markedAts [ idx ] > = timestamp ; 
+ } 
+ 
+ @ @ - 228 , 17 + 229 , 28 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable 
+ * Returns the DeletionTime for the tombstone overlapping { @ code name } ( there can ' t be more than one ) , 
+ * or null if { @ code name } is not covered by any tombstone . 
+ * / 
+ - public DeletionTime search ( Composite name ) { 
+ - int idx = searchInternal ( name ) ; 
+ + public DeletionTime searchDeletionTime ( Composite name ) 
+ + { 
+ + int idx = searchInternal ( name , 0 ) ; 
+ return idx < 0 ? null : new DeletionTime ( markedAts [ idx ] , delTimes [ idx ] ) ; 
+ } 
+ 
+ - private int searchInternal ( Composite name ) 
+ + public RangeTombstone search ( Composite name ) 
+ + { 
+ + int idx = searchInternal ( name , 0 ) ; 
+ + return idx < 0 ? null : rangeTombstone ( idx ) ; 
+ + } 
+ + 
+ + / * 
+ + * Return is the index of the range covering name if name is covered . If the return idx is negative , 
+ + * no range cover name and - idx - 1 is the index of the first range whose start is greater than name . 
+ + * / 
+ + private int searchInternal ( Composite name , int startIdx ) 
+ { 
+ if ( isEmpty ( ) ) 
+ return - 1 ; 
+ 
+ - int pos = Arrays . binarySearch ( starts , 0 , size , name , comparator ) ; 
+ + int pos = Arrays . binarySearch ( starts , startIdx , size , name , comparator ) ; 
+ if ( pos > = 0 ) 
+ { 
+ / / We ' re exactly on an interval start . The one subtility is that we need to check if 
+ @ @ - 255 , 7 + 267 , 7 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable 
+ if ( idx < 0 ) 
+ return - 1 ; 
+ 
+ - return comparator . compare ( name , ends [ idx ] ) < = 0 ? idx : - 1 ; 
+ + return comparator . compare ( name , ends [ idx ] ) < = 0 ? idx : - idx - 2 ; 
+ } 
+ } 
+ 
+ @ @ - 320 , 6 + 332 , 11 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable 
+ return false ; 
+ } 
+ 
+ + private RangeTombstone rangeTombstone ( int idx ) 
+ + { 
+ + return new RangeTombstone ( starts [ idx ] , ends [ idx ] , markedAts [ idx ] , delTimes [ idx ] ) ; 
+ + } 
+ + 
+ public Iterator < RangeTombstone > iterator ( ) 
+ { 
+ return new AbstractIterator < RangeTombstone > ( ) 
+ @ @ - 331 , 9 + 348 , 39 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable 
+ if ( idx > = size ) 
+ return endOfData ( ) ; 
+ 
+ - RangeTombstone t = new RangeTombstone ( starts [ idx ] , ends [ idx ] , markedAts [ idx ] , delTimes [ idx ] ) ; 
+ - idx + + ; 
+ - return t ; 
+ + return rangeTombstone ( idx + + ) ; 
+ + } 
+ + } ; 
+ + } 
+ + 
+ + public Iterator < RangeTombstone > iterator ( Composite from , Composite till ) 
+ + { 
+ + int startIdx = from . isEmpty ( ) ? 0 : searchInternal ( from , 0 ) ; 
+ + final int start = startIdx < 0 ? - startIdx - 1 : startIdx ; 
+ + 
+ + if ( start > = size ) 
+ + return Iterators . < RangeTombstone > emptyIterator ( ) ; 
+ + 
+ + int finishIdx = till . isEmpty ( ) ? size : searchInternal ( till , start ) ; 
+ + / / if stopIdx is the first range after ' till ' we care only until the previous range 
+ + final int finish = finishIdx < 0 ? - finishIdx - 2 : finishIdx ; 
+ + 
+ + / / Note : the following is true because we know ' from ' is before ' till ' in sorted order . 
+ + if ( start > finish ) 
+ + return Iterators . < RangeTombstone > emptyIterator ( ) ; 
+ + else if ( start = = finish ) 
+ + return Iterators . < RangeTombstone > singletonIterator ( rangeTombstone ( start ) ) ; 
+ + 
+ + return new AbstractIterator < RangeTombstone > ( ) 
+ + { 
+ + private int idx = start ; 
+ + 
+ + protected RangeTombstone computeNext ( ) 
+ + { 
+ + if ( idx > = size | | idx > finish ) 
+ + return endOfData ( ) ; 
+ + 
+ + return rangeTombstone ( idx + + ) ; 
+ } 
+ } ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / filter / IDiskAtomFilter . java b / src / java / org / apache / cassandra / db / filter / IDiskAtomFilter . java 
+ index 17967a8 . . 8142304 100644 
+ - - - a / src / java / org / apache / cassandra / db / filter / IDiskAtomFilter . java 
+ + + + b / src / java / org / apache / cassandra / db / filter / IDiskAtomFilter . java 
+ @ @ - 139 , 4 + 139 , 6 @ @ public interface IDiskAtomFilter 
+ return size ; 
+ } 
+ } 
+ + 
+ + public Iterator < RangeTombstone > getRangeTombstoneIterator ( ColumnFamily source ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / filter / NamesQueryFilter . java b / src / java / org / apache / cassandra / db / filter / NamesQueryFilter . java 
+ index 208bbdf . . b1745c3 100644 
+ - - - a / src / java / org / apache / cassandra / db / filter / NamesQueryFilter . java 
+ + + + b / src / java / org / apache / cassandra / db / filter / NamesQueryFilter . java 
+ @ @ - 27 , 6 + 27 , 7 @ @ import java . util . TreeSet ; 
+ 
+ import org . apache . commons . lang3 . StringUtils ; 
+ import com . google . common . collect . AbstractIterator ; 
+ + import com . google . common . collect . Iterators ; 
+ 
+ import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . db . columniterator . OnDiskAtomIterator ; 
+ @ @ - 258 , 4 + 259 , 33 @ @ public class NamesQueryFilter implements IDiskAtomFilter 
+ return size ; 
+ } 
+ } 
+ + 
+ + public Iterator < RangeTombstone > getRangeTombstoneIterator ( final ColumnFamily source ) 
+ + { 
+ + if ( ! source . deletionInfo ( ) . hasRanges ( ) ) 
+ + return Iterators . < RangeTombstone > emptyIterator ( ) ; 
+ + 
+ + return new AbstractIterator < RangeTombstone > ( ) 
+ + { 
+ + private final Iterator < CellName > names = columns . iterator ( ) ; 
+ + private RangeTombstone lastFindRange ; 
+ + 
+ + protected RangeTombstone computeNext ( ) 
+ + { 
+ + while ( names . hasNext ( ) ) 
+ + { 
+ + CellName next = names . next ( ) ; 
+ + if ( lastFindRange ! = null & & lastFindRange . includes ( source . getComparator ( ) , next ) ) 
+ + return lastFindRange ; 
+ + 
+ + / / We keep the last range around as since names are in sort order , it ' s 
+ + / / possible it will match the next name too . 
+ + lastFindRange = source . deletionInfo ( ) . rangeCovering ( next ) ; 
+ + if ( lastFindRange ! = null ) 
+ + return lastFindRange ; 
+ + } 
+ + return endOfData ( ) ; 
+ + } 
+ + } ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / filter / QueryFilter . java b / src / java / org / apache / cassandra / db / filter / QueryFilter . java 
+ index 53a2180 . . 9c3cc49 100644 
+ - - - a / src / java / org / apache / cassandra / db / filter / QueryFilter . java 
+ + + + b / src / java / org / apache / cassandra / db / filter / QueryFilter . java 
+ @ @ - 234 , 4 + 234 , 13 @ @ public class QueryFilter 
+ { 
+ return filter . shouldInclude ( sstable ) ; 
+ } 
+ + 
+ + public void delete ( DeletionInfo target , ColumnFamily source ) 
+ + { 
+ + target . add ( source . deletionInfo ( ) . getTopLevelDeletion ( ) ) ; 
+ + / / source is the CF currently in the memtable , and it can be large compared to what the filter selects , 
+ + / / so only consider those range tombstones that the filter do select . 
+ + for ( Iterator < RangeTombstone > iter = filter . getRangeTombstoneIterator ( source ) ; iter . hasNext ( ) ; ) 
+ + target . add ( iter . next ( ) , source . getComparator ( ) ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / filter / SliceQueryFilter . java b / src / java / org / apache / cassandra / db / filter / SliceQueryFilter . java 
+ index 26f6d9d . . f448db9 100644 
+ - - - a / src / java / org / apache / cassandra / db / filter / SliceQueryFilter . java 
+ + + + b / src / java / org / apache / cassandra / db / filter / SliceQueryFilter . java 
+ @ @ - 23 , 6 + 23 , 8 @ @ import java . io . DataOutput ; 
+ import java . io . IOException ; 
+ import java . util . * ; 
+ 
+ + import com . google . common . collect . AbstractIterator ; 
+ + import com . google . common . collect . Iterators ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 426 , 4 + 428 , 43 @ @ public class SliceQueryFilter implements IDiskAtomFilter 
+ return size ; 
+ } 
+ } 
+ + 
+ + public Iterator < RangeTombstone > getRangeTombstoneIterator ( final ColumnFamily source ) 
+ + { 
+ + final DeletionInfo delInfo = source . deletionInfo ( ) ; 
+ + if ( ! delInfo . hasRanges ( ) | | slices . length = = 0 ) 
+ + return Iterators . < RangeTombstone > emptyIterator ( ) ; 
+ + 
+ + return new AbstractIterator < RangeTombstone > ( ) 
+ + { 
+ + private int sliceIdx = 0 ; 
+ + private Iterator < RangeTombstone > sliceIter = currentRangeIter ( ) ; 
+ + 
+ + protected RangeTombstone computeNext ( ) 
+ + { 
+ + while ( true ) 
+ + { 
+ + if ( sliceIter . hasNext ( ) ) 
+ + return sliceIter . next ( ) ; 
+ + 
+ + if ( ! nextSlice ( ) ) 
+ + return endOfData ( ) ; 
+ + 
+ + sliceIter = currentRangeIter ( ) ; 
+ + } 
+ + } 
+ + 
+ + private Iterator < RangeTombstone > currentRangeIter ( ) 
+ + { 
+ + ColumnSlice slice = slices [ reversed ? ( slices . length - 1 - sliceIdx ) : sliceIdx ] ; 
+ + return reversed ? delInfo . rangeIterator ( slice . finish , slice . start ) 
+ + : delInfo . rangeIterator ( slice . start , slice . finish ) ; 
+ + } 
+ + 
+ + private boolean nextSlice ( ) 
+ + { 
+ + return + + sliceIdx < slices . length ; 
+ + } 
+ + } ; 
+ + } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / db / RangeTombstoneListTest . java b / test / unit / org / apache / cassandra / db / RangeTombstoneListTest . java 
+ index d739372 . . faa15f0 100644 
+ - - - a / test / unit / org / apache / cassandra / db / RangeTombstoneListTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / RangeTombstoneListTest . java 
+ @ @ - 112 , 7 + 112 , 7 @ @ public class RangeTombstoneListTest 
+ l2 . add ( rt ( 4 , 10 , 12L ) ) ; 
+ l2 . add ( rt ( 0 , 8 , 25L ) ) ; 
+ 
+ - assertEquals ( 25L , l2 . search ( b ( 8 ) ) . markedForDeleteAt ) ; 
+ + assertEquals ( 25L , l2 . searchDeletionTime ( b ( 8 ) ) . markedForDeleteAt ) ; 
+ } 
+ 
+ @ Test 
+ @ @ - 159 , 9 + 159 , 9 @ @ public class RangeTombstoneListTest 
+ l . add ( rt ( 1 , 4 , 2 ) ) ; 
+ l . add ( rt ( 4 , 10 , 5 ) ) ; 
+ 
+ - assertEquals ( 2 , l . search ( b ( 3 ) ) . markedForDeleteAt ) ; 
+ - assertEquals ( 5 , l . search ( b ( 4 ) ) . markedForDeleteAt ) ; 
+ - assertEquals ( 5 , l . search ( b ( 8 ) ) . markedForDeleteAt ) ; 
+ + assertEquals ( 2 , l . searchDeletionTime ( b ( 3 ) ) . markedForDeleteAt ) ; 
+ + assertEquals ( 5 , l . searchDeletionTime ( b ( 4 ) ) . markedForDeleteAt ) ; 
+ + assertEquals ( 5 , l . searchDeletionTime ( b ( 8 ) ) . markedForDeleteAt ) ; 
+ assertEquals ( 3 , l . size ( ) ) ; 
+ } 
+ 
+ @ @ - 175 , 20 + 175 , 20 @ @ public class RangeTombstoneListTest 
+ l . add ( rt ( 14 , 15 , 3 ) ) ; 
+ l . add ( rt ( 15 , 17 , 6 ) ) ; 
+ 
+ - assertEquals ( null , l . search ( b ( - 1 ) ) ) ; 
+ + assertEquals ( null , l . searchDeletionTime ( b ( - 1 ) ) ) ; 
+ 
+ - assertEquals ( 5 , l . search ( b ( 0 ) ) . markedForDeleteAt ) ; 
+ - assertEquals ( 5 , l . search ( b ( 3 ) ) . markedForDeleteAt ) ; 
+ - assertEquals ( 5 , l . search ( b ( 4 ) ) . markedForDeleteAt ) ; 
+ + assertEquals ( 5 , l . searchDeletionTime ( b ( 0 ) ) . markedForDeleteAt ) ; 
+ + assertEquals ( 5 , l . searchDeletionTime ( b ( 3 ) ) . markedForDeleteAt ) ; 
+ + assertEquals ( 5 , l . searchDeletionTime ( b ( 4 ) ) . markedForDeleteAt ) ; 
+ 
+ - assertEquals ( 2 , l . search ( b ( 5 ) ) . markedForDeleteAt ) ; 
+ + assertEquals ( 2 , l . searchDeletionTime ( b ( 5 ) ) . markedForDeleteAt ) ; 
+ 
+ - assertEquals ( null , l . search ( b ( 7 ) ) ) ; 
+ + assertEquals ( null , l . searchDeletionTime ( b ( 7 ) ) ) ; 
+ 
+ - assertEquals ( 3 , l . search ( b ( 14 ) ) . markedForDeleteAt ) ; 
+ + assertEquals ( 3 , l . searchDeletionTime ( b ( 14 ) ) . markedForDeleteAt ) ; 
+ 
+ - assertEquals ( 6 , l . search ( b ( 15 ) ) . markedForDeleteAt ) ; 
+ - assertEquals ( null , l . search ( b ( 18 ) ) ) ; 
+ + assertEquals ( 6 , l . searchDeletionTime ( b ( 15 ) ) . markedForDeleteAt ) ; 
+ + assertEquals ( null , l . searchDeletionTime ( b ( 18 ) ) ) ; 
+ } 
+ 
+ @ Test 
+ diff - - git a / test / unit / org / apache / cassandra / db / RangeTombstoneTest . java b / test / unit / org / apache / cassandra / db / RangeTombstoneTest . java 
+ index 1885716 . . a307485 100644 
+ - - - a / test / unit / org / apache / cassandra / db / RangeTombstoneTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / RangeTombstoneTest . java 
+ @ @ - 26 , 6 + 26 , 7 @ @ import org . apache . cassandra . utils . memory . AbstractAllocator ; 
+ import org . junit . Test ; 
+ 
+ import com . google . common . collect . ImmutableMap ; 
+ + import org . apache . commons . collections . CollectionUtils ; 
+ 
+ import org . apache . cassandra . SchemaLoader ; 
+ import org . apache . cassandra . config . ColumnDefinition ; 
+ @ @ - 112 , 6 + 113 , 107 @ @ public class RangeTombstoneTest extends SchemaLoader 
+ } 
+ 
+ @ Test 
+ + public void rangeTombstoneFilteringTest ( ) throws Exception 
+ + { 
+ + CompactionManager . instance . disableAutoCompaction ( ) ; 
+ + Keyspace keyspace = Keyspace . open ( KSNAME ) ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( CFNAME ) ; 
+ + 
+ + / / Inserting data 
+ + String key = " k111 " ; 
+ + RowMutation rm ; 
+ + ColumnFamily cf ; 
+ + 
+ + rm = new RowMutation ( KSNAME , ByteBufferUtil . bytes ( key ) ) ; 
+ + for ( int i = 0 ; i < 40 ; i + = 2 ) 
+ + add ( rm , i , 0 ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + rm = new RowMutation ( KSNAME , ByteBufferUtil . bytes ( key ) ) ; 
+ + cf = rm . addOrGet ( CFNAME ) ; 
+ + delete ( cf , 5 , 10 , 1 ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + rm = new RowMutation ( KSNAME , ByteBufferUtil . bytes ( key ) ) ; 
+ + cf = rm . addOrGet ( CFNAME ) ; 
+ + delete ( cf , 15 , 20 , 2 ) ; 
+ + rm . apply ( ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 11 ) , b ( 14 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + Collection < RangeTombstone > rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 0 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 11 ) , b ( 15 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 1 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 20 ) , b ( 25 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 1 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 12 ) , b ( 25 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 1 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 25 ) , b ( 35 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 0 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 1 ) , b ( 40 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 2 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 7 ) , b ( 17 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 2 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 5 ) , b ( 20 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 2 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 5 ) , b ( 15 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 2 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 1 ) , b ( 2 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 0 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 1 ) , b ( 5 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 1 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 1 ) , b ( 10 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 1 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 5 ) , b ( 6 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 1 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 17 ) , b ( 20 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 1 , rt . size ( ) ) ; 
+ + 
+ + cf = cfs . getColumnFamily ( QueryFilter . getSliceFilter ( dk ( key ) , CFNAME , b ( 17 ) , b ( 18 ) , false , Integer . MAX _ VALUE , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 1 , rt . size ( ) ) ; 
+ + 
+ + ColumnSlice [ ] slices = new ColumnSlice [ ] { new ColumnSlice ( b ( 1 ) , b ( 10 ) ) , new ColumnSlice ( b ( 16 ) , b ( 20 ) ) } ; 
+ + IDiskAtomFilter sqf = new SliceQueryFilter ( slices , false , Integer . MAX _ VALUE ) ; 
+ + cf = cfs . getColumnFamily ( new QueryFilter ( dk ( key ) , CFNAME , sqf , System . currentTimeMillis ( ) ) ) ; 
+ + rt = rangeTombstones ( cf ) ; 
+ + assertEquals ( 2 , rt . size ( ) ) ; 
+ + } 
+ + 
+ + private Collection < RangeTombstone > rangeTombstones ( ColumnFamily cf ) 
+ + { 
+ + List < RangeTombstone > res = new ArrayList < RangeTombstone > ( ) ; 
+ + CollectionUtils . addAll ( res , cf . deletionInfo ( ) . rangeIterator ( ) ) ; 
+ + return res ; 
+ + } 
+ + 
+ + @ Test 
+ public void overlappingRangeTest ( ) throws Exception 
+ { 
+ CompactionManager . instance . disableAutoCompaction ( ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / tools / SSTableImportTest . java b / test / unit / org / apache / cassandra / tools / SSTableImportTest . java 
+ index 6434143 . . 3576005 100644 
+ - - - a / test / unit / org / apache / cassandra / tools / SSTableImportTest . java 
+ + + + b / test / unit / org / apache / cassandra / tools / SSTableImportTest . java 
+ @ @ - 109 , 7 + 109 , 7 @ @ public class SSTableImportTest extends SchemaLoader 
+ ColumnFamily cf = cloneForAdditions ( qf . getSSTableColumnIterator ( reader ) ) ; 
+ qf . collateOnDiskAtom ( cf , qf . getSSTableColumnIterator ( reader ) , Integer . MIN _ VALUE ) ; 
+ 
+ - DeletionTime delTime = cf . deletionInfo ( ) . rangeCovering ( cf . getComparator ( ) . make ( ByteBufferUtil . bytes ( " superA " ) ) ) ; 
+ + DeletionTime delTime = cf . deletionInfo ( ) . deletionTimeFor ( cf . getComparator ( ) . make ( ByteBufferUtil . bytes ( " superA " ) ) ) ; 
+ assertEquals ( " supercolumn deletion time did not match the expected time " , new DeletionInfo ( 0 , 0 ) , new DeletionInfo ( delTime ) ) ; 
+ Cell subCell = cf . getColumn ( Util . cellname ( " superA " , " 636f6c4141 " ) ) ; 
+ assert subCell . value ( ) . equals ( hexToBytes ( " 76616c75654141 " ) ) ;
+
+NEAREST DIFF:
+diff - - git a / test / unit / org / apache / cassandra / db / TimeSortTest . java b / test / unit / org / apache / cassandra / db / TimeSortTest . java 
+ index c96d1d5 . . 3731d28 100644 
+ - - - a / test / unit / org / apache / cassandra / db / TimeSortTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / TimeSortTest . java 
+ @ @ - 38 , 14 + 38 , 13 @ @ public class TimeSortTest extends CleanupHelper 
+ for ( int i = 900 ; i < 1000 ; + + i ) 
+ { 
+ String key = Integer . toString ( i ) ; 
+ - RowMutation rm ; 
+ + RowMutation rm = new RowMutation ( " Table1 " , key ) ; 
+ for ( int j = 0 ; j < 8 ; + + j ) 
+ { 
+ byte [ ] bytes = j % 2 = = 0 ? " a " . getBytes ( ) : " b " . getBytes ( ) ; 
+ - rm = new RowMutation ( " Table1 " , key ) ; 
+ rm . add ( " StandardByTime1 : " + " Column - " + j , bytes , j * 2 ) ; 
+ - rm . apply ( ) ; 
+ } 
+ + rm . apply ( ) ; 
+ } 
+ 
+ validateTimeSort ( table ) ; 
+ @ @ - 55 , 20 + 54 , 19 @ @ public class TimeSortTest extends CleanupHelper 
+ 
+ / / interleave some new data to test memtable + sstable 
+ String key = " 900 " ; 
+ - RowMutation rm ; 
+ + RowMutation rm = new RowMutation ( " Table1 " , key ) ; 
+ for ( int j = 0 ; j < 4 ; + + j ) 
+ { 
+ - rm = new RowMutation ( " Table1 " , key ) ; 
+ rm . add ( " StandardByTime1 : " + " Column + " + j , ArrayUtils . EMPTY _ BYTE _ ARRAY , j * 2 + 1 ) ; 
+ - rm . apply ( ) ; 
+ } 
+ + rm . apply ( ) ; 
+ / / and some overwrites 
+ + rm = new RowMutation ( " Table1 " , key ) ; 
+ for ( int j = 4 ; j < 8 ; + + j ) 
+ { 
+ - rm = new RowMutation ( " Table1 " , key ) ; 
+ rm . add ( " StandardByTime1 : " + " Column - " + j , ArrayUtils . EMPTY _ BYTE _ ARRAY , j * 3 ) ; 
+ - rm . apply ( ) ; 
+ } 
+ + rm . apply ( ) ; 
+ / / verify 
+ ColumnFamily cf = table . getRow ( key , " StandardByTime1 " , 0 ) . getColumnFamilies ( ) . iterator ( ) . next ( ) ; 
+ SortedSet < IColumn > columns = cf . getAllColumns ( ) ;

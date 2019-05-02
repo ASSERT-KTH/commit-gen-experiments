@@ -1,0 +1,170 @@
+BLEU SCORE: 0.8290291181804004
+
+TEST MSG: Make sure sstables only get committed when it ' s safe to discard commit log records
+GENERATED MSG: Revert " Make sure sstables only get committed when it ' s safe to discard commit log records "
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 5cacdd0 . . 5242adf 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 . 11 <nl> + * Make sure sstables only get committed when it ' s safe to discard commit log records ( CASSANDRA - 12956 ) <nl> * Reject default _ time _ to _ live option when creating or altering MVs ( CASSANDRA - 12868 ) <nl> * Nodetool should use a more sane max heap size ( CASSANDRA - 12739 ) <nl> * LocalToken ensures token values are cloned on heap ( CASSANDRA - 12651 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index d2a51a9 . . 71e1653 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 919 , 34 + 919 , 17 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> * / <nl> private final class PostFlush implements Callable < ReplayPosition > <nl> { <nl> - final boolean flushSecondaryIndexes ; <nl> - final OpOrder . Barrier writeBarrier ; <nl> final CountDownLatch latch = new CountDownLatch ( 1 ) ; <nl> - volatile FSWriteError flushFailure = null ; <nl> + volatile Throwable flushFailure = null ; <nl> final List < Memtable > memtables ; <nl> <nl> - private PostFlush ( boolean flushSecondaryIndexes , OpOrder . Barrier writeBarrier , <nl> - List < Memtable > memtables ) <nl> + private PostFlush ( List < Memtable > memtables ) <nl> { <nl> - this . writeBarrier = writeBarrier ; <nl> - this . flushSecondaryIndexes = flushSecondaryIndexes ; <nl> this . memtables = memtables ; <nl> } <nl> <nl> public ReplayPosition call ( ) <nl> { <nl> - writeBarrier . await ( ) ; <nl> - <nl> - / * * <nl> - * we can flush 2is as soon as the barrier completes , as they will be consistent with ( or ahead of ) the <nl> - * flushed memtables and CL position , which is as good as we can guarantee . <nl> - * TODO : SecondaryIndex should support setBarrier ( ) , so custom implementations can co - ordinate exactly <nl> - * with CL as we do with memtables / CFS - backed SecondaryIndexes . <nl> - * / <nl> - <nl> - if ( flushSecondaryIndexes ) <nl> - indexManager . flushAllNonCFSBackedIndexesBlocking ( ) ; <nl> - <nl> try <nl> { <nl> / / we wait on the latch for the commitLogUpperBound to be set , and so that waiters <nl> @ @ - 970 , 7 + 953 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> metric . pendingFlushes . dec ( ) ; <nl> <nl> if ( flushFailure ! = null ) <nl> - throw flushFailure ; <nl> + Throwables . propagate ( flushFailure ) ; <nl> <nl> return commitLogUpperBound ; <nl> } <nl> @ @ - 1029 , 7 + 1012 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> / / since this happens after wiring up the commitLogUpperBound , we also know all operations with earlier <nl> / / replay positions have also completed , i . e . the memtables are done and ready to flush <nl> writeBarrier . issue ( ) ; <nl> - postFlush = new PostFlush ( ! truncate , writeBarrier , memtables ) ; <nl> + postFlush = new PostFlush ( memtables ) ; <nl> } <nl> <nl> public void run ( ) <nl> @ @ - 1047 , 24 + 1030 , 36 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> <nl> try <nl> { <nl> + boolean flushNonCf2i = true ; <nl> for ( Memtable memtable : memtables ) <nl> { <nl> Collection < SSTableReader > readers = Collections . emptyList ( ) ; <nl> if ( ! memtable . isClean ( ) & & ! truncate ) <nl> + { <nl> + / / TODO : SecondaryIndex should support setBarrier ( ) , so custom implementations can co - ordinate exactly <nl> + / / with CL as we do with memtables / CFS - backed SecondaryIndexes . <nl> + if ( flushNonCf2i ) <nl> + { <nl> + indexManager . flushAllNonCFSBackedIndexesBlocking ( ) ; <nl> + flushNonCf2i = false ; <nl> + } <nl> readers = memtable . flush ( ) ; <nl> + } <nl> memtable . cfs . replaceFlushed ( memtable , readers ) ; <nl> reclaim ( memtable ) ; <nl> } <nl> } <nl> - catch ( FSWriteError e ) <nl> + catch ( Throwable e ) <nl> { <nl> JVMStabilityInspector . inspectThrowable ( e ) ; <nl> / / If we weren ' t killed , try to continue work but do not allow CommitLog to be discarded . <nl> postFlush . flushFailure = e ; <nl> } <nl> - <nl> - / / signal the post - flush we ' ve done our work <nl> - postFlush . latch . countDown ( ) ; <nl> + finally <nl> + { <nl> + / / signal the post - flush we ' ve done our work <nl> + postFlush . latch . countDown ( ) ; <nl> + } <nl> } <nl> <nl> private void reclaim ( final Memtable memtable ) <nl> diff - - git a / test / unit / org / apache / cassandra / index / CustomIndexTest . java b / test / unit / org / apache / cassandra / index / CustomIndexTest . java <nl> index b8e4185 . . 6930d13 100644 <nl> - - - a / test / unit / org / apache / cassandra / index / CustomIndexTest . java <nl> + + + b / test / unit / org / apache / cassandra / index / CustomIndexTest . java <nl> @ @ - 624 , 6 + 624 , 43 @ @ public class CustomIndexTest extends CQLTester <nl> assertEquals ( " bar " , IndexWithOverloadedValidateOptions . options . get ( " foo " ) ) ; <nl> } <nl> <nl> + @ Test <nl> + public void testFailing2iFlush ( ) throws Throwable <nl> + { <nl> + createTable ( " CREATE TABLE % s ( pk int PRIMARY KEY , value int ) " ) ; <nl> + createIndex ( " CREATE CUSTOM INDEX IF NOT EXISTS ON % s ( value ) USING ' org . apache . cassandra . index . CustomIndexTest $ BrokenCustom2I ' " ) ; <nl> + <nl> + for ( int i = 0 ; i < 10 ; i + + ) <nl> + execute ( " INSERT INTO % s ( pk , value ) VALUES ( ? , ? ) " , i , i ) ; <nl> + <nl> + try <nl> + { <nl> + getCurrentColumnFamilyStore ( ) . forceBlockingFlush ( ) ; <nl> + fail ( " Flush should have thrown an exception . " ) ; <nl> + } <nl> + catch ( Throwable t ) <nl> + { <nl> + assertTrue ( t . getMessage ( ) . contains ( " Broken2I " ) ) ; <nl> + } <nl> + <nl> + / / SSTables remain uncommitted . <nl> + assertEquals ( 1 , getCurrentColumnFamilyStore ( ) . getDirectories ( ) . getDirectoryForNewSSTables ( ) . listFiles ( ) . length ) ; <nl> + } <nl> + <nl> + / / Used for index creation above <nl> + public static class BrokenCustom2I extends StubIndex <nl> + { <nl> + public BrokenCustom2I ( ColumnFamilyStore baseCfs , IndexMetadata metadata ) <nl> + { <nl> + super ( baseCfs , metadata ) ; <nl> + } <nl> + <nl> + public Callable < ? > getBlockingFlushTask ( ) <nl> + { <nl> + throw new RuntimeException ( " Broken2I " ) ; <nl> + } <nl> + } <nl> + <nl> private void testCreateIndex ( String indexName , String . . . targetColumnNames ) throws Throwable <nl> { <nl> createIndex ( String . format ( " CREATE CUSTOM INDEX % s ON % % s ( % s ) USING ' % s ' " ,
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 5cacdd0 . . 5242adf 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 . 11 
+ + * Make sure sstables only get committed when it ' s safe to discard commit log records ( CASSANDRA - 12956 ) 
+ * Reject default _ time _ to _ live option when creating or altering MVs ( CASSANDRA - 12868 ) 
+ * Nodetool should use a more sane max heap size ( CASSANDRA - 12739 ) 
+ * LocalToken ensures token values are cloned on heap ( CASSANDRA - 12651 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index d2a51a9 . . 71e1653 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 919 , 34 + 919 , 17 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ * / 
+ private final class PostFlush implements Callable < ReplayPosition > 
+ { 
+ - final boolean flushSecondaryIndexes ; 
+ - final OpOrder . Barrier writeBarrier ; 
+ final CountDownLatch latch = new CountDownLatch ( 1 ) ; 
+ - volatile FSWriteError flushFailure = null ; 
+ + volatile Throwable flushFailure = null ; 
+ final List < Memtable > memtables ; 
+ 
+ - private PostFlush ( boolean flushSecondaryIndexes , OpOrder . Barrier writeBarrier , 
+ - List < Memtable > memtables ) 
+ + private PostFlush ( List < Memtable > memtables ) 
+ { 
+ - this . writeBarrier = writeBarrier ; 
+ - this . flushSecondaryIndexes = flushSecondaryIndexes ; 
+ this . memtables = memtables ; 
+ } 
+ 
+ public ReplayPosition call ( ) 
+ { 
+ - writeBarrier . await ( ) ; 
+ - 
+ - / * * 
+ - * we can flush 2is as soon as the barrier completes , as they will be consistent with ( or ahead of ) the 
+ - * flushed memtables and CL position , which is as good as we can guarantee . 
+ - * TODO : SecondaryIndex should support setBarrier ( ) , so custom implementations can co - ordinate exactly 
+ - * with CL as we do with memtables / CFS - backed SecondaryIndexes . 
+ - * / 
+ - 
+ - if ( flushSecondaryIndexes ) 
+ - indexManager . flushAllNonCFSBackedIndexesBlocking ( ) ; 
+ - 
+ try 
+ { 
+ / / we wait on the latch for the commitLogUpperBound to be set , and so that waiters 
+ @ @ - 970 , 7 + 953 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ metric . pendingFlushes . dec ( ) ; 
+ 
+ if ( flushFailure ! = null ) 
+ - throw flushFailure ; 
+ + Throwables . propagate ( flushFailure ) ; 
+ 
+ return commitLogUpperBound ; 
+ } 
+ @ @ - 1029 , 7 + 1012 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ / / since this happens after wiring up the commitLogUpperBound , we also know all operations with earlier 
+ / / replay positions have also completed , i . e . the memtables are done and ready to flush 
+ writeBarrier . issue ( ) ; 
+ - postFlush = new PostFlush ( ! truncate , writeBarrier , memtables ) ; 
+ + postFlush = new PostFlush ( memtables ) ; 
+ } 
+ 
+ public void run ( ) 
+ @ @ - 1047 , 24 + 1030 , 36 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ 
+ try 
+ { 
+ + boolean flushNonCf2i = true ; 
+ for ( Memtable memtable : memtables ) 
+ { 
+ Collection < SSTableReader > readers = Collections . emptyList ( ) ; 
+ if ( ! memtable . isClean ( ) & & ! truncate ) 
+ + { 
+ + / / TODO : SecondaryIndex should support setBarrier ( ) , so custom implementations can co - ordinate exactly 
+ + / / with CL as we do with memtables / CFS - backed SecondaryIndexes . 
+ + if ( flushNonCf2i ) 
+ + { 
+ + indexManager . flushAllNonCFSBackedIndexesBlocking ( ) ; 
+ + flushNonCf2i = false ; 
+ + } 
+ readers = memtable . flush ( ) ; 
+ + } 
+ memtable . cfs . replaceFlushed ( memtable , readers ) ; 
+ reclaim ( memtable ) ; 
+ } 
+ } 
+ - catch ( FSWriteError e ) 
+ + catch ( Throwable e ) 
+ { 
+ JVMStabilityInspector . inspectThrowable ( e ) ; 
+ / / If we weren ' t killed , try to continue work but do not allow CommitLog to be discarded . 
+ postFlush . flushFailure = e ; 
+ } 
+ - 
+ - / / signal the post - flush we ' ve done our work 
+ - postFlush . latch . countDown ( ) ; 
+ + finally 
+ + { 
+ + / / signal the post - flush we ' ve done our work 
+ + postFlush . latch . countDown ( ) ; 
+ + } 
+ } 
+ 
+ private void reclaim ( final Memtable memtable ) 
+ diff - - git a / test / unit / org / apache / cassandra / index / CustomIndexTest . java b / test / unit / org / apache / cassandra / index / CustomIndexTest . java 
+ index b8e4185 . . 6930d13 100644 
+ - - - a / test / unit / org / apache / cassandra / index / CustomIndexTest . java 
+ + + + b / test / unit / org / apache / cassandra / index / CustomIndexTest . java 
+ @ @ - 624 , 6 + 624 , 43 @ @ public class CustomIndexTest extends CQLTester 
+ assertEquals ( " bar " , IndexWithOverloadedValidateOptions . options . get ( " foo " ) ) ; 
+ } 
+ 
+ + @ Test 
+ + public void testFailing2iFlush ( ) throws Throwable 
+ + { 
+ + createTable ( " CREATE TABLE % s ( pk int PRIMARY KEY , value int ) " ) ; 
+ + createIndex ( " CREATE CUSTOM INDEX IF NOT EXISTS ON % s ( value ) USING ' org . apache . cassandra . index . CustomIndexTest $ BrokenCustom2I ' " ) ; 
+ + 
+ + for ( int i = 0 ; i < 10 ; i + + ) 
+ + execute ( " INSERT INTO % s ( pk , value ) VALUES ( ? , ? ) " , i , i ) ; 
+ + 
+ + try 
+ + { 
+ + getCurrentColumnFamilyStore ( ) . forceBlockingFlush ( ) ; 
+ + fail ( " Flush should have thrown an exception . " ) ; 
+ + } 
+ + catch ( Throwable t ) 
+ + { 
+ + assertTrue ( t . getMessage ( ) . contains ( " Broken2I " ) ) ; 
+ + } 
+ + 
+ + / / SSTables remain uncommitted . 
+ + assertEquals ( 1 , getCurrentColumnFamilyStore ( ) . getDirectories ( ) . getDirectoryForNewSSTables ( ) . listFiles ( ) . length ) ; 
+ + } 
+ + 
+ + / / Used for index creation above 
+ + public static class BrokenCustom2I extends StubIndex 
+ + { 
+ + public BrokenCustom2I ( ColumnFamilyStore baseCfs , IndexMetadata metadata ) 
+ + { 
+ + super ( baseCfs , metadata ) ; 
+ + } 
+ + 
+ + public Callable < ? > getBlockingFlushTask ( ) 
+ + { 
+ + throw new RuntimeException ( " Broken2I " ) ; 
+ + } 
+ + } 
+ + 
+ private void testCreateIndex ( String indexName , String . . . targetColumnNames ) throws Throwable 
+ { 
+ createIndex ( String . format ( " CREATE CUSTOM INDEX % s ON % % s ( % s ) USING ' % s ' " ,
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

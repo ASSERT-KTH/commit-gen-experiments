@@ -1,0 +1,597 @@
+BLEU SCORE: 0.027757915716335905
+
+TEST MSG: Improve NTS endpoints calculation
+GENERATED MSG: update NTS calculateNaturalEndpoints to be O ( N log N )
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 2710ed3 . . 77034ef 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 2 <nl> + * Improve NTS endpoints calculation ( CASSANDRA - 10200 ) <nl> * Improve performance of the folderSize function ( CASSANDRA - 10677 ) <nl> * Add support for type casting in selection clause ( CASSANDRA - 10310 ) <nl> * Added graphing option to cassandra - stress ( CASSANDRA - 7918 ) <nl> diff - - git a / src / java / org / apache / cassandra / locator / NetworkTopologyStrategy . java b / src / java / org / apache / cassandra / locator / NetworkTopologyStrategy . java <nl> index 307a07f . . 9f74dcc 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / NetworkTopologyStrategy . java <nl> + + + b / src / java / org / apache / cassandra / locator / NetworkTopologyStrategy . java <nl> @ @ - 28 , 6 + 28 , 7 @ @ import org . apache . cassandra . exceptions . ConfigurationException ; <nl> import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . locator . TokenMetadata . Topology ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . apache . cassandra . utils . Pair ; <nl> <nl> import com . google . common . collect . Multimap ; <nl> <nl> @ @ - 48 , 14 + 49 , 12 @ @ import com . google . common . collect . Multimap ; <nl> * / <nl> public class NetworkTopologyStrategy extends AbstractReplicationStrategy <nl> { <nl> - private final IEndpointSnitch snitch ; <nl> private final Map < String , Integer > datacenters ; <nl> private static final Logger logger = LoggerFactory . getLogger ( NetworkTopologyStrategy . class ) ; <nl> <nl> public NetworkTopologyStrategy ( String keyspaceName , TokenMetadata tokenMetadata , IEndpointSnitch snitch , Map < String , String > configOptions ) throws ConfigurationException <nl> { <nl> super ( keyspaceName , tokenMetadata , snitch , configOptions ) ; <nl> - this . snitch = snitch ; <nl> <nl> Map < String , Integer > newDatacenters = new HashMap < String , Integer > ( ) ; <nl> if ( configOptions ! = null ) <nl> @ @ - 75 , 17 + 74 , 78 @ @ public class NetworkTopologyStrategy extends AbstractReplicationStrategy <nl> } <nl> <nl> / * * <nl> - * calculate endpoints in one pass through the tokens by tracking our progress in each DC , rack etc . <nl> + * Endpoint adder applying the replication rules for a given DC . <nl> + * / <nl> + private static final class DatacenterEndpoints <nl> + { <nl> + / * * List accepted endpoints get pushed into . * / <nl> + Set < InetAddress > endpoints ; <nl> + / * * <nl> + * Racks encountered so far . Replicas are put into separate racks while possible . <nl> + * For efficiency the set is shared between the instances , using the location pair ( dc , rack ) to make sure <nl> + * clashing names aren ' t a problem . <nl> + * / <nl> + Set < Pair < String , String > > racks ; <nl> + <nl> + / * * Number of replicas left to fill from this DC . * / <nl> + int rfLeft ; <nl> + int acceptableRackRepeats ; <nl> + <nl> + DatacenterEndpoints ( int rf , int rackCount , int nodeCount , Set < InetAddress > endpoints , Set < Pair < String , String > > racks ) <nl> + { <nl> + this . endpoints = endpoints ; <nl> + this . racks = racks ; <nl> + / / If there aren ' t enough nodes in this DC to fill the RF , the number of nodes is the effective RF . <nl> + this . rfLeft = Math . min ( rf , nodeCount ) ; <nl> + / / If there aren ' t enough racks in this DC to fill the RF , we ' ll still use at least one node from each rack , <nl> + / / and the difference is to be filled by the first encountered nodes . <nl> + acceptableRackRepeats = rf - rackCount ; <nl> + } <nl> + <nl> + / * * <nl> + * Attempts to add an endpoint to the replicas for this datacenter , adding to the endpoints set if successful . <nl> + * Returns true if the endpoint was added , and this datacenter does not require further replicas . <nl> + * / <nl> + boolean addEndpointAndCheckIfDone ( InetAddress ep , Pair < String , String > location ) <nl> + { <nl> + if ( done ( ) ) <nl> + return false ; <nl> + <nl> + if ( racks . add ( location ) ) <nl> + { <nl> + / / New rack . <nl> + - - rfLeft ; <nl> + boolean added = endpoints . add ( ep ) ; <nl> + assert added ; <nl> + return done ( ) ; <nl> + } <nl> + if ( acceptableRackRepeats < = 0 ) <nl> + / / There must be rfLeft distinct racks left , do not add any more rack repeats . <nl> + return false ; <nl> + if ( ! endpoints . add ( ep ) ) <nl> + / / Cannot repeat a node . <nl> + return false ; <nl> + / / Added a node that is from an already met rack to match RF when there aren ' t enough racks . <nl> + - - acceptableRackRepeats ; <nl> + - - rfLeft ; <nl> + return done ( ) ; <nl> + } <nl> + <nl> + boolean done ( ) <nl> + { <nl> + assert rfLeft > = 0 ; <nl> + return rfLeft = = 0 ; <nl> + } <nl> + } <nl> + <nl> + / * * <nl> + * calculate endpoints in one pass through the tokens by tracking our progress in each DC . <nl> * / <nl> - @ SuppressWarnings ( " serial " ) <nl> public List < InetAddress > calculateNaturalEndpoints ( Token searchToken , TokenMetadata tokenMetadata ) <nl> { <nl> / / we want to preserve insertion order so that the first added endpoint becomes primary <nl> Set < InetAddress > replicas = new LinkedHashSet < > ( ) ; <nl> - / / replicas we have found in each DC <nl> - Map < String , Set < InetAddress > > dcReplicas = new HashMap < > ( datacenters . size ( ) ) ; <nl> - for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) <nl> - dcReplicas . put ( dc . getKey ( ) , new HashSet < InetAddress > ( dc . getValue ( ) ) ) ; <nl> + Set < Pair < String , String > > seenRacks = new HashSet < > ( ) ; <nl> <nl> Topology topology = tokenMetadata . getTopology ( ) ; <nl> / / all endpoints in each DC , so we can check when we have exhausted all the members of a DC <nl> @ @ - 94 , 74 + 154 , 45 @ @ public class NetworkTopologyStrategy extends AbstractReplicationStrategy <nl> Map < String , Multimap < String , InetAddress > > racks = topology . getDatacenterRacks ( ) ; <nl> assert ! allEndpoints . isEmpty ( ) & & ! racks . isEmpty ( ) : " not aware of any cluster members " ; <nl> <nl> - / / tracks the racks we have already placed replicas in <nl> - Map < String , Set < String > > seenRacks = new HashMap < > ( datacenters . size ( ) ) ; <nl> - for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) <nl> - seenRacks . put ( dc . getKey ( ) , new HashSet < String > ( ) ) ; <nl> + int dcsToFill = 0 ; <nl> + Map < String , DatacenterEndpoints > dcs = new HashMap < > ( datacenters . size ( ) * 2 ) ; <nl> + <nl> + / / Create a DatacenterEndpoints object for each non - empty DC . <nl> + for ( Map . Entry < String , Integer > en : datacenters . entrySet ( ) ) <nl> + { <nl> + String dc = en . getKey ( ) ; <nl> + int rf = en . getValue ( ) ; <nl> + int nodeCount = sizeOrZero ( allEndpoints . get ( dc ) ) ; <nl> + <nl> + if ( rf < = 0 | | nodeCount < = 0 ) <nl> + continue ; <nl> <nl> - / / tracks the endpoints that we skipped over while looking for unique racks <nl> - / / when we relax the rack uniqueness we can append this to the current result so we don ' t have to wind back the iterator <nl> - Map < String , Set < InetAddress > > skippedDcEndpoints = new HashMap < > ( datacenters . size ( ) ) ; <nl> - for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) <nl> - skippedDcEndpoints . put ( dc . getKey ( ) , new LinkedHashSet < InetAddress > ( ) ) ; <nl> + DatacenterEndpoints dcEndpoints = new DatacenterEndpoints ( rf , sizeOrZero ( racks . get ( dc ) ) , nodeCount , replicas , seenRacks ) ; <nl> + dcs . put ( dc , dcEndpoints ) ; <nl> + + + dcsToFill ; <nl> + } <nl> <nl> Iterator < Token > tokenIter = TokenMetadata . ringIterator ( tokenMetadata . sortedTokens ( ) , searchToken , false ) ; <nl> - while ( tokenIter . hasNext ( ) & & ! hasSufficientReplicas ( dcReplicas , allEndpoints ) ) <nl> + while ( dcsToFill > 0 & & tokenIter . hasNext ( ) ) <nl> { <nl> Token next = tokenIter . next ( ) ; <nl> InetAddress ep = tokenMetadata . getEndpoint ( next ) ; <nl> - String dc = snitch . getDatacenter ( ep ) ; <nl> - / / have we already found all replicas for this dc ? <nl> - if ( ! datacenters . containsKey ( dc ) | | hasSufficientReplicas ( dc , dcReplicas , allEndpoints ) ) <nl> - continue ; <nl> - / / can we skip checking the rack ? <nl> - if ( seenRacks . get ( dc ) . size ( ) = = racks . get ( dc ) . keySet ( ) . size ( ) ) <nl> - { <nl> - dcReplicas . get ( dc ) . add ( ep ) ; <nl> - replicas . add ( ep ) ; <nl> - } <nl> - else <nl> - { <nl> - String rack = snitch . getRack ( ep ) ; <nl> - / / is this a new rack ? <nl> - if ( seenRacks . get ( dc ) . contains ( rack ) ) <nl> - { <nl> - skippedDcEndpoints . get ( dc ) . add ( ep ) ; <nl> - } <nl> - else <nl> - { <nl> - dcReplicas . get ( dc ) . add ( ep ) ; <nl> - replicas . add ( ep ) ; <nl> - seenRacks . get ( dc ) . add ( rack ) ; <nl> - / / if we ' ve run out of distinct racks , add the hosts we skipped past already ( up to RF ) <nl> - if ( seenRacks . get ( dc ) . size ( ) = = racks . get ( dc ) . keySet ( ) . size ( ) ) <nl> - { <nl> - Iterator < InetAddress > skippedIt = skippedDcEndpoints . get ( dc ) . iterator ( ) ; <nl> - while ( skippedIt . hasNext ( ) & & ! hasSufficientReplicas ( dc , dcReplicas , allEndpoints ) ) <nl> - { <nl> - InetAddress nextSkipped = skippedIt . next ( ) ; <nl> - dcReplicas . get ( dc ) . add ( nextSkipped ) ; <nl> - replicas . add ( nextSkipped ) ; <nl> - } <nl> - } <nl> - } <nl> - } <nl> + Pair < String , String > location = topology . getLocation ( ep ) ; <nl> + DatacenterEndpoints dcEndpoints = dcs . get ( location . left ) ; <nl> + if ( dcEndpoints ! = null & & dcEndpoints . addEndpointAndCheckIfDone ( ep , location ) ) <nl> + - - dcsToFill ; <nl> } <nl> - <nl> - return new ArrayList < InetAddress > ( replicas ) ; <nl> + return new ArrayList < > ( replicas ) ; <nl> } <nl> <nl> - private boolean hasSufficientReplicas ( String dc , Map < String , Set < InetAddress > > dcReplicas , Multimap < String , InetAddress > allEndpoints ) <nl> + private int sizeOrZero ( Multimap < ? , ? > collection ) <nl> { <nl> - return dcReplicas . get ( dc ) . size ( ) > = Math . min ( allEndpoints . get ( dc ) . size ( ) , getReplicationFactor ( dc ) ) ; <nl> + return collection ! = null ? collection . asMap ( ) . size ( ) : 0 ; <nl> } <nl> <nl> - private boolean hasSufficientReplicas ( Map < String , Set < InetAddress > > dcReplicas , Multimap < String , InetAddress > allEndpoints ) <nl> + private int sizeOrZero ( Collection < ? > collection ) <nl> { <nl> - for ( String dc : datacenters . keySet ( ) ) <nl> - if ( ! hasSufficientReplicas ( dc , dcReplicas , allEndpoints ) ) <nl> - return false ; <nl> - return true ; <nl> + return collection ! = null ? collection . size ( ) : 0 ; <nl> } <nl> <nl> public int getReplicationFactor ( ) <nl> diff - - git a / src / java / org / apache / cassandra / locator / TokenMetadata . java b / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> index e65b53e . . a3be9de 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> + + + b / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> @ @ - 828 , 20 + 828 , 20 @ @ public class TokenMetadata <nl> <nl> public Token getPredecessor ( Token token ) <nl> { <nl> - List tokens = sortedTokens ( ) ; <nl> + List < Token > tokens = sortedTokens ( ) ; <nl> int index = Collections . binarySearch ( tokens , token ) ; <nl> / / assert index > = 0 : token + " not found in " + StringUtils . join ( tokenToEndpointMap . keySet ( ) , " , " ) ; <nl> if ( index < 0 ) index = - index - 1 ; <nl> - return ( Token ) ( index = = 0 ? tokens . get ( tokens . size ( ) - 1 ) : tokens . get ( index - 1 ) ) ; <nl> + return index = = 0 ? tokens . get ( tokens . size ( ) - 1 ) : tokens . get ( index - 1 ) ; <nl> } <nl> <nl> public Token getSuccessor ( Token token ) <nl> { <nl> - List tokens = sortedTokens ( ) ; <nl> + List < Token > tokens = sortedTokens ( ) ; <nl> int index = Collections . binarySearch ( tokens , token ) ; <nl> / / assert index > = 0 : token + " not found in " + StringUtils . join ( tokenToEndpointMap . keySet ( ) , " , " ) ; <nl> if ( index < 0 ) return ( Token ) tokens . get ( - index - 1 ) ; <nl> - return ( Token ) ( ( index = = ( tokens . size ( ) - 1 ) ) ? tokens . get ( 0 ) : tokens . get ( index + 1 ) ) ; <nl> + return ( index = = ( tokens . size ( ) - 1 ) ) ? tokens . get ( 0 ) : tokens . get ( index + 1 ) ; <nl> } <nl> <nl> / * * @ return a copy of the bootstrapping tokens map * / <nl> @ @ - 902 , 7 + 902 , 7 @ @ public class TokenMetadata <nl> } <nl> } <nl> <nl> - public static int firstTokenIndex ( final ArrayList ring , Token start , boolean insertMin ) <nl> + public static int firstTokenIndex ( final ArrayList < Token > ring , Token start , boolean insertMin ) <nl> { <nl> assert ring . size ( ) > 0 ; <nl> / / insert the minimum token ( at index = = - 1 ) if we were asked to include it and it isn ' t a member of the ring <nl> @ @ - 930 , 7 + 930 , 7 @ @ public class TokenMetadata <nl> { <nl> if ( ring . isEmpty ( ) ) <nl> return includeMin ? Iterators . singletonIterator ( start . getPartitioner ( ) . getMinimumToken ( ) ) <nl> - : Iterators . < Token > emptyIterator ( ) ; <nl> + : Collections . emptyIterator ( ) ; <nl> <nl> final boolean insertMin = includeMin & & ! ring . get ( 0 ) . isMinimum ( ) ; <nl> final int startIndex = firstTokenIndex ( ring , start , insertMin ) ; <nl> @ @ - 1279 , 5 + 1279 , 14 @ @ public class TokenMetadata <nl> { <nl> return dcRacks ; <nl> } <nl> + <nl> + / * * <nl> + * @ return The DC and rack of the given endpoint . <nl> + * / <nl> + public Pair < String , String > getLocation ( InetAddress addr ) <nl> + { <nl> + return currentLocations . get ( addr ) ; <nl> + } <nl> + <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / locator / NetworkTopologyStrategyTest . java b / test / unit / org / apache / cassandra / locator / NetworkTopologyStrategyTest . java <nl> index bbfdd3b . . 3cba328 100644 <nl> - - - a / test / unit / org / apache / cassandra / locator / NetworkTopologyStrategyTest . java <nl> + + + b / test / unit / org / apache / cassandra / locator / NetworkTopologyStrategyTest . java <nl> @ @ - 21 , 24 + 21 , 26 @ @ package org . apache . cassandra . locator ; <nl> import java . io . IOException ; <nl> import java . net . InetAddress ; <nl> import java . net . UnknownHostException ; <nl> - import java . util . ArrayList ; <nl> - import java . util . HashMap ; <nl> - import java . util . HashSet ; <nl> - import java . util . List ; <nl> - import java . util . Map ; <nl> - import java . util . Set ; <nl> + import java . util . * ; <nl> + import java . util . stream . Collectors ; <nl> <nl> import com . google . common . collect . HashMultimap ; <nl> + import com . google . common . collect . ImmutableMap ; <nl> import com . google . common . collect . Multimap ; <nl> + <nl> import org . junit . Assert ; <nl> import org . junit . Test ; <nl> + <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . dht . Murmur3Partitioner ; <nl> import org . apache . cassandra . dht . OrderPreservingPartitioner . StringToken ; <nl> import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . exceptions . ConfigurationException ; <nl> + import org . apache . cassandra . locator . TokenMetadata . Topology ; <nl> + import org . apache . cassandra . service . StorageService ; <nl> <nl> public class NetworkTopologyStrategyTest <nl> { <nl> @ @ - 166 , 4 + 168 , 203 @ @ public class NetworkTopologyStrategyTest <nl> InetAddress add1 = InetAddress . getByAddress ( bytes ) ; <nl> metadata . updateNormalToken ( token1 , add1 ) ; <nl> } <nl> + <nl> + @ Test <nl> + public void testCalculateEndpoints ( ) throws UnknownHostException <nl> + { <nl> + final int NODES = 100 ; <nl> + final int VNODES = 64 ; <nl> + final int RUNS = 10 ; <nl> + StorageService . instance . setPartitionerUnsafe ( Murmur3Partitioner . instance ) ; <nl> + Map < String , Integer > datacenters = ImmutableMap . of ( " rf1 " , 1 , " rf3 " , 3 , " rf5 _ 1 " , 5 , " rf5 _ 2 " , 5 , " rf5 _ 3 " , 5 ) ; <nl> + List < InetAddress > nodes = new ArrayList < > ( NODES ) ; <nl> + for ( byte i = 0 ; i < NODES ; + + i ) <nl> + nodes . add ( InetAddress . getByAddress ( new byte [ ] { 127 , 0 , 0 , i } ) ) ; <nl> + for ( int run = 0 ; run < RUNS ; + + run ) <nl> + { <nl> + Random rand = new Random ( ) ; <nl> + IEndpointSnitch snitch = generateSnitch ( datacenters , nodes , rand ) ; <nl> + DatabaseDescriptor . setEndpointSnitch ( snitch ) ; <nl> + <nl> + TokenMetadata meta = new TokenMetadata ( ) ; <nl> + for ( int i = 0 ; i < NODES ; + + i ) / / Nodes <nl> + for ( int j = 0 ; j < VNODES ; + + j ) / / tokens / vnodes per node <nl> + meta . updateNormalToken ( Murmur3Partitioner . instance . getRandomToken ( rand ) , nodes . get ( i ) ) ; <nl> + testEquivalence ( meta , snitch , datacenters , rand ) ; <nl> + } <nl> + } <nl> + <nl> + void testEquivalence ( TokenMetadata tokenMetadata , IEndpointSnitch snitch , Map < String , Integer > datacenters , Random rand ) <nl> + { <nl> + NetworkTopologyStrategy nts = new NetworkTopologyStrategy ( " ks " , tokenMetadata , snitch , <nl> + datacenters . entrySet ( ) . stream ( ) . <nl> + collect ( Collectors . toMap ( x - > x . getKey ( ) , x - > Integer . toString ( x . getValue ( ) ) ) ) ) ; <nl> + for ( int i = 0 ; i < 1000 ; + + i ) <nl> + { <nl> + Token token = Murmur3Partitioner . instance . getRandomToken ( rand ) ; <nl> + List < InetAddress > expected = calculateNaturalEndpoints ( token , tokenMetadata , datacenters , snitch ) ; <nl> + List < InetAddress > actual = nts . calculateNaturalEndpoints ( token , tokenMetadata ) ; <nl> + if ( endpointsDiffer ( expected , actual ) ) <nl> + { <nl> + System . err . println ( " Endpoints mismatch for token " + token ) ; <nl> + System . err . println ( " expected : " + expected ) ; <nl> + System . err . println ( " actual : " + actual ) ; <nl> + Assert . assertEquals ( " Endpoints for token " + token + " mismatch . " , expected , actual ) ; <nl> + } <nl> + } <nl> + } <nl> + <nl> + private boolean endpointsDiffer ( List < InetAddress > ep1 , List < InetAddress > ep2 ) <nl> + { <nl> + / / Because the old algorithm does not put the nodes in the correct order in the case where more replicas <nl> + / / are required than there are racks in a dc , we accept different order as long as the primary <nl> + / / replica is the same . <nl> + if ( ep1 . equals ( ep2 ) ) <nl> + return false ; <nl> + if ( ! ep1 . get ( 0 ) . equals ( ep2 . get ( 0 ) ) ) <nl> + return true ; <nl> + Set < InetAddress > s1 = new HashSet < > ( ep1 ) ; <nl> + Set < InetAddress > s2 = new HashSet < > ( ep2 ) ; <nl> + return ! s1 . equals ( s2 ) ; <nl> + } <nl> + <nl> + IEndpointSnitch generateSnitch ( Map < String , Integer > datacenters , Collection < InetAddress > nodes , Random rand ) <nl> + { <nl> + final Map < InetAddress , String > nodeToRack = new HashMap < > ( ) ; <nl> + final Map < InetAddress , String > nodeToDC = new HashMap < > ( ) ; <nl> + Map < String , List < String > > racksPerDC = new HashMap < > ( ) ; <nl> + datacenters . forEach ( ( dc , rf ) - > racksPerDC . put ( dc , randomRacks ( rf , rand ) ) ) ; <nl> + int rf = datacenters . values ( ) . stream ( ) . mapToInt ( x - > x ) . sum ( ) ; <nl> + String [ ] dcs = new String [ rf ] ; <nl> + int pos = 0 ; <nl> + for ( Map . Entry < String , Integer > dce : datacenters . entrySet ( ) ) <nl> + { <nl> + for ( int i = 0 ; i < dce . getValue ( ) ; + + i ) <nl> + dcs [ pos + + ] = dce . getKey ( ) ; <nl> + } <nl> + <nl> + for ( InetAddress node : nodes ) <nl> + { <nl> + String dc = dcs [ rand . nextInt ( rf ) ] ; <nl> + List < String > racks = racksPerDC . get ( dc ) ; <nl> + String rack = racks . get ( rand . nextInt ( racks . size ( ) ) ) ; <nl> + nodeToRack . put ( node , rack ) ; <nl> + nodeToDC . put ( node , dc ) ; <nl> + } <nl> + <nl> + return new AbstractNetworkTopologySnitch ( ) <nl> + { <nl> + public String getRack ( InetAddress endpoint ) <nl> + { <nl> + return nodeToRack . get ( endpoint ) ; <nl> + } <nl> + <nl> + public String getDatacenter ( InetAddress endpoint ) <nl> + { <nl> + return nodeToDC . get ( endpoint ) ; <nl> + } <nl> + } ; <nl> + } <nl> + <nl> + private List < String > randomRacks ( int rf , Random rand ) <nl> + { <nl> + int rc = rand . nextInt ( rf * 3 - 1 ) + 1 ; <nl> + List < String > racks = new ArrayList < > ( rc ) ; <nl> + for ( int i = 0 ; i < rc ; + + i ) <nl> + racks . add ( Integer . toString ( i ) ) ; <nl> + return racks ; <nl> + } <nl> + <nl> + / / Copy of older endpoints calculation algorithm for comparison <nl> + public static List < InetAddress > calculateNaturalEndpoints ( Token searchToken , TokenMetadata tokenMetadata , Map < String , Integer > datacenters , IEndpointSnitch snitch ) <nl> + { <nl> + / / we want to preserve insertion order so that the first added endpoint becomes primary <nl> + Set < InetAddress > replicas = new LinkedHashSet < > ( ) ; <nl> + / / replicas we have found in each DC <nl> + Map < String , Set < InetAddress > > dcReplicas = new HashMap < > ( datacenters . size ( ) ) ; <nl> + for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) <nl> + dcReplicas . put ( dc . getKey ( ) , new HashSet < InetAddress > ( dc . getValue ( ) ) ) ; <nl> + <nl> + Topology topology = tokenMetadata . getTopology ( ) ; <nl> + / / all endpoints in each DC , so we can check when we have exhausted all the members of a DC <nl> + Multimap < String , InetAddress > allEndpoints = topology . getDatacenterEndpoints ( ) ; <nl> + / / all racks in a DC so we can check when we have exhausted all racks in a DC <nl> + Map < String , Multimap < String , InetAddress > > racks = topology . getDatacenterRacks ( ) ; <nl> + assert ! allEndpoints . isEmpty ( ) & & ! racks . isEmpty ( ) : " not aware of any cluster members " ; <nl> + <nl> + / / tracks the racks we have already placed replicas in <nl> + Map < String , Set < String > > seenRacks = new HashMap < > ( datacenters . size ( ) ) ; <nl> + for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) <nl> + seenRacks . put ( dc . getKey ( ) , new HashSet < String > ( ) ) ; <nl> + <nl> + / / tracks the endpoints that we skipped over while looking for unique racks <nl> + / / when we relax the rack uniqueness we can append this to the current result so we don ' t have to wind back the iterator <nl> + Map < String , Set < InetAddress > > skippedDcEndpoints = new HashMap < > ( datacenters . size ( ) ) ; <nl> + for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) <nl> + skippedDcEndpoints . put ( dc . getKey ( ) , new LinkedHashSet < InetAddress > ( ) ) ; <nl> + <nl> + Iterator < Token > tokenIter = TokenMetadata . ringIterator ( tokenMetadata . sortedTokens ( ) , searchToken , false ) ; <nl> + while ( tokenIter . hasNext ( ) & & ! hasSufficientReplicas ( dcReplicas , allEndpoints , datacenters ) ) <nl> + { <nl> + Token next = tokenIter . next ( ) ; <nl> + InetAddress ep = tokenMetadata . getEndpoint ( next ) ; <nl> + String dc = snitch . getDatacenter ( ep ) ; <nl> + / / have we already found all replicas for this dc ? <nl> + if ( ! datacenters . containsKey ( dc ) | | hasSufficientReplicas ( dc , dcReplicas , allEndpoints , datacenters ) ) <nl> + continue ; <nl> + / / can we skip checking the rack ? <nl> + if ( seenRacks . get ( dc ) . size ( ) = = racks . get ( dc ) . keySet ( ) . size ( ) ) <nl> + { <nl> + dcReplicas . get ( dc ) . add ( ep ) ; <nl> + replicas . add ( ep ) ; <nl> + } <nl> + else <nl> + { <nl> + String rack = snitch . getRack ( ep ) ; <nl> + / / is this a new rack ? <nl> + if ( seenRacks . get ( dc ) . contains ( rack ) ) <nl> + { <nl> + skippedDcEndpoints . get ( dc ) . add ( ep ) ; <nl> + } <nl> + else <nl> + { <nl> + dcReplicas . get ( dc ) . add ( ep ) ; <nl> + replicas . add ( ep ) ; <nl> + seenRacks . get ( dc ) . add ( rack ) ; <nl> + / / if we ' ve run out of distinct racks , add the hosts we skipped past already ( up to RF ) <nl> + if ( seenRacks . get ( dc ) . size ( ) = = racks . get ( dc ) . keySet ( ) . size ( ) ) <nl> + { <nl> + Iterator < InetAddress > skippedIt = skippedDcEndpoints . get ( dc ) . iterator ( ) ; <nl> + while ( skippedIt . hasNext ( ) & & ! hasSufficientReplicas ( dc , dcReplicas , allEndpoints , datacenters ) ) <nl> + { <nl> + InetAddress nextSkipped = skippedIt . next ( ) ; <nl> + dcReplicas . get ( dc ) . add ( nextSkipped ) ; <nl> + replicas . add ( nextSkipped ) ; <nl> + } <nl> + } <nl> + } <nl> + } <nl> + } <nl> + <nl> + return new ArrayList < InetAddress > ( replicas ) ; <nl> + } <nl> + <nl> + private static boolean hasSufficientReplicas ( String dc , Map < String , Set < InetAddress > > dcReplicas , Multimap < String , InetAddress > allEndpoints , Map < String , Integer > datacenters ) <nl> + { <nl> + return dcReplicas . get ( dc ) . size ( ) > = Math . min ( allEndpoints . get ( dc ) . size ( ) , getReplicationFactor ( dc , datacenters ) ) ; <nl> + } <nl> + <nl> + private static boolean hasSufficientReplicas ( Map < String , Set < InetAddress > > dcReplicas , Multimap < String , InetAddress > allEndpoints , Map < String , Integer > datacenters ) <nl> + { <nl> + for ( String dc : datacenters . keySet ( ) ) <nl> + if ( ! hasSufficientReplicas ( dc , dcReplicas , allEndpoints , datacenters ) ) <nl> + return false ; <nl> + return true ; <nl> + } <nl> + <nl> + public static int getReplicationFactor ( String dc , Map < String , Integer > datacenters ) <nl> + { <nl> + Integer replicas = datacenters . get ( dc ) ; <nl> + return replicas = = null ? 0 : replicas ; <nl> + } <nl> }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 72991f1 . . 7cd12a5 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 6 @ @ <nl> 1 . 1 . 3 <nl> + * avoid using global partitioner to estimate ranges in index sstables <nl> + ( CASSANDRA - 4403 ) <nl> * restore pre - CASSANDRA - 3862 approach to removing expired tombstones <nl> from row cache during compaction ( CASSANDRA - 4364 ) <nl> * ( stress ) support for CQL prepared statements ( CASSANDRA - 3633 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 93f022d . . 0b66020 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 904 , 9 + 904 , 10 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> / * * <nl> * Calculate expected file size of SSTable after compaction . <nl> * <nl> - * If operation type is { @ code CLEANUP } , then we calculate expected file size <nl> - * with checking token range to be eliminated . <nl> - * Other than that , we just add up all the files ' size , which is the worst case file <nl> + * If operation type is { @ code CLEANUP } and we ' re not dealing with an index sstable , <nl> + * then we calculate expected file size with checking token range to be eliminated . <nl> + * <nl> + * Otherwise , we just add up all the files ' size , which is the worst case file <nl> * size for compaction of all the list of files given . <nl> * <nl> * @ param sstables SSTables to calculate expected compacted file size <nl> @ @ - 915 , 21 + 916 , 18 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> * / <nl> public long getExpectedCompactedFileSize ( Iterable < SSTableReader > sstables , OperationType operation ) <nl> { <nl> - long expectedFileSize = 0 ; <nl> - if ( operation = = OperationType . CLEANUP ) <nl> + if ( operation ! = OperationType . CLEANUP | | isIndex ( ) ) <nl> { <nl> - Collection < Range < Token > > ranges = StorageService . instance . getLocalRanges ( table . name ) ; <nl> - for ( SSTableReader sstable : sstables ) <nl> - { <nl> - List < Pair < Long , Long > > positions = sstable . getPositionsForRanges ( ranges ) ; <nl> - for ( Pair < Long , Long > position : positions ) <nl> - expectedFileSize + = position . right - position . left ; <nl> - } <nl> + return SSTable . getTotalBytes ( sstables ) ; <nl> } <nl> - else <nl> + <nl> + long expectedFileSize = 0 ; <nl> + Collection < Range < Token > > ranges = StorageService . instance . getLocalRanges ( table . name ) ; <nl> + for ( SSTableReader sstable : sstables ) <nl> { <nl> - for ( SSTableReader sstable : sstables ) <nl> - expectedFileSize + = sstable . onDiskLength ( ) ; <nl> + List < Pair < Long , Long > > positions = sstable . getPositionsForRanges ( ranges ) ; <nl> + for ( Pair < Long , Long > position : positions ) <nl> + expectedFileSize + = position . right - position . left ; <nl> } <nl> return expectedFileSize ; <nl> }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 2710ed3 . . 77034ef 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 2 
+ + * Improve NTS endpoints calculation ( CASSANDRA - 10200 ) 
+ * Improve performance of the folderSize function ( CASSANDRA - 10677 ) 
+ * Add support for type casting in selection clause ( CASSANDRA - 10310 ) 
+ * Added graphing option to cassandra - stress ( CASSANDRA - 7918 ) 
+ diff - - git a / src / java / org / apache / cassandra / locator / NetworkTopologyStrategy . java b / src / java / org / apache / cassandra / locator / NetworkTopologyStrategy . java 
+ index 307a07f . . 9f74dcc 100644 
+ - - - a / src / java / org / apache / cassandra / locator / NetworkTopologyStrategy . java 
+ + + + b / src / java / org / apache / cassandra / locator / NetworkTopologyStrategy . java 
+ @ @ - 28 , 6 + 28 , 7 @ @ import org . apache . cassandra . exceptions . ConfigurationException ; 
+ import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . locator . TokenMetadata . Topology ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . apache . cassandra . utils . Pair ; 
+ 
+ import com . google . common . collect . Multimap ; 
+ 
+ @ @ - 48 , 14 + 49 , 12 @ @ import com . google . common . collect . Multimap ; 
+ * / 
+ public class NetworkTopologyStrategy extends AbstractReplicationStrategy 
+ { 
+ - private final IEndpointSnitch snitch ; 
+ private final Map < String , Integer > datacenters ; 
+ private static final Logger logger = LoggerFactory . getLogger ( NetworkTopologyStrategy . class ) ; 
+ 
+ public NetworkTopologyStrategy ( String keyspaceName , TokenMetadata tokenMetadata , IEndpointSnitch snitch , Map < String , String > configOptions ) throws ConfigurationException 
+ { 
+ super ( keyspaceName , tokenMetadata , snitch , configOptions ) ; 
+ - this . snitch = snitch ; 
+ 
+ Map < String , Integer > newDatacenters = new HashMap < String , Integer > ( ) ; 
+ if ( configOptions ! = null ) 
+ @ @ - 75 , 17 + 74 , 78 @ @ public class NetworkTopologyStrategy extends AbstractReplicationStrategy 
+ } 
+ 
+ / * * 
+ - * calculate endpoints in one pass through the tokens by tracking our progress in each DC , rack etc . 
+ + * Endpoint adder applying the replication rules for a given DC . 
+ + * / 
+ + private static final class DatacenterEndpoints 
+ + { 
+ + / * * List accepted endpoints get pushed into . * / 
+ + Set < InetAddress > endpoints ; 
+ + / * * 
+ + * Racks encountered so far . Replicas are put into separate racks while possible . 
+ + * For efficiency the set is shared between the instances , using the location pair ( dc , rack ) to make sure 
+ + * clashing names aren ' t a problem . 
+ + * / 
+ + Set < Pair < String , String > > racks ; 
+ + 
+ + / * * Number of replicas left to fill from this DC . * / 
+ + int rfLeft ; 
+ + int acceptableRackRepeats ; 
+ + 
+ + DatacenterEndpoints ( int rf , int rackCount , int nodeCount , Set < InetAddress > endpoints , Set < Pair < String , String > > racks ) 
+ + { 
+ + this . endpoints = endpoints ; 
+ + this . racks = racks ; 
+ + / / If there aren ' t enough nodes in this DC to fill the RF , the number of nodes is the effective RF . 
+ + this . rfLeft = Math . min ( rf , nodeCount ) ; 
+ + / / If there aren ' t enough racks in this DC to fill the RF , we ' ll still use at least one node from each rack , 
+ + / / and the difference is to be filled by the first encountered nodes . 
+ + acceptableRackRepeats = rf - rackCount ; 
+ + } 
+ + 
+ + / * * 
+ + * Attempts to add an endpoint to the replicas for this datacenter , adding to the endpoints set if successful . 
+ + * Returns true if the endpoint was added , and this datacenter does not require further replicas . 
+ + * / 
+ + boolean addEndpointAndCheckIfDone ( InetAddress ep , Pair < String , String > location ) 
+ + { 
+ + if ( done ( ) ) 
+ + return false ; 
+ + 
+ + if ( racks . add ( location ) ) 
+ + { 
+ + / / New rack . 
+ + - - rfLeft ; 
+ + boolean added = endpoints . add ( ep ) ; 
+ + assert added ; 
+ + return done ( ) ; 
+ + } 
+ + if ( acceptableRackRepeats < = 0 ) 
+ + / / There must be rfLeft distinct racks left , do not add any more rack repeats . 
+ + return false ; 
+ + if ( ! endpoints . add ( ep ) ) 
+ + / / Cannot repeat a node . 
+ + return false ; 
+ + / / Added a node that is from an already met rack to match RF when there aren ' t enough racks . 
+ + - - acceptableRackRepeats ; 
+ + - - rfLeft ; 
+ + return done ( ) ; 
+ + } 
+ + 
+ + boolean done ( ) 
+ + { 
+ + assert rfLeft > = 0 ; 
+ + return rfLeft = = 0 ; 
+ + } 
+ + } 
+ + 
+ + / * * 
+ + * calculate endpoints in one pass through the tokens by tracking our progress in each DC . 
+ * / 
+ - @ SuppressWarnings ( " serial " ) 
+ public List < InetAddress > calculateNaturalEndpoints ( Token searchToken , TokenMetadata tokenMetadata ) 
+ { 
+ / / we want to preserve insertion order so that the first added endpoint becomes primary 
+ Set < InetAddress > replicas = new LinkedHashSet < > ( ) ; 
+ - / / replicas we have found in each DC 
+ - Map < String , Set < InetAddress > > dcReplicas = new HashMap < > ( datacenters . size ( ) ) ; 
+ - for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) 
+ - dcReplicas . put ( dc . getKey ( ) , new HashSet < InetAddress > ( dc . getValue ( ) ) ) ; 
+ + Set < Pair < String , String > > seenRacks = new HashSet < > ( ) ; 
+ 
+ Topology topology = tokenMetadata . getTopology ( ) ; 
+ / / all endpoints in each DC , so we can check when we have exhausted all the members of a DC 
+ @ @ - 94 , 74 + 154 , 45 @ @ public class NetworkTopologyStrategy extends AbstractReplicationStrategy 
+ Map < String , Multimap < String , InetAddress > > racks = topology . getDatacenterRacks ( ) ; 
+ assert ! allEndpoints . isEmpty ( ) & & ! racks . isEmpty ( ) : " not aware of any cluster members " ; 
+ 
+ - / / tracks the racks we have already placed replicas in 
+ - Map < String , Set < String > > seenRacks = new HashMap < > ( datacenters . size ( ) ) ; 
+ - for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) 
+ - seenRacks . put ( dc . getKey ( ) , new HashSet < String > ( ) ) ; 
+ + int dcsToFill = 0 ; 
+ + Map < String , DatacenterEndpoints > dcs = new HashMap < > ( datacenters . size ( ) * 2 ) ; 
+ + 
+ + / / Create a DatacenterEndpoints object for each non - empty DC . 
+ + for ( Map . Entry < String , Integer > en : datacenters . entrySet ( ) ) 
+ + { 
+ + String dc = en . getKey ( ) ; 
+ + int rf = en . getValue ( ) ; 
+ + int nodeCount = sizeOrZero ( allEndpoints . get ( dc ) ) ; 
+ + 
+ + if ( rf < = 0 | | nodeCount < = 0 ) 
+ + continue ; 
+ 
+ - / / tracks the endpoints that we skipped over while looking for unique racks 
+ - / / when we relax the rack uniqueness we can append this to the current result so we don ' t have to wind back the iterator 
+ - Map < String , Set < InetAddress > > skippedDcEndpoints = new HashMap < > ( datacenters . size ( ) ) ; 
+ - for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) 
+ - skippedDcEndpoints . put ( dc . getKey ( ) , new LinkedHashSet < InetAddress > ( ) ) ; 
+ + DatacenterEndpoints dcEndpoints = new DatacenterEndpoints ( rf , sizeOrZero ( racks . get ( dc ) ) , nodeCount , replicas , seenRacks ) ; 
+ + dcs . put ( dc , dcEndpoints ) ; 
+ + + + dcsToFill ; 
+ + } 
+ 
+ Iterator < Token > tokenIter = TokenMetadata . ringIterator ( tokenMetadata . sortedTokens ( ) , searchToken , false ) ; 
+ - while ( tokenIter . hasNext ( ) & & ! hasSufficientReplicas ( dcReplicas , allEndpoints ) ) 
+ + while ( dcsToFill > 0 & & tokenIter . hasNext ( ) ) 
+ { 
+ Token next = tokenIter . next ( ) ; 
+ InetAddress ep = tokenMetadata . getEndpoint ( next ) ; 
+ - String dc = snitch . getDatacenter ( ep ) ; 
+ - / / have we already found all replicas for this dc ? 
+ - if ( ! datacenters . containsKey ( dc ) | | hasSufficientReplicas ( dc , dcReplicas , allEndpoints ) ) 
+ - continue ; 
+ - / / can we skip checking the rack ? 
+ - if ( seenRacks . get ( dc ) . size ( ) = = racks . get ( dc ) . keySet ( ) . size ( ) ) 
+ - { 
+ - dcReplicas . get ( dc ) . add ( ep ) ; 
+ - replicas . add ( ep ) ; 
+ - } 
+ - else 
+ - { 
+ - String rack = snitch . getRack ( ep ) ; 
+ - / / is this a new rack ? 
+ - if ( seenRacks . get ( dc ) . contains ( rack ) ) 
+ - { 
+ - skippedDcEndpoints . get ( dc ) . add ( ep ) ; 
+ - } 
+ - else 
+ - { 
+ - dcReplicas . get ( dc ) . add ( ep ) ; 
+ - replicas . add ( ep ) ; 
+ - seenRacks . get ( dc ) . add ( rack ) ; 
+ - / / if we ' ve run out of distinct racks , add the hosts we skipped past already ( up to RF ) 
+ - if ( seenRacks . get ( dc ) . size ( ) = = racks . get ( dc ) . keySet ( ) . size ( ) ) 
+ - { 
+ - Iterator < InetAddress > skippedIt = skippedDcEndpoints . get ( dc ) . iterator ( ) ; 
+ - while ( skippedIt . hasNext ( ) & & ! hasSufficientReplicas ( dc , dcReplicas , allEndpoints ) ) 
+ - { 
+ - InetAddress nextSkipped = skippedIt . next ( ) ; 
+ - dcReplicas . get ( dc ) . add ( nextSkipped ) ; 
+ - replicas . add ( nextSkipped ) ; 
+ - } 
+ - } 
+ - } 
+ - } 
+ + Pair < String , String > location = topology . getLocation ( ep ) ; 
+ + DatacenterEndpoints dcEndpoints = dcs . get ( location . left ) ; 
+ + if ( dcEndpoints ! = null & & dcEndpoints . addEndpointAndCheckIfDone ( ep , location ) ) 
+ + - - dcsToFill ; 
+ } 
+ - 
+ - return new ArrayList < InetAddress > ( replicas ) ; 
+ + return new ArrayList < > ( replicas ) ; 
+ } 
+ 
+ - private boolean hasSufficientReplicas ( String dc , Map < String , Set < InetAddress > > dcReplicas , Multimap < String , InetAddress > allEndpoints ) 
+ + private int sizeOrZero ( Multimap < ? , ? > collection ) 
+ { 
+ - return dcReplicas . get ( dc ) . size ( ) > = Math . min ( allEndpoints . get ( dc ) . size ( ) , getReplicationFactor ( dc ) ) ; 
+ + return collection ! = null ? collection . asMap ( ) . size ( ) : 0 ; 
+ } 
+ 
+ - private boolean hasSufficientReplicas ( Map < String , Set < InetAddress > > dcReplicas , Multimap < String , InetAddress > allEndpoints ) 
+ + private int sizeOrZero ( Collection < ? > collection ) 
+ { 
+ - for ( String dc : datacenters . keySet ( ) ) 
+ - if ( ! hasSufficientReplicas ( dc , dcReplicas , allEndpoints ) ) 
+ - return false ; 
+ - return true ; 
+ + return collection ! = null ? collection . size ( ) : 0 ; 
+ } 
+ 
+ public int getReplicationFactor ( ) 
+ diff - - git a / src / java / org / apache / cassandra / locator / TokenMetadata . java b / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ index e65b53e . . a3be9de 100644 
+ - - - a / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ + + + b / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ @ @ - 828 , 20 + 828 , 20 @ @ public class TokenMetadata 
+ 
+ public Token getPredecessor ( Token token ) 
+ { 
+ - List tokens = sortedTokens ( ) ; 
+ + List < Token > tokens = sortedTokens ( ) ; 
+ int index = Collections . binarySearch ( tokens , token ) ; 
+ / / assert index > = 0 : token + " not found in " + StringUtils . join ( tokenToEndpointMap . keySet ( ) , " , " ) ; 
+ if ( index < 0 ) index = - index - 1 ; 
+ - return ( Token ) ( index = = 0 ? tokens . get ( tokens . size ( ) - 1 ) : tokens . get ( index - 1 ) ) ; 
+ + return index = = 0 ? tokens . get ( tokens . size ( ) - 1 ) : tokens . get ( index - 1 ) ; 
+ } 
+ 
+ public Token getSuccessor ( Token token ) 
+ { 
+ - List tokens = sortedTokens ( ) ; 
+ + List < Token > tokens = sortedTokens ( ) ; 
+ int index = Collections . binarySearch ( tokens , token ) ; 
+ / / assert index > = 0 : token + " not found in " + StringUtils . join ( tokenToEndpointMap . keySet ( ) , " , " ) ; 
+ if ( index < 0 ) return ( Token ) tokens . get ( - index - 1 ) ; 
+ - return ( Token ) ( ( index = = ( tokens . size ( ) - 1 ) ) ? tokens . get ( 0 ) : tokens . get ( index + 1 ) ) ; 
+ + return ( index = = ( tokens . size ( ) - 1 ) ) ? tokens . get ( 0 ) : tokens . get ( index + 1 ) ; 
+ } 
+ 
+ / * * @ return a copy of the bootstrapping tokens map * / 
+ @ @ - 902 , 7 + 902 , 7 @ @ public class TokenMetadata 
+ } 
+ } 
+ 
+ - public static int firstTokenIndex ( final ArrayList ring , Token start , boolean insertMin ) 
+ + public static int firstTokenIndex ( final ArrayList < Token > ring , Token start , boolean insertMin ) 
+ { 
+ assert ring . size ( ) > 0 ; 
+ / / insert the minimum token ( at index = = - 1 ) if we were asked to include it and it isn ' t a member of the ring 
+ @ @ - 930 , 7 + 930 , 7 @ @ public class TokenMetadata 
+ { 
+ if ( ring . isEmpty ( ) ) 
+ return includeMin ? Iterators . singletonIterator ( start . getPartitioner ( ) . getMinimumToken ( ) ) 
+ - : Iterators . < Token > emptyIterator ( ) ; 
+ + : Collections . emptyIterator ( ) ; 
+ 
+ final boolean insertMin = includeMin & & ! ring . get ( 0 ) . isMinimum ( ) ; 
+ final int startIndex = firstTokenIndex ( ring , start , insertMin ) ; 
+ @ @ - 1279 , 5 + 1279 , 14 @ @ public class TokenMetadata 
+ { 
+ return dcRacks ; 
+ } 
+ + 
+ + / * * 
+ + * @ return The DC and rack of the given endpoint . 
+ + * / 
+ + public Pair < String , String > getLocation ( InetAddress addr ) 
+ + { 
+ + return currentLocations . get ( addr ) ; 
+ + } 
+ + 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / locator / NetworkTopologyStrategyTest . java b / test / unit / org / apache / cassandra / locator / NetworkTopologyStrategyTest . java 
+ index bbfdd3b . . 3cba328 100644 
+ - - - a / test / unit / org / apache / cassandra / locator / NetworkTopologyStrategyTest . java 
+ + + + b / test / unit / org / apache / cassandra / locator / NetworkTopologyStrategyTest . java 
+ @ @ - 21 , 24 + 21 , 26 @ @ package org . apache . cassandra . locator ; 
+ import java . io . IOException ; 
+ import java . net . InetAddress ; 
+ import java . net . UnknownHostException ; 
+ - import java . util . ArrayList ; 
+ - import java . util . HashMap ; 
+ - import java . util . HashSet ; 
+ - import java . util . List ; 
+ - import java . util . Map ; 
+ - import java . util . Set ; 
+ + import java . util . * ; 
+ + import java . util . stream . Collectors ; 
+ 
+ import com . google . common . collect . HashMultimap ; 
+ + import com . google . common . collect . ImmutableMap ; 
+ import com . google . common . collect . Multimap ; 
+ + 
+ import org . junit . Assert ; 
+ import org . junit . Test ; 
+ + 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . dht . Murmur3Partitioner ; 
+ import org . apache . cassandra . dht . OrderPreservingPartitioner . StringToken ; 
+ import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . exceptions . ConfigurationException ; 
+ + import org . apache . cassandra . locator . TokenMetadata . Topology ; 
+ + import org . apache . cassandra . service . StorageService ; 
+ 
+ public class NetworkTopologyStrategyTest 
+ { 
+ @ @ - 166 , 4 + 168 , 203 @ @ public class NetworkTopologyStrategyTest 
+ InetAddress add1 = InetAddress . getByAddress ( bytes ) ; 
+ metadata . updateNormalToken ( token1 , add1 ) ; 
+ } 
+ + 
+ + @ Test 
+ + public void testCalculateEndpoints ( ) throws UnknownHostException 
+ + { 
+ + final int NODES = 100 ; 
+ + final int VNODES = 64 ; 
+ + final int RUNS = 10 ; 
+ + StorageService . instance . setPartitionerUnsafe ( Murmur3Partitioner . instance ) ; 
+ + Map < String , Integer > datacenters = ImmutableMap . of ( " rf1 " , 1 , " rf3 " , 3 , " rf5 _ 1 " , 5 , " rf5 _ 2 " , 5 , " rf5 _ 3 " , 5 ) ; 
+ + List < InetAddress > nodes = new ArrayList < > ( NODES ) ; 
+ + for ( byte i = 0 ; i < NODES ; + + i ) 
+ + nodes . add ( InetAddress . getByAddress ( new byte [ ] { 127 , 0 , 0 , i } ) ) ; 
+ + for ( int run = 0 ; run < RUNS ; + + run ) 
+ + { 
+ + Random rand = new Random ( ) ; 
+ + IEndpointSnitch snitch = generateSnitch ( datacenters , nodes , rand ) ; 
+ + DatabaseDescriptor . setEndpointSnitch ( snitch ) ; 
+ + 
+ + TokenMetadata meta = new TokenMetadata ( ) ; 
+ + for ( int i = 0 ; i < NODES ; + + i ) / / Nodes 
+ + for ( int j = 0 ; j < VNODES ; + + j ) / / tokens / vnodes per node 
+ + meta . updateNormalToken ( Murmur3Partitioner . instance . getRandomToken ( rand ) , nodes . get ( i ) ) ; 
+ + testEquivalence ( meta , snitch , datacenters , rand ) ; 
+ + } 
+ + } 
+ + 
+ + void testEquivalence ( TokenMetadata tokenMetadata , IEndpointSnitch snitch , Map < String , Integer > datacenters , Random rand ) 
+ + { 
+ + NetworkTopologyStrategy nts = new NetworkTopologyStrategy ( " ks " , tokenMetadata , snitch , 
+ + datacenters . entrySet ( ) . stream ( ) . 
+ + collect ( Collectors . toMap ( x - > x . getKey ( ) , x - > Integer . toString ( x . getValue ( ) ) ) ) ) ; 
+ + for ( int i = 0 ; i < 1000 ; + + i ) 
+ + { 
+ + Token token = Murmur3Partitioner . instance . getRandomToken ( rand ) ; 
+ + List < InetAddress > expected = calculateNaturalEndpoints ( token , tokenMetadata , datacenters , snitch ) ; 
+ + List < InetAddress > actual = nts . calculateNaturalEndpoints ( token , tokenMetadata ) ; 
+ + if ( endpointsDiffer ( expected , actual ) ) 
+ + { 
+ + System . err . println ( " Endpoints mismatch for token " + token ) ; 
+ + System . err . println ( " expected : " + expected ) ; 
+ + System . err . println ( " actual : " + actual ) ; 
+ + Assert . assertEquals ( " Endpoints for token " + token + " mismatch . " , expected , actual ) ; 
+ + } 
+ + } 
+ + } 
+ + 
+ + private boolean endpointsDiffer ( List < InetAddress > ep1 , List < InetAddress > ep2 ) 
+ + { 
+ + / / Because the old algorithm does not put the nodes in the correct order in the case where more replicas 
+ + / / are required than there are racks in a dc , we accept different order as long as the primary 
+ + / / replica is the same . 
+ + if ( ep1 . equals ( ep2 ) ) 
+ + return false ; 
+ + if ( ! ep1 . get ( 0 ) . equals ( ep2 . get ( 0 ) ) ) 
+ + return true ; 
+ + Set < InetAddress > s1 = new HashSet < > ( ep1 ) ; 
+ + Set < InetAddress > s2 = new HashSet < > ( ep2 ) ; 
+ + return ! s1 . equals ( s2 ) ; 
+ + } 
+ + 
+ + IEndpointSnitch generateSnitch ( Map < String , Integer > datacenters , Collection < InetAddress > nodes , Random rand ) 
+ + { 
+ + final Map < InetAddress , String > nodeToRack = new HashMap < > ( ) ; 
+ + final Map < InetAddress , String > nodeToDC = new HashMap < > ( ) ; 
+ + Map < String , List < String > > racksPerDC = new HashMap < > ( ) ; 
+ + datacenters . forEach ( ( dc , rf ) - > racksPerDC . put ( dc , randomRacks ( rf , rand ) ) ) ; 
+ + int rf = datacenters . values ( ) . stream ( ) . mapToInt ( x - > x ) . sum ( ) ; 
+ + String [ ] dcs = new String [ rf ] ; 
+ + int pos = 0 ; 
+ + for ( Map . Entry < String , Integer > dce : datacenters . entrySet ( ) ) 
+ + { 
+ + for ( int i = 0 ; i < dce . getValue ( ) ; + + i ) 
+ + dcs [ pos + + ] = dce . getKey ( ) ; 
+ + } 
+ + 
+ + for ( InetAddress node : nodes ) 
+ + { 
+ + String dc = dcs [ rand . nextInt ( rf ) ] ; 
+ + List < String > racks = racksPerDC . get ( dc ) ; 
+ + String rack = racks . get ( rand . nextInt ( racks . size ( ) ) ) ; 
+ + nodeToRack . put ( node , rack ) ; 
+ + nodeToDC . put ( node , dc ) ; 
+ + } 
+ + 
+ + return new AbstractNetworkTopologySnitch ( ) 
+ + { 
+ + public String getRack ( InetAddress endpoint ) 
+ + { 
+ + return nodeToRack . get ( endpoint ) ; 
+ + } 
+ + 
+ + public String getDatacenter ( InetAddress endpoint ) 
+ + { 
+ + return nodeToDC . get ( endpoint ) ; 
+ + } 
+ + } ; 
+ + } 
+ + 
+ + private List < String > randomRacks ( int rf , Random rand ) 
+ + { 
+ + int rc = rand . nextInt ( rf * 3 - 1 ) + 1 ; 
+ + List < String > racks = new ArrayList < > ( rc ) ; 
+ + for ( int i = 0 ; i < rc ; + + i ) 
+ + racks . add ( Integer . toString ( i ) ) ; 
+ + return racks ; 
+ + } 
+ + 
+ + / / Copy of older endpoints calculation algorithm for comparison 
+ + public static List < InetAddress > calculateNaturalEndpoints ( Token searchToken , TokenMetadata tokenMetadata , Map < String , Integer > datacenters , IEndpointSnitch snitch ) 
+ + { 
+ + / / we want to preserve insertion order so that the first added endpoint becomes primary 
+ + Set < InetAddress > replicas = new LinkedHashSet < > ( ) ; 
+ + / / replicas we have found in each DC 
+ + Map < String , Set < InetAddress > > dcReplicas = new HashMap < > ( datacenters . size ( ) ) ; 
+ + for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) 
+ + dcReplicas . put ( dc . getKey ( ) , new HashSet < InetAddress > ( dc . getValue ( ) ) ) ; 
+ + 
+ + Topology topology = tokenMetadata . getTopology ( ) ; 
+ + / / all endpoints in each DC , so we can check when we have exhausted all the members of a DC 
+ + Multimap < String , InetAddress > allEndpoints = topology . getDatacenterEndpoints ( ) ; 
+ + / / all racks in a DC so we can check when we have exhausted all racks in a DC 
+ + Map < String , Multimap < String , InetAddress > > racks = topology . getDatacenterRacks ( ) ; 
+ + assert ! allEndpoints . isEmpty ( ) & & ! racks . isEmpty ( ) : " not aware of any cluster members " ; 
+ + 
+ + / / tracks the racks we have already placed replicas in 
+ + Map < String , Set < String > > seenRacks = new HashMap < > ( datacenters . size ( ) ) ; 
+ + for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) 
+ + seenRacks . put ( dc . getKey ( ) , new HashSet < String > ( ) ) ; 
+ + 
+ + / / tracks the endpoints that we skipped over while looking for unique racks 
+ + / / when we relax the rack uniqueness we can append this to the current result so we don ' t have to wind back the iterator 
+ + Map < String , Set < InetAddress > > skippedDcEndpoints = new HashMap < > ( datacenters . size ( ) ) ; 
+ + for ( Map . Entry < String , Integer > dc : datacenters . entrySet ( ) ) 
+ + skippedDcEndpoints . put ( dc . getKey ( ) , new LinkedHashSet < InetAddress > ( ) ) ; 
+ + 
+ + Iterator < Token > tokenIter = TokenMetadata . ringIterator ( tokenMetadata . sortedTokens ( ) , searchToken , false ) ; 
+ + while ( tokenIter . hasNext ( ) & & ! hasSufficientReplicas ( dcReplicas , allEndpoints , datacenters ) ) 
+ + { 
+ + Token next = tokenIter . next ( ) ; 
+ + InetAddress ep = tokenMetadata . getEndpoint ( next ) ; 
+ + String dc = snitch . getDatacenter ( ep ) ; 
+ + / / have we already found all replicas for this dc ? 
+ + if ( ! datacenters . containsKey ( dc ) | | hasSufficientReplicas ( dc , dcReplicas , allEndpoints , datacenters ) ) 
+ + continue ; 
+ + / / can we skip checking the rack ? 
+ + if ( seenRacks . get ( dc ) . size ( ) = = racks . get ( dc ) . keySet ( ) . size ( ) ) 
+ + { 
+ + dcReplicas . get ( dc ) . add ( ep ) ; 
+ + replicas . add ( ep ) ; 
+ + } 
+ + else 
+ + { 
+ + String rack = snitch . getRack ( ep ) ; 
+ + / / is this a new rack ? 
+ + if ( seenRacks . get ( dc ) . contains ( rack ) ) 
+ + { 
+ + skippedDcEndpoints . get ( dc ) . add ( ep ) ; 
+ + } 
+ + else 
+ + { 
+ + dcReplicas . get ( dc ) . add ( ep ) ; 
+ + replicas . add ( ep ) ; 
+ + seenRacks . get ( dc ) . add ( rack ) ; 
+ + / / if we ' ve run out of distinct racks , add the hosts we skipped past already ( up to RF ) 
+ + if ( seenRacks . get ( dc ) . size ( ) = = racks . get ( dc ) . keySet ( ) . size ( ) ) 
+ + { 
+ + Iterator < InetAddress > skippedIt = skippedDcEndpoints . get ( dc ) . iterator ( ) ; 
+ + while ( skippedIt . hasNext ( ) & & ! hasSufficientReplicas ( dc , dcReplicas , allEndpoints , datacenters ) ) 
+ + { 
+ + InetAddress nextSkipped = skippedIt . next ( ) ; 
+ + dcReplicas . get ( dc ) . add ( nextSkipped ) ; 
+ + replicas . add ( nextSkipped ) ; 
+ + } 
+ + } 
+ + } 
+ + } 
+ + } 
+ + 
+ + return new ArrayList < InetAddress > ( replicas ) ; 
+ + } 
+ + 
+ + private static boolean hasSufficientReplicas ( String dc , Map < String , Set < InetAddress > > dcReplicas , Multimap < String , InetAddress > allEndpoints , Map < String , Integer > datacenters ) 
+ + { 
+ + return dcReplicas . get ( dc ) . size ( ) > = Math . min ( allEndpoints . get ( dc ) . size ( ) , getReplicationFactor ( dc , datacenters ) ) ; 
+ + } 
+ + 
+ + private static boolean hasSufficientReplicas ( Map < String , Set < InetAddress > > dcReplicas , Multimap < String , InetAddress > allEndpoints , Map < String , Integer > datacenters ) 
+ + { 
+ + for ( String dc : datacenters . keySet ( ) ) 
+ + if ( ! hasSufficientReplicas ( dc , dcReplicas , allEndpoints , datacenters ) ) 
+ + return false ; 
+ + return true ; 
+ + } 
+ + 
+ + public static int getReplicationFactor ( String dc , Map < String , Integer > datacenters ) 
+ + { 
+ + Integer replicas = datacenters . get ( dc ) ; 
+ + return replicas = = null ? 0 : replicas ; 
+ + } 
+ }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 72991f1 . . 7cd12a5 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 6 @ @ 
+ 1 . 1 . 3 
+ + * avoid using global partitioner to estimate ranges in index sstables 
+ + ( CASSANDRA - 4403 ) 
+ * restore pre - CASSANDRA - 3862 approach to removing expired tombstones 
+ from row cache during compaction ( CASSANDRA - 4364 ) 
+ * ( stress ) support for CQL prepared statements ( CASSANDRA - 3633 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 93f022d . . 0b66020 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 904 , 9 + 904 , 10 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ / * * 
+ * Calculate expected file size of SSTable after compaction . 
+ * 
+ - * If operation type is { @ code CLEANUP } , then we calculate expected file size 
+ - * with checking token range to be eliminated . 
+ - * Other than that , we just add up all the files ' size , which is the worst case file 
+ + * If operation type is { @ code CLEANUP } and we ' re not dealing with an index sstable , 
+ + * then we calculate expected file size with checking token range to be eliminated . 
+ + * 
+ + * Otherwise , we just add up all the files ' size , which is the worst case file 
+ * size for compaction of all the list of files given . 
+ * 
+ * @ param sstables SSTables to calculate expected compacted file size 
+ @ @ - 915 , 21 + 916 , 18 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ * / 
+ public long getExpectedCompactedFileSize ( Iterable < SSTableReader > sstables , OperationType operation ) 
+ { 
+ - long expectedFileSize = 0 ; 
+ - if ( operation = = OperationType . CLEANUP ) 
+ + if ( operation ! = OperationType . CLEANUP | | isIndex ( ) ) 
+ { 
+ - Collection < Range < Token > > ranges = StorageService . instance . getLocalRanges ( table . name ) ; 
+ - for ( SSTableReader sstable : sstables ) 
+ - { 
+ - List < Pair < Long , Long > > positions = sstable . getPositionsForRanges ( ranges ) ; 
+ - for ( Pair < Long , Long > position : positions ) 
+ - expectedFileSize + = position . right - position . left ; 
+ - } 
+ + return SSTable . getTotalBytes ( sstables ) ; 
+ } 
+ - else 
+ + 
+ + long expectedFileSize = 0 ; 
+ + Collection < Range < Token > > ranges = StorageService . instance . getLocalRanges ( table . name ) ; 
+ + for ( SSTableReader sstable : sstables ) 
+ { 
+ - for ( SSTableReader sstable : sstables ) 
+ - expectedFileSize + = sstable . onDiskLength ( ) ; 
+ + List < Pair < Long , Long > > positions = sstable . getPositionsForRanges ( ranges ) ; 
+ + for ( Pair < Long , Long > position : positions ) 
+ + expectedFileSize + = position . right - position . left ; 
+ } 
+ return expectedFileSize ; 
+ }

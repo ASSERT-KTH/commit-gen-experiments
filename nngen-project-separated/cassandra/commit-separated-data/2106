@@ -1,0 +1,906 @@
+BLEU SCORE: 0.03214954573057458
+
+TEST MSG: Log unclean client disconnect excs at DEBUG
+GENERATED MSG: reads at ConsistencyLevel > 1 throwUnavailableException immediately if insufficient live nodes exist
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 01d32e7 . . c9d507a 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 6 @ @ <nl> 2 . 0 . 11 : <nl> + * Log exceptions related to unclean native protocol client disconnects <nl> + at DEBUG or INFO ( CASSANDRA - 7849 ) <nl> * Allow permissions cache to be set via JMX ( CASSANDRA - 7698 ) <nl> * Include schema _ triggers CF in readable system resources ( CASSANDRA - 7967 ) <nl> * Fix RowIndexEntry to report correct serializedSize ( CASSANDRA - 7948 ) <nl> diff - - git a / src / java / org / apache / cassandra / transport / Message . java b / src / java / org / apache / cassandra / transport / Message . java <nl> index bbe7e38 . . eb38558 100644 <nl> - - - a / src / java / org / apache / cassandra / transport / Message . java <nl> + + + b / src / java / org / apache / cassandra / transport / Message . java <nl> @ @ - 17 , 9 + 17 , 13 @ @ <nl> * / <nl> package org . apache . cassandra . transport ; <nl> <nl> + import java . io . IOException ; <nl> import java . util . EnumSet ; <nl> + import java . util . Set ; <nl> import java . util . UUID ; <nl> <nl> + import com . google . common . base . Predicate ; <nl> + import com . google . common . collect . ImmutableSet ; <nl> import org . jboss . netty . buffer . ChannelBuffer ; <nl> import org . jboss . netty . buffer . ChannelBuffers ; <nl> import org . jboss . netty . channel . * ; <nl> @ @ - 38 , 6 + 42 , 17 @ @ public abstract class Message <nl> { <nl> protected static final Logger logger = LoggerFactory . getLogger ( Message . class ) ; <nl> <nl> + / * * <nl> + * When we encounter an unexpected IOException we look for these { @ link Throwable # getMessage ( ) messages } <nl> + * ( because we have no better way to distinguish ) and log them at DEBUG rather than INFO , since they <nl> + * are generally caused by unclean client disconnects rather than an actual problem . <nl> + * / <nl> + private static final Set < String > ioExceptionsAtDebugLevel = ImmutableSet . < String > builder ( ) . <nl> + add ( " Connection reset by peer " ) . <nl> + add ( " Broken pipe " ) . <nl> + add ( " Connection timed out " ) . <nl> + build ( ) ; <nl> + <nl> public interface Codec < M extends Message > extends CBCodec < M > { } <nl> <nl> public enum Direction <nl> @ @ - 315 , 7 + 330 , 7 @ @ public abstract class Message <nl> catch ( Throwable ex ) <nl> { <nl> / / Don ' t let the exception propagate to exceptionCaught ( ) if we can help it so that we can assign the right streamID . <nl> - ctx . getChannel ( ) . write ( ErrorMessage . fromException ( ex ) . setStreamId ( request . getStreamId ( ) ) ) ; <nl> + ctx . getChannel ( ) . write ( ErrorMessage . fromException ( ex , new UnexpectedChannelExceptionHandler ( ctx . getChannel ( ) , true ) ) . setStreamId ( request . getStreamId ( ) ) ) ; <nl> } <nl> } <nl> <nl> @ @ - 325 , 7 + 340 , 7 @ @ public abstract class Message <nl> { <nl> if ( ctx . getChannel ( ) . isOpen ( ) ) <nl> { <nl> - ChannelFuture future = ctx . getChannel ( ) . write ( ErrorMessage . fromException ( e . getCause ( ) ) ) ; <nl> + ChannelFuture future = ctx . getChannel ( ) . write ( ErrorMessage . fromException ( e . getCause ( ) , new UnexpectedChannelExceptionHandler ( ctx . getChannel ( ) , false ) ) ) ; <nl> / / On protocol exception , close the channel as soon as the message have been sent <nl> if ( e . getCause ( ) instanceof ProtocolException ) <nl> { <nl> @ @ - 338 , 4 + 353 , 58 @ @ public abstract class Message <nl> } <nl> } <nl> } <nl> + <nl> + / * * <nl> + * Include the channel info in the logged information for unexpected errors , and ( if { @ link # alwaysLogAtError } is <nl> + * false then choose the log level based on the type of exception ( some are clearly client issues and shouldn ' t be <nl> + * logged at server ERROR level ) <nl> + * / <nl> + static final class UnexpectedChannelExceptionHandler implements Predicate < Throwable > <nl> + { <nl> + private final Channel channel ; <nl> + private final boolean alwaysLogAtError ; <nl> + <nl> + UnexpectedChannelExceptionHandler ( Channel channel , boolean alwaysLogAtError ) <nl> + { <nl> + this . channel = channel ; <nl> + this . alwaysLogAtError = alwaysLogAtError ; <nl> + } <nl> + <nl> + @ Override <nl> + public boolean apply ( Throwable exception ) <nl> + { <nl> + String message ; <nl> + try <nl> + { <nl> + message = " Unexpected exception during request ; channel = " + channel ; <nl> + } <nl> + catch ( Exception ignore ) <nl> + { <nl> + / / We don ' t want to make things worse if String . valueOf ( ) throws an exception <nl> + message = " Unexpected exception during request ; channel = < unprintable > " ; <nl> + } <nl> + <nl> + if ( ! alwaysLogAtError & & exception instanceof IOException ) <nl> + { <nl> + if ( ioExceptionsAtDebugLevel . contains ( exception . getMessage ( ) ) ) <nl> + { <nl> + / / Likely unclean client disconnects <nl> + logger . debug ( message , exception ) ; <nl> + } <nl> + else <nl> + { <nl> + / / Generally unhandled IO exceptions are network issues , not actual ERRORS <nl> + logger . info ( message , exception ) ; <nl> + } <nl> + } <nl> + else <nl> + { <nl> + / / Anything else is probably a bug in server of client binary protocol handling <nl> + logger . error ( message , exception ) ; <nl> + } <nl> + <nl> + / / We handled the exception . <nl> + return true ; <nl> + } <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / transport / messages / ErrorMessage . java b / src / java / org / apache / cassandra / transport / messages / ErrorMessage . java <nl> index 3ca5801 . . 4d60a1f 100644 <nl> - - - a / src / java / org / apache / cassandra / transport / messages / ErrorMessage . java <nl> + + + b / src / java / org / apache / cassandra / transport / messages / ErrorMessage . java <nl> @ @ - 17 , 10 + 17 , 8 @ @ <nl> * / <nl> package org . apache . cassandra . transport . messages ; <nl> <nl> - import java . nio . ByteBuffer ; <nl> - <nl> + import com . google . common . base . Predicate ; <nl> import org . jboss . netty . buffer . ChannelBuffer ; <nl> - import org . jboss . netty . buffer . ChannelBuffers ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 31 , 7 + 29 , 6 @ @ import org . apache . cassandra . transport . CBUtil ; <nl> import org . apache . cassandra . transport . Message ; <nl> import org . apache . cassandra . transport . ProtocolException ; <nl> import org . apache . cassandra . transport . ServerError ; <nl> - import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . MD5Digest ; <nl> <nl> / * * <nl> @ @ - 208 , 6 + 205 , 16 @ @ public class ErrorMessage extends Message . Response <nl> <nl> public static ErrorMessage fromException ( Throwable e ) <nl> { <nl> + return fromException ( e , null ) ; <nl> + } <nl> + <nl> + / * * <nl> + * @ param e the exception <nl> + * @ param unexpectedExceptionHandler a callback for handling unexpected exceptions . If null , or if this <nl> + * returns false , the error is logged at ERROR level via sl4fj <nl> + * / <nl> + public static ErrorMessage fromException ( Throwable e , Predicate < Throwable > unexpectedExceptionHandler ) <nl> + { <nl> int streamId = 0 ; <nl> if ( e instanceof WrappedException ) <nl> { <nl> @ @ - 219 , 7 + 226 , 9 @ @ public class ErrorMessage extends Message . Response <nl> return new ErrorMessage ( ( TransportException ) e , streamId ) ; <nl> <nl> / / Unexpected exception <nl> - logger . error ( " Unexpected exception during request " , e ) ; <nl> + if ( unexpectedExceptionHandler = = null | | ! unexpectedExceptionHandler . apply ( e ) ) <nl> + logger . error ( " Unexpected exception during request " , e ) ; <nl> + <nl> return new ErrorMessage ( new ServerError ( e ) , streamId ) ; <nl> } <nl>
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 571da4c . . 21563bb 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 27 , 6 + 27 , 8 @ @ dev <nl> ( CASSANDRA - 1804 ) <nl> * cli support index type enum names ( CASSANDRA - 1810 ) <nl> * improved validation of column _ metadata ( CASSANDRA - 1813 ) <nl> + * reads at ConsistencyLevel > 1 throw UnavailableException <nl> + immediately if insufficient live nodes exist ( CASSANDRA - 1803 ) <nl> <nl> <nl> 0 . 7 . 0 - rc1 <nl> diff - - git a / src / java / org / apache / cassandra / db / HintedHandOffManager . java b / src / java / org / apache / cassandra / db / HintedHandOffManager . java <nl> index dac5145 . . c83bb64 100644 <nl> - - - a / src / java / org / apache / cassandra / db / HintedHandOffManager . java <nl> + + + b / src / java / org / apache / cassandra / db / HintedHandOffManager . java <nl> @ @ - 24 , 6 + 24 , 7 @ @ import java . io . IOException ; <nl> import java . net . InetAddress ; <nl> import java . net . UnknownHostException ; <nl> import java . nio . ByteBuffer ; <nl> + import java . util . Arrays ; <nl> import java . util . Collection ; <nl> import java . util . concurrent . ExecutorService ; <nl> import java . util . concurrent . TimeoutException ; <nl> @ @ - 122 , 7 + 123 , 7 @ @ public class HintedHandOffManager <nl> rm . add ( cf ) ; <nl> Message message = rm . makeRowMutationMessage ( ) ; <nl> IWriteResponseHandler responseHandler = WriteResponseHandler . create ( endpoint ) ; <nl> - MessagingService . instance . sendRR ( message , new InetAddress [ ] { endpoint } , responseHandler ) ; <nl> + MessagingService . instance . sendRR ( message , Arrays . asList ( endpoint ) , responseHandler ) ; <nl> try <nl> { <nl> responseHandler . get ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java <nl> index 5da901c . . 883eb0a 100644 <nl> - - - a / src / java / org / apache / cassandra / net / MessagingService . java <nl> + + + b / src / java / org / apache / cassandra / net / MessagingService . java <nl> @ @ - 29 , 9 + 29 , 7 @ @ import java . nio . ByteBuffer ; <nl> import java . nio . channels . AsynchronousCloseException ; <nl> import java . nio . channels . ServerSocketChannel ; <nl> import java . security . MessageDigest ; <nl> - import java . util . EnumMap ; <nl> - import java . util . HashMap ; <nl> - import java . util . Map ; <nl> + import java . util . * ; <nl> import java . util . concurrent . ExecutorService ; <nl> import java . util . concurrent . TimeUnit ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> @ @ - 226 , 7 + 224 , 7 @ @ public class MessagingService implements MessagingServiceMBean <nl> * @ return an reference to an IAsyncResult which can be queried for the <nl> * response <nl> * / <nl> - public String sendRR ( Message message , InetAddress [ ] to , IAsyncCallback cb ) <nl> + public String sendRR ( Message message , Collection < InetAddress > to , IAsyncCallback cb ) <nl> { <nl> String messageId = message . getMessageId ( ) ; <nl> addCallback ( cb , messageId ) ; <nl> @ @ - 273 , 18 + 271 , 16 @ @ public class MessagingService implements MessagingServiceMBean <nl> * suggest that a timeout occured to the invoker of the send ( ) . <nl> * @ return an reference to message id used to match with the result <nl> * / <nl> - public String sendRR ( Message [ ] messages , InetAddress [ ] to , IAsyncCallback cb ) <nl> + public String sendRR ( Message [ ] messages , List < InetAddress > to , IAsyncCallback cb ) <nl> { <nl> - if ( messages . length ! = to . length ) <nl> - { <nl> + if ( messages . length ! = to . size ( ) ) <nl> throw new IllegalArgumentException ( " Number of messages and the number of endpoints need to be same . " ) ; <nl> - } <nl> String groupId = GuidGenerator . guid ( ) ; <nl> addCallback ( cb , groupId ) ; <nl> for ( int i = 0 ; i < messages . length ; + + i ) <nl> { <nl> messages [ i ] . setMessageId ( groupId ) ; <nl> - sendOneWay ( messages [ i ] , to [ i ] ) ; <nl> + sendOneWay ( messages [ i ] , to . get ( i ) ) ; <nl> } <nl> return groupId ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / ConsistencyChecker . java b / src / java / org / apache / cassandra / service / ConsistencyChecker . java <nl> index a30b67f . . f1bc2f2 100644 <nl> - - - a / src / java / org / apache / cassandra / service / ConsistencyChecker . java <nl> + + + b / src / java / org / apache / cassandra / service / ConsistencyChecker . java <nl> @ @ - 156 , 7 + 156 , 6 @ @ class ConsistencyChecker implements Runnable <nl> <nl> 	 static class DataRepairHandler implements IAsyncCallback <nl> 	 { <nl> - 	 	 private final Collection < Message > responses _ = new LinkedBlockingQueue < Message > ( ) ; <nl> 	 	 private final ReadResponseResolver readResponseResolver _ ; <nl> 	 	 private final int majority _ ; <nl> 	 	 <nl> @ @ - 167 , 7 + 166 , 6 @ @ class ConsistencyChecker implements Runnable <nl> / / wrap localRow in a response Message so it doesn ' t need to be special - cased in the resolver <nl> ReadResponse readResponse = new ReadResponse ( localRow ) ; <nl> Message fakeMessage = new Message ( FBUtilities . getLocalAddress ( ) , StorageService . Verb . INTERNAL _ RESPONSE , ArrayUtils . EMPTY _ BYTE _ ARRAY ) ; <nl> - responses _ . add ( fakeMessage ) ; <nl> readResponseResolver _ . injectPreProcessed ( fakeMessage , readResponse ) ; <nl> } <nl> <nl> @ @ - 176 , 15 + 174 , 14 @ @ class ConsistencyChecker implements Runnable <nl> 	 	 { <nl> 	 	 	 if ( logger _ . isDebugEnabled ( ) ) <nl> 	 	 	 logger _ . debug ( " Received response in DataRepairHandler : " + message . toString ( ) ) ; <nl> - 	 	 	 responses _ . add ( message ) ; <nl> readResponseResolver _ . preprocess ( message ) ; <nl> - if ( responses _ . size ( ) = = majority _ ) <nl> + if ( readResponseResolver _ . getMessageCount ( ) = = majority _ ) <nl> { <nl> Runnable runnable = new WrappedRunnable ( ) <nl> { <nl> public void runMayThrow ( ) throws IOException , DigestMismatchException <nl> { <nl> - readResponseResolver _ . resolve ( responses _ ) ; <nl> + readResponseResolver _ . resolve ( ) ; <nl> } <nl> } ; <nl> / / give remaining replicas until timeout to reply and get added to responses _ <nl> diff - - git a / src / java / org / apache / cassandra / service / DatacenterQuorumResponseHandler . java b / src / java / org / apache / cassandra / service / DatacenterQuorumResponseHandler . java <nl> index 6267df9 . . 0180d51 100644 <nl> - - - a / src / java / org / apache / cassandra / service / DatacenterQuorumResponseHandler . java <nl> + + + b / src / java / org / apache / cassandra / service / DatacenterQuorumResponseHandler . java <nl> @ @ - 21 , 6 + 21 , 9 @ @ package org . apache . cassandra . service ; <nl> * / <nl> <nl> <nl> + import java . net . InetAddress ; <nl> + import java . util . Collection ; <nl> + import java . util . List ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> @ @ - 29 , 6 + 32 , 7 @ @ import org . apache . cassandra . locator . IEndpointSnitch ; <nl> import org . apache . cassandra . locator . NetworkTopologyStrategy ; <nl> import org . apache . cassandra . net . Message ; <nl> import org . apache . cassandra . thrift . ConsistencyLevel ; <nl> + import org . apache . cassandra . thrift . UnavailableException ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> / * * <nl> @ @ - 49 , 14 + 53 , 14 @ @ public class DatacenterQuorumResponseHandler < T > extends QuorumResponseHandler < T > <nl> @ Override <nl> public void response ( Message message ) <nl> { <nl> - responses . add ( message ) ; / / we ' ll go ahead and resolve a reply from anyone , even if it ' s not from this dc <nl> + resolver . preprocess ( message ) ; <nl> <nl> int n ; <nl> n = localdc . equals ( snitch . getDatacenter ( message . getFrom ( ) ) ) <nl> ? localResponses . decrementAndGet ( ) <nl> : localResponses . get ( ) ; <nl> <nl> - if ( n = = 0 & & responseResolver . isDataPresent ( responses ) ) <nl> + if ( n = = 0 & & resolver . isDataPresent ( ) ) <nl> { <nl> condition . signal ( ) ; <nl> } <nl> @ @ - 68 , 4 + 72 , 18 @ @ public class DatacenterQuorumResponseHandler < T > extends QuorumResponseHandler < T > <nl> NetworkTopologyStrategy stategy = ( NetworkTopologyStrategy ) Table . open ( table ) . getReplicationStrategy ( ) ; <nl> 	 	 return ( stategy . getReplicationFactor ( localdc ) / 2 ) + 1 ; <nl> 	 } <nl> + <nl> + @ Override <nl> + public void assureSufficientLiveNodes ( Collection < InetAddress > endpoints ) throws UnavailableException <nl> + { <nl> + int localEndpoints = 0 ; <nl> + for ( InetAddress endpoint : endpoints ) <nl> + { <nl> + if ( localdc . equals ( snitch . getDatacenter ( endpoint ) ) ) <nl> + localEndpoints + + ; <nl> + } <nl> + <nl> + if ( localEndpoints < blockfor ) <nl> + throw new UnavailableException ( ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / IResponseResolver . java b / src / java / org / apache / cassandra / service / IResponseResolver . java <nl> index 0b5b54f . . ea61705 100644 <nl> - - - a / src / java / org / apache / cassandra / service / IResponseResolver . java <nl> + + + b / src / java / org / apache / cassandra / service / IResponseResolver . java <nl> @ @ - 34 , 8 + 34 , 10 @ @ public interface IResponseResolver < T > { <nl> 	 * repairs . Hence you need to derive a response resolver based on your <nl> 	 * needs from this interface . <nl> 	 * / <nl> - 	 public T resolve ( Collection < Message > responses ) throws DigestMismatchException , IOException ; <nl> - 	 public boolean isDataPresent ( Collection < Message > responses ) ; <nl> + 	 public T resolve ( ) throws DigestMismatchException , IOException ; <nl> + 	 public boolean isDataPresent ( ) ; <nl> <nl> public void preprocess ( Message message ) ; <nl> + public Iterable < Message > getMessages ( ) ; <nl> + public int getMessageCount ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / QuorumResponseHandler . java b / src / java / org / apache / cassandra / service / QuorumResponseHandler . java <nl> index a703e05 . . 9d7c7fd 100644 <nl> - - - a / src / java / org / apache / cassandra / service / QuorumResponseHandler . java <nl> + + + b / src / java / org / apache / cassandra / service / QuorumResponseHandler . java <nl> @ @ - 18 , 11 + 18 , 11 @ @ <nl> <nl> package org . apache . cassandra . service ; <nl> <nl> + import java . io . IOException ; <nl> + import java . net . InetAddress ; <nl> import java . util . Collection ; <nl> - import java . util . concurrent . LinkedBlockingQueue ; <nl> import java . util . concurrent . TimeUnit ; <nl> import java . util . concurrent . TimeoutException ; <nl> - import java . io . IOException ; <nl> <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . Table ; <nl> @ @ - 30 , 8 + 30 , 8 @ @ import org . apache . cassandra . net . IAsyncCallback ; <nl> import org . apache . cassandra . net . Message ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> import org . apache . cassandra . thrift . ConsistencyLevel ; <nl> + import org . apache . cassandra . thrift . UnavailableException ; <nl> import org . apache . cassandra . utils . SimpleCondition ; <nl> - <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 39 , 19 + 39 , 20 @ @ public class QuorumResponseHandler < T > implements IAsyncCallback <nl> { <nl> protected static final Logger logger = LoggerFactory . getLogger ( QuorumResponseHandler . class ) ; <nl> protected final SimpleCondition condition = new SimpleCondition ( ) ; <nl> - protected final Collection < Message > responses = new LinkedBlockingQueue < Message > ( ) ; ; <nl> - protected IResponseResolver < T > responseResolver ; <nl> + protected final IResponseResolver < T > resolver ; <nl> private final long startTime ; <nl> - protected int blockfor ; <nl> + protected final int blockfor ; <nl> <nl> / * * <nl> * Constructor when response count has to be calculated and blocked for . <nl> * / <nl> - public QuorumResponseHandler ( IResponseResolver < T > responseResolver , ConsistencyLevel consistencyLevel , String table ) <nl> + public QuorumResponseHandler ( IResponseResolver < T > resolver , ConsistencyLevel consistencyLevel , String table ) <nl> { <nl> this . blockfor = determineBlockFor ( consistencyLevel , table ) ; <nl> - this . responseResolver = responseResolver ; <nl> + this . resolver = resolver ; <nl> this . startTime = System . currentTimeMillis ( ) ; <nl> + <nl> + logger . debug ( " QuorumResponseHandler blocking for { } responses " , blockfor ) ; <nl> } <nl> <nl> public T get ( ) throws TimeoutException , DigestMismatchException , IOException <nl> @ @ - 72 , 35 + 73 , 31 @ @ public class QuorumResponseHandler < T > implements IAsyncCallback <nl> if ( ! success ) <nl> { <nl> StringBuilder sb = new StringBuilder ( " " ) ; <nl> - for ( Message message : responses ) <nl> + for ( Message message : resolver . getMessages ( ) ) <nl> { <nl> sb . append ( message . getFrom ( ) ) ; <nl> } <nl> - throw new TimeoutException ( " Operation timed out - received only " + responses . size ( ) + " responses from " + sb . toString ( ) + " . " ) ; <nl> + throw new TimeoutException ( " Operation timed out - received only " + resolver . getMessageCount ( ) + " responses from " + sb . toString ( ) + " . " ) ; <nl> } <nl> } <nl> finally <nl> { <nl> - for ( Message response : responses ) <nl> + for ( Message response : resolver . getMessages ( ) ) <nl> { <nl> MessagingService . removeRegisteredCallback ( response . getMessageId ( ) ) ; <nl> } <nl> } <nl> <nl> - return responseResolver . resolve ( responses ) ; <nl> + return resolver . resolve ( ) ; <nl> } <nl> <nl> public void response ( Message message ) <nl> { <nl> - responses . add ( message ) ; <nl> - responseResolver . preprocess ( message ) ; <nl> - if ( responses . size ( ) < blockfor ) { <nl> + resolver . preprocess ( message ) ; <nl> + if ( resolver . getMessageCount ( ) < blockfor ) <nl> return ; <nl> - } <nl> - if ( responseResolver . isDataPresent ( responses ) ) <nl> - { <nl> + if ( resolver . isDataPresent ( ) ) <nl> condition . signal ( ) ; <nl> - } <nl> } <nl> <nl> public int determineBlockFor ( ConsistencyLevel consistencyLevel , String table ) <nl> @ @ - 115 , 7 + 112 , 13 @ @ public class QuorumResponseHandler < T > implements IAsyncCallback <nl> case ALL : <nl> return Table . open ( table ) . getReplicationStrategy ( ) . getReplicationFactor ( ) ; <nl> default : <nl> - throw new UnsupportedOperationException ( " invalid consistency level : " + table . toString ( ) ) ; <nl> + throw new UnsupportedOperationException ( " invalid consistency level : " + consistencyLevel ) ; <nl> } <nl> } <nl> + <nl> + public void assureSufficientLiveNodes ( Collection < InetAddress > endpoints ) throws UnavailableException <nl> + { <nl> + if ( endpoints . size ( ) < blockfor ) <nl> + throw new UnavailableException ( ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java b / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java <nl> index bec0c12 . . 8b98019 100644 <nl> - - - a / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java <nl> + + + b / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java <nl> @ @ - 21 , 6 + 21 , 7 @ @ package org . apache . cassandra . service ; <nl> import java . io . IOException ; <nl> import java . net . InetAddress ; <nl> import java . util . * ; <nl> + import java . util . concurrent . LinkedBlockingQueue ; <nl> <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 45 , 6 + 46 , 7 @ @ public class RangeSliceResponseResolver implements IResponseResolver < List < Row > > <nl> private static final Logger logger _ = LoggerFactory . getLogger ( RangeSliceResponseResolver . class ) ; <nl> private final String table ; <nl> private final List < InetAddress > sources ; <nl> + protected final Collection < Message > responses = new LinkedBlockingQueue < Message > ( ) ; ; <nl> <nl> public RangeSliceResponseResolver ( String table , List < InetAddress > sources ) <nl> { <nl> @ @ - 53 , 7 + 55 , 7 @ @ public class RangeSliceResponseResolver implements IResponseResolver < List < Row > > <nl> this . table = table ; <nl> } <nl> <nl> - public List < Row > resolve ( Collection < Message > responses ) throws DigestMismatchException , IOException <nl> + public List < Row > resolve ( ) throws DigestMismatchException , IOException <nl> { <nl> CollatingIterator collator = new CollatingIterator ( new Comparator < Pair < Row , InetAddress > > ( ) <nl> { <nl> @ @ - 110 , 11 + 112 , 12 @ @ public class RangeSliceResponseResolver implements IResponseResolver < List < Row > > <nl> <nl> public void preprocess ( Message message ) <nl> { <nl> + responses . add ( message ) ; <nl> } <nl> <nl> - public boolean isDataPresent ( Collection < Message > responses ) <nl> + public boolean isDataPresent ( ) <nl> { <nl> - return responses . size ( ) > = sources . size ( ) ; <nl> + return ! responses . isEmpty ( ) ; <nl> } <nl> <nl> private static class RowIterator extends AbstractIterator < Pair < Row , InetAddress > > <nl> @ @ - 134 , 4 + 137 , 14 @ @ public class RangeSliceResponseResolver implements IResponseResolver < List < Row > > <nl> return iter . hasNext ( ) ? new Pair < Row , InetAddress > ( iter . next ( ) , source ) : endOfData ( ) ; <nl> } <nl> } <nl> + <nl> + public Iterable < Message > getMessages ( ) <nl> + { <nl> + return responses ; <nl> + } <nl> + <nl> + public int getMessageCount ( ) <nl> + { <nl> + return responses . size ( ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / ReadResponseResolver . java b / src / java / org / apache / cassandra / service / ReadResponseResolver . java <nl> index 4a4d658 . . 440f163 100644 <nl> - - - a / src / java / org / apache / cassandra / service / ReadResponseResolver . java <nl> + + + b / src / java / org / apache / cassandra / service / ReadResponseResolver . java <nl> @ @ - 58 , 14 + 58 , 14 @ @ public class ReadResponseResolver implements IResponseResolver < Row > <nl> * repair request should be scheduled . <nl> * <nl> * / <nl> - 	 public Row resolve ( Collection < Message > responses ) throws DigestMismatchException , IOException <nl> + 	 public Row resolve ( ) throws DigestMismatchException , IOException <nl> { <nl> if ( logger _ . isDebugEnabled ( ) ) <nl> - logger _ . debug ( " resolving " + responses . size ( ) + " responses " ) ; <nl> + logger _ . debug ( " resolving " + results . size ( ) + " responses " ) ; <nl> <nl> long startTime = System . currentTimeMillis ( ) ; <nl> - 	 	 List < ColumnFamily > versions = new ArrayList < ColumnFamily > ( responses . size ( ) ) ; <nl> - 	 	 List < InetAddress > endpoints = new ArrayList < InetAddress > ( responses . size ( ) ) ; <nl> + 	 	 List < ColumnFamily > versions = new ArrayList < ColumnFamily > ( ) ; <nl> + 	 	 List < InetAddress > endpoints = new ArrayList < InetAddress > ( ) ; <nl> 	 	 DecoratedKey key = null ; <nl> 	 	 ByteBuffer digest = FBUtilities . EMPTY _ BYTE _ BUFFER ; <nl> 	 	 boolean isDigestQuery = false ; <nl> @ @ - 76 , 11 + 76 , 10 @ @ public class ReadResponseResolver implements IResponseResolver < Row > <nl> * query exists then we need to compare the digest with <nl> * the digest of the data that is received . <nl> * / <nl> - 	 	 for ( Message message : responses ) <nl> - 	 	 { <nl> - ReadResponse result = results . get ( message ) ; <nl> - if ( result = = null ) <nl> - continue ; / / arrived after quorum already achieved <nl> + for ( Map . Entry < Message , ReadResponse > entry : results . entrySet ( ) ) <nl> + { <nl> + ReadResponse result = entry . getValue ( ) ; <nl> + Message message = entry . getKey ( ) ; <nl> if ( result . isDigestQuery ( ) ) <nl> { <nl> digest = result . digest ( ) ; <nl> @ @ - 187 , 6 + 186 , 8 @ @ public class ReadResponseResolver implements IResponseResolver < Row > <nl> try <nl> { <nl> ReadResponse result = ReadResponse . serializer ( ) . deserialize ( new DataInputStream ( bufIn ) ) ; <nl> + if ( logger _ . isDebugEnabled ( ) ) <nl> + logger _ . debug ( " Preprocessed { } response " , result . isDigestQuery ( ) ? " digest " : " data " ) ; <nl> results . put ( message , result ) ; <nl> } <nl> catch ( IOException e ) <nl> @ @ - 201 , 16 + 202 , 23 @ @ public class ReadResponseResolver implements IResponseResolver < Row > <nl> results . put ( message , result ) ; <nl> } <nl> <nl> - public boolean isDataPresent ( Collection < Message > responses ) <nl> + public boolean isDataPresent ( ) <nl> 	 { <nl> - for ( Message message : responses ) <nl> + for ( ReadResponse result : results . values ( ) ) <nl> { <nl> - ReadResponse result = results . get ( message ) ; <nl> - if ( result = = null ) <nl> - continue ; / / arrived concurrently <nl> if ( ! result . isDigestQuery ( ) ) <nl> return true ; <nl> } <nl> return false ; <nl> } <nl> + <nl> + public Iterable < Message > getMessages ( ) <nl> + { <nl> + return results . keySet ( ) ; <nl> + } <nl> + <nl> + public int getMessageCount ( ) <nl> + { <nl> + return results . size ( ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index 9b96607 . . 32a02dc 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 314 , 7 + 314 , 7 @ @ public class StorageProxy implements StorageProxyMBean <nl> private static List < Row > strongRead ( List < ReadCommand > commands , ConsistencyLevel consistency _ level ) throws IOException , UnavailableException , TimeoutException <nl> { <nl> List < QuorumResponseHandler < Row > > quorumResponseHandlers = new ArrayList < QuorumResponseHandler < Row > > ( ) ; <nl> - List < InetAddress [ ] > commandEndpoints = new ArrayList < InetAddress [ ] > ( ) ; <nl> + List < List < InetAddress > > commandEndpoints = new ArrayList < List < InetAddress > > ( ) ; <nl> List < Row > rows = new ArrayList < Row > ( ) ; <nl> <nl> / / send out read requests <nl> @ @ - 327 , 25 + 327 , 25 @ @ public class StorageProxy implements StorageProxyMBean <nl> Message messageDigestOnly = readMessageDigestOnly . makeReadMessage ( ) ; <nl> <nl> InetAddress dataPoint = StorageService . instance . findSuitableEndpoint ( command . table , command . key ) ; <nl> - List < InetAddress > endpointList = StorageService . instance . getLiveNaturalEndpoints ( command . table , command . key ) ; <nl> + List < InetAddress > endpoints = StorageService . instance . getLiveNaturalEndpoints ( command . table , command . key ) ; <nl> <nl> - InetAddress [ ] endpoints = new InetAddress [ endpointList . size ( ) ] ; <nl> - Message messages [ ] = new Message [ endpointList . size ( ) ] ; <nl> + AbstractReplicationStrategy rs = Table . open ( command . table ) . getReplicationStrategy ( ) ; <nl> + QuorumResponseHandler < Row > handler = rs . getQuorumResponseHandler ( new ReadResponseResolver ( command . table ) , consistency _ level ) ; <nl> + handler . assureSufficientLiveNodes ( endpoints ) ; <nl> + <nl> + Message messages [ ] = new Message [ endpoints . size ( ) ] ; <nl> / / data - request message is sent to dataPoint , the node that will actually get <nl> / / the data for us . The other replicas are only sent a digest query . <nl> int n = 0 ; <nl> - for ( InetAddress endpoint : endpointList ) <nl> + for ( InetAddress endpoint : endpoints ) <nl> { <nl> Message m = endpoint . equals ( dataPoint ) ? message : messageDigestOnly ; <nl> - endpoints [ n ] = endpoint ; <nl> messages [ n + + ] = m ; <nl> if ( logger . isDebugEnabled ( ) ) <nl> logger . debug ( " strongread reading " + ( m = = message ? " data " : " digest " ) + " for " + command + " from " + m . getMessageId ( ) + " @ " + endpoint ) ; <nl> } <nl> - AbstractReplicationStrategy rs = Table . open ( command . table ) . getReplicationStrategy ( ) ; <nl> - QuorumResponseHandler < Row > quorumResponseHandler = rs . getQuorumResponseHandler ( new ReadResponseResolver ( command . table ) , consistency _ level ) ; <nl> - MessagingService . instance . sendRR ( messages , endpoints , quorumResponseHandler ) ; <nl> - quorumResponseHandlers . add ( quorumResponseHandler ) ; <nl> + MessagingService . instance . sendRR ( messages , endpoints , handler ) ; <nl> + quorumResponseHandlers . add ( handler ) ; <nl> commandEndpoints . add ( endpoints ) ; <nl> } <nl> <nl> @ @ - 369 , 14 + 369 , 14 @ @ public class StorageProxy implements StorageProxyMBean <nl> catch ( DigestMismatchException ex ) <nl> { <nl> AbstractReplicationStrategy rs = Table . open ( command . table ) . getReplicationStrategy ( ) ; <nl> - QuorumResponseHandler < Row > qrhRepair = rs . getQuorumResponseHandler ( new ReadResponseResolver ( command . table ) , ConsistencyLevel . QUORUM ) ; <nl> + QuorumResponseHandler < Row > handler = rs . getQuorumResponseHandler ( new ReadResponseResolver ( command . table ) , ConsistencyLevel . QUORUM ) ; <nl> if ( logger . isDebugEnabled ( ) ) <nl> logger . debug ( " Digest mismatch : " , ex ) ; <nl> Message messageRepair = command . makeReadMessage ( ) ; <nl> - MessagingService . instance . sendRR ( messageRepair , commandEndpoints . get ( i ) , qrhRepair ) ; <nl> + MessagingService . instance . sendRR ( messageRepair , commandEndpoints . get ( i ) , handler ) ; <nl> if ( repairResponseHandlers = = null ) <nl> repairResponseHandlers = new ArrayList < QuorumResponseHandler < Row > > ( ) ; <nl> - repairResponseHandlers . add ( qrhRepair ) ; <nl> + repairResponseHandlers . add ( handler ) ; <nl> } <nl> } <nl> <nl> @ @ - 498 , 7 + 498 , 7 @ @ public class StorageProxy implements StorageProxyMBean <nl> final Message msg = new Message ( FBUtilities . getLocalAddress ( ) , StorageService . Verb . SCHEMA _ CHECK , ArrayUtils . EMPTY _ BYTE _ ARRAY ) ; <nl> final CountDownLatch latch = new CountDownLatch ( liveHosts . size ( ) ) ; <nl> / / an empty message acts as a request to the SchemaCheckVerbHandler . <nl> - MessagingService . instance . sendRR ( msg , liveHosts . toArray ( new InetAddress [ ] { } ) , new IAsyncCallback ( ) <nl> + MessagingService . instance . sendRR ( msg , liveHosts , new IAsyncCallback ( ) <nl> { <nl> public void response ( Message msg ) <nl> { <nl> @ @ - 775 , 7 + 775 , 7 @ @ public class StorageProxy implements StorageProxyMBean <nl> logger . debug ( " Starting to send truncate messages to hosts { } " , allEndpoints ) ; <nl> Truncation truncation = new Truncation ( keyspace , cfname ) ; <nl> Message message = truncation . makeTruncationMessage ( ) ; <nl> - MessagingService . instance . sendRR ( message , allEndpoints . toArray ( new InetAddress [ ] { } ) , responseHandler ) ; <nl> + MessagingService . instance . sendRR ( message , allEndpoints , responseHandler ) ; <nl> <nl> / / Wait for all <nl> logger . debug ( " Sent all truncate messages , now waiting for { } responses " , blockFor ) ; <nl> diff - - git a / src / java / org / apache / cassandra / thrift / CassandraServer . java b / src / java / org / apache / cassandra / thrift / CassandraServer . java <nl> index f0f72ff . . e8d659c 100644 <nl> - - - a / src / java / org / apache / cassandra / thrift / CassandraServer . java <nl> + + + b / src / java / org / apache / cassandra / thrift / CassandraServer . java <nl> @ @ - 138 , 6 + 138 , 7 @ @ public class CassandraServer implements Cassandra . Iface <nl> } <nl> catch ( TimeoutException e ) <nl> { <nl> + logger . debug ( " . . . timed out " ) ; <nl> 	 throw new TimedOutException ( ) ; <nl> } <nl> catch ( IOException e ) <nl> @ @ - 442 , 11 + 443 , 12 @ @ public class CassandraServer implements Cassandra . Iface <nl> <nl> try <nl> { <nl> - StorageProxy . mutate ( mutations , consistency _ level ) ; <nl> + StorageProxy . mutate ( mutations , consistency _ level ) ; <nl> } <nl> catch ( TimeoutException e ) <nl> { <nl> - throw new TimedOutException ( ) ; <nl> + logger . debug ( " . . . timed out " ) ; <nl> + throw new TimedOutException ( ) ; <nl> } <nl> } <nl> finally <nl> @ @ - 512 , 6 + 514 , 7 @ @ public class CassandraServer implements Cassandra . Iface <nl> } <nl> catch ( TimeoutException e ) <nl> { <nl> + logger . debug ( " . . . timed out " ) ; <nl> 	 throw new TimedOutException ( ) ; <nl> } <nl> catch ( IOException e ) <nl> @ @ - 556 , 6 + 559 , 7 @ @ public class CassandraServer implements Cassandra . Iface <nl> } <nl> catch ( TimeoutException e ) <nl> { <nl> + logger . debug ( " . . . timed out " ) ; <nl> throw new TimedOutException ( ) ; <nl> } <nl> return thriftifyKeySlices ( rows , column _ parent , column _ predicate ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / service / ConsistencyLevelTest . java b / test / unit / org / apache / cassandra / service / ConsistencyLevelTest . java <nl> new file mode 100644 <nl> index 0000000 . . de86cf4 <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / service / ConsistencyLevelTest . java <nl> @ @ - 0 , 0 + 1 , 145 @ @ <nl> + package org . apache . cassandra . service ; <nl> + <nl> + import java . net . InetAddress ; <nl> + import java . util . ArrayList ; <nl> + import java . util . List ; <nl> + <nl> + import com . google . common . collect . HashMultimap ; <nl> + import org . junit . Test ; <nl> + <nl> + import org . apache . cassandra . CleanupHelper ; <nl> + import org . apache . cassandra . Util ; <nl> + import org . apache . cassandra . config . ConfigurationException ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . db . Row ; <nl> + import org . apache . cassandra . dht . IPartitioner ; <nl> + import org . apache . cassandra . dht . RandomPartitioner ; <nl> + import org . apache . cassandra . dht . Token ; <nl> + import org . apache . cassandra . locator . AbstractReplicationStrategy ; <nl> + import org . apache . cassandra . locator . SimpleSnitch ; <nl> + import org . apache . cassandra . locator . TokenMetadata ; <nl> + import org . apache . cassandra . thrift . ConsistencyLevel ; <nl> + import org . apache . cassandra . thrift . UnavailableException ; <nl> + <nl> + import static org . junit . Assert . assertTrue ; <nl> + import static org . junit . Assert . fail ; <nl> + <nl> + public class ConsistencyLevelTest extends CleanupHelper <nl> + { <nl> + @ Test <nl> + public void testReadWriteConsistencyChecks ( ) throws Exception <nl> + { <nl> + StorageService ss = StorageService . instance ; <nl> + final int RING _ SIZE = 3 ; <nl> + <nl> + TokenMetadata tmd = ss . getTokenMetadata ( ) ; <nl> + tmd . clearUnsafe ( ) ; <nl> + IPartitioner partitioner = new RandomPartitioner ( ) ; <nl> + <nl> + ss . setPartitionerUnsafe ( partitioner ) ; <nl> + <nl> + ArrayList < Token > endpointTokens = new ArrayList < Token > ( ) ; <nl> + ArrayList < Token > keyTokens = new ArrayList < Token > ( ) ; <nl> + List < InetAddress > hosts = new ArrayList < InetAddress > ( ) ; <nl> + <nl> + Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , RING _ SIZE ) ; <nl> + <nl> + HashMultimap < InetAddress , InetAddress > hintedNodes = HashMultimap . create ( ) ; <nl> + <nl> + <nl> + AbstractReplicationStrategy strategy ; <nl> + <nl> + for ( String table : DatabaseDescriptor . getNonSystemTables ( ) ) <nl> + { <nl> + strategy = getStrategy ( table , tmd ) ; <nl> + StorageService . calculatePendingRanges ( strategy , table ) ; <nl> + int replicationFactor = strategy . getReplicationFactor ( ) ; <nl> + if ( replicationFactor < 2 ) <nl> + continue ; <nl> + <nl> + for ( ConsistencyLevel c : ConsistencyLevel . values ( ) ) <nl> + { <nl> + <nl> + if ( c = = ConsistencyLevel . EACH _ QUORUM | | c = = ConsistencyLevel . LOCAL _ QUORUM ) <nl> + continue ; <nl> + <nl> + for ( int i = 0 ; i < replicationFactor ; i + + ) <nl> + { <nl> + hintedNodes . clear ( ) ; <nl> + <nl> + for ( int j = 0 ; j < i ; j + + ) <nl> + { <nl> + hintedNodes . put ( hosts . get ( j ) , hosts . get ( j ) ) ; <nl> + } <nl> + <nl> + IWriteResponseHandler writeHandler = strategy . getWriteResponseHandler ( hosts , hintedNodes , c ) ; <nl> + <nl> + QuorumResponseHandler < Row > readHandler = strategy . getQuorumResponseHandler ( new ReadResponseResolver ( table ) , c ) ; <nl> + <nl> + boolean isWriteUnavailable = false ; <nl> + boolean isReadUnavailable = false ; <nl> + try <nl> + { <nl> + writeHandler . assureSufficientLiveNodes ( ) ; <nl> + } <nl> + catch ( UnavailableException e ) <nl> + { <nl> + isWriteUnavailable = true ; <nl> + } <nl> + <nl> + try <nl> + { <nl> + readHandler . assureSufficientLiveNodes ( hintedNodes . asMap ( ) . keySet ( ) ) ; <nl> + } <nl> + catch ( UnavailableException e ) <nl> + { <nl> + isReadUnavailable = true ; <nl> + } <nl> + <nl> + / / these should always match ( in this kind of test ) <nl> + assertTrue ( isWriteUnavailable = = isReadUnavailable ) ; <nl> + <nl> + switch ( c ) <nl> + { <nl> + case ALL : <nl> + if ( isWriteUnavailable ) <nl> + assertTrue ( hintedNodes . size ( ) < replicationFactor ) ; <nl> + else <nl> + assertTrue ( hintedNodes . size ( ) > = replicationFactor ) ; <nl> + <nl> + break ; <nl> + case ONE : <nl> + case ANY : <nl> + if ( isWriteUnavailable ) <nl> + assertTrue ( hintedNodes . size ( ) = = 0 ) ; <nl> + else <nl> + assertTrue ( hintedNodes . size ( ) > 0 ) ; <nl> + break ; <nl> + case QUORUM : <nl> + if ( isWriteUnavailable ) <nl> + assertTrue ( hintedNodes . size ( ) < ( replicationFactor / 2 + 1 ) ) ; <nl> + else <nl> + assertTrue ( hintedNodes . size ( ) > = ( replicationFactor / 2 + 1 ) ) ; <nl> + break ; <nl> + default : <nl> + fail ( " Unhandled CL : " + c ) ; <nl> + <nl> + } <nl> + } <nl> + } <nl> + return ; <nl> + } <nl> + <nl> + fail ( " Test requires at least one table with RF > 1 " ) ; <nl> + } <nl> + <nl> + private AbstractReplicationStrategy getStrategy ( String table , TokenMetadata tmd ) throws ConfigurationException <nl> + { <nl> + return AbstractReplicationStrategy . createReplicationStrategy ( table , <nl> + " org . apache . cassandra . locator . SimpleStrategy " , <nl> + tmd , <nl> + new SimpleSnitch ( ) , <nl> + null ) ; <nl> + } <nl> + <nl> + }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 01d32e7 . . c9d507a 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 6 @ @ 
+ 2 . 0 . 11 : 
+ + * Log exceptions related to unclean native protocol client disconnects 
+ + at DEBUG or INFO ( CASSANDRA - 7849 ) 
+ * Allow permissions cache to be set via JMX ( CASSANDRA - 7698 ) 
+ * Include schema _ triggers CF in readable system resources ( CASSANDRA - 7967 ) 
+ * Fix RowIndexEntry to report correct serializedSize ( CASSANDRA - 7948 ) 
+ diff - - git a / src / java / org / apache / cassandra / transport / Message . java b / src / java / org / apache / cassandra / transport / Message . java 
+ index bbe7e38 . . eb38558 100644 
+ - - - a / src / java / org / apache / cassandra / transport / Message . java 
+ + + + b / src / java / org / apache / cassandra / transport / Message . java 
+ @ @ - 17 , 9 + 17 , 13 @ @ 
+ * / 
+ package org . apache . cassandra . transport ; 
+ 
+ + import java . io . IOException ; 
+ import java . util . EnumSet ; 
+ + import java . util . Set ; 
+ import java . util . UUID ; 
+ 
+ + import com . google . common . base . Predicate ; 
+ + import com . google . common . collect . ImmutableSet ; 
+ import org . jboss . netty . buffer . ChannelBuffer ; 
+ import org . jboss . netty . buffer . ChannelBuffers ; 
+ import org . jboss . netty . channel . * ; 
+ @ @ - 38 , 6 + 42 , 17 @ @ public abstract class Message 
+ { 
+ protected static final Logger logger = LoggerFactory . getLogger ( Message . class ) ; 
+ 
+ + / * * 
+ + * When we encounter an unexpected IOException we look for these { @ link Throwable # getMessage ( ) messages } 
+ + * ( because we have no better way to distinguish ) and log them at DEBUG rather than INFO , since they 
+ + * are generally caused by unclean client disconnects rather than an actual problem . 
+ + * / 
+ + private static final Set < String > ioExceptionsAtDebugLevel = ImmutableSet . < String > builder ( ) . 
+ + add ( " Connection reset by peer " ) . 
+ + add ( " Broken pipe " ) . 
+ + add ( " Connection timed out " ) . 
+ + build ( ) ; 
+ + 
+ public interface Codec < M extends Message > extends CBCodec < M > { } 
+ 
+ public enum Direction 
+ @ @ - 315 , 7 + 330 , 7 @ @ public abstract class Message 
+ catch ( Throwable ex ) 
+ { 
+ / / Don ' t let the exception propagate to exceptionCaught ( ) if we can help it so that we can assign the right streamID . 
+ - ctx . getChannel ( ) . write ( ErrorMessage . fromException ( ex ) . setStreamId ( request . getStreamId ( ) ) ) ; 
+ + ctx . getChannel ( ) . write ( ErrorMessage . fromException ( ex , new UnexpectedChannelExceptionHandler ( ctx . getChannel ( ) , true ) ) . setStreamId ( request . getStreamId ( ) ) ) ; 
+ } 
+ } 
+ 
+ @ @ - 325 , 7 + 340 , 7 @ @ public abstract class Message 
+ { 
+ if ( ctx . getChannel ( ) . isOpen ( ) ) 
+ { 
+ - ChannelFuture future = ctx . getChannel ( ) . write ( ErrorMessage . fromException ( e . getCause ( ) ) ) ; 
+ + ChannelFuture future = ctx . getChannel ( ) . write ( ErrorMessage . fromException ( e . getCause ( ) , new UnexpectedChannelExceptionHandler ( ctx . getChannel ( ) , false ) ) ) ; 
+ / / On protocol exception , close the channel as soon as the message have been sent 
+ if ( e . getCause ( ) instanceof ProtocolException ) 
+ { 
+ @ @ - 338 , 4 + 353 , 58 @ @ public abstract class Message 
+ } 
+ } 
+ } 
+ + 
+ + / * * 
+ + * Include the channel info in the logged information for unexpected errors , and ( if { @ link # alwaysLogAtError } is 
+ + * false then choose the log level based on the type of exception ( some are clearly client issues and shouldn ' t be 
+ + * logged at server ERROR level ) 
+ + * / 
+ + static final class UnexpectedChannelExceptionHandler implements Predicate < Throwable > 
+ + { 
+ + private final Channel channel ; 
+ + private final boolean alwaysLogAtError ; 
+ + 
+ + UnexpectedChannelExceptionHandler ( Channel channel , boolean alwaysLogAtError ) 
+ + { 
+ + this . channel = channel ; 
+ + this . alwaysLogAtError = alwaysLogAtError ; 
+ + } 
+ + 
+ + @ Override 
+ + public boolean apply ( Throwable exception ) 
+ + { 
+ + String message ; 
+ + try 
+ + { 
+ + message = " Unexpected exception during request ; channel = " + channel ; 
+ + } 
+ + catch ( Exception ignore ) 
+ + { 
+ + / / We don ' t want to make things worse if String . valueOf ( ) throws an exception 
+ + message = " Unexpected exception during request ; channel = < unprintable > " ; 
+ + } 
+ + 
+ + if ( ! alwaysLogAtError & & exception instanceof IOException ) 
+ + { 
+ + if ( ioExceptionsAtDebugLevel . contains ( exception . getMessage ( ) ) ) 
+ + { 
+ + / / Likely unclean client disconnects 
+ + logger . debug ( message , exception ) ; 
+ + } 
+ + else 
+ + { 
+ + / / Generally unhandled IO exceptions are network issues , not actual ERRORS 
+ + logger . info ( message , exception ) ; 
+ + } 
+ + } 
+ + else 
+ + { 
+ + / / Anything else is probably a bug in server of client binary protocol handling 
+ + logger . error ( message , exception ) ; 
+ + } 
+ + 
+ + / / We handled the exception . 
+ + return true ; 
+ + } 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / transport / messages / ErrorMessage . java b / src / java / org / apache / cassandra / transport / messages / ErrorMessage . java 
+ index 3ca5801 . . 4d60a1f 100644 
+ - - - a / src / java / org / apache / cassandra / transport / messages / ErrorMessage . java 
+ + + + b / src / java / org / apache / cassandra / transport / messages / ErrorMessage . java 
+ @ @ - 17 , 10 + 17 , 8 @ @ 
+ * / 
+ package org . apache . cassandra . transport . messages ; 
+ 
+ - import java . nio . ByteBuffer ; 
+ - 
+ + import com . google . common . base . Predicate ; 
+ import org . jboss . netty . buffer . ChannelBuffer ; 
+ - import org . jboss . netty . buffer . ChannelBuffers ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 31 , 7 + 29 , 6 @ @ import org . apache . cassandra . transport . CBUtil ; 
+ import org . apache . cassandra . transport . Message ; 
+ import org . apache . cassandra . transport . ProtocolException ; 
+ import org . apache . cassandra . transport . ServerError ; 
+ - import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . MD5Digest ; 
+ 
+ / * * 
+ @ @ - 208 , 6 + 205 , 16 @ @ public class ErrorMessage extends Message . Response 
+ 
+ public static ErrorMessage fromException ( Throwable e ) 
+ { 
+ + return fromException ( e , null ) ; 
+ + } 
+ + 
+ + / * * 
+ + * @ param e the exception 
+ + * @ param unexpectedExceptionHandler a callback for handling unexpected exceptions . If null , or if this 
+ + * returns false , the error is logged at ERROR level via sl4fj 
+ + * / 
+ + public static ErrorMessage fromException ( Throwable e , Predicate < Throwable > unexpectedExceptionHandler ) 
+ + { 
+ int streamId = 0 ; 
+ if ( e instanceof WrappedException ) 
+ { 
+ @ @ - 219 , 7 + 226 , 9 @ @ public class ErrorMessage extends Message . Response 
+ return new ErrorMessage ( ( TransportException ) e , streamId ) ; 
+ 
+ / / Unexpected exception 
+ - logger . error ( " Unexpected exception during request " , e ) ; 
+ + if ( unexpectedExceptionHandler = = null | | ! unexpectedExceptionHandler . apply ( e ) ) 
+ + logger . error ( " Unexpected exception during request " , e ) ; 
+ + 
+ return new ErrorMessage ( new ServerError ( e ) , streamId ) ; 
+ } 
+
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 571da4c . . 21563bb 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 27 , 6 + 27 , 8 @ @ dev 
+ ( CASSANDRA - 1804 ) 
+ * cli support index type enum names ( CASSANDRA - 1810 ) 
+ * improved validation of column _ metadata ( CASSANDRA - 1813 ) 
+ + * reads at ConsistencyLevel > 1 throw UnavailableException 
+ + immediately if insufficient live nodes exist ( CASSANDRA - 1803 ) 
+ 
+ 
+ 0 . 7 . 0 - rc1 
+ diff - - git a / src / java / org / apache / cassandra / db / HintedHandOffManager . java b / src / java / org / apache / cassandra / db / HintedHandOffManager . java 
+ index dac5145 . . c83bb64 100644 
+ - - - a / src / java / org / apache / cassandra / db / HintedHandOffManager . java 
+ + + + b / src / java / org / apache / cassandra / db / HintedHandOffManager . java 
+ @ @ - 24 , 6 + 24 , 7 @ @ import java . io . IOException ; 
+ import java . net . InetAddress ; 
+ import java . net . UnknownHostException ; 
+ import java . nio . ByteBuffer ; 
+ + import java . util . Arrays ; 
+ import java . util . Collection ; 
+ import java . util . concurrent . ExecutorService ; 
+ import java . util . concurrent . TimeoutException ; 
+ @ @ - 122 , 7 + 123 , 7 @ @ public class HintedHandOffManager 
+ rm . add ( cf ) ; 
+ Message message = rm . makeRowMutationMessage ( ) ; 
+ IWriteResponseHandler responseHandler = WriteResponseHandler . create ( endpoint ) ; 
+ - MessagingService . instance . sendRR ( message , new InetAddress [ ] { endpoint } , responseHandler ) ; 
+ + MessagingService . instance . sendRR ( message , Arrays . asList ( endpoint ) , responseHandler ) ; 
+ try 
+ { 
+ responseHandler . get ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / net / MessagingService . java b / src / java / org / apache / cassandra / net / MessagingService . java 
+ index 5da901c . . 883eb0a 100644 
+ - - - a / src / java / org / apache / cassandra / net / MessagingService . java 
+ + + + b / src / java / org / apache / cassandra / net / MessagingService . java 
+ @ @ - 29 , 9 + 29 , 7 @ @ import java . nio . ByteBuffer ; 
+ import java . nio . channels . AsynchronousCloseException ; 
+ import java . nio . channels . ServerSocketChannel ; 
+ import java . security . MessageDigest ; 
+ - import java . util . EnumMap ; 
+ - import java . util . HashMap ; 
+ - import java . util . Map ; 
+ + import java . util . * ; 
+ import java . util . concurrent . ExecutorService ; 
+ import java . util . concurrent . TimeUnit ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ @ @ - 226 , 7 + 224 , 7 @ @ public class MessagingService implements MessagingServiceMBean 
+ * @ return an reference to an IAsyncResult which can be queried for the 
+ * response 
+ * / 
+ - public String sendRR ( Message message , InetAddress [ ] to , IAsyncCallback cb ) 
+ + public String sendRR ( Message message , Collection < InetAddress > to , IAsyncCallback cb ) 
+ { 
+ String messageId = message . getMessageId ( ) ; 
+ addCallback ( cb , messageId ) ; 
+ @ @ - 273 , 18 + 271 , 16 @ @ public class MessagingService implements MessagingServiceMBean 
+ * suggest that a timeout occured to the invoker of the send ( ) . 
+ * @ return an reference to message id used to match with the result 
+ * / 
+ - public String sendRR ( Message [ ] messages , InetAddress [ ] to , IAsyncCallback cb ) 
+ + public String sendRR ( Message [ ] messages , List < InetAddress > to , IAsyncCallback cb ) 
+ { 
+ - if ( messages . length ! = to . length ) 
+ - { 
+ + if ( messages . length ! = to . size ( ) ) 
+ throw new IllegalArgumentException ( " Number of messages and the number of endpoints need to be same . " ) ; 
+ - } 
+ String groupId = GuidGenerator . guid ( ) ; 
+ addCallback ( cb , groupId ) ; 
+ for ( int i = 0 ; i < messages . length ; + + i ) 
+ { 
+ messages [ i ] . setMessageId ( groupId ) ; 
+ - sendOneWay ( messages [ i ] , to [ i ] ) ; 
+ + sendOneWay ( messages [ i ] , to . get ( i ) ) ; 
+ } 
+ return groupId ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / ConsistencyChecker . java b / src / java / org / apache / cassandra / service / ConsistencyChecker . java 
+ index a30b67f . . f1bc2f2 100644 
+ - - - a / src / java / org / apache / cassandra / service / ConsistencyChecker . java 
+ + + + b / src / java / org / apache / cassandra / service / ConsistencyChecker . java 
+ @ @ - 156 , 7 + 156 , 6 @ @ class ConsistencyChecker implements Runnable 
+ 
+ 	 static class DataRepairHandler implements IAsyncCallback 
+ 	 { 
+ - 	 	 private final Collection < Message > responses _ = new LinkedBlockingQueue < Message > ( ) ; 
+ 	 	 private final ReadResponseResolver readResponseResolver _ ; 
+ 	 	 private final int majority _ ; 
+ 	 	 
+ @ @ - 167 , 7 + 166 , 6 @ @ class ConsistencyChecker implements Runnable 
+ / / wrap localRow in a response Message so it doesn ' t need to be special - cased in the resolver 
+ ReadResponse readResponse = new ReadResponse ( localRow ) ; 
+ Message fakeMessage = new Message ( FBUtilities . getLocalAddress ( ) , StorageService . Verb . INTERNAL _ RESPONSE , ArrayUtils . EMPTY _ BYTE _ ARRAY ) ; 
+ - responses _ . add ( fakeMessage ) ; 
+ readResponseResolver _ . injectPreProcessed ( fakeMessage , readResponse ) ; 
+ } 
+ 
+ @ @ - 176 , 15 + 174 , 14 @ @ class ConsistencyChecker implements Runnable 
+ 	 	 { 
+ 	 	 	 if ( logger _ . isDebugEnabled ( ) ) 
+ 	 	 	 logger _ . debug ( " Received response in DataRepairHandler : " + message . toString ( ) ) ; 
+ - 	 	 	 responses _ . add ( message ) ; 
+ readResponseResolver _ . preprocess ( message ) ; 
+ - if ( responses _ . size ( ) = = majority _ ) 
+ + if ( readResponseResolver _ . getMessageCount ( ) = = majority _ ) 
+ { 
+ Runnable runnable = new WrappedRunnable ( ) 
+ { 
+ public void runMayThrow ( ) throws IOException , DigestMismatchException 
+ { 
+ - readResponseResolver _ . resolve ( responses _ ) ; 
+ + readResponseResolver _ . resolve ( ) ; 
+ } 
+ } ; 
+ / / give remaining replicas until timeout to reply and get added to responses _ 
+ diff - - git a / src / java / org / apache / cassandra / service / DatacenterQuorumResponseHandler . java b / src / java / org / apache / cassandra / service / DatacenterQuorumResponseHandler . java 
+ index 6267df9 . . 0180d51 100644 
+ - - - a / src / java / org / apache / cassandra / service / DatacenterQuorumResponseHandler . java 
+ + + + b / src / java / org / apache / cassandra / service / DatacenterQuorumResponseHandler . java 
+ @ @ - 21 , 6 + 21 , 9 @ @ package org . apache . cassandra . service ; 
+ * / 
+ 
+ 
+ + import java . net . InetAddress ; 
+ + import java . util . Collection ; 
+ + import java . util . List ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ @ @ - 29 , 6 + 32 , 7 @ @ import org . apache . cassandra . locator . IEndpointSnitch ; 
+ import org . apache . cassandra . locator . NetworkTopologyStrategy ; 
+ import org . apache . cassandra . net . Message ; 
+ import org . apache . cassandra . thrift . ConsistencyLevel ; 
+ + import org . apache . cassandra . thrift . UnavailableException ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ / * * 
+ @ @ - 49 , 14 + 53 , 14 @ @ public class DatacenterQuorumResponseHandler < T > extends QuorumResponseHandler < T > 
+ @ Override 
+ public void response ( Message message ) 
+ { 
+ - responses . add ( message ) ; / / we ' ll go ahead and resolve a reply from anyone , even if it ' s not from this dc 
+ + resolver . preprocess ( message ) ; 
+ 
+ int n ; 
+ n = localdc . equals ( snitch . getDatacenter ( message . getFrom ( ) ) ) 
+ ? localResponses . decrementAndGet ( ) 
+ : localResponses . get ( ) ; 
+ 
+ - if ( n = = 0 & & responseResolver . isDataPresent ( responses ) ) 
+ + if ( n = = 0 & & resolver . isDataPresent ( ) ) 
+ { 
+ condition . signal ( ) ; 
+ } 
+ @ @ - 68 , 4 + 72 , 18 @ @ public class DatacenterQuorumResponseHandler < T > extends QuorumResponseHandler < T > 
+ NetworkTopologyStrategy stategy = ( NetworkTopologyStrategy ) Table . open ( table ) . getReplicationStrategy ( ) ; 
+ 	 	 return ( stategy . getReplicationFactor ( localdc ) / 2 ) + 1 ; 
+ 	 } 
+ + 
+ + @ Override 
+ + public void assureSufficientLiveNodes ( Collection < InetAddress > endpoints ) throws UnavailableException 
+ + { 
+ + int localEndpoints = 0 ; 
+ + for ( InetAddress endpoint : endpoints ) 
+ + { 
+ + if ( localdc . equals ( snitch . getDatacenter ( endpoint ) ) ) 
+ + localEndpoints + + ; 
+ + } 
+ + 
+ + if ( localEndpoints < blockfor ) 
+ + throw new UnavailableException ( ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / IResponseResolver . java b / src / java / org / apache / cassandra / service / IResponseResolver . java 
+ index 0b5b54f . . ea61705 100644 
+ - - - a / src / java / org / apache / cassandra / service / IResponseResolver . java 
+ + + + b / src / java / org / apache / cassandra / service / IResponseResolver . java 
+ @ @ - 34 , 8 + 34 , 10 @ @ public interface IResponseResolver < T > { 
+ 	 * repairs . Hence you need to derive a response resolver based on your 
+ 	 * needs from this interface . 
+ 	 * / 
+ - 	 public T resolve ( Collection < Message > responses ) throws DigestMismatchException , IOException ; 
+ - 	 public boolean isDataPresent ( Collection < Message > responses ) ; 
+ + 	 public T resolve ( ) throws DigestMismatchException , IOException ; 
+ + 	 public boolean isDataPresent ( ) ; 
+ 
+ public void preprocess ( Message message ) ; 
+ + public Iterable < Message > getMessages ( ) ; 
+ + public int getMessageCount ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / QuorumResponseHandler . java b / src / java / org / apache / cassandra / service / QuorumResponseHandler . java 
+ index a703e05 . . 9d7c7fd 100644 
+ - - - a / src / java / org / apache / cassandra / service / QuorumResponseHandler . java 
+ + + + b / src / java / org / apache / cassandra / service / QuorumResponseHandler . java 
+ @ @ - 18 , 11 + 18 , 11 @ @ 
+ 
+ package org . apache . cassandra . service ; 
+ 
+ + import java . io . IOException ; 
+ + import java . net . InetAddress ; 
+ import java . util . Collection ; 
+ - import java . util . concurrent . LinkedBlockingQueue ; 
+ import java . util . concurrent . TimeUnit ; 
+ import java . util . concurrent . TimeoutException ; 
+ - import java . io . IOException ; 
+ 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . Table ; 
+ @ @ - 30 , 8 + 30 , 8 @ @ import org . apache . cassandra . net . IAsyncCallback ; 
+ import org . apache . cassandra . net . Message ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ import org . apache . cassandra . thrift . ConsistencyLevel ; 
+ + import org . apache . cassandra . thrift . UnavailableException ; 
+ import org . apache . cassandra . utils . SimpleCondition ; 
+ - 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 39 , 19 + 39 , 20 @ @ public class QuorumResponseHandler < T > implements IAsyncCallback 
+ { 
+ protected static final Logger logger = LoggerFactory . getLogger ( QuorumResponseHandler . class ) ; 
+ protected final SimpleCondition condition = new SimpleCondition ( ) ; 
+ - protected final Collection < Message > responses = new LinkedBlockingQueue < Message > ( ) ; ; 
+ - protected IResponseResolver < T > responseResolver ; 
+ + protected final IResponseResolver < T > resolver ; 
+ private final long startTime ; 
+ - protected int blockfor ; 
+ + protected final int blockfor ; 
+ 
+ / * * 
+ * Constructor when response count has to be calculated and blocked for . 
+ * / 
+ - public QuorumResponseHandler ( IResponseResolver < T > responseResolver , ConsistencyLevel consistencyLevel , String table ) 
+ + public QuorumResponseHandler ( IResponseResolver < T > resolver , ConsistencyLevel consistencyLevel , String table ) 
+ { 
+ this . blockfor = determineBlockFor ( consistencyLevel , table ) ; 
+ - this . responseResolver = responseResolver ; 
+ + this . resolver = resolver ; 
+ this . startTime = System . currentTimeMillis ( ) ; 
+ + 
+ + logger . debug ( " QuorumResponseHandler blocking for { } responses " , blockfor ) ; 
+ } 
+ 
+ public T get ( ) throws TimeoutException , DigestMismatchException , IOException 
+ @ @ - 72 , 35 + 73 , 31 @ @ public class QuorumResponseHandler < T > implements IAsyncCallback 
+ if ( ! success ) 
+ { 
+ StringBuilder sb = new StringBuilder ( " " ) ; 
+ - for ( Message message : responses ) 
+ + for ( Message message : resolver . getMessages ( ) ) 
+ { 
+ sb . append ( message . getFrom ( ) ) ; 
+ } 
+ - throw new TimeoutException ( " Operation timed out - received only " + responses . size ( ) + " responses from " + sb . toString ( ) + " . " ) ; 
+ + throw new TimeoutException ( " Operation timed out - received only " + resolver . getMessageCount ( ) + " responses from " + sb . toString ( ) + " . " ) ; 
+ } 
+ } 
+ finally 
+ { 
+ - for ( Message response : responses ) 
+ + for ( Message response : resolver . getMessages ( ) ) 
+ { 
+ MessagingService . removeRegisteredCallback ( response . getMessageId ( ) ) ; 
+ } 
+ } 
+ 
+ - return responseResolver . resolve ( responses ) ; 
+ + return resolver . resolve ( ) ; 
+ } 
+ 
+ public void response ( Message message ) 
+ { 
+ - responses . add ( message ) ; 
+ - responseResolver . preprocess ( message ) ; 
+ - if ( responses . size ( ) < blockfor ) { 
+ + resolver . preprocess ( message ) ; 
+ + if ( resolver . getMessageCount ( ) < blockfor ) 
+ return ; 
+ - } 
+ - if ( responseResolver . isDataPresent ( responses ) ) 
+ - { 
+ + if ( resolver . isDataPresent ( ) ) 
+ condition . signal ( ) ; 
+ - } 
+ } 
+ 
+ public int determineBlockFor ( ConsistencyLevel consistencyLevel , String table ) 
+ @ @ - 115 , 7 + 112 , 13 @ @ public class QuorumResponseHandler < T > implements IAsyncCallback 
+ case ALL : 
+ return Table . open ( table ) . getReplicationStrategy ( ) . getReplicationFactor ( ) ; 
+ default : 
+ - throw new UnsupportedOperationException ( " invalid consistency level : " + table . toString ( ) ) ; 
+ + throw new UnsupportedOperationException ( " invalid consistency level : " + consistencyLevel ) ; 
+ } 
+ } 
+ + 
+ + public void assureSufficientLiveNodes ( Collection < InetAddress > endpoints ) throws UnavailableException 
+ + { 
+ + if ( endpoints . size ( ) < blockfor ) 
+ + throw new UnavailableException ( ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java b / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java 
+ index bec0c12 . . 8b98019 100644 
+ - - - a / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java 
+ + + + b / src / java / org / apache / cassandra / service / RangeSliceResponseResolver . java 
+ @ @ - 21 , 6 + 21 , 7 @ @ package org . apache . cassandra . service ; 
+ import java . io . IOException ; 
+ import java . net . InetAddress ; 
+ import java . util . * ; 
+ + import java . util . concurrent . LinkedBlockingQueue ; 
+ 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 45 , 6 + 46 , 7 @ @ public class RangeSliceResponseResolver implements IResponseResolver < List < Row > > 
+ private static final Logger logger _ = LoggerFactory . getLogger ( RangeSliceResponseResolver . class ) ; 
+ private final String table ; 
+ private final List < InetAddress > sources ; 
+ + protected final Collection < Message > responses = new LinkedBlockingQueue < Message > ( ) ; ; 
+ 
+ public RangeSliceResponseResolver ( String table , List < InetAddress > sources ) 
+ { 
+ @ @ - 53 , 7 + 55 , 7 @ @ public class RangeSliceResponseResolver implements IResponseResolver < List < Row > > 
+ this . table = table ; 
+ } 
+ 
+ - public List < Row > resolve ( Collection < Message > responses ) throws DigestMismatchException , IOException 
+ + public List < Row > resolve ( ) throws DigestMismatchException , IOException 
+ { 
+ CollatingIterator collator = new CollatingIterator ( new Comparator < Pair < Row , InetAddress > > ( ) 
+ { 
+ @ @ - 110 , 11 + 112 , 12 @ @ public class RangeSliceResponseResolver implements IResponseResolver < List < Row > > 
+ 
+ public void preprocess ( Message message ) 
+ { 
+ + responses . add ( message ) ; 
+ } 
+ 
+ - public boolean isDataPresent ( Collection < Message > responses ) 
+ + public boolean isDataPresent ( ) 
+ { 
+ - return responses . size ( ) > = sources . size ( ) ; 
+ + return ! responses . isEmpty ( ) ; 
+ } 
+ 
+ private static class RowIterator extends AbstractIterator < Pair < Row , InetAddress > > 
+ @ @ - 134 , 4 + 137 , 14 @ @ public class RangeSliceResponseResolver implements IResponseResolver < List < Row > > 
+ return iter . hasNext ( ) ? new Pair < Row , InetAddress > ( iter . next ( ) , source ) : endOfData ( ) ; 
+ } 
+ } 
+ + 
+ + public Iterable < Message > getMessages ( ) 
+ + { 
+ + return responses ; 
+ + } 
+ + 
+ + public int getMessageCount ( ) 
+ + { 
+ + return responses . size ( ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / ReadResponseResolver . java b / src / java / org / apache / cassandra / service / ReadResponseResolver . java 
+ index 4a4d658 . . 440f163 100644 
+ - - - a / src / java / org / apache / cassandra / service / ReadResponseResolver . java 
+ + + + b / src / java / org / apache / cassandra / service / ReadResponseResolver . java 
+ @ @ - 58 , 14 + 58 , 14 @ @ public class ReadResponseResolver implements IResponseResolver < Row > 
+ * repair request should be scheduled . 
+ * 
+ * / 
+ - 	 public Row resolve ( Collection < Message > responses ) throws DigestMismatchException , IOException 
+ + 	 public Row resolve ( ) throws DigestMismatchException , IOException 
+ { 
+ if ( logger _ . isDebugEnabled ( ) ) 
+ - logger _ . debug ( " resolving " + responses . size ( ) + " responses " ) ; 
+ + logger _ . debug ( " resolving " + results . size ( ) + " responses " ) ; 
+ 
+ long startTime = System . currentTimeMillis ( ) ; 
+ - 	 	 List < ColumnFamily > versions = new ArrayList < ColumnFamily > ( responses . size ( ) ) ; 
+ - 	 	 List < InetAddress > endpoints = new ArrayList < InetAddress > ( responses . size ( ) ) ; 
+ + 	 	 List < ColumnFamily > versions = new ArrayList < ColumnFamily > ( ) ; 
+ + 	 	 List < InetAddress > endpoints = new ArrayList < InetAddress > ( ) ; 
+ 	 	 DecoratedKey key = null ; 
+ 	 	 ByteBuffer digest = FBUtilities . EMPTY _ BYTE _ BUFFER ; 
+ 	 	 boolean isDigestQuery = false ; 
+ @ @ - 76 , 11 + 76 , 10 @ @ public class ReadResponseResolver implements IResponseResolver < Row > 
+ * query exists then we need to compare the digest with 
+ * the digest of the data that is received . 
+ * / 
+ - 	 	 for ( Message message : responses ) 
+ - 	 	 { 
+ - ReadResponse result = results . get ( message ) ; 
+ - if ( result = = null ) 
+ - continue ; / / arrived after quorum already achieved 
+ + for ( Map . Entry < Message , ReadResponse > entry : results . entrySet ( ) ) 
+ + { 
+ + ReadResponse result = entry . getValue ( ) ; 
+ + Message message = entry . getKey ( ) ; 
+ if ( result . isDigestQuery ( ) ) 
+ { 
+ digest = result . digest ( ) ; 
+ @ @ - 187 , 6 + 186 , 8 @ @ public class ReadResponseResolver implements IResponseResolver < Row > 
+ try 
+ { 
+ ReadResponse result = ReadResponse . serializer ( ) . deserialize ( new DataInputStream ( bufIn ) ) ; 
+ + if ( logger _ . isDebugEnabled ( ) ) 
+ + logger _ . debug ( " Preprocessed { } response " , result . isDigestQuery ( ) ? " digest " : " data " ) ; 
+ results . put ( message , result ) ; 
+ } 
+ catch ( IOException e ) 
+ @ @ - 201 , 16 + 202 , 23 @ @ public class ReadResponseResolver implements IResponseResolver < Row > 
+ results . put ( message , result ) ; 
+ } 
+ 
+ - public boolean isDataPresent ( Collection < Message > responses ) 
+ + public boolean isDataPresent ( ) 
+ 	 { 
+ - for ( Message message : responses ) 
+ + for ( ReadResponse result : results . values ( ) ) 
+ { 
+ - ReadResponse result = results . get ( message ) ; 
+ - if ( result = = null ) 
+ - continue ; / / arrived concurrently 
+ if ( ! result . isDigestQuery ( ) ) 
+ return true ; 
+ } 
+ return false ; 
+ } 
+ + 
+ + public Iterable < Message > getMessages ( ) 
+ + { 
+ + return results . keySet ( ) ; 
+ + } 
+ + 
+ + public int getMessageCount ( ) 
+ + { 
+ + return results . size ( ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index 9b96607 . . 32a02dc 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 314 , 7 + 314 , 7 @ @ public class StorageProxy implements StorageProxyMBean 
+ private static List < Row > strongRead ( List < ReadCommand > commands , ConsistencyLevel consistency _ level ) throws IOException , UnavailableException , TimeoutException 
+ { 
+ List < QuorumResponseHandler < Row > > quorumResponseHandlers = new ArrayList < QuorumResponseHandler < Row > > ( ) ; 
+ - List < InetAddress [ ] > commandEndpoints = new ArrayList < InetAddress [ ] > ( ) ; 
+ + List < List < InetAddress > > commandEndpoints = new ArrayList < List < InetAddress > > ( ) ; 
+ List < Row > rows = new ArrayList < Row > ( ) ; 
+ 
+ / / send out read requests 
+ @ @ - 327 , 25 + 327 , 25 @ @ public class StorageProxy implements StorageProxyMBean 
+ Message messageDigestOnly = readMessageDigestOnly . makeReadMessage ( ) ; 
+ 
+ InetAddress dataPoint = StorageService . instance . findSuitableEndpoint ( command . table , command . key ) ; 
+ - List < InetAddress > endpointList = StorageService . instance . getLiveNaturalEndpoints ( command . table , command . key ) ; 
+ + List < InetAddress > endpoints = StorageService . instance . getLiveNaturalEndpoints ( command . table , command . key ) ; 
+ 
+ - InetAddress [ ] endpoints = new InetAddress [ endpointList . size ( ) ] ; 
+ - Message messages [ ] = new Message [ endpointList . size ( ) ] ; 
+ + AbstractReplicationStrategy rs = Table . open ( command . table ) . getReplicationStrategy ( ) ; 
+ + QuorumResponseHandler < Row > handler = rs . getQuorumResponseHandler ( new ReadResponseResolver ( command . table ) , consistency _ level ) ; 
+ + handler . assureSufficientLiveNodes ( endpoints ) ; 
+ + 
+ + Message messages [ ] = new Message [ endpoints . size ( ) ] ; 
+ / / data - request message is sent to dataPoint , the node that will actually get 
+ / / the data for us . The other replicas are only sent a digest query . 
+ int n = 0 ; 
+ - for ( InetAddress endpoint : endpointList ) 
+ + for ( InetAddress endpoint : endpoints ) 
+ { 
+ Message m = endpoint . equals ( dataPoint ) ? message : messageDigestOnly ; 
+ - endpoints [ n ] = endpoint ; 
+ messages [ n + + ] = m ; 
+ if ( logger . isDebugEnabled ( ) ) 
+ logger . debug ( " strongread reading " + ( m = = message ? " data " : " digest " ) + " for " + command + " from " + m . getMessageId ( ) + " @ " + endpoint ) ; 
+ } 
+ - AbstractReplicationStrategy rs = Table . open ( command . table ) . getReplicationStrategy ( ) ; 
+ - QuorumResponseHandler < Row > quorumResponseHandler = rs . getQuorumResponseHandler ( new ReadResponseResolver ( command . table ) , consistency _ level ) ; 
+ - MessagingService . instance . sendRR ( messages , endpoints , quorumResponseHandler ) ; 
+ - quorumResponseHandlers . add ( quorumResponseHandler ) ; 
+ + MessagingService . instance . sendRR ( messages , endpoints , handler ) ; 
+ + quorumResponseHandlers . add ( handler ) ; 
+ commandEndpoints . add ( endpoints ) ; 
+ } 
+ 
+ @ @ - 369 , 14 + 369 , 14 @ @ public class StorageProxy implements StorageProxyMBean 
+ catch ( DigestMismatchException ex ) 
+ { 
+ AbstractReplicationStrategy rs = Table . open ( command . table ) . getReplicationStrategy ( ) ; 
+ - QuorumResponseHandler < Row > qrhRepair = rs . getQuorumResponseHandler ( new ReadResponseResolver ( command . table ) , ConsistencyLevel . QUORUM ) ; 
+ + QuorumResponseHandler < Row > handler = rs . getQuorumResponseHandler ( new ReadResponseResolver ( command . table ) , ConsistencyLevel . QUORUM ) ; 
+ if ( logger . isDebugEnabled ( ) ) 
+ logger . debug ( " Digest mismatch : " , ex ) ; 
+ Message messageRepair = command . makeReadMessage ( ) ; 
+ - MessagingService . instance . sendRR ( messageRepair , commandEndpoints . get ( i ) , qrhRepair ) ; 
+ + MessagingService . instance . sendRR ( messageRepair , commandEndpoints . get ( i ) , handler ) ; 
+ if ( repairResponseHandlers = = null ) 
+ repairResponseHandlers = new ArrayList < QuorumResponseHandler < Row > > ( ) ; 
+ - repairResponseHandlers . add ( qrhRepair ) ; 
+ + repairResponseHandlers . add ( handler ) ; 
+ } 
+ } 
+ 
+ @ @ - 498 , 7 + 498 , 7 @ @ public class StorageProxy implements StorageProxyMBean 
+ final Message msg = new Message ( FBUtilities . getLocalAddress ( ) , StorageService . Verb . SCHEMA _ CHECK , ArrayUtils . EMPTY _ BYTE _ ARRAY ) ; 
+ final CountDownLatch latch = new CountDownLatch ( liveHosts . size ( ) ) ; 
+ / / an empty message acts as a request to the SchemaCheckVerbHandler . 
+ - MessagingService . instance . sendRR ( msg , liveHosts . toArray ( new InetAddress [ ] { } ) , new IAsyncCallback ( ) 
+ + MessagingService . instance . sendRR ( msg , liveHosts , new IAsyncCallback ( ) 
+ { 
+ public void response ( Message msg ) 
+ { 
+ @ @ - 775 , 7 + 775 , 7 @ @ public class StorageProxy implements StorageProxyMBean 
+ logger . debug ( " Starting to send truncate messages to hosts { } " , allEndpoints ) ; 
+ Truncation truncation = new Truncation ( keyspace , cfname ) ; 
+ Message message = truncation . makeTruncationMessage ( ) ; 
+ - MessagingService . instance . sendRR ( message , allEndpoints . toArray ( new InetAddress [ ] { } ) , responseHandler ) ; 
+ + MessagingService . instance . sendRR ( message , allEndpoints , responseHandler ) ; 
+ 
+ / / Wait for all 
+ logger . debug ( " Sent all truncate messages , now waiting for { } responses " , blockFor ) ; 
+ diff - - git a / src / java / org / apache / cassandra / thrift / CassandraServer . java b / src / java / org / apache / cassandra / thrift / CassandraServer . java 
+ index f0f72ff . . e8d659c 100644 
+ - - - a / src / java / org / apache / cassandra / thrift / CassandraServer . java 
+ + + + b / src / java / org / apache / cassandra / thrift / CassandraServer . java 
+ @ @ - 138 , 6 + 138 , 7 @ @ public class CassandraServer implements Cassandra . Iface 
+ } 
+ catch ( TimeoutException e ) 
+ { 
+ + logger . debug ( " . . . timed out " ) ; 
+ 	 throw new TimedOutException ( ) ; 
+ } 
+ catch ( IOException e ) 
+ @ @ - 442 , 11 + 443 , 12 @ @ public class CassandraServer implements Cassandra . Iface 
+ 
+ try 
+ { 
+ - StorageProxy . mutate ( mutations , consistency _ level ) ; 
+ + StorageProxy . mutate ( mutations , consistency _ level ) ; 
+ } 
+ catch ( TimeoutException e ) 
+ { 
+ - throw new TimedOutException ( ) ; 
+ + logger . debug ( " . . . timed out " ) ; 
+ + throw new TimedOutException ( ) ; 
+ } 
+ } 
+ finally 
+ @ @ - 512 , 6 + 514 , 7 @ @ public class CassandraServer implements Cassandra . Iface 
+ } 
+ catch ( TimeoutException e ) 
+ { 
+ + logger . debug ( " . . . timed out " ) ; 
+ 	 throw new TimedOutException ( ) ; 
+ } 
+ catch ( IOException e ) 
+ @ @ - 556 , 6 + 559 , 7 @ @ public class CassandraServer implements Cassandra . Iface 
+ } 
+ catch ( TimeoutException e ) 
+ { 
+ + logger . debug ( " . . . timed out " ) ; 
+ throw new TimedOutException ( ) ; 
+ } 
+ return thriftifyKeySlices ( rows , column _ parent , column _ predicate ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / service / ConsistencyLevelTest . java b / test / unit / org / apache / cassandra / service / ConsistencyLevelTest . java 
+ new file mode 100644 
+ index 0000000 . . de86cf4 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / service / ConsistencyLevelTest . java 
+ @ @ - 0 , 0 + 1 , 145 @ @ 
+ + package org . apache . cassandra . service ; 
+ + 
+ + import java . net . InetAddress ; 
+ + import java . util . ArrayList ; 
+ + import java . util . List ; 
+ + 
+ + import com . google . common . collect . HashMultimap ; 
+ + import org . junit . Test ; 
+ + 
+ + import org . apache . cassandra . CleanupHelper ; 
+ + import org . apache . cassandra . Util ; 
+ + import org . apache . cassandra . config . ConfigurationException ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . db . Row ; 
+ + import org . apache . cassandra . dht . IPartitioner ; 
+ + import org . apache . cassandra . dht . RandomPartitioner ; 
+ + import org . apache . cassandra . dht . Token ; 
+ + import org . apache . cassandra . locator . AbstractReplicationStrategy ; 
+ + import org . apache . cassandra . locator . SimpleSnitch ; 
+ + import org . apache . cassandra . locator . TokenMetadata ; 
+ + import org . apache . cassandra . thrift . ConsistencyLevel ; 
+ + import org . apache . cassandra . thrift . UnavailableException ; 
+ + 
+ + import static org . junit . Assert . assertTrue ; 
+ + import static org . junit . Assert . fail ; 
+ + 
+ + public class ConsistencyLevelTest extends CleanupHelper 
+ + { 
+ + @ Test 
+ + public void testReadWriteConsistencyChecks ( ) throws Exception 
+ + { 
+ + StorageService ss = StorageService . instance ; 
+ + final int RING _ SIZE = 3 ; 
+ + 
+ + TokenMetadata tmd = ss . getTokenMetadata ( ) ; 
+ + tmd . clearUnsafe ( ) ; 
+ + IPartitioner partitioner = new RandomPartitioner ( ) ; 
+ + 
+ + ss . setPartitionerUnsafe ( partitioner ) ; 
+ + 
+ + ArrayList < Token > endpointTokens = new ArrayList < Token > ( ) ; 
+ + ArrayList < Token > keyTokens = new ArrayList < Token > ( ) ; 
+ + List < InetAddress > hosts = new ArrayList < InetAddress > ( ) ; 
+ + 
+ + Util . createInitialRing ( ss , partitioner , endpointTokens , keyTokens , hosts , RING _ SIZE ) ; 
+ + 
+ + HashMultimap < InetAddress , InetAddress > hintedNodes = HashMultimap . create ( ) ; 
+ + 
+ + 
+ + AbstractReplicationStrategy strategy ; 
+ + 
+ + for ( String table : DatabaseDescriptor . getNonSystemTables ( ) ) 
+ + { 
+ + strategy = getStrategy ( table , tmd ) ; 
+ + StorageService . calculatePendingRanges ( strategy , table ) ; 
+ + int replicationFactor = strategy . getReplicationFactor ( ) ; 
+ + if ( replicationFactor < 2 ) 
+ + continue ; 
+ + 
+ + for ( ConsistencyLevel c : ConsistencyLevel . values ( ) ) 
+ + { 
+ + 
+ + if ( c = = ConsistencyLevel . EACH _ QUORUM | | c = = ConsistencyLevel . LOCAL _ QUORUM ) 
+ + continue ; 
+ + 
+ + for ( int i = 0 ; i < replicationFactor ; i + + ) 
+ + { 
+ + hintedNodes . clear ( ) ; 
+ + 
+ + for ( int j = 0 ; j < i ; j + + ) 
+ + { 
+ + hintedNodes . put ( hosts . get ( j ) , hosts . get ( j ) ) ; 
+ + } 
+ + 
+ + IWriteResponseHandler writeHandler = strategy . getWriteResponseHandler ( hosts , hintedNodes , c ) ; 
+ + 
+ + QuorumResponseHandler < Row > readHandler = strategy . getQuorumResponseHandler ( new ReadResponseResolver ( table ) , c ) ; 
+ + 
+ + boolean isWriteUnavailable = false ; 
+ + boolean isReadUnavailable = false ; 
+ + try 
+ + { 
+ + writeHandler . assureSufficientLiveNodes ( ) ; 
+ + } 
+ + catch ( UnavailableException e ) 
+ + { 
+ + isWriteUnavailable = true ; 
+ + } 
+ + 
+ + try 
+ + { 
+ + readHandler . assureSufficientLiveNodes ( hintedNodes . asMap ( ) . keySet ( ) ) ; 
+ + } 
+ + catch ( UnavailableException e ) 
+ + { 
+ + isReadUnavailable = true ; 
+ + } 
+ + 
+ + / / these should always match ( in this kind of test ) 
+ + assertTrue ( isWriteUnavailable = = isReadUnavailable ) ; 
+ + 
+ + switch ( c ) 
+ + { 
+ + case ALL : 
+ + if ( isWriteUnavailable ) 
+ + assertTrue ( hintedNodes . size ( ) < replicationFactor ) ; 
+ + else 
+ + assertTrue ( hintedNodes . size ( ) > = replicationFactor ) ; 
+ + 
+ + break ; 
+ + case ONE : 
+ + case ANY : 
+ + if ( isWriteUnavailable ) 
+ + assertTrue ( hintedNodes . size ( ) = = 0 ) ; 
+ + else 
+ + assertTrue ( hintedNodes . size ( ) > 0 ) ; 
+ + break ; 
+ + case QUORUM : 
+ + if ( isWriteUnavailable ) 
+ + assertTrue ( hintedNodes . size ( ) < ( replicationFactor / 2 + 1 ) ) ; 
+ + else 
+ + assertTrue ( hintedNodes . size ( ) > = ( replicationFactor / 2 + 1 ) ) ; 
+ + break ; 
+ + default : 
+ + fail ( " Unhandled CL : " + c ) ; 
+ + 
+ + } 
+ + } 
+ + } 
+ + return ; 
+ + } 
+ + 
+ + fail ( " Test requires at least one table with RF > 1 " ) ; 
+ + } 
+ + 
+ + private AbstractReplicationStrategy getStrategy ( String table , TokenMetadata tmd ) throws ConfigurationException 
+ + { 
+ + return AbstractReplicationStrategy . createReplicationStrategy ( table , 
+ + " org . apache . cassandra . locator . SimpleStrategy " , 
+ + tmd , 
+ + new SimpleSnitch ( ) , 
+ + null ) ; 
+ + } 
+ + 
+ + }

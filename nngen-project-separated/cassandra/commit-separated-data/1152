@@ -1,0 +1,666 @@
+BLEU SCORE: 0.015732934811145335
+
+TEST MSG: Fix integer overflow in DataOutputBuffer doubling and test as best as possible given that allocating 2 gigs in a unit test is problematic .
+GENERATED MSG: clean up SequentialWriter and friends
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 7541212 . . cf73f57 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 16 , 6 + 16 , 7 @ @ <nl> * Fix RangeNamesQueryPager ( CASSANDRA - 10509 ) <nl> * Deprecate Pig support ( CASSANDRA - 10542 ) <nl> * Reduce contention getting instances of CompositeType ( CASSANDRA - 10433 ) <nl> + * Fix IllegalArgumentException in DataOutputBuffer . reallocate for large buffers ( CASSANDRA - 10592 ) <nl> Merged from 2 . 1 : <nl> * Add proper error handling to stream receiver ( CASSANDRA - 10774 ) <nl> * Warn or fail when changing cluster topology live ( CASSANDRA - 10243 ) <nl> diff - - git a / src / java / org / apache / cassandra / io / util / BufferedDataOutputStreamPlus . java b / src / java / org / apache / cassandra / io / util / BufferedDataOutputStreamPlus . java <nl> index 5669a8d . . d55db47 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / BufferedDataOutputStreamPlus . java <nl> + + + b / src / java / org / apache / cassandra / io / util / BufferedDataOutputStreamPlus . java <nl> @ @ - 118 , 7 + 118 , 7 @ @ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus <nl> } <nl> else <nl> { <nl> - doFlush ( ) ; <nl> + doFlush ( len - copied ) ; <nl> } <nl> } <nl> } <nl> @ @ - 142 , 11 + 142 , 12 @ @ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus <nl> else <nl> { <nl> assert toWrite . isDirect ( ) ; <nl> - if ( toWrite . remaining ( ) > buffer . remaining ( ) ) <nl> + int toWriteRemaining = toWrite . remaining ( ) ; <nl> + if ( toWriteRemaining > buffer . remaining ( ) ) <nl> { <nl> - doFlush ( ) ; <nl> + doFlush ( toWriteRemaining ) ; <nl> MemoryUtil . duplicateDirectByteBuffer ( toWrite , hollowBuffer ) ; <nl> - if ( toWrite . remaining ( ) > buffer . remaining ( ) ) <nl> + if ( toWriteRemaining > buffer . remaining ( ) ) <nl> { <nl> while ( hollowBuffer . hasRemaining ( ) ) <nl> channel . write ( hollowBuffer ) ; <nl> @ @ - 254 , 7 + 255 , 10 @ @ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus <nl> write ( buffer ) ; <nl> } <nl> <nl> - protected void doFlush ( ) throws IOException <nl> + / * <nl> + * Count is the number of bytes remaining to write ignoring already remaining capacity <nl> + * / <nl> + protected void doFlush ( int count ) throws IOException <nl> { <nl> buffer . flip ( ) ; <nl> <nl> @ @ - 267 , 13 + 271 , 13 @ @ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus <nl> @ Override <nl> public void flush ( ) throws IOException <nl> { <nl> - doFlush ( ) ; <nl> + doFlush ( 0 ) ; <nl> } <nl> <nl> @ Override <nl> public void close ( ) throws IOException <nl> { <nl> - doFlush ( ) ; <nl> + doFlush ( 0 ) ; <nl> channel . close ( ) ; <nl> FileUtils . clean ( buffer ) ; <nl> buffer = null ; <nl> @ @ - 282 , 7 + 286 , 7 @ @ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus <nl> protected void ensureRemaining ( int minimum ) throws IOException <nl> { <nl> if ( buffer . remaining ( ) < minimum ) <nl> - doFlush ( ) ; <nl> + doFlush ( minimum ) ; <nl> } <nl> <nl> @ Override <nl> diff - - git a / src / java / org / apache / cassandra / io / util / DataOutputBuffer . java b / src / java / org / apache / cassandra / io / util / DataOutputBuffer . java <nl> index 6ffc895 . . 6ea6d97 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / DataOutputBuffer . java <nl> + + + b / src / java / org / apache / cassandra / io / util / DataOutputBuffer . java <nl> @ @ - 21 , 6 + 21 , 10 @ @ import java . io . IOException ; <nl> import java . nio . ByteBuffer ; <nl> import java . nio . channels . WritableByteChannel ; <nl> <nl> + import org . apache . cassandra . config . Config ; <nl> + <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> + import com . google . common . base . Preconditions ; <nl> <nl> / * * <nl> * An implementation of the DataOutputStream interface using a FastByteArrayOutputStream and exposing <nl> @ @ - 30 , 6 + 34 , 11 @ @ import java . nio . channels . WritableByteChannel ; <nl> * / <nl> public class DataOutputBuffer extends BufferedDataOutputStreamPlus <nl> { <nl> + / * <nl> + * Threshold at which resizing transitions from doubling to increasing by 50 % <nl> + * / <nl> + private static final long DOUBLING _ THRESHOLD = Long . getLong ( Config . PROPERTY _ PREFIX + " DOB _ DOUBLING _ THRESHOLD _ MB " , 64 ) ; <nl> + <nl> public DataOutputBuffer ( ) <nl> { <nl> this ( 128 ) ; <nl> @ @ - 51 , 16 + 60 , 70 @ @ public class DataOutputBuffer extends BufferedDataOutputStreamPlus <nl> throw new UnsupportedOperationException ( ) ; <nl> } <nl> <nl> + / / The actual value observed in Hotspot is only - 2 <nl> + / / ByteArrayOutputStream uses - 8 <nl> + @ VisibleForTesting <nl> + static final int MAX _ ARRAY _ SIZE = Integer . MAX _ VALUE - 8 ; <nl> + <nl> + @ VisibleForTesting <nl> + static int saturatedArraySizeCast ( long size ) <nl> + { <nl> + Preconditions . checkArgument ( size > = 0 ) ; <nl> + return ( int ) Math . min ( MAX _ ARRAY _ SIZE , size ) ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + static int checkedArraySizeCast ( long size ) <nl> + { <nl> + Preconditions . checkArgument ( size > = 0 ) ; <nl> + Preconditions . checkArgument ( size < = MAX _ ARRAY _ SIZE ) ; <nl> + return ( int ) size ; <nl> + } <nl> + <nl> @ Override <nl> - protected void doFlush ( ) throws IOException <nl> + protected void doFlush ( int count ) throws IOException <nl> + { <nl> + reallocate ( count ) ; <nl> + } <nl> + <nl> + / / Hack for test , make it possible to override checking the buffer capacity <nl> + @ VisibleForTesting <nl> + long capacity ( ) <nl> + { <nl> + return buffer . capacity ( ) ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + long validateReallocation ( long newSize ) <nl> + { <nl> + int saturatedSize = saturatedArraySizeCast ( newSize ) ; <nl> + if ( saturatedSize < = capacity ( ) ) <nl> + throw new RuntimeException ( ) ; <nl> + return saturatedSize ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + long calculateNewSize ( long count ) <nl> { <nl> - reallocate ( buffer . capacity ( ) * 2 ) ; <nl> + long capacity = capacity ( ) ; <nl> + / / Both sides of this max expression need to use long arithmetic to avoid integer overflow <nl> + / / count and capacity are longs so that ensures it right now . <nl> + long newSize = capacity + count ; <nl> + <nl> + / / For large buffers don ' t double , increase by 50 % <nl> + if ( capacity > 1024L * 1024L * DOUBLING _ THRESHOLD ) <nl> + newSize = Math . max ( ( capacity * 3L ) / 2L , newSize ) ; <nl> + else <nl> + newSize = Math . max ( capacity * 2L , newSize ) ; <nl> + <nl> + return validateReallocation ( newSize ) ; <nl> } <nl> <nl> - protected void reallocate ( long newSize ) <nl> + protected void reallocate ( long count ) <nl> { <nl> - assert newSize < = Integer . MAX _ VALUE ; <nl> - ByteBuffer newBuffer = ByteBuffer . allocate ( ( int ) newSize ) ; <nl> + if ( count < = 0 ) <nl> + return ; <nl> + ByteBuffer newBuffer = ByteBuffer . allocate ( checkedArraySizeCast ( calculateNewSize ( count ) ) ) ; <nl> buffer . flip ( ) ; <nl> newBuffer . put ( buffer ) ; <nl> buffer = newBuffer ; <nl> @ @ - 72 , 12 + 135 , 13 @ @ public class DataOutputBuffer extends BufferedDataOutputStreamPlus <nl> return new GrowingChannel ( ) ; <nl> } <nl> <nl> - private final class GrowingChannel implements WritableByteChannel <nl> + @ VisibleForTesting <nl> + final class GrowingChannel implements WritableByteChannel <nl> { <nl> public int write ( ByteBuffer src ) throws IOException <nl> { <nl> int count = src . remaining ( ) ; <nl> - reallocate ( Math . max ( ( buffer . capacity ( ) * 3 ) / 2 , buffer . capacity ( ) + count ) ) ; <nl> + reallocate ( count ) ; <nl> buffer . put ( src ) ; <nl> return count ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / DataOutputBufferFixed . java b / src / java / org / apache / cassandra / io / util / DataOutputBufferFixed . java <nl> index fb8d671 . . c815c9e 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / DataOutputBufferFixed . java <nl> + + + b / src / java / org / apache / cassandra / io / util / DataOutputBufferFixed . java <nl> @ @ - 47 , 7 + 47 , 7 @ @ public class DataOutputBufferFixed extends DataOutputBuffer <nl> } <nl> <nl> @ Override <nl> - protected void doFlush ( ) throws IOException <nl> + protected void doFlush ( int count ) throws IOException <nl> { <nl> throw new BufferOverflowException ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java b / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java <nl> index aad3266 . . 24eb93c 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java <nl> + + + b / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java <nl> @ @ - 42 , 8 + 42 , 10 @ @ public class SafeMemoryWriter extends DataOutputBuffer <nl> return memory ; <nl> } <nl> <nl> - protected void reallocate ( long newCapacity ) <nl> + @ Override <nl> + protected void reallocate ( long count ) <nl> { <nl> + long newCapacity = calculateNewSize ( count ) ; <nl> if ( newCapacity ! = capacity ( ) ) <nl> { <nl> long position = length ( ) ; <nl> @ @ - 93 , 6 + 95 , 12 @ @ public class SafeMemoryWriter extends DataOutputBuffer <nl> return this ; <nl> } <nl> <nl> + @ Override <nl> + public long validateReallocation ( long newSize ) <nl> + { <nl> + return newSize ; <nl> + } <nl> + <nl> private static long tailOffset ( Memory memory ) <nl> { <nl> return Math . max ( 0 , memory . size - Integer . MAX _ VALUE ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / io / util / DataOutputTest . java b / test / unit / org / apache / cassandra / io / util / DataOutputTest . java <nl> index bbdf4e1 . . 1fb5597 100644 <nl> - - - a / test / unit / org / apache / cassandra / io / util / DataOutputTest . java <nl> + + + b / test / unit / org / apache / cassandra / io / util / DataOutputTest . java <nl> @ @ - 31 , 7 + 31 , 10 @ @ import java . io . IOException ; <nl> import java . io . RandomAccessFile ; <nl> import java . nio . ByteBuffer ; <nl> import java . nio . channels . Channels ; <nl> + import java . util . ArrayDeque ; <nl> + import java . util . Deque ; <nl> import java . util . Random ; <nl> + import java . util . concurrent . Callable ; <nl> import java . util . concurrent . ThreadLocalRandom ; <nl> <nl> import org . junit . Assert ; <nl> @ @ - 83 , 6 + 86 , 18 @ @ public class DataOutputTest <nl> } <nl> <nl> @ Test <nl> + public void testDataOutputBufferZeroReallocate ( ) throws IOException <nl> + { <nl> + try ( DataOutputBufferSpy write = new DataOutputBufferSpy ( ) ) <nl> + { <nl> + for ( int ii = 0 ; ii < 1000000 ; ii + + ) <nl> + { <nl> + write . superReallocate ( 0 ) ; <nl> + } <nl> + } <nl> + } <nl> + <nl> + @ Test <nl> public void testDataOutputDirectByteBuffer ( ) throws IOException <nl> { <nl> ByteBuffer buf = wrap ( new byte [ 345 ] , true ) ; <nl> @ @ - 102 , 6 + 117 , 193 @ @ public class DataOutputTest <nl> testRead ( test , canon ) ; <nl> } <nl> <nl> + private static class DataOutputBufferSpy extends DataOutputBuffer <nl> + { <nl> + Deque < Long > sizes = new ArrayDeque < > ( ) ; <nl> + <nl> + DataOutputBufferSpy ( ) <nl> + { <nl> + sizes . offer ( 128L ) ; <nl> + } <nl> + <nl> + void publicFlush ( ) throws IOException <nl> + { <nl> + / / Going to allow it to double instead of specifying a count <nl> + doFlush ( 1 ) ; <nl> + } <nl> + <nl> + void superReallocate ( int count ) throws IOException <nl> + { <nl> + super . reallocate ( count ) ; <nl> + } <nl> + <nl> + @ Override <nl> + protected void reallocate ( long count ) <nl> + { <nl> + if ( count < = 0 ) <nl> + return ; <nl> + Long lastSize = sizes . peekLast ( ) ; <nl> + long newSize = calculateNewSize ( count ) ; <nl> + sizes . offer ( newSize ) ; <nl> + if ( newSize > DataOutputBuffer . MAX _ ARRAY _ SIZE ) <nl> + throw new RuntimeException ( ) ; <nl> + if ( newSize < 0 ) <nl> + throw new AssertionError ( ) ; <nl> + if ( lastSize ! = null & & newSize < = lastSize ) <nl> + throw new AssertionError ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> + protected long capacity ( ) <nl> + { <nl> + return sizes . peekLast ( ) . intValue ( ) ; <nl> + } <nl> + } <nl> + <nl> + / / Check for overflow at the max size , without actually allocating all the memory <nl> + @ Test <nl> + public void testDataOutputBufferMaxSizeFake ( ) throws IOException <nl> + { <nl> + try ( DataOutputBufferSpy write = new DataOutputBufferSpy ( ) ) <nl> + { <nl> + boolean threw = false ; <nl> + try <nl> + { <nl> + while ( true ) <nl> + write . publicFlush ( ) ; <nl> + } <nl> + catch ( RuntimeException e ) { <nl> + if ( e . getClass ( ) = = RuntimeException . class ) <nl> + threw = true ; <nl> + } <nl> + Assert . assertTrue ( threw ) ; <nl> + Assert . assertTrue ( write . sizes . peekLast ( ) > = DataOutputBuffer . MAX _ ARRAY _ SIZE ) ; <nl> + } <nl> + } <nl> + <nl> + @ Test <nl> + public void testDataOutputBufferMaxSize ( ) throws IOException <nl> + { <nl> + / / Need a lot of heap to run this test for real . <nl> + / / Tested everything else as much as possible since we can ' t do it all the time <nl> + if ( Runtime . getRuntime ( ) . maxMemory ( ) < 5033164800L ) <nl> + return ; <nl> + <nl> + try ( DataOutputBuffer write = new DataOutputBuffer ( ) ) <nl> + { <nl> + / / Doesn ' t throw up to DataOuptutBuffer . MAX _ ARRAY _ SIZE which is the array size limit in Java <nl> + for ( int ii = 0 ; ii < DataOutputBuffer . MAX _ ARRAY _ SIZE / 8 ; ii + + ) <nl> + write . writeLong ( 0 ) ; <nl> + write . write ( new byte [ 7 ] ) ; <nl> + <nl> + / / Should fail due to validation <nl> + checkThrowsRuntimeException ( validateReallocationCallable ( write , DataOutputBuffer . MAX _ ARRAY _ SIZE + 1 ) ) ; <nl> + / / Check that it does throw <nl> + checkThrowsRuntimeException ( new Callable < Object > ( ) <nl> + { <nl> + public Object call ( ) throws Exception <nl> + { <nl> + write . write ( 42 ) ; <nl> + return null ; <nl> + } <nl> + } ) ; <nl> + } <nl> + } <nl> + <nl> + / / Can ' t test it for real without tons of heap so test as much validation as possible <nl> + @ Test <nl> + public void testDataOutputBufferBigReallocation ( ) throws Exception <nl> + { <nl> + / / Check saturating cast behavior <nl> + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE , DataOutputBuffer . saturatedArraySizeCast ( DataOutputBuffer . MAX _ ARRAY _ SIZE + 1L ) ) ; <nl> + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE , DataOutputBuffer . saturatedArraySizeCast ( DataOutputBuffer . MAX _ ARRAY _ SIZE ) ) ; <nl> + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 , DataOutputBuffer . saturatedArraySizeCast ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 ) ) ; <nl> + Assert . assertEquals ( 0 , DataOutputBuffer . saturatedArraySizeCast ( 0 ) ) ; <nl> + Assert . assertEquals ( 1 , DataOutputBuffer . saturatedArraySizeCast ( 1 ) ) ; <nl> + checkThrowsIAE ( saturatedArraySizeCastCallable ( - 1 ) ) ; <nl> + <nl> + / / Check checked cast behavior <nl> + checkThrowsIAE ( checkedArraySizeCastCallable ( DataOutputBuffer . MAX _ ARRAY _ SIZE + 1L ) ) ; <nl> + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE , DataOutputBuffer . checkedArraySizeCast ( DataOutputBuffer . MAX _ ARRAY _ SIZE ) ) ; <nl> + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 , DataOutputBuffer . checkedArraySizeCast ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 ) ) ; <nl> + Assert . assertEquals ( 0 , DataOutputBuffer . checkedArraySizeCast ( 0 ) ) ; <nl> + Assert . assertEquals ( 1 , DataOutputBuffer . checkedArraySizeCast ( 1 ) ) ; <nl> + checkThrowsIAE ( checkedArraySizeCastCallable ( - 1 ) ) ; <nl> + <nl> + <nl> + try ( DataOutputBuffer write = new DataOutputBuffer ( ) ) <nl> + { <nl> + / / Checked validation performed by DOB <nl> + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE , write . validateReallocation ( DataOutputBuffer . MAX _ ARRAY _ SIZE + 1L ) ) ; <nl> + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE , write . validateReallocation ( DataOutputBuffer . MAX _ ARRAY _ SIZE ) ) ; <nl> + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 , write . validateReallocation ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 ) ) ; <nl> + checkThrowsRuntimeException ( validateReallocationCallable ( write , 0 ) ) ; <nl> + checkThrowsRuntimeException ( validateReallocationCallable ( write , 1 ) ) ; <nl> + checkThrowsIAE ( validateReallocationCallable ( write , - 1 ) ) ; <nl> + } <nl> + } <nl> + <nl> + Callable < Object > saturatedArraySizeCastCallable ( final long value ) <nl> + { <nl> + return new Callable < Object > ( ) <nl> + { <nl> + @ Override <nl> + public Object call ( ) throws Exception <nl> + { <nl> + return DataOutputBuffer . saturatedArraySizeCast ( value ) ; <nl> + } <nl> + } ; <nl> + } <nl> + <nl> + Callable < Object > checkedArraySizeCastCallable ( final long value ) <nl> + { <nl> + return new Callable < Object > ( ) <nl> + { <nl> + @ Override <nl> + public Object call ( ) throws Exception <nl> + { <nl> + return DataOutputBuffer . checkedArraySizeCast ( value ) ; <nl> + } <nl> + } ; <nl> + } <nl> + <nl> + Callable < Object > validateReallocationCallable ( final DataOutputBuffer write , final long value ) <nl> + { <nl> + return new Callable < Object > ( ) <nl> + { <nl> + @ Override <nl> + public Object call ( ) throws Exception <nl> + { <nl> + return write . validateReallocation ( value ) ; <nl> + } <nl> + } ; <nl> + } <nl> + <nl> + private static void checkThrowsIAE ( Callable < Object > c ) <nl> + { <nl> + checkThrowsException ( c , IllegalArgumentException . class ) ; <nl> + } <nl> + <nl> + private static void checkThrowsRuntimeException ( Callable < Object > c ) <nl> + { <nl> + checkThrowsException ( c , RuntimeException . class ) ; <nl> + } <nl> + <nl> + private static void checkThrowsException ( Callable < Object > c , Class < ? > exceptionClass ) <nl> + { <nl> + boolean threw = false ; <nl> + try <nl> + { <nl> + c . call ( ) ; <nl> + } <nl> + catch ( Throwable t ) <nl> + { <nl> + if ( t . getClass ( ) = = exceptionClass ) <nl> + threw = true ; <nl> + } <nl> + Assert . assertTrue ( threw ) ; <nl> + } <nl> + <nl> @ Test <nl> public void testSafeMemoryWriter ( ) throws IOException <nl> {
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 78d7267 . . 7348a99 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 1 . 1 . 3 <nl> + * munmap commitlog segments before rename ( CASSANDRA - 4337 ) <nl> * ( JMX ) rename getRangeKeySample to sampleKeyRange to avoid returning <nl> multi - MB results as an attribute ( CASSANDRA - 4452 ) <nl> * flush based on data size , not throughput ; overwritten columns no <nl> diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> index 8cb2cba . . 54486d0 100644 <nl> - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> @ @ - 41 , 7 + 41 , 6 @ @ import org . apache . cassandra . db . DefsTable ; <nl> import org . apache . cassandra . db . SystemTable ; <nl> import org . apache . cassandra . dht . IPartitioner ; <nl> import org . apache . cassandra . io . util . FileUtils ; <nl> - import org . apache . cassandra . io . util . MmappedSegmentedFile ; <nl> import org . apache . cassandra . locator . DynamicEndpointSnitch ; <nl> import org . apache . cassandra . locator . EndpointSnitchInfo ; <nl> import org . apache . cassandra . locator . IEndpointSnitch ; <nl> @ @ - 196 , 9 + 195 , 6 @ @ public class DatabaseDescriptor <nl> indexAccessMode = conf . disk _ access _ mode ; <nl> logger . info ( " DiskAccessMode is " + conf . disk _ access _ mode + " , indexAccessMode is " + indexAccessMode ) ; <nl> } <nl> - / / We could enable cleaner for index only mmap but it probably doesn ' t matter much <nl> - if ( conf . disk _ access _ mode = = Config . DiskAccessMode . mmap ) <nl> - MmappedSegmentedFile . initCleaner ( ) ; <nl> <nl> 	 logger . debug ( " page _ cache _ hinting is " + conf . populate _ io _ cache _ on _ flush ) ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / Directories . java b / src / java / org / apache / cassandra / db / Directories . java <nl> index f023c8c . . 9c9f9b8 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Directories . java <nl> + + + b / src / java / org / apache / cassandra / db / Directories . java <nl> @ @ - 117 , 7 + 117 , 7 @ @ public class Directories <nl> / / Requesting GC has a chance to free space only if we ' re using mmap and a non SUN jvm <nl> if ( path = = null <nl> & & ( DatabaseDescriptor . getDiskAccessMode ( ) = = Config . DiskAccessMode . mmap | | DatabaseDescriptor . getIndexAccessMode ( ) = = Config . DiskAccessMode . mmap ) <nl> - & & ! MmappedSegmentedFile . isCleanerAvailable ( ) ) <nl> + & & ! FileUtils . isCleanerAvailable ( ) ) <nl> { <nl> logger . info ( " Forcing GC to free up disk space . Upgrade to the Oracle JVM to avoid this " ) ; <nl> StorageService . instance . requestGC ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> index 0449c47 . . fcd4130 100644 <nl> - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java <nl> @ @ - 314 , 6 + 314 , 7 @ @ public class CommitLogSegment <nl> <nl> try <nl> { <nl> + FileUtils . clean ( buffer ) ; <nl> logFileAccessor . close ( ) ; <nl> closed = true ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / FileUtils . java b / src / java / org / apache / cassandra / io / util / FileUtils . java <nl> index 4ddf8b6 . . 5ed6276 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / FileUtils . java <nl> + + + b / src / java / org / apache / cassandra / io / util / FileUtils . java <nl> @ @ - 19 , 6 + 19 , 9 @ @ <nl> package org . apache . cassandra . io . util ; <nl> <nl> import java . io . * ; <nl> + import java . lang . reflect . InvocationTargetException ; <nl> + import java . lang . reflect . Method ; <nl> + import java . nio . MappedByteBuffer ; <nl> import java . text . DecimalFormat ; <nl> import java . util . Comparator ; <nl> import java . util . List ; <nl> @ @ - 39 , 6 + 42 , 22 @ @ public class FileUtils <nl> private static final double gb _ = 1024 * 1024 * 1024d ; <nl> private static final double tb _ = 1024 * 1024 * 1024 * 1024d ; <nl> <nl> + private static final Method cleanerMethod = initCleaner ( ) ; <nl> + <nl> + private static Method initCleaner ( ) <nl> + { <nl> + try <nl> + { <nl> + return Class . forName ( " sun . nio . ch . DirectBuffer " ) . getMethod ( " cleaner " ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + / / Perhaps a non - sun - derived JVM - contributions welcome <nl> + logger _ . info ( " Cannot initialize un - mmaper . ( Are you using a non - SUN JVM ? ) Compacted data files will not be removed promptly . Consider using a SUN JVM or using standard disk access mode " ) ; <nl> + return null ; <nl> + } <nl> + } <nl> + <nl> public static void deleteWithConfirm ( String file ) throws IOException <nl> { <nl> deleteWithConfirm ( new File ( file ) ) ; <nl> @ @ - 118 , 6 + 137 , 32 @ @ public class FileUtils <nl> throw e ; <nl> } <nl> <nl> + public static boolean isCleanerAvailable ( ) <nl> + { <nl> + return cleanerMethod ! = null ; <nl> + } <nl> + <nl> + public static void clean ( MappedByteBuffer buffer ) <nl> + { <nl> + try <nl> + { <nl> + Object cleaner = cleanerMethod . invoke ( buffer ) ; <nl> + cleaner . getClass ( ) . getMethod ( " clean " ) . invoke ( cleaner ) ; <nl> + } <nl> + catch ( IllegalAccessException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + catch ( InvocationTargetException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + catch ( NoSuchMethodException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> public static class FileComparator implements Comparator < File > <nl> { <nl> public int compare ( File f , File f2 ) <nl> diff - - git a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> index a933630 . . 5ebbe24 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> @ @ - 25 , 7 + 25 , 6 @ @ import java . io . File ; <nl> import java . io . IOError ; <nl> import java . io . IOException ; <nl> import java . io . RandomAccessFile ; <nl> - import java . lang . reflect . Method ; <nl> import java . nio . MappedByteBuffer ; <nl> import java . nio . channels . FileChannel ; <nl> import java . util . ArrayList ; <nl> @ @ - 42 , 8 + 41 , 6 @ @ public class MmappedSegmentedFile extends SegmentedFile <nl> / / in a perfect world , MAX _ SEGMENT _ SIZE would be final , but we need to test with a smaller size to stay sane . <nl> public static long MAX _ SEGMENT _ SIZE = Integer . MAX _ VALUE ; <nl> <nl> - private static Method cleanerMethod = null ; <nl> - <nl> / * * <nl> * Sorted array of segment offsets and MappedByteBuffers for segments . If mmap is completely disabled , or if the <nl> * segment would be too long to mmap , the value for an offset will be null , indicating that we need to fall back <nl> @ @ - 98 , 27 + 95 , 9 @ @ public class MmappedSegmentedFile extends SegmentedFile <nl> } <nl> } <nl> <nl> - public static void initCleaner ( ) <nl> - { <nl> - try <nl> - { <nl> - cleanerMethod = Class . forName ( " sun . nio . ch . DirectBuffer " ) . getMethod ( " cleaner " ) ; <nl> - } <nl> - catch ( Exception e ) <nl> - { <nl> - / / Perhaps a non - sun - derived JVM - contributions welcome <nl> - logger . info ( " Cannot initialize un - mmaper . ( Are you using a non - SUN JVM ? ) Compacted data files will not be removed promptly . Consider using a SUN JVM or using standard disk access mode " ) ; <nl> - } <nl> - } <nl> - <nl> - public static boolean isCleanerAvailable ( ) <nl> - { <nl> - return cleanerMethod ! = null ; <nl> - } <nl> - <nl> public void cleanup ( ) <nl> { <nl> - if ( cleanerMethod = = null ) <nl> + if ( ! FileUtils . isCleanerAvailable ( ) ) <nl> return ; <nl> <nl> / * <nl> @ @ - 132 , 9 + 111 , 7 @ @ public class MmappedSegmentedFile extends SegmentedFile <nl> { <nl> if ( segment . right = = null ) <nl> continue ; <nl> - <nl> - Object cleaner = cleanerMethod . invoke ( segment . right ) ; <nl> - cleaner . getClass ( ) . getMethod ( " clean " ) . invoke ( cleaner ) ; <nl> + FileUtils . clean ( segment . right ) ; <nl> } <nl> logger . debug ( " All segments have been unmapped successfully " ) ; <nl> }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 7541212 . . cf73f57 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 16 , 6 + 16 , 7 @ @ 
+ * Fix RangeNamesQueryPager ( CASSANDRA - 10509 ) 
+ * Deprecate Pig support ( CASSANDRA - 10542 ) 
+ * Reduce contention getting instances of CompositeType ( CASSANDRA - 10433 ) 
+ + * Fix IllegalArgumentException in DataOutputBuffer . reallocate for large buffers ( CASSANDRA - 10592 ) 
+ Merged from 2 . 1 : 
+ * Add proper error handling to stream receiver ( CASSANDRA - 10774 ) 
+ * Warn or fail when changing cluster topology live ( CASSANDRA - 10243 ) 
+ diff - - git a / src / java / org / apache / cassandra / io / util / BufferedDataOutputStreamPlus . java b / src / java / org / apache / cassandra / io / util / BufferedDataOutputStreamPlus . java 
+ index 5669a8d . . d55db47 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / BufferedDataOutputStreamPlus . java 
+ + + + b / src / java / org / apache / cassandra / io / util / BufferedDataOutputStreamPlus . java 
+ @ @ - 118 , 7 + 118 , 7 @ @ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus 
+ } 
+ else 
+ { 
+ - doFlush ( ) ; 
+ + doFlush ( len - copied ) ; 
+ } 
+ } 
+ } 
+ @ @ - 142 , 11 + 142 , 12 @ @ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus 
+ else 
+ { 
+ assert toWrite . isDirect ( ) ; 
+ - if ( toWrite . remaining ( ) > buffer . remaining ( ) ) 
+ + int toWriteRemaining = toWrite . remaining ( ) ; 
+ + if ( toWriteRemaining > buffer . remaining ( ) ) 
+ { 
+ - doFlush ( ) ; 
+ + doFlush ( toWriteRemaining ) ; 
+ MemoryUtil . duplicateDirectByteBuffer ( toWrite , hollowBuffer ) ; 
+ - if ( toWrite . remaining ( ) > buffer . remaining ( ) ) 
+ + if ( toWriteRemaining > buffer . remaining ( ) ) 
+ { 
+ while ( hollowBuffer . hasRemaining ( ) ) 
+ channel . write ( hollowBuffer ) ; 
+ @ @ - 254 , 7 + 255 , 10 @ @ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus 
+ write ( buffer ) ; 
+ } 
+ 
+ - protected void doFlush ( ) throws IOException 
+ + / * 
+ + * Count is the number of bytes remaining to write ignoring already remaining capacity 
+ + * / 
+ + protected void doFlush ( int count ) throws IOException 
+ { 
+ buffer . flip ( ) ; 
+ 
+ @ @ - 267 , 13 + 271 , 13 @ @ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus 
+ @ Override 
+ public void flush ( ) throws IOException 
+ { 
+ - doFlush ( ) ; 
+ + doFlush ( 0 ) ; 
+ } 
+ 
+ @ Override 
+ public void close ( ) throws IOException 
+ { 
+ - doFlush ( ) ; 
+ + doFlush ( 0 ) ; 
+ channel . close ( ) ; 
+ FileUtils . clean ( buffer ) ; 
+ buffer = null ; 
+ @ @ - 282 , 7 + 286 , 7 @ @ public class BufferedDataOutputStreamPlus extends DataOutputStreamPlus 
+ protected void ensureRemaining ( int minimum ) throws IOException 
+ { 
+ if ( buffer . remaining ( ) < minimum ) 
+ - doFlush ( ) ; 
+ + doFlush ( minimum ) ; 
+ } 
+ 
+ @ Override 
+ diff - - git a / src / java / org / apache / cassandra / io / util / DataOutputBuffer . java b / src / java / org / apache / cassandra / io / util / DataOutputBuffer . java 
+ index 6ffc895 . . 6ea6d97 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / DataOutputBuffer . java 
+ + + + b / src / java / org / apache / cassandra / io / util / DataOutputBuffer . java 
+ @ @ - 21 , 6 + 21 , 10 @ @ import java . io . IOException ; 
+ import java . nio . ByteBuffer ; 
+ import java . nio . channels . WritableByteChannel ; 
+ 
+ + import org . apache . cassandra . config . Config ; 
+ + 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ + import com . google . common . base . Preconditions ; 
+ 
+ / * * 
+ * An implementation of the DataOutputStream interface using a FastByteArrayOutputStream and exposing 
+ @ @ - 30 , 6 + 34 , 11 @ @ import java . nio . channels . WritableByteChannel ; 
+ * / 
+ public class DataOutputBuffer extends BufferedDataOutputStreamPlus 
+ { 
+ + / * 
+ + * Threshold at which resizing transitions from doubling to increasing by 50 % 
+ + * / 
+ + private static final long DOUBLING _ THRESHOLD = Long . getLong ( Config . PROPERTY _ PREFIX + " DOB _ DOUBLING _ THRESHOLD _ MB " , 64 ) ; 
+ + 
+ public DataOutputBuffer ( ) 
+ { 
+ this ( 128 ) ; 
+ @ @ - 51 , 16 + 60 , 70 @ @ public class DataOutputBuffer extends BufferedDataOutputStreamPlus 
+ throw new UnsupportedOperationException ( ) ; 
+ } 
+ 
+ + / / The actual value observed in Hotspot is only - 2 
+ + / / ByteArrayOutputStream uses - 8 
+ + @ VisibleForTesting 
+ + static final int MAX _ ARRAY _ SIZE = Integer . MAX _ VALUE - 8 ; 
+ + 
+ + @ VisibleForTesting 
+ + static int saturatedArraySizeCast ( long size ) 
+ + { 
+ + Preconditions . checkArgument ( size > = 0 ) ; 
+ + return ( int ) Math . min ( MAX _ ARRAY _ SIZE , size ) ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + static int checkedArraySizeCast ( long size ) 
+ + { 
+ + Preconditions . checkArgument ( size > = 0 ) ; 
+ + Preconditions . checkArgument ( size < = MAX _ ARRAY _ SIZE ) ; 
+ + return ( int ) size ; 
+ + } 
+ + 
+ @ Override 
+ - protected void doFlush ( ) throws IOException 
+ + protected void doFlush ( int count ) throws IOException 
+ + { 
+ + reallocate ( count ) ; 
+ + } 
+ + 
+ + / / Hack for test , make it possible to override checking the buffer capacity 
+ + @ VisibleForTesting 
+ + long capacity ( ) 
+ + { 
+ + return buffer . capacity ( ) ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + long validateReallocation ( long newSize ) 
+ + { 
+ + int saturatedSize = saturatedArraySizeCast ( newSize ) ; 
+ + if ( saturatedSize < = capacity ( ) ) 
+ + throw new RuntimeException ( ) ; 
+ + return saturatedSize ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + long calculateNewSize ( long count ) 
+ { 
+ - reallocate ( buffer . capacity ( ) * 2 ) ; 
+ + long capacity = capacity ( ) ; 
+ + / / Both sides of this max expression need to use long arithmetic to avoid integer overflow 
+ + / / count and capacity are longs so that ensures it right now . 
+ + long newSize = capacity + count ; 
+ + 
+ + / / For large buffers don ' t double , increase by 50 % 
+ + if ( capacity > 1024L * 1024L * DOUBLING _ THRESHOLD ) 
+ + newSize = Math . max ( ( capacity * 3L ) / 2L , newSize ) ; 
+ + else 
+ + newSize = Math . max ( capacity * 2L , newSize ) ; 
+ + 
+ + return validateReallocation ( newSize ) ; 
+ } 
+ 
+ - protected void reallocate ( long newSize ) 
+ + protected void reallocate ( long count ) 
+ { 
+ - assert newSize < = Integer . MAX _ VALUE ; 
+ - ByteBuffer newBuffer = ByteBuffer . allocate ( ( int ) newSize ) ; 
+ + if ( count < = 0 ) 
+ + return ; 
+ + ByteBuffer newBuffer = ByteBuffer . allocate ( checkedArraySizeCast ( calculateNewSize ( count ) ) ) ; 
+ buffer . flip ( ) ; 
+ newBuffer . put ( buffer ) ; 
+ buffer = newBuffer ; 
+ @ @ - 72 , 12 + 135 , 13 @ @ public class DataOutputBuffer extends BufferedDataOutputStreamPlus 
+ return new GrowingChannel ( ) ; 
+ } 
+ 
+ - private final class GrowingChannel implements WritableByteChannel 
+ + @ VisibleForTesting 
+ + final class GrowingChannel implements WritableByteChannel 
+ { 
+ public int write ( ByteBuffer src ) throws IOException 
+ { 
+ int count = src . remaining ( ) ; 
+ - reallocate ( Math . max ( ( buffer . capacity ( ) * 3 ) / 2 , buffer . capacity ( ) + count ) ) ; 
+ + reallocate ( count ) ; 
+ buffer . put ( src ) ; 
+ return count ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / DataOutputBufferFixed . java b / src / java / org / apache / cassandra / io / util / DataOutputBufferFixed . java 
+ index fb8d671 . . c815c9e 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / DataOutputBufferFixed . java 
+ + + + b / src / java / org / apache / cassandra / io / util / DataOutputBufferFixed . java 
+ @ @ - 47 , 7 + 47 , 7 @ @ public class DataOutputBufferFixed extends DataOutputBuffer 
+ } 
+ 
+ @ Override 
+ - protected void doFlush ( ) throws IOException 
+ + protected void doFlush ( int count ) throws IOException 
+ { 
+ throw new BufferOverflowException ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java b / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java 
+ index aad3266 . . 24eb93c 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java 
+ + + + b / src / java / org / apache / cassandra / io / util / SafeMemoryWriter . java 
+ @ @ - 42 , 8 + 42 , 10 @ @ public class SafeMemoryWriter extends DataOutputBuffer 
+ return memory ; 
+ } 
+ 
+ - protected void reallocate ( long newCapacity ) 
+ + @ Override 
+ + protected void reallocate ( long count ) 
+ { 
+ + long newCapacity = calculateNewSize ( count ) ; 
+ if ( newCapacity ! = capacity ( ) ) 
+ { 
+ long position = length ( ) ; 
+ @ @ - 93 , 6 + 95 , 12 @ @ public class SafeMemoryWriter extends DataOutputBuffer 
+ return this ; 
+ } 
+ 
+ + @ Override 
+ + public long validateReallocation ( long newSize ) 
+ + { 
+ + return newSize ; 
+ + } 
+ + 
+ private static long tailOffset ( Memory memory ) 
+ { 
+ return Math . max ( 0 , memory . size - Integer . MAX _ VALUE ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / io / util / DataOutputTest . java b / test / unit / org / apache / cassandra / io / util / DataOutputTest . java 
+ index bbdf4e1 . . 1fb5597 100644 
+ - - - a / test / unit / org / apache / cassandra / io / util / DataOutputTest . java 
+ + + + b / test / unit / org / apache / cassandra / io / util / DataOutputTest . java 
+ @ @ - 31 , 7 + 31 , 10 @ @ import java . io . IOException ; 
+ import java . io . RandomAccessFile ; 
+ import java . nio . ByteBuffer ; 
+ import java . nio . channels . Channels ; 
+ + import java . util . ArrayDeque ; 
+ + import java . util . Deque ; 
+ import java . util . Random ; 
+ + import java . util . concurrent . Callable ; 
+ import java . util . concurrent . ThreadLocalRandom ; 
+ 
+ import org . junit . Assert ; 
+ @ @ - 83 , 6 + 86 , 18 @ @ public class DataOutputTest 
+ } 
+ 
+ @ Test 
+ + public void testDataOutputBufferZeroReallocate ( ) throws IOException 
+ + { 
+ + try ( DataOutputBufferSpy write = new DataOutputBufferSpy ( ) ) 
+ + { 
+ + for ( int ii = 0 ; ii < 1000000 ; ii + + ) 
+ + { 
+ + write . superReallocate ( 0 ) ; 
+ + } 
+ + } 
+ + } 
+ + 
+ + @ Test 
+ public void testDataOutputDirectByteBuffer ( ) throws IOException 
+ { 
+ ByteBuffer buf = wrap ( new byte [ 345 ] , true ) ; 
+ @ @ - 102 , 6 + 117 , 193 @ @ public class DataOutputTest 
+ testRead ( test , canon ) ; 
+ } 
+ 
+ + private static class DataOutputBufferSpy extends DataOutputBuffer 
+ + { 
+ + Deque < Long > sizes = new ArrayDeque < > ( ) ; 
+ + 
+ + DataOutputBufferSpy ( ) 
+ + { 
+ + sizes . offer ( 128L ) ; 
+ + } 
+ + 
+ + void publicFlush ( ) throws IOException 
+ + { 
+ + / / Going to allow it to double instead of specifying a count 
+ + doFlush ( 1 ) ; 
+ + } 
+ + 
+ + void superReallocate ( int count ) throws IOException 
+ + { 
+ + super . reallocate ( count ) ; 
+ + } 
+ + 
+ + @ Override 
+ + protected void reallocate ( long count ) 
+ + { 
+ + if ( count < = 0 ) 
+ + return ; 
+ + Long lastSize = sizes . peekLast ( ) ; 
+ + long newSize = calculateNewSize ( count ) ; 
+ + sizes . offer ( newSize ) ; 
+ + if ( newSize > DataOutputBuffer . MAX _ ARRAY _ SIZE ) 
+ + throw new RuntimeException ( ) ; 
+ + if ( newSize < 0 ) 
+ + throw new AssertionError ( ) ; 
+ + if ( lastSize ! = null & & newSize < = lastSize ) 
+ + throw new AssertionError ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ + protected long capacity ( ) 
+ + { 
+ + return sizes . peekLast ( ) . intValue ( ) ; 
+ + } 
+ + } 
+ + 
+ + / / Check for overflow at the max size , without actually allocating all the memory 
+ + @ Test 
+ + public void testDataOutputBufferMaxSizeFake ( ) throws IOException 
+ + { 
+ + try ( DataOutputBufferSpy write = new DataOutputBufferSpy ( ) ) 
+ + { 
+ + boolean threw = false ; 
+ + try 
+ + { 
+ + while ( true ) 
+ + write . publicFlush ( ) ; 
+ + } 
+ + catch ( RuntimeException e ) { 
+ + if ( e . getClass ( ) = = RuntimeException . class ) 
+ + threw = true ; 
+ + } 
+ + Assert . assertTrue ( threw ) ; 
+ + Assert . assertTrue ( write . sizes . peekLast ( ) > = DataOutputBuffer . MAX _ ARRAY _ SIZE ) ; 
+ + } 
+ + } 
+ + 
+ + @ Test 
+ + public void testDataOutputBufferMaxSize ( ) throws IOException 
+ + { 
+ + / / Need a lot of heap to run this test for real . 
+ + / / Tested everything else as much as possible since we can ' t do it all the time 
+ + if ( Runtime . getRuntime ( ) . maxMemory ( ) < 5033164800L ) 
+ + return ; 
+ + 
+ + try ( DataOutputBuffer write = new DataOutputBuffer ( ) ) 
+ + { 
+ + / / Doesn ' t throw up to DataOuptutBuffer . MAX _ ARRAY _ SIZE which is the array size limit in Java 
+ + for ( int ii = 0 ; ii < DataOutputBuffer . MAX _ ARRAY _ SIZE / 8 ; ii + + ) 
+ + write . writeLong ( 0 ) ; 
+ + write . write ( new byte [ 7 ] ) ; 
+ + 
+ + / / Should fail due to validation 
+ + checkThrowsRuntimeException ( validateReallocationCallable ( write , DataOutputBuffer . MAX _ ARRAY _ SIZE + 1 ) ) ; 
+ + / / Check that it does throw 
+ + checkThrowsRuntimeException ( new Callable < Object > ( ) 
+ + { 
+ + public Object call ( ) throws Exception 
+ + { 
+ + write . write ( 42 ) ; 
+ + return null ; 
+ + } 
+ + } ) ; 
+ + } 
+ + } 
+ + 
+ + / / Can ' t test it for real without tons of heap so test as much validation as possible 
+ + @ Test 
+ + public void testDataOutputBufferBigReallocation ( ) throws Exception 
+ + { 
+ + / / Check saturating cast behavior 
+ + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE , DataOutputBuffer . saturatedArraySizeCast ( DataOutputBuffer . MAX _ ARRAY _ SIZE + 1L ) ) ; 
+ + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE , DataOutputBuffer . saturatedArraySizeCast ( DataOutputBuffer . MAX _ ARRAY _ SIZE ) ) ; 
+ + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 , DataOutputBuffer . saturatedArraySizeCast ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 ) ) ; 
+ + Assert . assertEquals ( 0 , DataOutputBuffer . saturatedArraySizeCast ( 0 ) ) ; 
+ + Assert . assertEquals ( 1 , DataOutputBuffer . saturatedArraySizeCast ( 1 ) ) ; 
+ + checkThrowsIAE ( saturatedArraySizeCastCallable ( - 1 ) ) ; 
+ + 
+ + / / Check checked cast behavior 
+ + checkThrowsIAE ( checkedArraySizeCastCallable ( DataOutputBuffer . MAX _ ARRAY _ SIZE + 1L ) ) ; 
+ + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE , DataOutputBuffer . checkedArraySizeCast ( DataOutputBuffer . MAX _ ARRAY _ SIZE ) ) ; 
+ + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 , DataOutputBuffer . checkedArraySizeCast ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 ) ) ; 
+ + Assert . assertEquals ( 0 , DataOutputBuffer . checkedArraySizeCast ( 0 ) ) ; 
+ + Assert . assertEquals ( 1 , DataOutputBuffer . checkedArraySizeCast ( 1 ) ) ; 
+ + checkThrowsIAE ( checkedArraySizeCastCallable ( - 1 ) ) ; 
+ + 
+ + 
+ + try ( DataOutputBuffer write = new DataOutputBuffer ( ) ) 
+ + { 
+ + / / Checked validation performed by DOB 
+ + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE , write . validateReallocation ( DataOutputBuffer . MAX _ ARRAY _ SIZE + 1L ) ) ; 
+ + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE , write . validateReallocation ( DataOutputBuffer . MAX _ ARRAY _ SIZE ) ) ; 
+ + Assert . assertEquals ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 , write . validateReallocation ( DataOutputBuffer . MAX _ ARRAY _ SIZE - 1 ) ) ; 
+ + checkThrowsRuntimeException ( validateReallocationCallable ( write , 0 ) ) ; 
+ + checkThrowsRuntimeException ( validateReallocationCallable ( write , 1 ) ) ; 
+ + checkThrowsIAE ( validateReallocationCallable ( write , - 1 ) ) ; 
+ + } 
+ + } 
+ + 
+ + Callable < Object > saturatedArraySizeCastCallable ( final long value ) 
+ + { 
+ + return new Callable < Object > ( ) 
+ + { 
+ + @ Override 
+ + public Object call ( ) throws Exception 
+ + { 
+ + return DataOutputBuffer . saturatedArraySizeCast ( value ) ; 
+ + } 
+ + } ; 
+ + } 
+ + 
+ + Callable < Object > checkedArraySizeCastCallable ( final long value ) 
+ + { 
+ + return new Callable < Object > ( ) 
+ + { 
+ + @ Override 
+ + public Object call ( ) throws Exception 
+ + { 
+ + return DataOutputBuffer . checkedArraySizeCast ( value ) ; 
+ + } 
+ + } ; 
+ + } 
+ + 
+ + Callable < Object > validateReallocationCallable ( final DataOutputBuffer write , final long value ) 
+ + { 
+ + return new Callable < Object > ( ) 
+ + { 
+ + @ Override 
+ + public Object call ( ) throws Exception 
+ + { 
+ + return write . validateReallocation ( value ) ; 
+ + } 
+ + } ; 
+ + } 
+ + 
+ + private static void checkThrowsIAE ( Callable < Object > c ) 
+ + { 
+ + checkThrowsException ( c , IllegalArgumentException . class ) ; 
+ + } 
+ + 
+ + private static void checkThrowsRuntimeException ( Callable < Object > c ) 
+ + { 
+ + checkThrowsException ( c , RuntimeException . class ) ; 
+ + } 
+ + 
+ + private static void checkThrowsException ( Callable < Object > c , Class < ? > exceptionClass ) 
+ + { 
+ + boolean threw = false ; 
+ + try 
+ + { 
+ + c . call ( ) ; 
+ + } 
+ + catch ( Throwable t ) 
+ + { 
+ + if ( t . getClass ( ) = = exceptionClass ) 
+ + threw = true ; 
+ + } 
+ + Assert . assertTrue ( threw ) ; 
+ + } 
+ + 
+ @ Test 
+ public void testSafeMemoryWriter ( ) throws IOException 
+ {
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 78d7267 . . 7348a99 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 1 . 1 . 3 
+ + * munmap commitlog segments before rename ( CASSANDRA - 4337 ) 
+ * ( JMX ) rename getRangeKeySample to sampleKeyRange to avoid returning 
+ multi - MB results as an attribute ( CASSANDRA - 4452 ) 
+ * flush based on data size , not throughput ; overwritten columns no 
+ diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ index 8cb2cba . . 54486d0 100644 
+ - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ @ @ - 41 , 7 + 41 , 6 @ @ import org . apache . cassandra . db . DefsTable ; 
+ import org . apache . cassandra . db . SystemTable ; 
+ import org . apache . cassandra . dht . IPartitioner ; 
+ import org . apache . cassandra . io . util . FileUtils ; 
+ - import org . apache . cassandra . io . util . MmappedSegmentedFile ; 
+ import org . apache . cassandra . locator . DynamicEndpointSnitch ; 
+ import org . apache . cassandra . locator . EndpointSnitchInfo ; 
+ import org . apache . cassandra . locator . IEndpointSnitch ; 
+ @ @ - 196 , 9 + 195 , 6 @ @ public class DatabaseDescriptor 
+ indexAccessMode = conf . disk _ access _ mode ; 
+ logger . info ( " DiskAccessMode is " + conf . disk _ access _ mode + " , indexAccessMode is " + indexAccessMode ) ; 
+ } 
+ - / / We could enable cleaner for index only mmap but it probably doesn ' t matter much 
+ - if ( conf . disk _ access _ mode = = Config . DiskAccessMode . mmap ) 
+ - MmappedSegmentedFile . initCleaner ( ) ; 
+ 
+ 	 logger . debug ( " page _ cache _ hinting is " + conf . populate _ io _ cache _ on _ flush ) ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / Directories . java b / src / java / org / apache / cassandra / db / Directories . java 
+ index f023c8c . . 9c9f9b8 100644 
+ - - - a / src / java / org / apache / cassandra / db / Directories . java 
+ + + + b / src / java / org / apache / cassandra / db / Directories . java 
+ @ @ - 117 , 7 + 117 , 7 @ @ public class Directories 
+ / / Requesting GC has a chance to free space only if we ' re using mmap and a non SUN jvm 
+ if ( path = = null 
+ & & ( DatabaseDescriptor . getDiskAccessMode ( ) = = Config . DiskAccessMode . mmap | | DatabaseDescriptor . getIndexAccessMode ( ) = = Config . DiskAccessMode . mmap ) 
+ - & & ! MmappedSegmentedFile . isCleanerAvailable ( ) ) 
+ + & & ! FileUtils . isCleanerAvailable ( ) ) 
+ { 
+ logger . info ( " Forcing GC to free up disk space . Upgrade to the Oracle JVM to avoid this " ) ; 
+ StorageService . instance . requestGC ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ index 0449c47 . . fcd4130 100644 
+ - - - a / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ + + + b / src / java / org / apache / cassandra / db / commitlog / CommitLogSegment . java 
+ @ @ - 314 , 6 + 314 , 7 @ @ public class CommitLogSegment 
+ 
+ try 
+ { 
+ + FileUtils . clean ( buffer ) ; 
+ logFileAccessor . close ( ) ; 
+ closed = true ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / FileUtils . java b / src / java / org / apache / cassandra / io / util / FileUtils . java 
+ index 4ddf8b6 . . 5ed6276 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / FileUtils . java 
+ + + + b / src / java / org / apache / cassandra / io / util / FileUtils . java 
+ @ @ - 19 , 6 + 19 , 9 @ @ 
+ package org . apache . cassandra . io . util ; 
+ 
+ import java . io . * ; 
+ + import java . lang . reflect . InvocationTargetException ; 
+ + import java . lang . reflect . Method ; 
+ + import java . nio . MappedByteBuffer ; 
+ import java . text . DecimalFormat ; 
+ import java . util . Comparator ; 
+ import java . util . List ; 
+ @ @ - 39 , 6 + 42 , 22 @ @ public class FileUtils 
+ private static final double gb _ = 1024 * 1024 * 1024d ; 
+ private static final double tb _ = 1024 * 1024 * 1024 * 1024d ; 
+ 
+ + private static final Method cleanerMethod = initCleaner ( ) ; 
+ + 
+ + private static Method initCleaner ( ) 
+ + { 
+ + try 
+ + { 
+ + return Class . forName ( " sun . nio . ch . DirectBuffer " ) . getMethod ( " cleaner " ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + / / Perhaps a non - sun - derived JVM - contributions welcome 
+ + logger _ . info ( " Cannot initialize un - mmaper . ( Are you using a non - SUN JVM ? ) Compacted data files will not be removed promptly . Consider using a SUN JVM or using standard disk access mode " ) ; 
+ + return null ; 
+ + } 
+ + } 
+ + 
+ public static void deleteWithConfirm ( String file ) throws IOException 
+ { 
+ deleteWithConfirm ( new File ( file ) ) ; 
+ @ @ - 118 , 6 + 137 , 32 @ @ public class FileUtils 
+ throw e ; 
+ } 
+ 
+ + public static boolean isCleanerAvailable ( ) 
+ + { 
+ + return cleanerMethod ! = null ; 
+ + } 
+ + 
+ + public static void clean ( MappedByteBuffer buffer ) 
+ + { 
+ + try 
+ + { 
+ + Object cleaner = cleanerMethod . invoke ( buffer ) ; 
+ + cleaner . getClass ( ) . getMethod ( " clean " ) . invoke ( cleaner ) ; 
+ + } 
+ + catch ( IllegalAccessException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + catch ( InvocationTargetException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + catch ( NoSuchMethodException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ public static class FileComparator implements Comparator < File > 
+ { 
+ public int compare ( File f , File f2 ) 
+ diff - - git a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ index a933630 . . 5ebbe24 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ @ @ - 25 , 7 + 25 , 6 @ @ import java . io . File ; 
+ import java . io . IOError ; 
+ import java . io . IOException ; 
+ import java . io . RandomAccessFile ; 
+ - import java . lang . reflect . Method ; 
+ import java . nio . MappedByteBuffer ; 
+ import java . nio . channels . FileChannel ; 
+ import java . util . ArrayList ; 
+ @ @ - 42 , 8 + 41 , 6 @ @ public class MmappedSegmentedFile extends SegmentedFile 
+ / / in a perfect world , MAX _ SEGMENT _ SIZE would be final , but we need to test with a smaller size to stay sane . 
+ public static long MAX _ SEGMENT _ SIZE = Integer . MAX _ VALUE ; 
+ 
+ - private static Method cleanerMethod = null ; 
+ - 
+ / * * 
+ * Sorted array of segment offsets and MappedByteBuffers for segments . If mmap is completely disabled , or if the 
+ * segment would be too long to mmap , the value for an offset will be null , indicating that we need to fall back 
+ @ @ - 98 , 27 + 95 , 9 @ @ public class MmappedSegmentedFile extends SegmentedFile 
+ } 
+ } 
+ 
+ - public static void initCleaner ( ) 
+ - { 
+ - try 
+ - { 
+ - cleanerMethod = Class . forName ( " sun . nio . ch . DirectBuffer " ) . getMethod ( " cleaner " ) ; 
+ - } 
+ - catch ( Exception e ) 
+ - { 
+ - / / Perhaps a non - sun - derived JVM - contributions welcome 
+ - logger . info ( " Cannot initialize un - mmaper . ( Are you using a non - SUN JVM ? ) Compacted data files will not be removed promptly . Consider using a SUN JVM or using standard disk access mode " ) ; 
+ - } 
+ - } 
+ - 
+ - public static boolean isCleanerAvailable ( ) 
+ - { 
+ - return cleanerMethod ! = null ; 
+ - } 
+ - 
+ public void cleanup ( ) 
+ { 
+ - if ( cleanerMethod = = null ) 
+ + if ( ! FileUtils . isCleanerAvailable ( ) ) 
+ return ; 
+ 
+ / * 
+ @ @ - 132 , 9 + 111 , 7 @ @ public class MmappedSegmentedFile extends SegmentedFile 
+ { 
+ if ( segment . right = = null ) 
+ continue ; 
+ - 
+ - Object cleaner = cleanerMethod . invoke ( segment . right ) ; 
+ - cleaner . getClass ( ) . getMethod ( " clean " ) . invoke ( cleaner ) ; 
+ + FileUtils . clean ( segment . right ) ; 
+ } 
+ logger . debug ( " All segments have been unmapped successfully " ) ; 
+ }

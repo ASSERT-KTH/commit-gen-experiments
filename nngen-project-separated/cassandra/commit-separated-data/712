@@ -1,0 +1,574 @@
+BLEU SCORE: 0.02383853510228548
+
+TEST MSG: Make it possible to compact a given token range
+GENERATED MSG: merge from 1 . 0
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index db2e221 . . 23a6eb0 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 10 <nl> + * Make it possible to compact a given token range ( CASSANDRA - 10643 ) <nl> * Allow updating DynamicEndpointSnitch properties via JMX ( CASSANDRA - 12179 ) <nl> * Collect metrics on queries by consistency level ( CASSANDRA - 7384 ) <nl> * Add support for GROUP BY to SELECT statement ( CASSANDRA - 10707 ) <nl> diff - - git a / doc / source / operating / compaction . rst b / doc / source / operating / compaction . rst <nl> index 8d70a41 . . b0f97c4 100644 <nl> - - - a / doc / source / operating / compaction . rst <nl> + + + b / doc / source / operating / compaction . rst <nl> @ @ - 45 , 6 + 45 , 12 @ @ Secondary index rebuild <nl> rebuild the secondary indexes on the node . <nl> Anticompaction <nl> after repair the ranges that were actually repaired are split out of the sstables that existed when repair started . <nl> + Sub range compaction <nl> + It is possible to only compact a given sub range - this could be useful if you know a token that has been <nl> + misbehaving - either gathering many updates or many deletes . ( ` ` nodetool compact - st x - et y ` ` ) will pick <nl> + all sstables containing the range between x and y and issue a compaction for those sstables . For STCS this will <nl> + most likely include all sstables but with LCS it can issue the compaction for a subset of the sstables . With LCS <nl> + the resulting sstable will end up in L0 . <nl> <nl> When is a minor compaction triggered ? <nl> ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 53f5305 . . 84fcb86 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 2109 , 12 + 2109 , 16 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> forceMajorCompaction ( false ) ; <nl> } <nl> <nl> - <nl> public void forceMajorCompaction ( boolean splitOutput ) throws InterruptedException , ExecutionException <nl> { <nl> CompactionManager . instance . performMaximal ( this , splitOutput ) ; <nl> } <nl> <nl> + public void forceCompactionForTokenRange ( Collection < Range < Token > > tokenRanges ) throws ExecutionException , InterruptedException <nl> + { <nl> + CompactionManager . instance . forceCompactionForTokenRange ( this , tokenRanges ) ; <nl> + } <nl> + <nl> public static Iterable < ColumnFamilyStore > all ( ) <nl> { <nl> List < Iterable < ColumnFamilyStore > > stores = new ArrayList < Iterable < ColumnFamilyStore > > ( Schema . instance . getKeyspaces ( ) . size ( ) ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java b / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java <nl> index 4df9f8d . . ccaacf6 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java <nl> @ @ - 17 , 6 + 17 , 7 @ @ <nl> * / <nl> package org . apache . cassandra . db ; <nl> <nl> + import java . util . Collection ; <nl> import java . util . List ; <nl> import java . util . Map ; <nl> import java . util . concurrent . ExecutionException ; <nl> @ @ - 24 , 6 + 25 , 9 @ @ import java . util . concurrent . ExecutionException ; <nl> import javax . management . openmbean . CompositeData ; <nl> import javax . management . openmbean . OpenDataException ; <nl> <nl> + import org . apache . cassandra . dht . Range ; <nl> + import org . apache . cassandra . dht . Token ; <nl> + <nl> / * * <nl> * The MBean interface for ColumnFamilyStore <nl> * / <nl> @ @ - 45 , 6 + 49 , 10 @ @ public interface ColumnFamilyStoreMBean <nl> public void forceMajorCompaction ( boolean splitOutput ) throws ExecutionException , InterruptedException ; <nl> <nl> / * * <nl> + * force a major compaction of specified key range in this column family <nl> + * / <nl> + public void forceCompactionForTokenRange ( Collection < Range < Token > > tokenRanges ) throws ExecutionException , InterruptedException ; <nl> + / * * <nl> * Gets the minimum number of sstables in queue before compaction kicks off <nl> * / <nl> public int getMinimumCompactionThreshold ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> index 1cfc76b . . ac6c753 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> @ @ - 44 , 6 + 44 , 7 @ @ import org . apache . cassandra . config . Schema ; <nl> import org . apache . cassandra . db . * ; <nl> import org . apache . cassandra . db . compaction . CompactionInfo . Holder ; <nl> import org . apache . cassandra . db . lifecycle . LifecycleTransaction ; <nl> + import org . apache . cassandra . db . lifecycle . SSTableIntervalTree ; <nl> import org . apache . cassandra . db . lifecycle . SSTableSet ; <nl> import org . apache . cassandra . db . lifecycle . View ; <nl> import org . apache . cassandra . db . rows . UnfilteredRowIterator ; <nl> @ @ - 703 , 11 + 704 , 13 @ @ public class CompactionManager implements CompactionManagerMBean <nl> return Collections . emptyList ( ) ; <nl> <nl> List < Future < ? > > futures = new ArrayList < > ( ) ; <nl> + <nl> int nonEmptyTasks = 0 ; <nl> for ( final AbstractCompactionTask task : tasks ) <nl> { <nl> if ( task . transaction . originals ( ) . size ( ) > 0 ) <nl> nonEmptyTasks + + ; <nl> + <nl> Runnable runnable = new WrappedRunnable ( ) <nl> { <nl> protected void runMayThrow ( ) <nl> @ @ - 724 , 9 + 727 , 59 @ @ public class CompactionManager implements CompactionManagerMBean <nl> } <nl> if ( nonEmptyTasks > 1 ) <nl> logger . info ( " Major compaction will not result in a single sstable - repaired and unrepaired data is kept separate and compaction runs per data _ file _ directory . " ) ; <nl> + <nl> + <nl> return futures ; <nl> } <nl> <nl> + public void forceCompactionForTokenRange ( ColumnFamilyStore cfStore , Collection < Range < Token > > ranges ) <nl> + { <nl> + final Collection < AbstractCompactionTask > tasks = cfStore . runWithCompactionsDisabled ( ( ) - > <nl> + { <nl> + Collection < SSTableReader > sstables = sstablesInBounds ( cfStore , ranges ) ; <nl> + if ( sstables = = null | | sstables . isEmpty ( ) ) <nl> + { <nl> + logger . debug ( " No sstables found for the provided token range " ) ; <nl> + return null ; <nl> + } <nl> + return cfStore . getCompactionStrategyManager ( ) . getUserDefinedTasks ( sstables , getDefaultGcBefore ( cfStore , FBUtilities . nowInSeconds ( ) ) ) ; <nl> + } , false , false ) ; <nl> + <nl> + if ( tasks = = null ) <nl> + return ; <nl> + <nl> + Runnable runnable = new WrappedRunnable ( ) <nl> + { <nl> + protected void runMayThrow ( ) <nl> + { <nl> + for ( AbstractCompactionTask task : tasks ) <nl> + if ( task ! = null ) <nl> + task . execute ( metrics ) ; <nl> + } <nl> + } ; <nl> + <nl> + if ( executor . isShutdown ( ) ) <nl> + { <nl> + logger . info ( " Compaction executor has shut down , not submitting task " ) ; <nl> + return ; <nl> + } <nl> + FBUtilities . waitOnFuture ( executor . submit ( runnable ) ) ; <nl> + } <nl> + <nl> + private static Collection < SSTableReader > sstablesInBounds ( ColumnFamilyStore cfs , Collection < Range < Token > > tokenRangeCollection ) <nl> + { <nl> + final Set < SSTableReader > sstables = new HashSet < > ( ) ; <nl> + Iterable < SSTableReader > liveTables = cfs . getTracker ( ) . getView ( ) . select ( SSTableSet . LIVE ) ; <nl> + SSTableIntervalTree tree = SSTableIntervalTree . build ( liveTables ) ; <nl> + <nl> + for ( Range < Token > tokenRange : tokenRangeCollection ) <nl> + { <nl> + Iterable < SSTableReader > ssTableReaders = View . sstablesInBounds ( tokenRange . left . minKeyBound ( ) , tokenRange . right . maxKeyBound ( ) , tree ) ; <nl> + Iterables . addAll ( sstables , ssTableReaders ) ; <nl> + } <nl> + return sstables ; <nl> + } <nl> + <nl> public void forceUserDefinedCompaction ( String dataFiles ) <nl> { <nl> String [ ] filenames = dataFiles . split ( " , " ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionStrategyManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionStrategyManager . java <nl> index bf367a3 . . ce97926 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionStrategyManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionStrategyManager . java <nl> @ @ - 743 , 7 + 743 , 6 @ @ public class CompactionStrategyManager implements INotificationConsumer <nl> { <nl> maybeReload ( cfs . metadata ) ; <nl> List < AbstractCompactionTask > ret = new ArrayList < > ( ) ; <nl> - <nl> readLock . lock ( ) ; <nl> try <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java <nl> index 25c5d20 . . 287e387 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java <nl> @ @ - 145 , 8 + 145 , 9 @ @ public class LeveledCompactionStrategy extends AbstractCompactionStrategy <nl> @ Override <nl> public AbstractCompactionTask getUserDefinedTask ( Collection < SSTableReader > sstables , int gcBefore ) <nl> { <nl> - if ( sstables . size ( ) ! = 1 ) <nl> - throw new UnsupportedOperationException ( " LevelDB compaction strategy does not allow user - specified compactions " ) ; <nl> + <nl> + if ( sstables . isEmpty ( ) ) <nl> + return null ; <nl> <nl> LifecycleTransaction transaction = cfs . getTracker ( ) . tryModify ( sstables , OperationType . COMPACTION ) ; <nl> if ( transaction = = null ) <nl> @ @ - 154 , 8 + 155 , 8 @ @ public class LeveledCompactionStrategy extends AbstractCompactionStrategy <nl> logger . trace ( " Unable to mark { } for compaction ; probably a background compaction got to it first . You can disable background compactions temporarily if this is a problem " , sstables ) ; <nl> return null ; <nl> } <nl> - int level = sstables . iterator ( ) . next ( ) . getSSTableLevel ( ) ; <nl> - return getCompactionTask ( transaction , gcBefore , level = = 0 ? Integer . MAX _ VALUE : getMaxSSTableBytes ( ) ) ; <nl> + int level = sstables . size ( ) > 1 ? 0 : sstables . iterator ( ) . next ( ) . getSSTableLevel ( ) ; <nl> + return new LeveledCompactionTask ( cfs , transaction , level , gcBefore , level = = 0 ? Long . MAX _ VALUE : getMaxSSTableBytes ( ) , false ) ; <nl> } <nl> <nl> @ Override <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index eade850 . . 0a95827 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 2860 , 10 + 2860 , 21 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> * the tag given to the snapshot ; may not be null or empty <nl> * / <nl> public void takeTableSnapshot ( String keyspaceName , String tableName , String tag ) <nl> - throws IOException { <nl> + throws IOException <nl> + { <nl> takeMultipleTableSnapshot ( tag , false , keyspaceName + " . " + tableName ) ; <nl> } <nl> <nl> + public void forceKeyspaceCompactionForTokenRange ( String keyspaceName , String startToken , String endToken , String . . . tableNames ) throws IOException , ExecutionException , InterruptedException <nl> + { <nl> + Collection < Range < Token > > tokenRanges = createRepairRangeFrom ( startToken , endToken ) ; <nl> + <nl> + for ( ColumnFamilyStore cfStore : getValidColumnFamilies ( true , false , keyspaceName , tableNames ) ) <nl> + { <nl> + cfStore . forceCompactionForTokenRange ( tokenRanges ) ; <nl> + } <nl> + } <nl> + <nl> / * * <nl> * Takes the snapshot for the given keyspaces . A snapshot name must be specified . <nl> * <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageServiceMBean . java b / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> index 2e5651a . . 0f93177 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> @ @ - 255 , 6 + 255 , 11 @ @ public interface StorageServiceMBean extends NotificationEmitter <nl> public int relocateSSTables ( String keyspace , String . . . cfnames ) throws IOException , ExecutionException , InterruptedException ; <nl> public int relocateSSTables ( int jobs , String keyspace , String . . . cfnames ) throws IOException , ExecutionException , InterruptedException ; <nl> / * * <nl> + * Forces major compaction of specified token range in a single keyspace <nl> + * / <nl> + public void forceKeyspaceCompactionForTokenRange ( String keyspaceName , String startToken , String endToken , String . . . tableNames ) throws IOException , ExecutionException , InterruptedException ; <nl> + <nl> + / * * <nl> * Trigger a cleanup of keys on a single keyspace <nl> * / <nl> @ Deprecated <nl> diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> index c33dfa4 . . bd0d8db 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> @ @ - 335 , 6 + 335 , 11 @ @ public class NodeProbe implements AutoCloseable <nl> ssProxy . relocateSSTables ( jobs , keyspace , cfnames ) ; <nl> } <nl> <nl> + public void forceKeyspaceCompactionForTokenRange ( String keyspaceName , final String startToken , final String endToken , String . . . tableNames ) throws IOException , ExecutionException , InterruptedException <nl> + { <nl> + ssProxy . forceKeyspaceCompactionForTokenRange ( keyspaceName , startToken , endToken , tableNames ) ; <nl> + } <nl> + <nl> public void forceKeyspaceFlush ( String keyspaceName , String . . . tableNames ) throws IOException , ExecutionException , InterruptedException <nl> { <nl> ssProxy . forceKeyspaceFlush ( keyspaceName , tableNames ) ; <nl> diff - - git a / src / java / org / apache / cassandra / tools / nodetool / Compact . java b / src / java / org / apache / cassandra / tools / nodetool / Compact . java <nl> index f268f0a . . ef10a83 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / nodetool / Compact . java <nl> + + + b / src / java / org / apache / cassandra / tools / nodetool / Compact . java <nl> @ @ - 17 , 6 + 17 , 8 @ @ <nl> * / <nl> package org . apache . cassandra . tools . nodetool ; <nl> <nl> + import static org . apache . commons . lang3 . StringUtils . EMPTY ; <nl> + <nl> import io . airlift . command . Arguments ; <nl> import io . airlift . command . Command ; <nl> import io . airlift . command . Option ; <nl> @ @ - 39 , 14 + 41 , 27 @ @ public class Compact extends NodeToolCmd <nl> @ Option ( title = " user - defined " , name = { " - - user - defined " } , description = " Use - - user - defined to submit listed files for user - defined compaction " ) <nl> private boolean userDefined = false ; <nl> <nl> + @ Option ( title = " start _ token " , name = { " - st " , " - - start - token " } , description = " Use - st to specify a token at which the compaction range starts " ) <nl> + private String startToken = EMPTY ; <nl> + <nl> + @ Option ( title = " end _ token " , name = { " - et " , " - - end - token " } , description = " Use - et to specify a token at which compaction range ends " ) <nl> + private String endToken = EMPTY ; <nl> + <nl> + <nl> @ Override <nl> public void execute ( NodeProbe probe ) <nl> { <nl> - if ( splitOutput & & userDefined ) <nl> + final boolean tokenProvided = ! ( startToken . isEmpty ( ) & & endToken . isEmpty ( ) ) ; <nl> + if ( splitOutput & & ( userDefined | | tokenProvided ) ) <nl> { <nl> - throw new RuntimeException ( " Invalid option combination : User defined compaction can not be split " ) ; <nl> + throw new RuntimeException ( " Invalid option combination : Can not use split - output here " ) ; <nl> } <nl> - else if ( userDefined ) <nl> + if ( userDefined & & tokenProvided ) <nl> + { <nl> + throw new RuntimeException ( " Invalid option combination : Can not provide tokens when using user - defined " ) ; <nl> + } <nl> + <nl> + if ( userDefined ) <nl> { <nl> try <nl> { <nl> @ @ - 65 , 7 + 80 , 14 @ @ public class Compact extends NodeToolCmd <nl> { <nl> try <nl> { <nl> - probe . forceKeyspaceCompaction ( splitOutput , keyspace , tableNames ) ; <nl> + if ( tokenProvided ) <nl> + { <nl> + probe . forceKeyspaceCompactionForTokenRange ( keyspace , startToken , endToken , tableNames ) ; <nl> + } <nl> + else <nl> + { <nl> + probe . forceKeyspaceCompaction ( splitOutput , keyspace , tableNames ) ; <nl> + } <nl> } catch ( Exception e ) <nl> { <nl> throw new RuntimeException ( " Error occurred during compaction " , e ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java <nl> index bd964ed . . 12144eb 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java <nl> @ @ - 18 , 6 + 18 , 7 @ @ <nl> package org . apache . cassandra . db . compaction ; <nl> <nl> import java . nio . ByteBuffer ; <nl> + import java . util . ArrayList ; <nl> import java . util . Arrays ; <nl> import java . util . Collection ; <nl> import java . util . Collections ; <nl> @ @ - 41 , 6 + 42 , 7 @ @ import org . apache . cassandra . SchemaLoader ; <nl> import org . apache . cassandra . Util ; <nl> import org . apache . cassandra . UpdateBuilder ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> + import org . apache . cassandra . db . DecoratedKey ; <nl> import org . apache . cassandra . db . Keyspace ; <nl> import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . dht . Token ; <nl> @ @ - 368 , 4 + 370 , 77 @ @ public class LeveledCompactionStrategyTest <nl> assertTrue ( unrepaired . manifest . getLevel ( 1 ) . contains ( sstable2 ) ) ; <nl> assertFalse ( repaired . manifest . getLevel ( 1 ) . contains ( sstable2 ) ) ; <nl> } <nl> + <nl> + <nl> + <nl> + @ Test <nl> + public void testTokenRangeCompaction ( ) throws Exception <nl> + { <nl> + / / Remove any existing data so we can start out clean with predictable number of sstables <nl> + cfs . truncateBlocking ( ) ; <nl> + <nl> + / / Disable auto compaction so cassandra does not compact <nl> + CompactionManager . instance . disableAutoCompaction ( ) ; <nl> + <nl> + ByteBuffer value = ByteBuffer . wrap ( new byte [ 100 * 1024 ] ) ; / / 100 KB value , make it easy to have multiple files <nl> + <nl> + DecoratedKey key1 = Util . dk ( String . valueOf ( 1 ) ) ; <nl> + DecoratedKey key2 = Util . dk ( String . valueOf ( 2 ) ) ; <nl> + List < DecoratedKey > keys = new ArrayList < > ( Arrays . asList ( key1 , key2 ) ) ; <nl> + int numIterations = 10 ; <nl> + int columns = 2 ; <nl> + <nl> + / / Add enough data to trigger multiple sstables . <nl> + <nl> + / / create 10 sstables that contain data for both key1 and key2 <nl> + for ( int i = 0 ; i < numIterations ; i + + ) { <nl> + for ( DecoratedKey key : keys ) { <nl> + UpdateBuilder update = UpdateBuilder . create ( cfs . metadata , key ) ; <nl> + for ( int c = 0 ; c < columns ; c + + ) <nl> + update . newRow ( " column " + c ) . add ( " val " , value ) ; <nl> + update . applyUnsafe ( ) ; <nl> + } <nl> + cfs . forceBlockingFlush ( ) ; <nl> + } <nl> + <nl> + / / create 20 more sstables with 10 containing data for key1 and other 10 containing data for key2 <nl> + for ( int i = 0 ; i < numIterations ; i + + ) { <nl> + for ( DecoratedKey key : keys ) { <nl> + UpdateBuilder update = UpdateBuilder . create ( cfs . metadata , key ) ; <nl> + for ( int c = 0 ; c < columns ; c + + ) <nl> + update . newRow ( " column " + c ) . add ( " val " , value ) ; <nl> + update . applyUnsafe ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + } <nl> + } <nl> + <nl> + / / We should have a total of 30 sstables by now <nl> + assertEquals ( 30 , cfs . getLiveSSTables ( ) . size ( ) ) ; <nl> + <nl> + / / Compact just the tables with key2 <nl> + / / Bit hackish to use the key1 . token as the prior key but works in BytesToken <nl> + Range < Token > tokenRange = new Range < > ( key2 . getToken ( ) , key2 . getToken ( ) ) ; <nl> + Collection < Range < Token > > tokenRanges = new ArrayList < > ( Arrays . asList ( tokenRange ) ) ; <nl> + cfs . forceCompactionForTokenRange ( tokenRanges ) ; <nl> + <nl> + while ( CompactionManager . instance . isCompacting ( Arrays . asList ( cfs ) ) ) { <nl> + Thread . sleep ( 100 ) ; <nl> + } <nl> + <nl> + / / 20 tables that have key2 should have been compacted in to 1 table resulting in 11 ( 30 - 20 + 1 ) <nl> + assertEquals ( 11 , cfs . getLiveSSTables ( ) . size ( ) ) ; <nl> + <nl> + / / Compact just the tables with key1 . At this point all 11 tables should have key1 <nl> + Range < Token > tokenRange2 = new Range < > ( key1 . getToken ( ) , key1 . getToken ( ) ) ; <nl> + Collection < Range < Token > > tokenRanges2 = new ArrayList < > ( Arrays . asList ( tokenRange2 ) ) ; <nl> + cfs . forceCompactionForTokenRange ( tokenRanges2 ) ; <nl> + <nl> + <nl> + while ( CompactionManager . instance . isCompacting ( Arrays . asList ( cfs ) ) ) { <nl> + Thread . sleep ( 100 ) ; <nl> + } <nl> + <nl> + / / the 11 tables containing key1 should all compact to 1 table <nl> + assertEquals ( 1 , cfs . getLiveSSTables ( ) . size ( ) ) ; <nl> + } <nl> }
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index d518830 . . 52cc2c1 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 29 , 7 + 29 , 7 @ @ <nl> * add scheduler JMX metrics ( CASSANDRA - 2962 ) <nl> * add block level checksum for compressed data ( CASSANDRA - 1717 ) <nl> * make column family backed column map pluggable and introduce unsynchronized <nl> - ArrayList backed one to speedup reads ( CASSANDRA - 2843 ) <nl> + ArrayList backed one to speedup reads ( CASSANDRA - 2843 , 3165 ) <nl> * refactoring of the secondary index api ( CASSANDRA - 2982 ) <nl> * make CL > ONE reads wait for digest reconciliation before returning <nl> ( CASSANDRA - 2494 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> index c316a85 . . 71c7213 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java <nl> @ @ - 67 , 6 + 67 , 11 @ @ public class ArrayBackedSortedColumns extends ArrayList < IColumn > implements ISor <nl> this . reversed = reversed ; <nl> } <nl> <nl> + public ISortedColumns . Factory getFactory ( ) <nl> + { <nl> + return factory ( ) ; <nl> + } <nl> + <nl> public AbstractType < ? > getComparator ( ) <nl> { <nl> return comparator ; <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> index 1239d1c . . 38bc0d7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java <nl> @ @ - 81 , 14 + 81 , 19 @ @ public class ColumnFamily extends AbstractColumnContainer <nl> this . cfm = cfm ; <nl> } <nl> <nl> - public ColumnFamily cloneMeShallow ( ) <nl> + public ColumnFamily cloneMeShallow ( ISortedColumns . Factory factory ) <nl> { <nl> - ColumnFamily cf = ColumnFamily . create ( cfm ) ; <nl> + ColumnFamily cf = ColumnFamily . create ( cfm , factory ) ; <nl> / / since deletion info is immutable , aliasing it is fine <nl> cf . deletionInfo . set ( deletionInfo . get ( ) ) ; <nl> return cf ; <nl> } <nl> <nl> + public ColumnFamily cloneMeShallow ( ) <nl> + { <nl> + return cloneMeShallow ( columns . getFactory ( ) ) ; <nl> + } <nl> + <nl> public AbstractType getSubComparator ( ) <nl> { <nl> IColumnSerializer s = getColumnSerializer ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 0bfd1c5 . . 552d3e9 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1162 , 8 + 1162 , 11 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> } <nl> } <nl> <nl> - / * * filter a cached row , which will not be modified by the filter , but may be modified by throwing out <nl> - * tombstones that are no longer relevant . * / <nl> + / * * <nl> + * Filter a cached row , which will not be modified by the filter , but may be modified by throwing out <nl> + * tombstones that are no longer relevant . <nl> + * The returned column family won ' t be thread safe . <nl> + * / <nl> ColumnFamily filterColumnFamily ( ColumnFamily cached , QueryFilter filter , int gcBefore ) <nl> { <nl> / / special case slicing the entire row : <nl> @ @ - 1184 , 7 + 1187 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> IColumn sc = cached . getColumn ( filter . path . superColumnName ) ; <nl> if ( sc = = null | | sliceFilter . count > = sc . getSubColumns ( ) . size ( ) ) <nl> { <nl> - ColumnFamily cf = cached . cloneMeShallow ( ) ; <nl> + ColumnFamily cf = cached . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; <nl> if ( sc ! = null ) <nl> cf . addColumn ( sc , HeapAllocator . instance ) ; <nl> return removeDeleted ( cf , gcBefore ) ; <nl> @ @ - 1203 , 7 + 1206 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> } <nl> <nl> IColumnIterator ci = filter . getMemtableColumnIterator ( cached , null , getComparator ( ) ) ; <nl> - ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ) ; <nl> + ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; <nl> filter . collateColumns ( cf , Collections . singletonList ( ci ) , getComparator ( ) , gcBefore ) ; <nl> / / TODO this is necessary because when we collate supercolumns together , we don ' t check <nl> / / their subcolumns for relevance , so we need to do a second prune post facto here . <nl> diff - - git a / src / java / org / apache / cassandra / db / ISortedColumns . java b / src / java / org / apache / cassandra / db / ISortedColumns . java <nl> index 37f5a60 . . 624dec7 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ISortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / ISortedColumns . java <nl> @ @ - 42 , 6 + 42 , 11 @ @ public interface ISortedColumns extends IIterableColumns <nl> public ISortedColumns cloneMe ( ) ; <nl> <nl> / * * <nl> + * Returns the factory used for this ISortedColumns implementation . <nl> + * / <nl> + public Factory getFactory ( ) ; <nl> + <nl> + / * * <nl> * Adds a column to this column map . <nl> * If a column with the same name is already present in the map , it will <nl> * be replaced by the newly added column . <nl> diff - - git a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java <nl> index cd2488a . . 13a111a 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java <nl> @ @ - 62 , 6 + 62 , 11 @ @ public class ThreadSafeSortedColumns extends ConcurrentSkipListMap < ByteBuffer , I <nl> super ( columns ) ; <nl> } <nl> <nl> + public ISortedColumns . Factory getFactory ( ) <nl> + { <nl> + return factory ( ) ; <nl> + } <nl> + <nl> public ISortedColumns cloneMe ( ) <nl> { <nl> return new ThreadSafeSortedColumns ( this ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java <nl> index 34e83dc . . 6c3fc42 100644 <nl> - - - a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java <nl> @ @ - 62 , 6 + 62 , 11 @ @ public class TreeMapBackedSortedColumns extends TreeMap < ByteBuffer , IColumn > imp <nl> super ( columns ) ; <nl> } <nl> <nl> + public ISortedColumns . Factory getFactory ( ) <nl> + { <nl> + return factory ( ) ; <nl> + } <nl> + <nl> public ISortedColumns cloneMe ( ) <nl> { <nl> return new TreeMapBackedSortedColumns ( this ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index db2e221 . . 23a6eb0 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 10 
+ + * Make it possible to compact a given token range ( CASSANDRA - 10643 ) 
+ * Allow updating DynamicEndpointSnitch properties via JMX ( CASSANDRA - 12179 ) 
+ * Collect metrics on queries by consistency level ( CASSANDRA - 7384 ) 
+ * Add support for GROUP BY to SELECT statement ( CASSANDRA - 10707 ) 
+ diff - - git a / doc / source / operating / compaction . rst b / doc / source / operating / compaction . rst 
+ index 8d70a41 . . b0f97c4 100644 
+ - - - a / doc / source / operating / compaction . rst 
+ + + + b / doc / source / operating / compaction . rst 
+ @ @ - 45 , 6 + 45 , 12 @ @ Secondary index rebuild 
+ rebuild the secondary indexes on the node . 
+ Anticompaction 
+ after repair the ranges that were actually repaired are split out of the sstables that existed when repair started . 
+ + Sub range compaction 
+ + It is possible to only compact a given sub range - this could be useful if you know a token that has been 
+ + misbehaving - either gathering many updates or many deletes . ( ` ` nodetool compact - st x - et y ` ` ) will pick 
+ + all sstables containing the range between x and y and issue a compaction for those sstables . For STCS this will 
+ + most likely include all sstables but with LCS it can issue the compaction for a subset of the sstables . With LCS 
+ + the resulting sstable will end up in L0 . 
+ 
+ When is a minor compaction triggered ? 
+ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 53f5305 . . 84fcb86 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 2109 , 12 + 2109 , 16 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ forceMajorCompaction ( false ) ; 
+ } 
+ 
+ - 
+ public void forceMajorCompaction ( boolean splitOutput ) throws InterruptedException , ExecutionException 
+ { 
+ CompactionManager . instance . performMaximal ( this , splitOutput ) ; 
+ } 
+ 
+ + public void forceCompactionForTokenRange ( Collection < Range < Token > > tokenRanges ) throws ExecutionException , InterruptedException 
+ + { 
+ + CompactionManager . instance . forceCompactionForTokenRange ( this , tokenRanges ) ; 
+ + } 
+ + 
+ public static Iterable < ColumnFamilyStore > all ( ) 
+ { 
+ List < Iterable < ColumnFamilyStore > > stores = new ArrayList < Iterable < ColumnFamilyStore > > ( Schema . instance . getKeyspaces ( ) . size ( ) ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java b / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java 
+ index 4df9f8d . . ccaacf6 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStoreMBean . java 
+ @ @ - 17 , 6 + 17 , 7 @ @ 
+ * / 
+ package org . apache . cassandra . db ; 
+ 
+ + import java . util . Collection ; 
+ import java . util . List ; 
+ import java . util . Map ; 
+ import java . util . concurrent . ExecutionException ; 
+ @ @ - 24 , 6 + 25 , 9 @ @ import java . util . concurrent . ExecutionException ; 
+ import javax . management . openmbean . CompositeData ; 
+ import javax . management . openmbean . OpenDataException ; 
+ 
+ + import org . apache . cassandra . dht . Range ; 
+ + import org . apache . cassandra . dht . Token ; 
+ + 
+ / * * 
+ * The MBean interface for ColumnFamilyStore 
+ * / 
+ @ @ - 45 , 6 + 49 , 10 @ @ public interface ColumnFamilyStoreMBean 
+ public void forceMajorCompaction ( boolean splitOutput ) throws ExecutionException , InterruptedException ; 
+ 
+ / * * 
+ + * force a major compaction of specified key range in this column family 
+ + * / 
+ + public void forceCompactionForTokenRange ( Collection < Range < Token > > tokenRanges ) throws ExecutionException , InterruptedException ; 
+ + / * * 
+ * Gets the minimum number of sstables in queue before compaction kicks off 
+ * / 
+ public int getMinimumCompactionThreshold ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ index 1cfc76b . . ac6c753 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ @ @ - 44 , 6 + 44 , 7 @ @ import org . apache . cassandra . config . Schema ; 
+ import org . apache . cassandra . db . * ; 
+ import org . apache . cassandra . db . compaction . CompactionInfo . Holder ; 
+ import org . apache . cassandra . db . lifecycle . LifecycleTransaction ; 
+ + import org . apache . cassandra . db . lifecycle . SSTableIntervalTree ; 
+ import org . apache . cassandra . db . lifecycle . SSTableSet ; 
+ import org . apache . cassandra . db . lifecycle . View ; 
+ import org . apache . cassandra . db . rows . UnfilteredRowIterator ; 
+ @ @ - 703 , 11 + 704 , 13 @ @ public class CompactionManager implements CompactionManagerMBean 
+ return Collections . emptyList ( ) ; 
+ 
+ List < Future < ? > > futures = new ArrayList < > ( ) ; 
+ + 
+ int nonEmptyTasks = 0 ; 
+ for ( final AbstractCompactionTask task : tasks ) 
+ { 
+ if ( task . transaction . originals ( ) . size ( ) > 0 ) 
+ nonEmptyTasks + + ; 
+ + 
+ Runnable runnable = new WrappedRunnable ( ) 
+ { 
+ protected void runMayThrow ( ) 
+ @ @ - 724 , 9 + 727 , 59 @ @ public class CompactionManager implements CompactionManagerMBean 
+ } 
+ if ( nonEmptyTasks > 1 ) 
+ logger . info ( " Major compaction will not result in a single sstable - repaired and unrepaired data is kept separate and compaction runs per data _ file _ directory . " ) ; 
+ + 
+ + 
+ return futures ; 
+ } 
+ 
+ + public void forceCompactionForTokenRange ( ColumnFamilyStore cfStore , Collection < Range < Token > > ranges ) 
+ + { 
+ + final Collection < AbstractCompactionTask > tasks = cfStore . runWithCompactionsDisabled ( ( ) - > 
+ + { 
+ + Collection < SSTableReader > sstables = sstablesInBounds ( cfStore , ranges ) ; 
+ + if ( sstables = = null | | sstables . isEmpty ( ) ) 
+ + { 
+ + logger . debug ( " No sstables found for the provided token range " ) ; 
+ + return null ; 
+ + } 
+ + return cfStore . getCompactionStrategyManager ( ) . getUserDefinedTasks ( sstables , getDefaultGcBefore ( cfStore , FBUtilities . nowInSeconds ( ) ) ) ; 
+ + } , false , false ) ; 
+ + 
+ + if ( tasks = = null ) 
+ + return ; 
+ + 
+ + Runnable runnable = new WrappedRunnable ( ) 
+ + { 
+ + protected void runMayThrow ( ) 
+ + { 
+ + for ( AbstractCompactionTask task : tasks ) 
+ + if ( task ! = null ) 
+ + task . execute ( metrics ) ; 
+ + } 
+ + } ; 
+ + 
+ + if ( executor . isShutdown ( ) ) 
+ + { 
+ + logger . info ( " Compaction executor has shut down , not submitting task " ) ; 
+ + return ; 
+ + } 
+ + FBUtilities . waitOnFuture ( executor . submit ( runnable ) ) ; 
+ + } 
+ + 
+ + private static Collection < SSTableReader > sstablesInBounds ( ColumnFamilyStore cfs , Collection < Range < Token > > tokenRangeCollection ) 
+ + { 
+ + final Set < SSTableReader > sstables = new HashSet < > ( ) ; 
+ + Iterable < SSTableReader > liveTables = cfs . getTracker ( ) . getView ( ) . select ( SSTableSet . LIVE ) ; 
+ + SSTableIntervalTree tree = SSTableIntervalTree . build ( liveTables ) ; 
+ + 
+ + for ( Range < Token > tokenRange : tokenRangeCollection ) 
+ + { 
+ + Iterable < SSTableReader > ssTableReaders = View . sstablesInBounds ( tokenRange . left . minKeyBound ( ) , tokenRange . right . maxKeyBound ( ) , tree ) ; 
+ + Iterables . addAll ( sstables , ssTableReaders ) ; 
+ + } 
+ + return sstables ; 
+ + } 
+ + 
+ public void forceUserDefinedCompaction ( String dataFiles ) 
+ { 
+ String [ ] filenames = dataFiles . split ( " , " ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionStrategyManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionStrategyManager . java 
+ index bf367a3 . . ce97926 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionStrategyManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionStrategyManager . java 
+ @ @ - 743 , 7 + 743 , 6 @ @ public class CompactionStrategyManager implements INotificationConsumer 
+ { 
+ maybeReload ( cfs . metadata ) ; 
+ List < AbstractCompactionTask > ret = new ArrayList < > ( ) ; 
+ - 
+ readLock . lock ( ) ; 
+ try 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java 
+ index 25c5d20 . . 287e387 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / LeveledCompactionStrategy . java 
+ @ @ - 145 , 8 + 145 , 9 @ @ public class LeveledCompactionStrategy extends AbstractCompactionStrategy 
+ @ Override 
+ public AbstractCompactionTask getUserDefinedTask ( Collection < SSTableReader > sstables , int gcBefore ) 
+ { 
+ - if ( sstables . size ( ) ! = 1 ) 
+ - throw new UnsupportedOperationException ( " LevelDB compaction strategy does not allow user - specified compactions " ) ; 
+ + 
+ + if ( sstables . isEmpty ( ) ) 
+ + return null ; 
+ 
+ LifecycleTransaction transaction = cfs . getTracker ( ) . tryModify ( sstables , OperationType . COMPACTION ) ; 
+ if ( transaction = = null ) 
+ @ @ - 154 , 8 + 155 , 8 @ @ public class LeveledCompactionStrategy extends AbstractCompactionStrategy 
+ logger . trace ( " Unable to mark { } for compaction ; probably a background compaction got to it first . You can disable background compactions temporarily if this is a problem " , sstables ) ; 
+ return null ; 
+ } 
+ - int level = sstables . iterator ( ) . next ( ) . getSSTableLevel ( ) ; 
+ - return getCompactionTask ( transaction , gcBefore , level = = 0 ? Integer . MAX _ VALUE : getMaxSSTableBytes ( ) ) ; 
+ + int level = sstables . size ( ) > 1 ? 0 : sstables . iterator ( ) . next ( ) . getSSTableLevel ( ) ; 
+ + return new LeveledCompactionTask ( cfs , transaction , level , gcBefore , level = = 0 ? Long . MAX _ VALUE : getMaxSSTableBytes ( ) , false ) ; 
+ } 
+ 
+ @ Override 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index eade850 . . 0a95827 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 2860 , 10 + 2860 , 21 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ * the tag given to the snapshot ; may not be null or empty 
+ * / 
+ public void takeTableSnapshot ( String keyspaceName , String tableName , String tag ) 
+ - throws IOException { 
+ + throws IOException 
+ + { 
+ takeMultipleTableSnapshot ( tag , false , keyspaceName + " . " + tableName ) ; 
+ } 
+ 
+ + public void forceKeyspaceCompactionForTokenRange ( String keyspaceName , String startToken , String endToken , String . . . tableNames ) throws IOException , ExecutionException , InterruptedException 
+ + { 
+ + Collection < Range < Token > > tokenRanges = createRepairRangeFrom ( startToken , endToken ) ; 
+ + 
+ + for ( ColumnFamilyStore cfStore : getValidColumnFamilies ( true , false , keyspaceName , tableNames ) ) 
+ + { 
+ + cfStore . forceCompactionForTokenRange ( tokenRanges ) ; 
+ + } 
+ + } 
+ + 
+ / * * 
+ * Takes the snapshot for the given keyspaces . A snapshot name must be specified . 
+ * 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageServiceMBean . java b / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ index 2e5651a . . 0f93177 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ @ @ - 255 , 6 + 255 , 11 @ @ public interface StorageServiceMBean extends NotificationEmitter 
+ public int relocateSSTables ( String keyspace , String . . . cfnames ) throws IOException , ExecutionException , InterruptedException ; 
+ public int relocateSSTables ( int jobs , String keyspace , String . . . cfnames ) throws IOException , ExecutionException , InterruptedException ; 
+ / * * 
+ + * Forces major compaction of specified token range in a single keyspace 
+ + * / 
+ + public void forceKeyspaceCompactionForTokenRange ( String keyspaceName , String startToken , String endToken , String . . . tableNames ) throws IOException , ExecutionException , InterruptedException ; 
+ + 
+ + / * * 
+ * Trigger a cleanup of keys on a single keyspace 
+ * / 
+ @ Deprecated 
+ diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ index c33dfa4 . . bd0d8db 100644 
+ - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ @ @ - 335 , 6 + 335 , 11 @ @ public class NodeProbe implements AutoCloseable 
+ ssProxy . relocateSSTables ( jobs , keyspace , cfnames ) ; 
+ } 
+ 
+ + public void forceKeyspaceCompactionForTokenRange ( String keyspaceName , final String startToken , final String endToken , String . . . tableNames ) throws IOException , ExecutionException , InterruptedException 
+ + { 
+ + ssProxy . forceKeyspaceCompactionForTokenRange ( keyspaceName , startToken , endToken , tableNames ) ; 
+ + } 
+ + 
+ public void forceKeyspaceFlush ( String keyspaceName , String . . . tableNames ) throws IOException , ExecutionException , InterruptedException 
+ { 
+ ssProxy . forceKeyspaceFlush ( keyspaceName , tableNames ) ; 
+ diff - - git a / src / java / org / apache / cassandra / tools / nodetool / Compact . java b / src / java / org / apache / cassandra / tools / nodetool / Compact . java 
+ index f268f0a . . ef10a83 100644 
+ - - - a / src / java / org / apache / cassandra / tools / nodetool / Compact . java 
+ + + + b / src / java / org / apache / cassandra / tools / nodetool / Compact . java 
+ @ @ - 17 , 6 + 17 , 8 @ @ 
+ * / 
+ package org . apache . cassandra . tools . nodetool ; 
+ 
+ + import static org . apache . commons . lang3 . StringUtils . EMPTY ; 
+ + 
+ import io . airlift . command . Arguments ; 
+ import io . airlift . command . Command ; 
+ import io . airlift . command . Option ; 
+ @ @ - 39 , 14 + 41 , 27 @ @ public class Compact extends NodeToolCmd 
+ @ Option ( title = " user - defined " , name = { " - - user - defined " } , description = " Use - - user - defined to submit listed files for user - defined compaction " ) 
+ private boolean userDefined = false ; 
+ 
+ + @ Option ( title = " start _ token " , name = { " - st " , " - - start - token " } , description = " Use - st to specify a token at which the compaction range starts " ) 
+ + private String startToken = EMPTY ; 
+ + 
+ + @ Option ( title = " end _ token " , name = { " - et " , " - - end - token " } , description = " Use - et to specify a token at which compaction range ends " ) 
+ + private String endToken = EMPTY ; 
+ + 
+ + 
+ @ Override 
+ public void execute ( NodeProbe probe ) 
+ { 
+ - if ( splitOutput & & userDefined ) 
+ + final boolean tokenProvided = ! ( startToken . isEmpty ( ) & & endToken . isEmpty ( ) ) ; 
+ + if ( splitOutput & & ( userDefined | | tokenProvided ) ) 
+ { 
+ - throw new RuntimeException ( " Invalid option combination : User defined compaction can not be split " ) ; 
+ + throw new RuntimeException ( " Invalid option combination : Can not use split - output here " ) ; 
+ } 
+ - else if ( userDefined ) 
+ + if ( userDefined & & tokenProvided ) 
+ + { 
+ + throw new RuntimeException ( " Invalid option combination : Can not provide tokens when using user - defined " ) ; 
+ + } 
+ + 
+ + if ( userDefined ) 
+ { 
+ try 
+ { 
+ @ @ - 65 , 7 + 80 , 14 @ @ public class Compact extends NodeToolCmd 
+ { 
+ try 
+ { 
+ - probe . forceKeyspaceCompaction ( splitOutput , keyspace , tableNames ) ; 
+ + if ( tokenProvided ) 
+ + { 
+ + probe . forceKeyspaceCompactionForTokenRange ( keyspace , startToken , endToken , tableNames ) ; 
+ + } 
+ + else 
+ + { 
+ + probe . forceKeyspaceCompaction ( splitOutput , keyspace , tableNames ) ; 
+ + } 
+ } catch ( Exception e ) 
+ { 
+ throw new RuntimeException ( " Error occurred during compaction " , e ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java 
+ index bd964ed . . 12144eb 100644 
+ - - - a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java 
+ @ @ - 18 , 6 + 18 , 7 @ @ 
+ package org . apache . cassandra . db . compaction ; 
+ 
+ import java . nio . ByteBuffer ; 
+ + import java . util . ArrayList ; 
+ import java . util . Arrays ; 
+ import java . util . Collection ; 
+ import java . util . Collections ; 
+ @ @ - 41 , 6 + 42 , 7 @ @ import org . apache . cassandra . SchemaLoader ; 
+ import org . apache . cassandra . Util ; 
+ import org . apache . cassandra . UpdateBuilder ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ + import org . apache . cassandra . db . DecoratedKey ; 
+ import org . apache . cassandra . db . Keyspace ; 
+ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . dht . Token ; 
+ @ @ - 368 , 4 + 370 , 77 @ @ public class LeveledCompactionStrategyTest 
+ assertTrue ( unrepaired . manifest . getLevel ( 1 ) . contains ( sstable2 ) ) ; 
+ assertFalse ( repaired . manifest . getLevel ( 1 ) . contains ( sstable2 ) ) ; 
+ } 
+ + 
+ + 
+ + 
+ + @ Test 
+ + public void testTokenRangeCompaction ( ) throws Exception 
+ + { 
+ + / / Remove any existing data so we can start out clean with predictable number of sstables 
+ + cfs . truncateBlocking ( ) ; 
+ + 
+ + / / Disable auto compaction so cassandra does not compact 
+ + CompactionManager . instance . disableAutoCompaction ( ) ; 
+ + 
+ + ByteBuffer value = ByteBuffer . wrap ( new byte [ 100 * 1024 ] ) ; / / 100 KB value , make it easy to have multiple files 
+ + 
+ + DecoratedKey key1 = Util . dk ( String . valueOf ( 1 ) ) ; 
+ + DecoratedKey key2 = Util . dk ( String . valueOf ( 2 ) ) ; 
+ + List < DecoratedKey > keys = new ArrayList < > ( Arrays . asList ( key1 , key2 ) ) ; 
+ + int numIterations = 10 ; 
+ + int columns = 2 ; 
+ + 
+ + / / Add enough data to trigger multiple sstables . 
+ + 
+ + / / create 10 sstables that contain data for both key1 and key2 
+ + for ( int i = 0 ; i < numIterations ; i + + ) { 
+ + for ( DecoratedKey key : keys ) { 
+ + UpdateBuilder update = UpdateBuilder . create ( cfs . metadata , key ) ; 
+ + for ( int c = 0 ; c < columns ; c + + ) 
+ + update . newRow ( " column " + c ) . add ( " val " , value ) ; 
+ + update . applyUnsafe ( ) ; 
+ + } 
+ + cfs . forceBlockingFlush ( ) ; 
+ + } 
+ + 
+ + / / create 20 more sstables with 10 containing data for key1 and other 10 containing data for key2 
+ + for ( int i = 0 ; i < numIterations ; i + + ) { 
+ + for ( DecoratedKey key : keys ) { 
+ + UpdateBuilder update = UpdateBuilder . create ( cfs . metadata , key ) ; 
+ + for ( int c = 0 ; c < columns ; c + + ) 
+ + update . newRow ( " column " + c ) . add ( " val " , value ) ; 
+ + update . applyUnsafe ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + } 
+ + } 
+ + 
+ + / / We should have a total of 30 sstables by now 
+ + assertEquals ( 30 , cfs . getLiveSSTables ( ) . size ( ) ) ; 
+ + 
+ + / / Compact just the tables with key2 
+ + / / Bit hackish to use the key1 . token as the prior key but works in BytesToken 
+ + Range < Token > tokenRange = new Range < > ( key2 . getToken ( ) , key2 . getToken ( ) ) ; 
+ + Collection < Range < Token > > tokenRanges = new ArrayList < > ( Arrays . asList ( tokenRange ) ) ; 
+ + cfs . forceCompactionForTokenRange ( tokenRanges ) ; 
+ + 
+ + while ( CompactionManager . instance . isCompacting ( Arrays . asList ( cfs ) ) ) { 
+ + Thread . sleep ( 100 ) ; 
+ + } 
+ + 
+ + / / 20 tables that have key2 should have been compacted in to 1 table resulting in 11 ( 30 - 20 + 1 ) 
+ + assertEquals ( 11 , cfs . getLiveSSTables ( ) . size ( ) ) ; 
+ + 
+ + / / Compact just the tables with key1 . At this point all 11 tables should have key1 
+ + Range < Token > tokenRange2 = new Range < > ( key1 . getToken ( ) , key1 . getToken ( ) ) ; 
+ + Collection < Range < Token > > tokenRanges2 = new ArrayList < > ( Arrays . asList ( tokenRange2 ) ) ; 
+ + cfs . forceCompactionForTokenRange ( tokenRanges2 ) ; 
+ + 
+ + 
+ + while ( CompactionManager . instance . isCompacting ( Arrays . asList ( cfs ) ) ) { 
+ + Thread . sleep ( 100 ) ; 
+ + } 
+ + 
+ + / / the 11 tables containing key1 should all compact to 1 table 
+ + assertEquals ( 1 , cfs . getLiveSSTables ( ) . size ( ) ) ; 
+ + } 
+ }
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index d518830 . . 52cc2c1 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 29 , 7 + 29 , 7 @ @ 
+ * add scheduler JMX metrics ( CASSANDRA - 2962 ) 
+ * add block level checksum for compressed data ( CASSANDRA - 1717 ) 
+ * make column family backed column map pluggable and introduce unsynchronized 
+ - ArrayList backed one to speedup reads ( CASSANDRA - 2843 ) 
+ + ArrayList backed one to speedup reads ( CASSANDRA - 2843 , 3165 ) 
+ * refactoring of the secondary index api ( CASSANDRA - 2982 ) 
+ * make CL > ONE reads wait for digest reconciliation before returning 
+ ( CASSANDRA - 2494 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ index c316a85 . . 71c7213 100644 
+ - - - a / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / ArrayBackedSortedColumns . java 
+ @ @ - 67 , 6 + 67 , 11 @ @ public class ArrayBackedSortedColumns extends ArrayList < IColumn > implements ISor 
+ this . reversed = reversed ; 
+ } 
+ 
+ + public ISortedColumns . Factory getFactory ( ) 
+ + { 
+ + return factory ( ) ; 
+ + } 
+ + 
+ public AbstractType < ? > getComparator ( ) 
+ { 
+ return comparator ; 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamily . java b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ index 1239d1c . . 38bc0d7 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamily . java 
+ @ @ - 81 , 14 + 81 , 19 @ @ public class ColumnFamily extends AbstractColumnContainer 
+ this . cfm = cfm ; 
+ } 
+ 
+ - public ColumnFamily cloneMeShallow ( ) 
+ + public ColumnFamily cloneMeShallow ( ISortedColumns . Factory factory ) 
+ { 
+ - ColumnFamily cf = ColumnFamily . create ( cfm ) ; 
+ + ColumnFamily cf = ColumnFamily . create ( cfm , factory ) ; 
+ / / since deletion info is immutable , aliasing it is fine 
+ cf . deletionInfo . set ( deletionInfo . get ( ) ) ; 
+ return cf ; 
+ } 
+ 
+ + public ColumnFamily cloneMeShallow ( ) 
+ + { 
+ + return cloneMeShallow ( columns . getFactory ( ) ) ; 
+ + } 
+ + 
+ public AbstractType getSubComparator ( ) 
+ { 
+ IColumnSerializer s = getColumnSerializer ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 0bfd1c5 . . 552d3e9 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1162 , 8 + 1162 , 11 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ } 
+ } 
+ 
+ - / * * filter a cached row , which will not be modified by the filter , but may be modified by throwing out 
+ - * tombstones that are no longer relevant . * / 
+ + / * * 
+ + * Filter a cached row , which will not be modified by the filter , but may be modified by throwing out 
+ + * tombstones that are no longer relevant . 
+ + * The returned column family won ' t be thread safe . 
+ + * / 
+ ColumnFamily filterColumnFamily ( ColumnFamily cached , QueryFilter filter , int gcBefore ) 
+ { 
+ / / special case slicing the entire row : 
+ @ @ - 1184 , 7 + 1187 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ IColumn sc = cached . getColumn ( filter . path . superColumnName ) ; 
+ if ( sc = = null | | sliceFilter . count > = sc . getSubColumns ( ) . size ( ) ) 
+ { 
+ - ColumnFamily cf = cached . cloneMeShallow ( ) ; 
+ + ColumnFamily cf = cached . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; 
+ if ( sc ! = null ) 
+ cf . addColumn ( sc , HeapAllocator . instance ) ; 
+ return removeDeleted ( cf , gcBefore ) ; 
+ @ @ - 1203 , 7 + 1206 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ } 
+ 
+ IColumnIterator ci = filter . getMemtableColumnIterator ( cached , null , getComparator ( ) ) ; 
+ - ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ) ; 
+ + ColumnFamily cf = ci . getColumnFamily ( ) . cloneMeShallow ( ArrayBackedSortedColumns . factory ( ) ) ; 
+ filter . collateColumns ( cf , Collections . singletonList ( ci ) , getComparator ( ) , gcBefore ) ; 
+ / / TODO this is necessary because when we collate supercolumns together , we don ' t check 
+ / / their subcolumns for relevance , so we need to do a second prune post facto here . 
+ diff - - git a / src / java / org / apache / cassandra / db / ISortedColumns . java b / src / java / org / apache / cassandra / db / ISortedColumns . java 
+ index 37f5a60 . . 624dec7 100644 
+ - - - a / src / java / org / apache / cassandra / db / ISortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / ISortedColumns . java 
+ @ @ - 42 , 6 + 42 , 11 @ @ public interface ISortedColumns extends IIterableColumns 
+ public ISortedColumns cloneMe ( ) ; 
+ 
+ / * * 
+ + * Returns the factory used for this ISortedColumns implementation . 
+ + * / 
+ + public Factory getFactory ( ) ; 
+ + 
+ + / * * 
+ * Adds a column to this column map . 
+ * If a column with the same name is already present in the map , it will 
+ * be replaced by the newly added column . 
+ diff - - git a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java 
+ index cd2488a . . 13a111a 100644 
+ - - - a / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / ThreadSafeSortedColumns . java 
+ @ @ - 62 , 6 + 62 , 11 @ @ public class ThreadSafeSortedColumns extends ConcurrentSkipListMap < ByteBuffer , I 
+ super ( columns ) ; 
+ } 
+ 
+ + public ISortedColumns . Factory getFactory ( ) 
+ + { 
+ + return factory ( ) ; 
+ + } 
+ + 
+ public ISortedColumns cloneMe ( ) 
+ { 
+ return new ThreadSafeSortedColumns ( this ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java 
+ index 34e83dc . . 6c3fc42 100644 
+ - - - a / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / TreeMapBackedSortedColumns . java 
+ @ @ - 62 , 6 + 62 , 11 @ @ public class TreeMapBackedSortedColumns extends TreeMap < ByteBuffer , IColumn > imp 
+ super ( columns ) ; 
+ } 
+ 
+ + public ISortedColumns . Factory getFactory ( ) 
+ + { 
+ + return factory ( ) ; 
+ + } 
+ + 
+ public ISortedColumns cloneMe ( ) 
+ { 
+ return new TreeMapBackedSortedColumns ( this ) ;

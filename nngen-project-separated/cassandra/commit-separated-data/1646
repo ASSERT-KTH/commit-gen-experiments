@@ -1,0 +1,383 @@
+BLEU SCORE: 0.027611988917697356
+
+TEST MSG: Only stream from unrepaired sstables during incremental repair
+GENERATED MSG: Keep sstable level when bootstrapping
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index f2f12c4 . . bff5970 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 <nl> + * Only stream from unrepaired sstables with incremental repair ( CASSANDRA - 8267 ) <nl> * Aggregate UDFs allow SFUNC return type to differ from STYPE if FFUNC specified ( CASSANDRA - 9321 ) <nl> * Failure detector detects and ignores local pauses ( CASSANDRA - 9183 ) <nl> * Remove Thrift dependencies in bundled tools ( CASSANDRA - 8358 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 26a430a . . fec3afc 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1816 , 7 + 1816 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> * @ return a ViewFragment containing the sstables and memtables that may need to be merged <nl> * for rows for all of @ param rowBoundsCollection , inclusive , according to the interval tree . <nl> * / <nl> - public Function < DataTracker . View , List < SSTableReader > > viewFilter ( final Collection < AbstractBounds < RowPosition > > rowBoundsCollection ) <nl> + public Function < DataTracker . View , List < SSTableReader > > viewFilter ( final Collection < AbstractBounds < RowPosition > > rowBoundsCollection , final boolean includeRepaired ) <nl> { <nl> return new Function < DataTracker . View , List < SSTableReader > > ( ) <nl> { <nl> @ @ - 1824 , 8 + 1824 , 15 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> { <nl> Set < SSTableReader > sstables = Sets . newHashSet ( ) ; <nl> for ( AbstractBounds < RowPosition > rowBounds : rowBoundsCollection ) <nl> - sstables . addAll ( view . sstablesInBounds ( rowBounds ) ) ; <nl> + { <nl> + for ( SSTableReader sstable : view . sstablesInBounds ( rowBounds ) ) <nl> + { <nl> + if ( includeRepaired | | ! sstable . isRepaired ( ) ) <nl> + sstables . add ( sstable ) ; <nl> + } <nl> + } <nl> <nl> + logger . debug ( " ViewFilter for { } / { } sstables " , sstables . size ( ) , getSSTables ( ) . size ( ) ) ; <nl> return ImmutableList . copyOf ( sstables ) ; <nl> } <nl> } ; <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java b / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java <nl> index 6991958 . . 910cdcc 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java <nl> @ @ - 156 , 7 + 156 , 7 @ @ public class SSTableLoader implements StreamEventHandler <nl> client . init ( keyspace ) ; <nl> outputHandler . output ( " Established connection to initial hosts " ) ; <nl> <nl> - StreamPlan plan = new StreamPlan ( " Bulk Load " , 0 , connectionsPerHost , false ) . connectionFactory ( client . getConnectionFactory ( ) ) ; <nl> + StreamPlan plan = new StreamPlan ( " Bulk Load " , 0 , connectionsPerHost , false , false ) . connectionFactory ( client . getConnectionFactory ( ) ) ; <nl> <nl> Map < InetAddress , Collection < Range < Token > > > endpointToRanges = client . getEndpointToRangesMap ( ) ; <nl> openSSTables ( endpointToRanges ) ; <nl> diff - - git a / src / java / org / apache / cassandra / net / IncomingStreamingConnection . java b / src / java / org / apache / cassandra / net / IncomingStreamingConnection . java <nl> index d00e4b8 . . 274e47b 100644 <nl> - - - a / src / java / org / apache / cassandra / net / IncomingStreamingConnection . java <nl> + + + b / src / java / org / apache / cassandra / net / IncomingStreamingConnection . java <nl> @ @ - 66 , 7 + 66 , 7 @ @ public class IncomingStreamingConnection extends Thread implements Closeable <nl> / / The receiving side distinguish two connections by looking at StreamInitMessage # isForOutgoing . <nl> / / Note : we cannot use the same socket for incoming and outgoing streams because we want to <nl> / / parallelize said streams and the socket is blocking , so we might deadlock . <nl> - StreamResultFuture . initReceivingSide ( init . sessionIndex , init . planId , init . description , init . from , socket , init . isForOutgoing , version , init . keepSSTableLevel ) ; <nl> + StreamResultFuture . initReceivingSide ( init . sessionIndex , init . planId , init . description , init . from , socket , init . isForOutgoing , version , init . keepSSTableLevel , init . isIncremental ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / repair / LocalSyncTask . java b / src / java / org / apache / cassandra / repair / LocalSyncTask . java <nl> index 010c959 . . daace01 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / LocalSyncTask . java <nl> + + + b / src / java / org / apache / cassandra / repair / LocalSyncTask . java <nl> @ @ - 26 , 6 + 26 , 7 @ @ import org . slf4j . LoggerFactory ; <nl> import org . apache . cassandra . db . SystemKeyspace ; <nl> import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . dht . Token ; <nl> + import org . apache . cassandra . service . ActiveRepairService ; <nl> import org . apache . cassandra . streaming . ProgressInfo ; <nl> import org . apache . cassandra . streaming . StreamEvent ; <nl> import org . apache . cassandra . streaming . StreamEventHandler ; <nl> @ @ - 65 , 8 + 66 , 14 @ @ public class LocalSyncTask extends SyncTask implements StreamEventHandler <nl> <nl> String message = String . format ( " Performing streaming repair of % d ranges with % s " , differences . size ( ) , dst ) ; <nl> logger . info ( " [ repair # { } ] { } " , desc . sessionId , message ) ; <nl> + boolean isIncremental = false ; <nl> + if ( desc . parentSessionId ! = null ) <nl> + { <nl> + ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( desc . parentSessionId ) ; <nl> + isIncremental = prs . isIncremental ; <nl> + } <nl> Tracing . traceRepair ( message ) ; <nl> - new StreamPlan ( " Repair " , repairedAt , 1 , false ) . listeners ( this ) <nl> + new StreamPlan ( " Repair " , repairedAt , 1 , false , isIncremental ) . listeners ( this ) <nl> . flushBeforeTransfer ( true ) <nl> / / request ranges from the remote node <nl> . requestRanges ( dst , preferred , desc . keyspace , differences , desc . columnFamily ) <nl> diff - - git a / src / java / org / apache / cassandra / repair / StreamingRepairTask . java b / src / java / org / apache / cassandra / repair / StreamingRepairTask . java <nl> index cbf0580 . . 25ef06e 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / StreamingRepairTask . java <nl> + + + b / src / java / org / apache / cassandra / repair / StreamingRepairTask . java <nl> @ @ - 26 , 6 + 26 , 7 @ @ import org . apache . cassandra . db . SystemKeyspace ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> import org . apache . cassandra . repair . messages . SyncComplete ; <nl> import org . apache . cassandra . repair . messages . SyncRequest ; <nl> + import org . apache . cassandra . service . ActiveRepairService ; <nl> import org . apache . cassandra . streaming . StreamEvent ; <nl> import org . apache . cassandra . streaming . StreamEventHandler ; <nl> import org . apache . cassandra . streaming . StreamPlan ; <nl> @ @ - 55 , 7 + 56 , 13 @ @ public class StreamingRepairTask implements Runnable , StreamEventHandler <nl> InetAddress dest = request . dst ; <nl> InetAddress preferred = SystemKeyspace . getPreferredIP ( dest ) ; <nl> logger . info ( String . format ( " [ streaming task # % s ] Performing streaming repair of % d ranges with % s " , desc . sessionId , request . ranges . size ( ) , request . dst ) ) ; <nl> - new StreamPlan ( " Repair " , repairedAt , 1 , false ) . listeners ( this ) <nl> + boolean isIncremental = false ; <nl> + if ( desc . parentSessionId ! = null ) <nl> + { <nl> + ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( desc . parentSessionId ) ; <nl> + isIncremental = prs . isIncremental ; <nl> + } <nl> + new StreamPlan ( " Repair " , repairedAt , 1 , false , isIncremental ) . listeners ( this ) <nl> . flushBeforeTransfer ( true ) <nl> / / request ranges from the remote node <nl> . requestRanges ( dest , preferred , desc . keyspace , request . ranges , desc . columnFamily ) <nl> diff - - git a / src / java / org / apache / cassandra / streaming / ConnectionHandler . java b / src / java / org / apache / cassandra / streaming / ConnectionHandler . java <nl> index 780018c . . bb27972 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / ConnectionHandler . java <nl> + + + b / src / java / org / apache / cassandra / streaming / ConnectionHandler . java <nl> @ @ - 183 , 7 + 183 , 8 @ @ public class ConnectionHandler <nl> session . planId ( ) , <nl> session . description ( ) , <nl> isForOutgoing , <nl> - session . keepSSTableLevel ( ) ) ; <nl> + session . keepSSTableLevel ( ) , <nl> + session . isIncremental ( ) ) ; <nl> ByteBuffer messageBuf = message . createMessage ( false , protocolVersion ) ; <nl> DataOutputStreamPlus out = getWriteChannel ( socket ) ; <nl> out . write ( messageBuf ) ; <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamCoordinator . java b / src / java / org / apache / cassandra / streaming / StreamCoordinator . java <nl> index 8d0cdce . . 603366d 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamCoordinator . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamCoordinator . java <nl> @ @ - 46 , 12 + 46 , 14 @ @ public class StreamCoordinator <nl> private final int connectionsPerHost ; <nl> private StreamConnectionFactory factory ; <nl> private final boolean keepSSTableLevel ; <nl> + private final boolean isIncremental ; <nl> <nl> - public StreamCoordinator ( int connectionsPerHost , boolean keepSSTableLevel , StreamConnectionFactory factory ) <nl> + public StreamCoordinator ( int connectionsPerHost , boolean keepSSTableLevel , boolean isIncremental , StreamConnectionFactory factory ) <nl> { <nl> this . connectionsPerHost = connectionsPerHost ; <nl> this . factory = factory ; <nl> this . keepSSTableLevel = keepSSTableLevel ; <nl> + this . isIncremental = isIncremental ; <nl> } <nl> <nl> public void setConnectionFactory ( StreamConnectionFactory factory ) <nl> @ @ - 235 , 7 + 237 , 7 @ @ public class StreamCoordinator <nl> / / create <nl> if ( streamSessions . size ( ) < connectionsPerHost ) <nl> { <nl> - StreamSession session = new StreamSession ( peer , connecting , factory , streamSessions . size ( ) , keepSSTableLevel ) ; <nl> + StreamSession session = new StreamSession ( peer , connecting , factory , streamSessions . size ( ) , keepSSTableLevel , isIncremental ) ; <nl> streamSessions . put ( + + lastReturned , session ) ; <nl> return session ; <nl> } <nl> @ @ - 267 , 7 + 269 , 7 @ @ public class StreamCoordinator <nl> StreamSession session = streamSessions . get ( id ) ; <nl> if ( session = = null ) <nl> { <nl> - session = new StreamSession ( peer , connecting , factory , id , keepSSTableLevel ) ; <nl> + session = new StreamSession ( peer , connecting , factory , id , keepSSTableLevel , isIncremental ) ; <nl> streamSessions . put ( id , session ) ; <nl> } <nl> return session ; <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamPlan . java b / src / java / org / apache / cassandra / streaming / StreamPlan . java <nl> index 0e5cc6f . . 0d963ed 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamPlan . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamPlan . java <nl> @ @ - 47 , 19 + 47 , 19 @ @ public class StreamPlan <nl> * / <nl> public StreamPlan ( String description ) <nl> { <nl> - this ( description , ActiveRepairService . UNREPAIRED _ SSTABLE , 1 , false ) ; <nl> + this ( description , ActiveRepairService . UNREPAIRED _ SSTABLE , 1 , false , false ) ; <nl> } <nl> <nl> public StreamPlan ( String description , boolean keepSSTableLevels ) <nl> { <nl> - this ( description , ActiveRepairService . UNREPAIRED _ SSTABLE , 1 , keepSSTableLevels ) ; <nl> + this ( description , ActiveRepairService . UNREPAIRED _ SSTABLE , 1 , keepSSTableLevels , false ) ; <nl> } <nl> <nl> - public StreamPlan ( String description , long repairedAt , int connectionsPerHost , boolean keepSSTableLevels ) <nl> + public StreamPlan ( String description , long repairedAt , int connectionsPerHost , boolean keepSSTableLevels , boolean isIncremental ) <nl> { <nl> this . description = description ; <nl> this . repairedAt = repairedAt ; <nl> - this . coordinator = new StreamCoordinator ( connectionsPerHost , keepSSTableLevels , new DefaultConnectionFactory ( ) ) ; <nl> + this . coordinator = new StreamCoordinator ( connectionsPerHost , keepSSTableLevels , isIncremental , new DefaultConnectionFactory ( ) ) ; <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamResultFuture . java b / src / java / org / apache / cassandra / streaming / StreamResultFuture . java <nl> index ce9518a . . 99adab0 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamResultFuture . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamResultFuture . java <nl> @ @ - 69 , 9 + 69 , 9 @ @ public final class StreamResultFuture extends AbstractFuture < StreamState > <nl> set ( getCurrentState ( ) ) ; <nl> } <nl> <nl> - private StreamResultFuture ( UUID planId , String description , boolean keepSSTableLevels ) <nl> + private StreamResultFuture ( UUID planId , String description , boolean keepSSTableLevels , boolean isIncremental ) <nl> { <nl> - this ( planId , description , new StreamCoordinator ( 0 , keepSSTableLevels , new DefaultConnectionFactory ( ) ) ) ; <nl> + this ( planId , description , new StreamCoordinator ( 0 , keepSSTableLevels , isIncremental , new DefaultConnectionFactory ( ) ) ) ; <nl> } <nl> <nl> static StreamResultFuture init ( UUID planId , String description , Collection < StreamEventHandler > listeners , StreamCoordinator coordinator ) <nl> @ @ - 102 , 7 + 102 , 8 @ @ public final class StreamResultFuture extends AbstractFuture < StreamState > <nl> Socket socket , <nl> boolean isForOutgoing , <nl> int version , <nl> - boolean keepSSTableLevel ) throws IOException <nl> + boolean keepSSTableLevel , <nl> + boolean isIncremental ) throws IOException <nl> { <nl> StreamResultFuture future = StreamManager . instance . getReceivingStream ( planId ) ; <nl> if ( future = = null ) <nl> @ @ - 110 , 7 + 111 , 7 @ @ public final class StreamResultFuture extends AbstractFuture < StreamState > <nl> logger . info ( " [ Stream # { } ID # { } ] Creating new streaming plan for { } " , planId , sessionIndex , description ) ; <nl> <nl> / / The main reason we create a StreamResultFuture on the receiving side is for JMX exposure . <nl> - future = new StreamResultFuture ( planId , description , keepSSTableLevel ) ; <nl> + future = new StreamResultFuture ( planId , description , keepSSTableLevel , isIncremental ) ; <nl> StreamManager . instance . registerReceiving ( future ) ; <nl> } <nl> future . attachSocket ( from , sessionIndex , socket , isForOutgoing , version ) ; <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamSession . java b / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> index 5a056c4 . . 09ee3e4 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamSession . java <nl> @ @ - 145 , 6 + 145 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber <nl> <nl> private AtomicBoolean isAborted = new AtomicBoolean ( false ) ; <nl> private final boolean keepSSTableLevel ; <nl> + private final boolean isIncremental ; <nl> <nl> public static enum State <nl> { <nl> @ @ - 166 , 7 + 167 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber <nl> * @ param connecting Actual connecting address <nl> * @ param factory is used for establishing connection <nl> * / <nl> - public StreamSession ( InetAddress peer , InetAddress connecting , StreamConnectionFactory factory , int index , boolean keepSSTableLevel ) <nl> + public StreamSession ( InetAddress peer , InetAddress connecting , StreamConnectionFactory factory , int index , boolean keepSSTableLevel , boolean isIncremental ) <nl> { <nl> this . peer = peer ; <nl> this . connecting = connecting ; <nl> @ @ - 175 , 6 + 176 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber <nl> this . handler = new ConnectionHandler ( this ) ; <nl> this . metrics = StreamingMetrics . get ( connecting ) ; <nl> this . keepSSTableLevel = keepSSTableLevel ; <nl> + this . isIncremental = isIncremental ; <nl> } <nl> <nl> public UUID planId ( ) <nl> @ @ - 197 , 6 + 199 , 12 @ @ public class StreamSession implements IEndpointStateChangeSubscriber <nl> return keepSSTableLevel ; <nl> } <nl> <nl> + public boolean isIncremental ( ) <nl> + { <nl> + return isIncremental ; <nl> + } <nl> + <nl> + <nl> / * * <nl> * Bind this session to report to specific { @ link StreamResultFuture } and <nl> * perform pre - streaming initialization . <nl> @ @ - 306 , 7 + 314 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber <nl> List < AbstractBounds < RowPosition > > rowBoundsList = new ArrayList < > ( ranges . size ( ) ) ; <nl> for ( Range < Token > range : ranges ) <nl> rowBoundsList . add ( Range . makeRowRange ( range ) ) ; <nl> - refs . addAll ( cfStore . selectAndReference ( cfStore . viewFilter ( rowBoundsList ) ) . refs ) ; <nl> + refs . addAll ( cfStore . selectAndReference ( cfStore . viewFilter ( rowBoundsList , ! isIncremental ) ) . refs ) ; <nl> } <nl> <nl> List < SSTableStreamingSections > sections = new ArrayList < > ( refs . size ( ) ) ; <nl> diff - - git a / src / java / org / apache / cassandra / streaming / messages / StreamInitMessage . java b / src / java / org / apache / cassandra / streaming / messages / StreamInitMessage . java <nl> index 03ac944 . . 4928039 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / messages / StreamInitMessage . java <nl> + + + b / src / java / org / apache / cassandra / streaming / messages / StreamInitMessage . java <nl> @ @ - 48 , 8 + 48 , 9 @ @ public class StreamInitMessage <nl> / / true if this init message is to connect for outgoing message on receiving side <nl> public final boolean isForOutgoing ; <nl> public final boolean keepSSTableLevel ; <nl> + public final boolean isIncremental ; <nl> <nl> - public StreamInitMessage ( InetAddress from , int sessionIndex , UUID planId , String description , boolean isForOutgoing , boolean keepSSTableLevel ) <nl> + public StreamInitMessage ( InetAddress from , int sessionIndex , UUID planId , String description , boolean isForOutgoing , boolean keepSSTableLevel , boolean isIncremental ) <nl> { <nl> this . from = from ; <nl> this . sessionIndex = sessionIndex ; <nl> @ @ - 57 , 6 + 58 , 7 @ @ public class StreamInitMessage <nl> this . description = description ; <nl> this . isForOutgoing = isForOutgoing ; <nl> this . keepSSTableLevel = keepSSTableLevel ; <nl> + this . isIncremental = isIncremental ; <nl> } <nl> <nl> / * * <nl> @ @ - 109 , 6 + 111 , 7 @ @ public class StreamInitMessage <nl> out . writeUTF ( message . description ) ; <nl> out . writeBoolean ( message . isForOutgoing ) ; <nl> out . writeBoolean ( message . keepSSTableLevel ) ; <nl> + out . writeBoolean ( message . isIncremental ) ; <nl> } <nl> <nl> public StreamInitMessage deserialize ( DataInput in , int version ) throws IOException <nl> @ @ - 119 , 7 + 122 , 8 @ @ public class StreamInitMessage <nl> String description = in . readUTF ( ) ; <nl> boolean sentByInitiator = in . readBoolean ( ) ; <nl> boolean keepSSTableLevel = in . readBoolean ( ) ; <nl> - return new StreamInitMessage ( from , sessionIndex , planId , description , sentByInitiator , keepSSTableLevel ) ; <nl> + boolean isIncremental = in . readBoolean ( ) ; <nl> + return new StreamInitMessage ( from , sessionIndex , planId , description , sentByInitiator , keepSSTableLevel , isIncremental ) ; <nl> } <nl> <nl> public long serializedSize ( StreamInitMessage message , int version ) <nl> @ @ - 130 , 6 + 134 , 7 @ @ public class StreamInitMessage <nl> size + = TypeSizes . NATIVE . sizeof ( message . description ) ; <nl> size + = TypeSizes . NATIVE . sizeof ( message . isForOutgoing ) ; <nl> size + = TypeSizes . NATIVE . sizeof ( message . keepSSTableLevel ) ; <nl> + size + = TypeSizes . NATIVE . sizeof ( message . isIncremental ) ; <nl> return size ; <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java b / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java <nl> index c8b9f05 . . 86781d9 100644 <nl> - - - a / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java <nl> + + + b / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java <nl> @ @ - 42 , 7 + 42 , 7 @ @ public class StreamStateStoreTest <nl> Range < Token > range = new Range < > ( factory . fromString ( " 0 " ) , factory . fromString ( " 100 " ) ) ; <nl> <nl> InetAddress local = FBUtilities . getBroadcastAddress ( ) ; <nl> - StreamSession session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true ) ; <nl> + StreamSession session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true , false ) ; <nl> session . addStreamRequest ( " keyspace1 " , Collections . singleton ( range ) , Collections . singleton ( " cf " ) , 0 ) ; <nl> <nl> StreamStateStore store = new StreamStateStore ( ) ; <nl> @ @ - 63 , 7 + 63 , 7 @ @ public class StreamStateStoreTest <nl> <nl> / / add different range within the same keyspace <nl> Range < Token > range2 = new Range < > ( factory . fromString ( " 100 " ) , factory . fromString ( " 200 " ) ) ; <nl> - session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true ) ; <nl> + session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true , false ) ; <nl> session . addStreamRequest ( " keyspace1 " , Collections . singleton ( range2 ) , Collections . singleton ( " cf " ) , 0 ) ; <nl> session . state ( StreamSession . State . COMPLETE ) ; <nl> store . handleStreamEvent ( new StreamEvent . SessionCompleteEvent ( session ) ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / streaming / StreamTransferTaskTest . java b / test / unit / org / apache / cassandra / streaming / StreamTransferTaskTest . java <nl> index 87b9c38 . . a0ac870 100644 <nl> - - - a / test / unit / org / apache / cassandra / streaming / StreamTransferTaskTest . java <nl> + + + b / test / unit / org / apache / cassandra / streaming / StreamTransferTaskTest . java <nl> @ @ - 64 , 7 + 64 , 7 @ @ public class StreamTransferTaskTest <nl> String cf = " Standard1 " ; <nl> <nl> InetAddress peer = FBUtilities . getBroadcastAddress ( ) ; <nl> - StreamSession session = new StreamSession ( peer , peer , null , 0 , true ) ; <nl> + StreamSession session = new StreamSession ( peer , peer , null , 0 , true , false ) ; <nl> ColumnFamilyStore cfs = Keyspace . open ( ks ) . getColumnFamilyStore ( cf ) ; <nl> <nl> / / create two sstables
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index f2f12c4 . . bff5970 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 
+ + * Only stream from unrepaired sstables with incremental repair ( CASSANDRA - 8267 ) 
+ * Aggregate UDFs allow SFUNC return type to differ from STYPE if FFUNC specified ( CASSANDRA - 9321 ) 
+ * Failure detector detects and ignores local pauses ( CASSANDRA - 9183 ) 
+ * Remove Thrift dependencies in bundled tools ( CASSANDRA - 8358 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 26a430a . . fec3afc 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1816 , 7 + 1816 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ * @ return a ViewFragment containing the sstables and memtables that may need to be merged 
+ * for rows for all of @ param rowBoundsCollection , inclusive , according to the interval tree . 
+ * / 
+ - public Function < DataTracker . View , List < SSTableReader > > viewFilter ( final Collection < AbstractBounds < RowPosition > > rowBoundsCollection ) 
+ + public Function < DataTracker . View , List < SSTableReader > > viewFilter ( final Collection < AbstractBounds < RowPosition > > rowBoundsCollection , final boolean includeRepaired ) 
+ { 
+ return new Function < DataTracker . View , List < SSTableReader > > ( ) 
+ { 
+ @ @ - 1824 , 8 + 1824 , 15 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ { 
+ Set < SSTableReader > sstables = Sets . newHashSet ( ) ; 
+ for ( AbstractBounds < RowPosition > rowBounds : rowBoundsCollection ) 
+ - sstables . addAll ( view . sstablesInBounds ( rowBounds ) ) ; 
+ + { 
+ + for ( SSTableReader sstable : view . sstablesInBounds ( rowBounds ) ) 
+ + { 
+ + if ( includeRepaired | | ! sstable . isRepaired ( ) ) 
+ + sstables . add ( sstable ) ; 
+ + } 
+ + } 
+ 
+ + logger . debug ( " ViewFilter for { } / { } sstables " , sstables . size ( ) , getSSTables ( ) . size ( ) ) ; 
+ return ImmutableList . copyOf ( sstables ) ; 
+ } 
+ } ; 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java b / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java 
+ index 6991958 . . 910cdcc 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableLoader . java 
+ @ @ - 156 , 7 + 156 , 7 @ @ public class SSTableLoader implements StreamEventHandler 
+ client . init ( keyspace ) ; 
+ outputHandler . output ( " Established connection to initial hosts " ) ; 
+ 
+ - StreamPlan plan = new StreamPlan ( " Bulk Load " , 0 , connectionsPerHost , false ) . connectionFactory ( client . getConnectionFactory ( ) ) ; 
+ + StreamPlan plan = new StreamPlan ( " Bulk Load " , 0 , connectionsPerHost , false , false ) . connectionFactory ( client . getConnectionFactory ( ) ) ; 
+ 
+ Map < InetAddress , Collection < Range < Token > > > endpointToRanges = client . getEndpointToRangesMap ( ) ; 
+ openSSTables ( endpointToRanges ) ; 
+ diff - - git a / src / java / org / apache / cassandra / net / IncomingStreamingConnection . java b / src / java / org / apache / cassandra / net / IncomingStreamingConnection . java 
+ index d00e4b8 . . 274e47b 100644 
+ - - - a / src / java / org / apache / cassandra / net / IncomingStreamingConnection . java 
+ + + + b / src / java / org / apache / cassandra / net / IncomingStreamingConnection . java 
+ @ @ - 66 , 7 + 66 , 7 @ @ public class IncomingStreamingConnection extends Thread implements Closeable 
+ / / The receiving side distinguish two connections by looking at StreamInitMessage # isForOutgoing . 
+ / / Note : we cannot use the same socket for incoming and outgoing streams because we want to 
+ / / parallelize said streams and the socket is blocking , so we might deadlock . 
+ - StreamResultFuture . initReceivingSide ( init . sessionIndex , init . planId , init . description , init . from , socket , init . isForOutgoing , version , init . keepSSTableLevel ) ; 
+ + StreamResultFuture . initReceivingSide ( init . sessionIndex , init . planId , init . description , init . from , socket , init . isForOutgoing , version , init . keepSSTableLevel , init . isIncremental ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / repair / LocalSyncTask . java b / src / java / org / apache / cassandra / repair / LocalSyncTask . java 
+ index 010c959 . . daace01 100644 
+ - - - a / src / java / org / apache / cassandra / repair / LocalSyncTask . java 
+ + + + b / src / java / org / apache / cassandra / repair / LocalSyncTask . java 
+ @ @ - 26 , 6 + 26 , 7 @ @ import org . slf4j . LoggerFactory ; 
+ import org . apache . cassandra . db . SystemKeyspace ; 
+ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . dht . Token ; 
+ + import org . apache . cassandra . service . ActiveRepairService ; 
+ import org . apache . cassandra . streaming . ProgressInfo ; 
+ import org . apache . cassandra . streaming . StreamEvent ; 
+ import org . apache . cassandra . streaming . StreamEventHandler ; 
+ @ @ - 65 , 8 + 66 , 14 @ @ public class LocalSyncTask extends SyncTask implements StreamEventHandler 
+ 
+ String message = String . format ( " Performing streaming repair of % d ranges with % s " , differences . size ( ) , dst ) ; 
+ logger . info ( " [ repair # { } ] { } " , desc . sessionId , message ) ; 
+ + boolean isIncremental = false ; 
+ + if ( desc . parentSessionId ! = null ) 
+ + { 
+ + ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( desc . parentSessionId ) ; 
+ + isIncremental = prs . isIncremental ; 
+ + } 
+ Tracing . traceRepair ( message ) ; 
+ - new StreamPlan ( " Repair " , repairedAt , 1 , false ) . listeners ( this ) 
+ + new StreamPlan ( " Repair " , repairedAt , 1 , false , isIncremental ) . listeners ( this ) 
+ . flushBeforeTransfer ( true ) 
+ / / request ranges from the remote node 
+ . requestRanges ( dst , preferred , desc . keyspace , differences , desc . columnFamily ) 
+ diff - - git a / src / java / org / apache / cassandra / repair / StreamingRepairTask . java b / src / java / org / apache / cassandra / repair / StreamingRepairTask . java 
+ index cbf0580 . . 25ef06e 100644 
+ - - - a / src / java / org / apache / cassandra / repair / StreamingRepairTask . java 
+ + + + b / src / java / org / apache / cassandra / repair / StreamingRepairTask . java 
+ @ @ - 26 , 6 + 26 , 7 @ @ import org . apache . cassandra . db . SystemKeyspace ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ import org . apache . cassandra . repair . messages . SyncComplete ; 
+ import org . apache . cassandra . repair . messages . SyncRequest ; 
+ + import org . apache . cassandra . service . ActiveRepairService ; 
+ import org . apache . cassandra . streaming . StreamEvent ; 
+ import org . apache . cassandra . streaming . StreamEventHandler ; 
+ import org . apache . cassandra . streaming . StreamPlan ; 
+ @ @ - 55 , 7 + 56 , 13 @ @ public class StreamingRepairTask implements Runnable , StreamEventHandler 
+ InetAddress dest = request . dst ; 
+ InetAddress preferred = SystemKeyspace . getPreferredIP ( dest ) ; 
+ logger . info ( String . format ( " [ streaming task # % s ] Performing streaming repair of % d ranges with % s " , desc . sessionId , request . ranges . size ( ) , request . dst ) ) ; 
+ - new StreamPlan ( " Repair " , repairedAt , 1 , false ) . listeners ( this ) 
+ + boolean isIncremental = false ; 
+ + if ( desc . parentSessionId ! = null ) 
+ + { 
+ + ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( desc . parentSessionId ) ; 
+ + isIncremental = prs . isIncremental ; 
+ + } 
+ + new StreamPlan ( " Repair " , repairedAt , 1 , false , isIncremental ) . listeners ( this ) 
+ . flushBeforeTransfer ( true ) 
+ / / request ranges from the remote node 
+ . requestRanges ( dest , preferred , desc . keyspace , request . ranges , desc . columnFamily ) 
+ diff - - git a / src / java / org / apache / cassandra / streaming / ConnectionHandler . java b / src / java / org / apache / cassandra / streaming / ConnectionHandler . java 
+ index 780018c . . bb27972 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / ConnectionHandler . java 
+ + + + b / src / java / org / apache / cassandra / streaming / ConnectionHandler . java 
+ @ @ - 183 , 7 + 183 , 8 @ @ public class ConnectionHandler 
+ session . planId ( ) , 
+ session . description ( ) , 
+ isForOutgoing , 
+ - session . keepSSTableLevel ( ) ) ; 
+ + session . keepSSTableLevel ( ) , 
+ + session . isIncremental ( ) ) ; 
+ ByteBuffer messageBuf = message . createMessage ( false , protocolVersion ) ; 
+ DataOutputStreamPlus out = getWriteChannel ( socket ) ; 
+ out . write ( messageBuf ) ; 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamCoordinator . java b / src / java / org / apache / cassandra / streaming / StreamCoordinator . java 
+ index 8d0cdce . . 603366d 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamCoordinator . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamCoordinator . java 
+ @ @ - 46 , 12 + 46 , 14 @ @ public class StreamCoordinator 
+ private final int connectionsPerHost ; 
+ private StreamConnectionFactory factory ; 
+ private final boolean keepSSTableLevel ; 
+ + private final boolean isIncremental ; 
+ 
+ - public StreamCoordinator ( int connectionsPerHost , boolean keepSSTableLevel , StreamConnectionFactory factory ) 
+ + public StreamCoordinator ( int connectionsPerHost , boolean keepSSTableLevel , boolean isIncremental , StreamConnectionFactory factory ) 
+ { 
+ this . connectionsPerHost = connectionsPerHost ; 
+ this . factory = factory ; 
+ this . keepSSTableLevel = keepSSTableLevel ; 
+ + this . isIncremental = isIncremental ; 
+ } 
+ 
+ public void setConnectionFactory ( StreamConnectionFactory factory ) 
+ @ @ - 235 , 7 + 237 , 7 @ @ public class StreamCoordinator 
+ / / create 
+ if ( streamSessions . size ( ) < connectionsPerHost ) 
+ { 
+ - StreamSession session = new StreamSession ( peer , connecting , factory , streamSessions . size ( ) , keepSSTableLevel ) ; 
+ + StreamSession session = new StreamSession ( peer , connecting , factory , streamSessions . size ( ) , keepSSTableLevel , isIncremental ) ; 
+ streamSessions . put ( + + lastReturned , session ) ; 
+ return session ; 
+ } 
+ @ @ - 267 , 7 + 269 , 7 @ @ public class StreamCoordinator 
+ StreamSession session = streamSessions . get ( id ) ; 
+ if ( session = = null ) 
+ { 
+ - session = new StreamSession ( peer , connecting , factory , id , keepSSTableLevel ) ; 
+ + session = new StreamSession ( peer , connecting , factory , id , keepSSTableLevel , isIncremental ) ; 
+ streamSessions . put ( id , session ) ; 
+ } 
+ return session ; 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamPlan . java b / src / java / org / apache / cassandra / streaming / StreamPlan . java 
+ index 0e5cc6f . . 0d963ed 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamPlan . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamPlan . java 
+ @ @ - 47 , 19 + 47 , 19 @ @ public class StreamPlan 
+ * / 
+ public StreamPlan ( String description ) 
+ { 
+ - this ( description , ActiveRepairService . UNREPAIRED _ SSTABLE , 1 , false ) ; 
+ + this ( description , ActiveRepairService . UNREPAIRED _ SSTABLE , 1 , false , false ) ; 
+ } 
+ 
+ public StreamPlan ( String description , boolean keepSSTableLevels ) 
+ { 
+ - this ( description , ActiveRepairService . UNREPAIRED _ SSTABLE , 1 , keepSSTableLevels ) ; 
+ + this ( description , ActiveRepairService . UNREPAIRED _ SSTABLE , 1 , keepSSTableLevels , false ) ; 
+ } 
+ 
+ - public StreamPlan ( String description , long repairedAt , int connectionsPerHost , boolean keepSSTableLevels ) 
+ + public StreamPlan ( String description , long repairedAt , int connectionsPerHost , boolean keepSSTableLevels , boolean isIncremental ) 
+ { 
+ this . description = description ; 
+ this . repairedAt = repairedAt ; 
+ - this . coordinator = new StreamCoordinator ( connectionsPerHost , keepSSTableLevels , new DefaultConnectionFactory ( ) ) ; 
+ + this . coordinator = new StreamCoordinator ( connectionsPerHost , keepSSTableLevels , isIncremental , new DefaultConnectionFactory ( ) ) ; 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamResultFuture . java b / src / java / org / apache / cassandra / streaming / StreamResultFuture . java 
+ index ce9518a . . 99adab0 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamResultFuture . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamResultFuture . java 
+ @ @ - 69 , 9 + 69 , 9 @ @ public final class StreamResultFuture extends AbstractFuture < StreamState > 
+ set ( getCurrentState ( ) ) ; 
+ } 
+ 
+ - private StreamResultFuture ( UUID planId , String description , boolean keepSSTableLevels ) 
+ + private StreamResultFuture ( UUID planId , String description , boolean keepSSTableLevels , boolean isIncremental ) 
+ { 
+ - this ( planId , description , new StreamCoordinator ( 0 , keepSSTableLevels , new DefaultConnectionFactory ( ) ) ) ; 
+ + this ( planId , description , new StreamCoordinator ( 0 , keepSSTableLevels , isIncremental , new DefaultConnectionFactory ( ) ) ) ; 
+ } 
+ 
+ static StreamResultFuture init ( UUID planId , String description , Collection < StreamEventHandler > listeners , StreamCoordinator coordinator ) 
+ @ @ - 102 , 7 + 102 , 8 @ @ public final class StreamResultFuture extends AbstractFuture < StreamState > 
+ Socket socket , 
+ boolean isForOutgoing , 
+ int version , 
+ - boolean keepSSTableLevel ) throws IOException 
+ + boolean keepSSTableLevel , 
+ + boolean isIncremental ) throws IOException 
+ { 
+ StreamResultFuture future = StreamManager . instance . getReceivingStream ( planId ) ; 
+ if ( future = = null ) 
+ @ @ - 110 , 7 + 111 , 7 @ @ public final class StreamResultFuture extends AbstractFuture < StreamState > 
+ logger . info ( " [ Stream # { } ID # { } ] Creating new streaming plan for { } " , planId , sessionIndex , description ) ; 
+ 
+ / / The main reason we create a StreamResultFuture on the receiving side is for JMX exposure . 
+ - future = new StreamResultFuture ( planId , description , keepSSTableLevel ) ; 
+ + future = new StreamResultFuture ( planId , description , keepSSTableLevel , isIncremental ) ; 
+ StreamManager . instance . registerReceiving ( future ) ; 
+ } 
+ future . attachSocket ( from , sessionIndex , socket , isForOutgoing , version ) ; 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamSession . java b / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ index 5a056c4 . . 09ee3e4 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamSession . java 
+ @ @ - 145 , 6 + 145 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber 
+ 
+ private AtomicBoolean isAborted = new AtomicBoolean ( false ) ; 
+ private final boolean keepSSTableLevel ; 
+ + private final boolean isIncremental ; 
+ 
+ public static enum State 
+ { 
+ @ @ - 166 , 7 + 167 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber 
+ * @ param connecting Actual connecting address 
+ * @ param factory is used for establishing connection 
+ * / 
+ - public StreamSession ( InetAddress peer , InetAddress connecting , StreamConnectionFactory factory , int index , boolean keepSSTableLevel ) 
+ + public StreamSession ( InetAddress peer , InetAddress connecting , StreamConnectionFactory factory , int index , boolean keepSSTableLevel , boolean isIncremental ) 
+ { 
+ this . peer = peer ; 
+ this . connecting = connecting ; 
+ @ @ - 175 , 6 + 176 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber 
+ this . handler = new ConnectionHandler ( this ) ; 
+ this . metrics = StreamingMetrics . get ( connecting ) ; 
+ this . keepSSTableLevel = keepSSTableLevel ; 
+ + this . isIncremental = isIncremental ; 
+ } 
+ 
+ public UUID planId ( ) 
+ @ @ - 197 , 6 + 199 , 12 @ @ public class StreamSession implements IEndpointStateChangeSubscriber 
+ return keepSSTableLevel ; 
+ } 
+ 
+ + public boolean isIncremental ( ) 
+ + { 
+ + return isIncremental ; 
+ + } 
+ + 
+ + 
+ / * * 
+ * Bind this session to report to specific { @ link StreamResultFuture } and 
+ * perform pre - streaming initialization . 
+ @ @ - 306 , 7 + 314 , 7 @ @ public class StreamSession implements IEndpointStateChangeSubscriber 
+ List < AbstractBounds < RowPosition > > rowBoundsList = new ArrayList < > ( ranges . size ( ) ) ; 
+ for ( Range < Token > range : ranges ) 
+ rowBoundsList . add ( Range . makeRowRange ( range ) ) ; 
+ - refs . addAll ( cfStore . selectAndReference ( cfStore . viewFilter ( rowBoundsList ) ) . refs ) ; 
+ + refs . addAll ( cfStore . selectAndReference ( cfStore . viewFilter ( rowBoundsList , ! isIncremental ) ) . refs ) ; 
+ } 
+ 
+ List < SSTableStreamingSections > sections = new ArrayList < > ( refs . size ( ) ) ; 
+ diff - - git a / src / java / org / apache / cassandra / streaming / messages / StreamInitMessage . java b / src / java / org / apache / cassandra / streaming / messages / StreamInitMessage . java 
+ index 03ac944 . . 4928039 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / messages / StreamInitMessage . java 
+ + + + b / src / java / org / apache / cassandra / streaming / messages / StreamInitMessage . java 
+ @ @ - 48 , 8 + 48 , 9 @ @ public class StreamInitMessage 
+ / / true if this init message is to connect for outgoing message on receiving side 
+ public final boolean isForOutgoing ; 
+ public final boolean keepSSTableLevel ; 
+ + public final boolean isIncremental ; 
+ 
+ - public StreamInitMessage ( InetAddress from , int sessionIndex , UUID planId , String description , boolean isForOutgoing , boolean keepSSTableLevel ) 
+ + public StreamInitMessage ( InetAddress from , int sessionIndex , UUID planId , String description , boolean isForOutgoing , boolean keepSSTableLevel , boolean isIncremental ) 
+ { 
+ this . from = from ; 
+ this . sessionIndex = sessionIndex ; 
+ @ @ - 57 , 6 + 58 , 7 @ @ public class StreamInitMessage 
+ this . description = description ; 
+ this . isForOutgoing = isForOutgoing ; 
+ this . keepSSTableLevel = keepSSTableLevel ; 
+ + this . isIncremental = isIncremental ; 
+ } 
+ 
+ / * * 
+ @ @ - 109 , 6 + 111 , 7 @ @ public class StreamInitMessage 
+ out . writeUTF ( message . description ) ; 
+ out . writeBoolean ( message . isForOutgoing ) ; 
+ out . writeBoolean ( message . keepSSTableLevel ) ; 
+ + out . writeBoolean ( message . isIncremental ) ; 
+ } 
+ 
+ public StreamInitMessage deserialize ( DataInput in , int version ) throws IOException 
+ @ @ - 119 , 7 + 122 , 8 @ @ public class StreamInitMessage 
+ String description = in . readUTF ( ) ; 
+ boolean sentByInitiator = in . readBoolean ( ) ; 
+ boolean keepSSTableLevel = in . readBoolean ( ) ; 
+ - return new StreamInitMessage ( from , sessionIndex , planId , description , sentByInitiator , keepSSTableLevel ) ; 
+ + boolean isIncremental = in . readBoolean ( ) ; 
+ + return new StreamInitMessage ( from , sessionIndex , planId , description , sentByInitiator , keepSSTableLevel , isIncremental ) ; 
+ } 
+ 
+ public long serializedSize ( StreamInitMessage message , int version ) 
+ @ @ - 130 , 6 + 134 , 7 @ @ public class StreamInitMessage 
+ size + = TypeSizes . NATIVE . sizeof ( message . description ) ; 
+ size + = TypeSizes . NATIVE . sizeof ( message . isForOutgoing ) ; 
+ size + = TypeSizes . NATIVE . sizeof ( message . keepSSTableLevel ) ; 
+ + size + = TypeSizes . NATIVE . sizeof ( message . isIncremental ) ; 
+ return size ; 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java b / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java 
+ index c8b9f05 . . 86781d9 100644 
+ - - - a / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java 
+ + + + b / test / unit / org / apache / cassandra / dht / StreamStateStoreTest . java 
+ @ @ - 42 , 7 + 42 , 7 @ @ public class StreamStateStoreTest 
+ Range < Token > range = new Range < > ( factory . fromString ( " 0 " ) , factory . fromString ( " 100 " ) ) ; 
+ 
+ InetAddress local = FBUtilities . getBroadcastAddress ( ) ; 
+ - StreamSession session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true ) ; 
+ + StreamSession session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true , false ) ; 
+ session . addStreamRequest ( " keyspace1 " , Collections . singleton ( range ) , Collections . singleton ( " cf " ) , 0 ) ; 
+ 
+ StreamStateStore store = new StreamStateStore ( ) ; 
+ @ @ - 63 , 7 + 63 , 7 @ @ public class StreamStateStoreTest 
+ 
+ / / add different range within the same keyspace 
+ Range < Token > range2 = new Range < > ( factory . fromString ( " 100 " ) , factory . fromString ( " 200 " ) ) ; 
+ - session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true ) ; 
+ + session = new StreamSession ( local , local , new DefaultConnectionFactory ( ) , 0 , true , false ) ; 
+ session . addStreamRequest ( " keyspace1 " , Collections . singleton ( range2 ) , Collections . singleton ( " cf " ) , 0 ) ; 
+ session . state ( StreamSession . State . COMPLETE ) ; 
+ store . handleStreamEvent ( new StreamEvent . SessionCompleteEvent ( session ) ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / streaming / StreamTransferTaskTest . java b / test / unit / org / apache / cassandra / streaming / StreamTransferTaskTest . java 
+ index 87b9c38 . . a0ac870 100644 
+ - - - a / test / unit / org / apache / cassandra / streaming / StreamTransferTaskTest . java 
+ + + + b / test / unit / org / apache / cassandra / streaming / StreamTransferTaskTest . java 
+ @ @ - 64 , 7 + 64 , 7 @ @ public class StreamTransferTaskTest 
+ String cf = " Standard1 " ; 
+ 
+ InetAddress peer = FBUtilities . getBroadcastAddress ( ) ; 
+ - StreamSession session = new StreamSession ( peer , peer , null , 0 , true ) ; 
+ + StreamSession session = new StreamSession ( peer , peer , null , 0 , true , false ) ; 
+ ColumnFamilyStore cfs = Keyspace . open ( ks ) . getColumnFamilyStore ( cf ) ; 
+ 
+ / / create two sstables
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

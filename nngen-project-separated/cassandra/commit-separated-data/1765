@@ -1,0 +1,1306 @@
+BLEU SCORE: 0.03283637368030199
+
+TEST MSG: Keep node up when bootstrap streaming failed
+GENERATED MSG: add Move command
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 1648b76 . . 7df303f 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 72 , 7 + 72 , 7 @ @ <nl> * Select optimal CRC32 implementation at runtime ( CASSANDRA - 8614 ) <nl> * Evaluate MurmurHash of Token once per query ( CASSANDRA - 7096 ) <nl> * Generalize progress reporting ( CASSANDRA - 8901 ) <nl> - * Resumable bootstrap streaming ( CASSANDRA - 8838 ) <nl> + * Resumable bootstrap streaming ( CASSANDRA - 8838 , CASSANDRA - 8942 ) <nl> * Allow scrub for secondary index ( CASSANDRA - 5174 ) <nl> <nl> 2 . 1 . 4 <nl> diff - - git a / NEWS . txt b / NEWS . txt <nl> index c742f08 . . 641be77 100644 <nl> - - - a / NEWS . txt <nl> + + + b / NEWS . txt <nl> @ @ - 45 , 6 + 45 , 9 @ @ New features <nl> installed which is accessible by Cassandra . Old versions of <nl> libjna packages ( < 4 . 0 . 0 ) will cause problems - e . g . Debian Wheezy <nl> contains libjna versin 3 . 2 . x . <nl> + - The node now keeps up when streaming is failed during bootstrapping . You can <nl> + use new ` nodetool bootstrap resume ` command to continue streaming after resolving <nl> + an issue . <nl> <nl> <nl> Upgrading <nl> diff - - git a / src / java / org / apache / cassandra / dht / BootStrapper . java b / src / java / org / apache / cassandra / dht / BootStrapper . java <nl> index 9d9cf0f . . aca05f0 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / BootStrapper . java <nl> + + + b / src / java / org / apache / cassandra / dht / BootStrapper . java <nl> @ @ - 21 , 8 + 21 , 9 @ @ import java . io . DataInput ; <nl> import java . io . IOException ; <nl> import java . net . InetAddress ; <nl> import java . util . * ; <nl> - import java . util . concurrent . ExecutionException ; <nl> + import java . util . concurrent . atomic . AtomicInteger ; <nl> <nl> + import com . google . common . util . concurrent . ListenableFuture ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 37 , 8 + 38 , 12 @ @ import org . apache . cassandra . io . util . DataOutputPlus ; <nl> import org . apache . cassandra . locator . AbstractReplicationStrategy ; <nl> import org . apache . cassandra . locator . TokenMetadata ; <nl> import org . apache . cassandra . service . StorageService ; <nl> + import org . apache . cassandra . streaming . * ; <nl> + import org . apache . cassandra . utils . progress . ProgressEvent ; <nl> + import org . apache . cassandra . utils . progress . ProgressEventNotifierSupport ; <nl> + import org . apache . cassandra . utils . progress . ProgressEventType ; <nl> <nl> - public class BootStrapper <nl> + public class BootStrapper extends ProgressEventNotifierSupport <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( BootStrapper . class ) ; <nl> <nl> @ @ - 58 , 7 + 63 , 7 @ @ public class BootStrapper <nl> this . tokenMetadata = tmd ; <nl> } <nl> <nl> - public void bootstrap ( StreamStateStore stateStore , boolean useStrictConsistency ) <nl> + public ListenableFuture < StreamState > bootstrap ( StreamStateStore stateStore , boolean useStrictConsistency ) <nl> { <nl> logger . debug ( " Beginning bootstrap process " ) ; <nl> <nl> @ @ - 77 , 19 + 82 , 70 @ @ public class BootStrapper <nl> streamer . addRanges ( keyspaceName , strategy . getPendingAddressRanges ( tokenMetadata , tokens , address ) ) ; <nl> } <nl> <nl> - try <nl> + StreamResultFuture bootstrapStreamResult = streamer . fetchAsync ( ) ; <nl> + bootstrapStreamResult . addEventListener ( new StreamEventHandler ( ) <nl> { <nl> - streamer . fetchAsync ( ) . get ( ) ; <nl> - StorageService . instance . finishBootstrapping ( ) ; <nl> - } <nl> - catch ( InterruptedException e ) <nl> - { <nl> - throw new RuntimeException ( " Interrupted while waiting on bootstrap to complete . Bootstrap will have to be restarted . " ) ; <nl> - } <nl> - catch ( ExecutionException e ) <nl> - { <nl> - throw new RuntimeException ( " Error during bootstrap : " + e . getCause ( ) . getMessage ( ) , e . getCause ( ) ) ; <nl> - } <nl> + private final AtomicInteger receivedFiles = new AtomicInteger ( ) ; <nl> + private final AtomicInteger totalFilesToReceive = new AtomicInteger ( ) ; <nl> + <nl> + @ Override <nl> + public void handleStreamEvent ( StreamEvent event ) <nl> + { <nl> + switch ( event . eventType ) <nl> + { <nl> + case STREAM _ PREPARED : <nl> + StreamEvent . SessionPreparedEvent prepared = ( StreamEvent . SessionPreparedEvent ) event ; <nl> + int currentTotal = totalFilesToReceive . addAndGet ( ( int ) prepared . session . getTotalFilesToReceive ( ) ) ; <nl> + ProgressEvent prepareProgress = new ProgressEvent ( ProgressEventType . PROGRESS , receivedFiles . get ( ) , currentTotal , " prepare with " + prepared . session . peer + " complete " ) ; <nl> + fireProgressEvent ( " bootstrap " , prepareProgress ) ; <nl> + break ; <nl> + <nl> + case FILE _ PROGRESS : <nl> + StreamEvent . ProgressEvent progress = ( StreamEvent . ProgressEvent ) event ; <nl> + if ( progress . progress . isCompleted ( ) ) <nl> + { <nl> + int received = receivedFiles . incrementAndGet ( ) ; <nl> + ProgressEvent currentProgress = new ProgressEvent ( ProgressEventType . PROGRESS , received , totalFilesToReceive . get ( ) , " received file " + progress . progress . fileName ) ; <nl> + fireProgressEvent ( " bootstrap " , currentProgress ) ; <nl> + } <nl> + break ; <nl> + <nl> + case STREAM _ COMPLETE : <nl> + StreamEvent . SessionCompleteEvent completeEvent = ( StreamEvent . SessionCompleteEvent ) event ; <nl> + ProgressEvent completeProgress = new ProgressEvent ( ProgressEventType . PROGRESS , receivedFiles . get ( ) , totalFilesToReceive . get ( ) , " session with " + completeEvent . peer + " complete " ) ; <nl> + fireProgressEvent ( " bootstrap " , completeProgress ) ; <nl> + break ; <nl> + } <nl> + } <nl> + <nl> + @ Override <nl> + public void onSuccess ( StreamState streamState ) <nl> + { <nl> + ProgressEventType type ; <nl> + String message ; <nl> + <nl> + if ( streamState . hasFailedSession ( ) ) <nl> + { <nl> + type = ProgressEventType . ERROR ; <nl> + message = " Some bootstrap stream failed " ; <nl> + } <nl> + else <nl> + { <nl> + type = ProgressEventType . SUCCESS ; <nl> + message = " Bootstrap streaming success " ; <nl> + } <nl> + ProgressEvent currentProgress = new ProgressEvent ( type , receivedFiles . get ( ) , totalFilesToReceive . get ( ) , message ) ; <nl> + fireProgressEvent ( " bootstrap " , currentProgress ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void onFailure ( Throwable throwable ) <nl> + { <nl> + ProgressEvent currentProgress = new ProgressEvent ( ProgressEventType . ERROR , receivedFiles . get ( ) , totalFilesToReceive . get ( ) , throwable . getMessage ( ) ) ; <nl> + fireProgressEvent ( " bootstrap " , currentProgress ) ; <nl> + } <nl> + } ) ; <nl> + return bootstrapStreamResult ; <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index 1c82764 . . 996791e 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 70 , 6 + 70 , 8 @ @ import org . apache . cassandra . thrift . TokenRange ; <nl> import org . apache . cassandra . thrift . cassandraConstants ; <nl> import org . apache . cassandra . tracing . TraceKeyspace ; <nl> import org . apache . cassandra . utils . * ; <nl> + import org . apache . cassandra . utils . progress . ProgressEvent ; <nl> + import org . apache . cassandra . utils . progress . ProgressEventType ; <nl> import org . apache . cassandra . utils . progress . jmx . JMXProgressSupport ; <nl> <nl> import static java . nio . charset . StandardCharsets . ISO _ 8859 _ 1 ; <nl> @ @ - 135 , 7 + 137 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> private InetAddress removingNode ; <nl> <nl> / * Are we starting this node in bootstrap mode ? * / <nl> - private boolean isBootstrapMode ; <nl> + private volatile boolean isBootstrapMode ; <nl> <nl> / * we bootstrap but do NOT join the ring unless told to do so * / <nl> private boolean isSurveyMode = Boolean . parseBoolean ( System . getProperty ( " cassandra . write _ survey " , " false " ) ) ; <nl> @ @ - 168 , 11 + 170 , 6 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> <nl> private final StreamStateStore streamStateStore = new StreamStateStore ( ) ; <nl> <nl> - public void finishBootstrapping ( ) <nl> - { <nl> - isBootstrapMode = false ; <nl> - } <nl> - <nl> / * * This method updates the local token on disk * / <nl> public void setTokens ( Collection < Token > tokens ) <nl> { <nl> @ @ - 468 , 7 + 465 , 8 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> { <nl> logger . info ( " Cassandra version : { } " , FBUtilities . getReleaseVersionString ( ) ) ; <nl> logger . info ( " Thrift API version : { } " , cassandraConstants . VERSION ) ; <nl> - logger . info ( " CQL supported versions : { } ( default : { } ) " , StringUtils . join ( ClientState . getCQLSupportedVersion ( ) , " , " ) , ClientState . DEFAULT _ CQL _ VERSION ) ; <nl> + logger . info ( " CQL supported versions : { } ( default : { } ) " , <nl> + StringUtils . join ( ClientState . getCQLSupportedVersion ( ) , " , " ) , ClientState . DEFAULT _ CQL _ VERSION ) ; <nl> <nl> initialized = true ; <nl> <nl> @ @ - 671 , 13 + 669 , 20 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> / / We attempted to replace this with a schema - presence check , but you need a meaningful sleep <nl> / / to get schema info from gossip which defeats the purpose . See CASSANDRA - 4427 for the gory details . <nl> Set < InetAddress > current = new HashSet < > ( ) ; <nl> - logger . debug ( " Bootstrap variables : { } { } { } { } " , <nl> - DatabaseDescriptor . isAutoBootstrap ( ) , <nl> - SystemKeyspace . bootstrapInProgress ( ) , <nl> - SystemKeyspace . bootstrapComplete ( ) , <nl> - DatabaseDescriptor . getSeeds ( ) . contains ( FBUtilities . getBroadcastAddress ( ) ) ) ; <nl> + if ( logger . isDebugEnabled ( ) ) <nl> + { <nl> + logger . debug ( " Bootstrap variables : { } { } { } { } " , <nl> + DatabaseDescriptor . isAutoBootstrap ( ) , <nl> + SystemKeyspace . bootstrapInProgress ( ) , <nl> + SystemKeyspace . bootstrapComplete ( ) , <nl> + DatabaseDescriptor . getSeeds ( ) . contains ( FBUtilities . getBroadcastAddress ( ) ) ) ; <nl> + } <nl> if ( DatabaseDescriptor . isAutoBootstrap ( ) & & ! SystemKeyspace . bootstrapComplete ( ) & & DatabaseDescriptor . getSeeds ( ) . contains ( FBUtilities . getBroadcastAddress ( ) ) ) <nl> + { <nl> logger . info ( " This node will not auto bootstrap because it is configured to be a seed node . " ) ; <nl> + } <nl> + <nl> + boolean dataAvailable = true ; / / make this to false when bootstrap streaming failed <nl> if ( shouldBootstrap ( ) ) <nl> { <nl> if ( SystemKeyspace . bootstrapInProgress ( ) ) <nl> @ @ - 708 , 18 + 713 , 19 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; <nl> setMode ( Mode . JOINING , " calculation complete , ready to bootstrap " , true ) ; <nl> <nl> + logger . debug ( " . . . got ring + schema info " ) ; <nl> <nl> - if ( logger . isDebugEnabled ( ) ) <nl> - logger . debug ( " . . . got ring + schema info " ) ; <nl> - <nl> - if ( Boolean . parseBoolean ( System . getProperty ( " cassandra . consistent . rangemovement " , " true " ) ) & & <nl> + if ( useStrictConsistency & & <nl> ( <nl> tokenMetadata . getBootstrapTokens ( ) . valueSet ( ) . size ( ) > 0 | | <nl> tokenMetadata . getLeavingEndpoints ( ) . size ( ) > 0 | | <nl> tokenMetadata . getMovingEndpoints ( ) . size ( ) > 0 <nl> ) ) <nl> + { <nl> throw new UnsupportedOperationException ( " Other bootstrapping / leaving / moving nodes detected , cannot bootstrap while cassandra . consistent . rangemovement is true " ) ; <nl> + } <nl> <nl> + / / get bootstrap tokens <nl> if ( ! replacing ) <nl> { <nl> if ( tokenMetadata . isMember ( FBUtilities . getBroadcastAddress ( ) ) ) <nl> @ @ - 777 , 8 + 783 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> setMode ( Mode . JOINING , " Replacing a node with token ( s ) : " + bootstrapTokens , true ) ; <nl> } <nl> <nl> - bootstrap ( bootstrapTokens ) ; <nl> - assert ! isBootstrapMode ; / / bootstrap will block until finished <nl> + dataAvailable = bootstrap ( bootstrapTokens ) ; <nl> } <nl> else <nl> { <nl> @ @ - 796 , 7 + 801 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> } <nl> else <nl> { <nl> - bootstrapTokens = new ArrayList < Token > ( initialTokens . size ( ) ) ; <nl> + bootstrapTokens = new ArrayList < > ( initialTokens . size ( ) ) ; <nl> for ( String token : initialTokens ) <nl> bootstrapTokens . add ( getPartitioner ( ) . getTokenFactory ( ) . fromString ( token ) ) ; <nl> logger . info ( " Saved tokens not found . Using configuration value : { } " , bootstrapTokens ) ; <nl> @ @ - 817 , 16 + 822 , 24 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> <nl> if ( ! isSurveyMode ) <nl> { <nl> - / / start participating in the ring . <nl> - SystemKeyspace . setBootstrapState ( SystemKeyspace . BootstrapState . COMPLETED ) ; <nl> - setTokens ( bootstrapTokens ) ; <nl> - / / remove the existing info about the replaced node . <nl> - if ( ! current . isEmpty ( ) ) <nl> - for ( InetAddress existing : current ) <nl> - Gossiper . instance . replacedEndpoint ( existing ) ; <nl> - assert tokenMetadata . sortedTokens ( ) . size ( ) > 0 ; <nl> - <nl> - doAuthSetup ( ) ; <nl> + if ( dataAvailable ) <nl> + { <nl> + / / start participating in the ring . <nl> + SystemKeyspace . setBootstrapState ( SystemKeyspace . BootstrapState . COMPLETED ) ; <nl> + setTokens ( bootstrapTokens ) ; <nl> + / / remove the existing info about the replaced node . <nl> + if ( ! current . isEmpty ( ) ) <nl> + { <nl> + for ( InetAddress existing : current ) <nl> + Gossiper . instance . replacedEndpoint ( existing ) ; <nl> + } <nl> + assert tokenMetadata . sortedTokens ( ) . size ( ) > 0 ; <nl> + doAuthSetup ( ) ; <nl> + } <nl> + else <nl> + { <nl> + logger . warn ( " Some data streaming failed . Use nodetool to check bootstrap state and resume . For more , see ` nodetool help bootstrap ` . { } " , SystemKeyspace . getBootstrapState ( ) ) ; <nl> + } <nl> } <nl> else <nl> { <nl> @ @ - 1009 , 7 + 1022 , 16 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> logger . debug ( logMsg ) ; <nl> } <nl> <nl> - private void bootstrap ( Collection < Token > tokens ) <nl> + / * * <nl> + * Bootstrap node by fetching data from other nodes . <nl> + * If node is bootstrapping as a new node , then this also announces bootstrapping to the cluster . <nl> + * <nl> + * This blocks until streaming is done . <nl> + * <nl> + * @ param tokens bootstrapping tokens <nl> + * @ return true if bootstrap succeeds . <nl> + * / <nl> + private boolean bootstrap ( final Collection < Token > tokens ) <nl> { <nl> isBootstrapMode = true ; <nl> SystemKeyspace . updateTokens ( tokens ) ; / / DON ' T use setToken , that makes us part of the ring locally which is incorrect until we are done bootstrapping <nl> @ @ - 1039 , 8 + 1061 , 86 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> } <nl> <nl> setMode ( Mode . JOINING , " Starting to bootstrap . . . " , true ) ; <nl> - new BootStrapper ( FBUtilities . getBroadcastAddress ( ) , tokens , tokenMetadata ) . bootstrap ( streamStateStore , ! replacing & & useStrictConsistency ) ; / / handles token update <nl> - logger . info ( " Bootstrap completed ! for the tokens { } " , tokens ) ; <nl> + BootStrapper bootstrapper = new BootStrapper ( FBUtilities . getBroadcastAddress ( ) , tokens , tokenMetadata ) ; <nl> + bootstrapper . addProgressListener ( progressSupport ) ; <nl> + ListenableFuture < StreamState > bootstrapStream = bootstrapper . bootstrap ( streamStateStore , ! replacing & & useStrictConsistency ) ; / / handles token update <nl> + Futures . addCallback ( bootstrapStream , new FutureCallback < StreamState > ( ) <nl> + { <nl> + @ Override <nl> + public void onSuccess ( StreamState streamState ) <nl> + { <nl> + isBootstrapMode = false ; <nl> + logger . info ( " Bootstrap completed ! for the tokens { } " , tokens ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void onFailure ( Throwable e ) <nl> + { <nl> + logger . warn ( " Error during bootstrap : " + e . getCause ( ) . getMessage ( ) , e . getCause ( ) ) ; <nl> + } <nl> + } ) ; <nl> + try <nl> + { <nl> + bootstrapStream . get ( ) ; <nl> + return true ; <nl> + } <nl> + catch ( Throwable e ) <nl> + { <nl> + logger . error ( " Error while waiting on bootstrap to complete . Bootstrap will have to be restarted . " , e ) ; <nl> + return false ; <nl> + } <nl> + } <nl> + <nl> + public boolean resumeBootstrap ( ) <nl> + { <nl> + if ( isBootstrapMode & & SystemKeyspace . bootstrapInProgress ( ) ) <nl> + { <nl> + logger . info ( " Resuming bootstrap . . . " ) ; <nl> + <nl> + / / get bootstrap tokens saved in system keyspace <nl> + final Collection < Token > tokens = SystemKeyspace . getSavedTokens ( ) ; <nl> + / / already bootstrapped ranges are filtered during bootstrap <nl> + BootStrapper bootstrapper = new BootStrapper ( FBUtilities . getBroadcastAddress ( ) , tokens , tokenMetadata ) ; <nl> + bootstrapper . addProgressListener ( progressSupport ) ; <nl> + ListenableFuture < StreamState > bootstrapStream = bootstrapper . bootstrap ( streamStateStore , ! replacing & & useStrictConsistency ) ; / / handles token update <nl> + Futures . addCallback ( bootstrapStream , new FutureCallback < StreamState > ( ) <nl> + { <nl> + @ Override <nl> + public void onSuccess ( StreamState streamState ) <nl> + { <nl> + isBootstrapMode = false ; <nl> + / / start participating in the ring . <nl> + / / pretend we are in survey mode so we can use joinRing ( ) here <nl> + isSurveyMode = true ; <nl> + try <nl> + { <nl> + progressSupport . progress ( " bootstrap " , ProgressEvent . createNotification ( " Joining ring . . . " ) ) ; <nl> + joinRing ( ) ; <nl> + } <nl> + catch ( IOException ignore ) <nl> + { <nl> + / / joinRing with survey mode does not throw IOException <nl> + } <nl> + progressSupport . progress ( " bootstrap " , new ProgressEvent ( ProgressEventType . COMPLETE , 1 , 1 , " Resume bootstrap complete " ) ) ; <nl> + logger . info ( " Resume complete " ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void onFailure ( Throwable e ) <nl> + { <nl> + String message = " Error during bootstrap : " + e . getCause ( ) . getMessage ( ) ; <nl> + logger . error ( message , e . getCause ( ) ) ; <nl> + progressSupport . progress ( " bootstrap " , new ProgressEvent ( ProgressEventType . ERROR , 1 , 1 , message ) ) ; <nl> + progressSupport . progress ( " bootstrap " , new ProgressEvent ( ProgressEventType . COMPLETE , 1 , 1 , " Resume bootstrap complete " ) ) ; <nl> + } <nl> + } ) ; <nl> + return true ; <nl> + } <nl> + else <nl> + { <nl> + logger . info ( " Resuming bootstrap is requested , but the node is already bootstrapped . " ) ; <nl> + return false ; <nl> + } <nl> } <nl> <nl> public boolean isBootstrapMode ( ) <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageServiceMBean . java b / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> index c533618 . . 3d04058 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> @ @ - 529 , 4 + 529 , 12 @ @ public interface StorageServiceMBean extends NotificationEmitter <nl> <nl> / * * Sets the hinted handoff throttle in kb per second , per delivery thread . * / <nl> public void setHintedHandoffThrottleInKB ( int throttleInKB ) ; <nl> + <nl> + / * * <nl> + * Resume bootstrap streaming when there is failed data streaming . <nl> + * <nl> + * <nl> + * @ return true if the node successfully starts resuming . ( this does not mean bootstrap streaming was success . ) <nl> + * / <nl> + public boolean resumeBootstrap ( ) ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / tools / BootstrapMonitor . java b / src / java / org / apache / cassandra / tools / BootstrapMonitor . java <nl> new file mode 100644 <nl> index 0000000 . . 9719192 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / tools / BootstrapMonitor . java <nl> @ @ - 0 , 0 + 1 , 88 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . tools ; <nl> + <nl> + import java . io . IOException ; <nl> + import java . io . PrintStream ; <nl> + import java . text . SimpleDateFormat ; <nl> + import java . util . concurrent . locks . Condition ; <nl> + <nl> + import org . apache . cassandra . utils . concurrent . SimpleCondition ; <nl> + import org . apache . cassandra . utils . progress . ProgressEvent ; <nl> + import org . apache . cassandra . utils . progress . ProgressEventType ; <nl> + import org . apache . cassandra . utils . progress . jmx . JMXNotificationProgressListener ; <nl> + <nl> + public class BootstrapMonitor extends JMXNotificationProgressListener <nl> + { <nl> + private final SimpleDateFormat format = new SimpleDateFormat ( " yyyy - MM - dd HH : mm : ss , SSS " ) ; <nl> + private final PrintStream out ; <nl> + private final Condition condition = new SimpleCondition ( ) ; <nl> + <nl> + public BootstrapMonitor ( PrintStream out ) <nl> + { <nl> + this . out = out ; <nl> + } <nl> + <nl> + public void awaitCompletion ( ) throws InterruptedException <nl> + { <nl> + condition . await ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public boolean isInterestedIn ( String tag ) <nl> + { <nl> + return " bootstrap " . equals ( tag ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void handleNotificationLost ( long timestamp , String message ) <nl> + { <nl> + super . handleNotificationLost ( timestamp , message ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void handleConnectionClosed ( long timestamp , String message ) <nl> + { <nl> + handleConnectionFailed ( timestamp , message ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void handleConnectionFailed ( long timestamp , String message ) <nl> + { <nl> + Exception error = new IOException ( String . format ( " [ % s ] JMX connection closed . ( % s ) " , <nl> + format . format ( timestamp ) , message ) ) ; <nl> + out . println ( error . getMessage ( ) ) ; <nl> + condition . signalAll ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void progress ( String tag , ProgressEvent event ) <nl> + { <nl> + ProgressEventType type = event . getType ( ) ; <nl> + String message = String . format ( " [ % s ] % s " , format . format ( System . currentTimeMillis ( ) ) , event . getMessage ( ) ) ; <nl> + if ( type = = ProgressEventType . PROGRESS ) <nl> + { <nl> + message = message + " ( progress : " + ( int ) event . getProgressPercentage ( ) + " % ) " ; <nl> + } <nl> + out . println ( message ) ; <nl> + if ( type = = ProgressEventType . COMPLETE ) <nl> + { <nl> + condition . signalAll ( ) ; <nl> + } <nl> + } <nl> + } <nl> diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> index 5012ef5 . . edb2478 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> @ @ - 1179 , 6 + 1179 , 41 @ @ public class NodeProbe implements AutoCloseable <nl> { <nl> return ssProxy . getLoggingLevels ( ) ; <nl> } <nl> + <nl> + public void resumeBootstrap ( PrintStream out ) throws IOException <nl> + { <nl> + BootstrapMonitor monitor = new BootstrapMonitor ( out ) ; <nl> + try <nl> + { <nl> + jmxc . addConnectionNotificationListener ( monitor , null , null ) ; <nl> + ssProxy . addNotificationListener ( monitor , null , null ) ; <nl> + if ( ssProxy . resumeBootstrap ( ) ) <nl> + { <nl> + out . println ( " Resuming bootstrap " ) ; <nl> + monitor . awaitCompletion ( ) ; <nl> + } <nl> + else <nl> + { <nl> + out . println ( " Node is already bootstrapped . " ) ; <nl> + } <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new IOException ( e ) ; <nl> + } <nl> + finally <nl> + { <nl> + try <nl> + { <nl> + ssProxy . removeNotificationListener ( monitor ) ; <nl> + jmxc . removeConnectionNotificationListener ( monitor ) ; <nl> + } <nl> + catch ( Throwable e ) <nl> + { <nl> + out . println ( " Exception occurred during clean - up . " + e ) ; <nl> + } <nl> + } <nl> + } <nl> } <nl> <nl> class ColumnFamilyStoreMBeanIterator implements Iterator < Map . Entry < String , ColumnFamilyStoreMBean > > <nl> diff - - git a / src / java / org / apache / cassandra / tools / NodeTool . java b / src / java / org / apache / cassandra / tools / NodeTool . java <nl> index 4b56a2c . . 9c804c0 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / NodeTool . java <nl> + + + b / src / java / org / apache / cassandra / tools / NodeTool . java <nl> @ @ - 156 , 11 + 156 , 19 @ @ public class NodeTool <nl> GetLoggingLevels . class <nl> ) ; <nl> <nl> - Cli < Runnable > parser = Cli . < Runnable > builder ( " nodetool " ) <nl> - . withDescription ( " Manage your Cassandra cluster " ) <nl> + Cli . CliBuilder < Runnable > builder = Cli . builder ( " nodetool " ) ; <nl> + <nl> + builder . withDescription ( " Manage your Cassandra cluster " ) <nl> + . withDefaultCommand ( Help . class ) <nl> + . withCommands ( commands ) ; <nl> + <nl> + / / bootstrap commands <nl> + builder . withGroup ( " bootstrap " ) <nl> + . withDescription ( " Monitor / manage node ' s bootstrap process " ) <nl> . withDefaultCommand ( Help . class ) <nl> - . withCommands ( commands ) <nl> - . build ( ) ; <nl> + . withCommand ( BootstrapResume . class ) ; <nl> + <nl> + Cli < Runnable > parser = builder . build ( ) ; <nl> <nl> int status = 0 ; <nl> try <nl> @ @ - 2700 , 4 + 2708 , 20 @ @ public class NodeTool <nl> } <nl> } <nl> <nl> + @ Command ( name = " resume " , description = " Resume bootstrap streaming " ) <nl> + public static class BootstrapResume extends NodeToolCmd <nl> + { <nl> + @ Override <nl> + protected void execute ( NodeProbe probe ) <nl> + { <nl> + try <nl> + { <nl> + probe . resumeBootstrap ( System . out ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + } <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / utils / progress / ProgressEventNotifierSupport . java b / src / java / org / apache / cassandra / utils / progress / ProgressEventNotifierSupport . java <nl> new file mode 100644 <nl> index 0000000 . . f5fe795 <nl> - - - / dev / null <nl> + + + b / src / java / org / apache / cassandra / utils / progress / ProgressEventNotifierSupport . java <nl> @ @ - 0 , 0 + 1 , 49 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + package org . apache . cassandra . utils . progress ; <nl> + <nl> + import java . util . List ; <nl> + import java . util . concurrent . CopyOnWriteArrayList ; <nl> + <nl> + / * * <nl> + * Provides basic , thread safe ProgressEvent notification support <nl> + * / <nl> + public abstract class ProgressEventNotifierSupport implements ProgressEventNotifier <nl> + { <nl> + private List < ProgressListener > listeners = new CopyOnWriteArrayList < > ( ) ; <nl> + <nl> + @ Override <nl> + public void addProgressListener ( ProgressListener listener ) <nl> + { <nl> + listeners . add ( listener ) ; <nl> + } <nl> + <nl> + @ Override <nl> + public void removeProgressListener ( ProgressListener listener ) <nl> + { <nl> + listeners . remove ( listener ) ; <nl> + } <nl> + <nl> + protected void fireProgressEvent ( String tag , ProgressEvent event ) <nl> + { <nl> + for ( ProgressListener listener : listeners ) <nl> + { <nl> + listener . progress ( tag , event ) ; <nl> + } <nl> + } <nl> + }
+NEAREST DIFF (one line): diff - - git a / bin / tokenupdater b / bin / tokenupdater <nl> deleted file mode 100755 <nl> index 12118e9 . . 0000000 <nl> - - - a / bin / tokenupdater <nl> + + + / dev / null <nl> @ @ - 1 , 49 + 0 , 0 @ @ <nl> - # ! / bin / sh <nl> - # Licensed to the Apache Software Foundation ( ASF ) under one <nl> - # or more contributor license agreements . See the NOTICE file <nl> - # distributed with this work for additional information <nl> - # regarding copyright ownership . The ASF licenses this file <nl> - # to you under the Apache License , Version 2 . 0 ( the <nl> - # " License " ) ; you may not use this file except in compliance <nl> - # with the License . You may obtain a copy of the License at <nl> - # <nl> - # http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - # <nl> - # Unless required by applicable law or agreed to in writing , software <nl> - # distributed under the License is distributed on an " AS IS " BASIS , <nl> - # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - # See the License for the specific language governing permissions and <nl> - # limitations under the License . <nl> - <nl> - <nl> - if [ " x $ CASSANDRA _ INCLUDE " = " x " ] ; then <nl> - for include in / usr / share / cassandra / cassandra . in . sh \ <nl> - / usr / local / share / cassandra / cassandra . in . sh \ <nl> - / opt / cassandra / cassandra . in . sh \ <nl> - ` dirname $ 0 ` / cassandra . in . sh ; do <nl> - if [ - r $ include ] ; then <nl> - . $ include <nl> - break <nl> - fi <nl> - done <nl> - elif [ - r $ CASSANDRA _ INCLUDE ] ; then <nl> - . $ CASSANDRA _ INCLUDE <nl> - fi <nl> - <nl> - if [ - z $ CASSANDRA _ CONF - o - z $ CLASSPATH ] ; then <nl> - echo " You must set the CASSANDRA _ CONF and CLASSPATH vars " > & 2 <nl> - exit 1 <nl> - fi <nl> - <nl> - # Special - case path variables . <nl> - case " ` uname ` " in <nl> - CYGWIN * ) <nl> - CLASSPATH = ` cygpath - p - w " $ CLASSPATH " ` <nl> - CASSANDRA _ CONF = ` cygpath - p - w " $ CASSANDRA _ CONF " ` <nl> - ; ; <nl> - esac <nl> - <nl> - java - cp $ CLASSPATH - Dstorage - config = $ CASSANDRA _ CONF \ <nl> - org . apache . cassandra . tools . TokenUpdater $ @ <nl> - <nl> - # vi : ai sw = 4 ts = 4 tw = 0 et <nl> diff - - git a / src / java / org / apache / cassandra / db / SystemTable . java b / src / java / org / apache / cassandra / db / SystemTable . java <nl> index 61dbbdc . . c03535f 100644 <nl> - - - a / src / java / org / apache / cassandra / db / SystemTable . java <nl> + + + b / src / java / org / apache / cassandra / db / SystemTable . java <nl> @ @ - 127 , 7 + 127 , 7 @ @ public class SystemTable <nl> if ( initialToken = = null ) <nl> token = p . getRandomToken ( ) ; <nl> else <nl> - token = p . getToken ( initialToken ) ; <nl> + token = p . getTokenFactory ( ) . fromString ( initialToken ) ; <nl> <nl> logger . info ( " Saved Token not found . Using " + token ) ; <nl> / / seconds - since - epoch isn ' t a foolproof new generation <nl> diff - - git a / src / java / org / apache / cassandra / dht / IPartitioner . java b / src / java / org / apache / cassandra / dht / IPartitioner . java <nl> index 27469d5 . . 6cb3135 100644 <nl> - - - a / src / java / org / apache / cassandra / dht / IPartitioner . java <nl> + + + b / src / java / org / apache / cassandra / dht / IPartitioner . java <nl> @ @ - 72 , 6 + 72 , 8 @ @ public interface IPartitioner < T extends Token > <nl> <nl> / * * <nl> * @ return a Token that can be used to route a given key <nl> + * ( This is NOT a method to create a Token from its string representation ; <nl> + * for that , use TokenFactory . fromString . ) <nl> * / <nl> public T getToken ( String key ) ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / io / SSTable . java b / src / java / org / apache / cassandra / io / SSTable . java <nl> index 4f60c37 . . 43d41ca 100644 <nl> - - - a / src / java / org / apache / cassandra / io / SSTable . java <nl> + + + b / src / java / org / apache / cassandra / io / SSTable . java <nl> @ @ - 50 , 6 + 50 , 7 @ @ public abstract class SSTable <nl> { <nl> private static final Logger logger = Logger . getLogger ( SSTable . class ) ; <nl> <nl> + public static final int FILES _ ON _ DISK = 3 ; / / data , index , and bloom filter <nl> <nl> protected String path ; <nl> protected IPartitioner partitioner ; <nl> diff - - git a / src / java / org / apache / cassandra / io / Streaming . java b / src / java / org / apache / cassandra / io / Streaming . java <nl> index 31f2a04 . . c3b00f0 100644 <nl> - - - a / src / java / org / apache / cassandra / io / Streaming . java <nl> + + + b / src / java / org / apache / cassandra / io / Streaming . java <nl> @ @ - 72 , 7 + 72 , 7 @ @ public class Streaming <nl> if ( sstables . isEmpty ( ) ) <nl> return ; <nl> <nl> - StreamContextManager . StreamContext [ ] streamContexts = new StreamContextManager . StreamContext [ sstables . size ( ) ] ; <nl> + StreamContextManager . StreamContext [ ] streamContexts = new StreamContextManager . StreamContext [ SSTable . FILES _ ON _ DISK * sstables . size ( ) ] ; <nl> int i = 0 ; <nl> for ( SSTableReader sstable : sstables ) <nl> { <nl> @ @ - 130 , 7 + 130 , 6 @ @ public class Streaming <nl> StreamContextManager . StreamStatus streamStatus = new StreamContextManager . StreamStatus ( streamContext . getTargetFile ( ) , streamContext . getExpectedBytes ( ) ) ; <nl> String file = getNewFileNameFromOldContextAndNames ( fileNames , streamContext ) ; <nl> <nl> - / / String file = DatabaseDescriptor . getDataFileLocationForTable ( streamContext . getTable ( ) ) + File . separator + newFileName + " - Data . db " ; <nl> if ( logger . isDebugEnabled ( ) ) <nl> logger . debug ( " Received Data from : " + message . getFrom ( ) + " " + streamContext . getTargetFile ( ) + " " + file ) ; <nl> streamContext . setTargetFile ( file ) ; <nl> diff - - git a / src / java / org / apache / cassandra / locator / TokenMetadata . java b / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> index 5fd7eca . . 164d80f 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> + + + b / src / java / org / apache / cassandra / locator / TokenMetadata . java <nl> @ @ - 88 , 6 + 88 , 7 @ @ public class TokenMetadata <nl> lock . writeLock ( ) . lock ( ) ; <nl> try <nl> { <nl> + tokenToEndPointMap . inverse ( ) . remove ( endpoint ) ; <nl> if ( ! endpoint . equals ( tokenToEndPointMap . put ( token , endpoint ) ) ) <nl> { <nl> sortedTokens = sortTokens ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / net / TcpConnection . java b / src / java / org / apache / cassandra / net / TcpConnection . java <nl> index 62a73a2 . . ae6601b 100644 <nl> - - - a / src / java / org / apache / cassandra / net / TcpConnection . java <nl> + + + b / src / java / org / apache / cassandra / net / TcpConnection . java <nl> @ @ - 71 , 7 + 71 , 6 @ @ public class TcpConnection extends SelectionKeyHandler implements Comparable <nl> <nl> private TcpConnection ( InetAddress from , InetAddress to , TcpConnectionManager pool , boolean streaming ) throws IOException <nl> { <nl> - logger _ . debug ( " creating connection from " + from + " to " + to ) ; <nl> socketChannel _ = SocketChannel . open ( ) ; <nl> socketChannel _ . socket ( ) . bind ( new InetSocketAddress ( from , 0 ) ) ; <nl> socketChannel _ . configureBlocking ( false ) ; <nl> @ @ - 291 , 18 + 290 , 20 @ @ public class TcpConnection extends SelectionKeyHandler implements Comparable <nl> <nl> void closeSocket ( ) <nl> { <nl> - logger _ . warn ( " Closing down connection " + socketChannel _ + " with " + pendingWrites _ . size ( ) + " writes remaining . " ) ; <nl> + if ( pendingWrites _ . size ( ) > 0 ) <nl> + logger _ . error ( " Closing down connection " + socketChannel _ + " with " + pendingWrites _ . size ( ) + " writes remaining . " ) ; <nl> cancel ( key _ ) ; <nl> pendingWrites _ . clear ( ) ; <nl> } <nl> <nl> void errorClose ( ) <nl> { <nl> - logger _ . warn ( " Closing down connection " + socketChannel _ ) ; <nl> + logger _ . info ( " Closing errored connection " + socketChannel _ ) ; <nl> pendingWrites _ . clear ( ) ; <nl> cancel ( key _ ) ; <nl> pendingWrites _ . clear ( ) ; <nl> - pool _ . destroy ( this ) ; <nl> + if ( pool _ ! = null ) <nl> + pool _ . destroy ( this ) ; <nl> } <nl> <nl> private void cancel ( SelectionKey key ) <nl> diff - - git a / src / java / org / apache / cassandra / net / io / StreamContextManager . java b / src / java / org / apache / cassandra / net / io / StreamContextManager . java <nl> index 28bb4f3 . . 4723afc 100644 <nl> - - - a / src / java / org / apache / cassandra / net / io / StreamContextManager . java <nl> + + + b / src / java / org / apache / cassandra / net / io / StreamContextManager . java <nl> @ @ - 261 , 7 + 261 , 7 @ @ public class StreamContextManager <nl> { <nl> List < StreamContext > context = ctxBag _ . get ( key ) ; <nl> if ( context = = null ) <nl> - throw new IllegalStateException ( " Streaming context has not been set . " ) ; <nl> + throw new IllegalStateException ( " Streaming context has not been set for " + key ) ; <nl> StreamContext streamContext = context . remove ( 0 ) ; <nl> if ( context . isEmpty ( ) ) <nl> ctxBag _ . remove ( key ) ; <nl> @ @ - 272 , 7 + 272 , 7 @ @ public class StreamContextManager <nl> { <nl> List < StreamStatus > status = streamStatusBag _ . get ( key ) ; <nl> if ( status = = null ) <nl> - throw new IllegalStateException ( " Streaming status has not been set . " ) ; <nl> + throw new IllegalStateException ( " Streaming status has not been set for " + key ) ; <nl> StreamStatus streamStatus = status . remove ( 0 ) ; <nl> if ( status . isEmpty ( ) ) <nl> streamStatusBag _ . remove ( key ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index 36c6ebc . . 6a51332 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 19 , 6 + 19 , 7 @ @ <nl> package org . apache . cassandra . service ; <nl> <nl> import java . io . IOException ; <nl> + import java . io . IOError ; <nl> import java . lang . management . ManagementFactory ; <nl> import java . lang . reflect . Constructor ; <nl> import java . util . * ; <nl> @ @ - 71 , 7 + 72 , 6 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> <nl> / * All verb handler identifiers * / <nl> public final static String mutationVerbHandler _ = " ROW - MUTATION - VERB - HANDLER " ; <nl> - public final static String tokenVerbHandler _ = " TOKEN - VERB - HANDLER " ; <nl> public final static String binaryVerbHandler _ = " BINARY - VERB - HANDLER " ; <nl> public final static String readRepairVerbHandler _ = " READ - REPAIR - VERB - HANDLER " ; <nl> public final static String readVerbHandler _ = " ROW - READ - VERB - HANDLER " ; <nl> @ @ - 165 , 7 + 165 , 7 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> { <nl> bootstrapSet . remove ( s ) ; <nl> if ( logger _ . isDebugEnabled ( ) ) <nl> - logger _ . debug ( " Removed " + s + " as a bootstrap source " ) ; <nl> + logger _ . debug ( " Removed " + s + " as a bootstrap source ; remaining is [ " + StringUtils . join ( bootstrapSet , " , " ) + " ] " ) ; <nl> <nl> if ( bootstrapSet . isEmpty ( ) ) <nl> { <nl> @ @ - 222 , 7 + 222 , 6 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> endPointSnitch _ = DatabaseDescriptor . getEndPointSnitch ( ) ; <nl> <nl> / * register the verb handlers * / <nl> - MessagingService . instance ( ) . registerVerbHandlers ( tokenVerbHandler _ , new TokenUpdateVerbHandler ( ) ) ; <nl> MessagingService . instance ( ) . registerVerbHandlers ( binaryVerbHandler _ , new BinaryVerbHandler ( ) ) ; <nl> MessagingService . instance ( ) . registerVerbHandlers ( mutationVerbHandler _ , new RowMutationVerbHandler ( ) ) ; <nl> MessagingService . instance ( ) . registerVerbHandlers ( readRepairVerbHandler _ , new ReadRepairVerbHandler ( ) ) ; <nl> @ @ - 258 , 8 + 257 , 6 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> public void start ( ) throws IOException <nl> { <nl> storageMetadata _ = SystemTable . initMetadata ( ) ; <nl> - isBootstrapMode = DatabaseDescriptor . isAutoBootstrap ( ) <nl> - & & ! ( DatabaseDescriptor . getSeeds ( ) . contains ( FBUtilities . getLocalAddress ( ) ) | | SystemTable . isBootstrapped ( ) ) ; <nl> <nl> / * Listen for application messages * / <nl> MessagingService . instance ( ) . listen ( FBUtilities . getLocalAddress ( ) ) ; <nl> @ @ - 277 , 15 + 274 , 14 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> Gossiper . instance ( ) . register ( this ) ; <nl> Gossiper . instance ( ) . start ( FBUtilities . getLocalAddress ( ) , storageMetadata _ . getGeneration ( ) ) ; <nl> <nl> - if ( isBootstrapMode ) <nl> + if ( DatabaseDescriptor . isAutoBootstrap ( ) <nl> + & & ! ( DatabaseDescriptor . getSeeds ( ) . contains ( FBUtilities . getLocalAddress ( ) ) | | SystemTable . isBootstrapped ( ) ) ) <nl> { <nl> logger _ . info ( " Starting in bootstrap mode ( first , sleeping to get load information ) " ) ; <nl> StorageLoadBalancer . instance ( ) . waitForLoadInfo ( ) ; <nl> logger _ . info ( " . . . got load info " ) ; <nl> Token token = BootStrapper . getBootstrapToken ( tokenMetadata _ , StorageLoadBalancer . instance ( ) . getLoadInfo ( ) ) ; <nl> - SystemTable . updateToken ( token ) ; / / DON ' T use setToken , that makes us part of the ring locally which is incorrect until we are done bootstrapping <nl> - Gossiper . instance ( ) . addApplicationState ( StorageService . STATE _ BOOTSTRAPPING , new ApplicationState ( partitioner _ . getTokenFactory ( ) . toString ( getLocalToken ( ) ) ) ) ; <nl> - new BootStrapper ( replicationStrategy _ , FBUtilities . getLocalAddress ( ) , getLocalToken ( ) , tokenMetadata _ ) . startBootstrap ( ) ; / / handles token update <nl> + startBootstrap ( token ) ; <nl> / / don ' t finish startup ( enabling thrift ) until after bootstrap is done <nl> while ( isBootstrapMode ) <nl> { <nl> @ @ - 303 , 13 + 299 , 21 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> { <nl> SystemTable . setBootstrapped ( true ) ; <nl> Token token = storageMetadata _ . getToken ( ) ; <nl> - setToken ( token ) ; <nl> + tokenMetadata _ . update ( token , FBUtilities . getLocalAddress ( ) ) ; <nl> Gossiper . instance ( ) . addApplicationState ( StorageService . STATE _ NORMAL , new ApplicationState ( partitioner _ . getTokenFactory ( ) . toString ( token ) ) ) ; <nl> } <nl> <nl> assert tokenMetadata _ . sortedTokens ( ) . size ( ) > 0 ; <nl> } <nl> <nl> + private void startBootstrap ( Token token ) throws IOException <nl> + { <nl> + isBootstrapMode = true ; <nl> + SystemTable . updateToken ( token ) ; / / DON ' T use setToken , that makes us part of the ring locally which is incorrect until we are done bootstrapping <nl> + Gossiper . instance ( ) . addApplicationState ( StorageService . STATE _ BOOTSTRAPPING , new ApplicationState ( partitioner _ . getTokenFactory ( ) . toString ( token ) ) ) ; <nl> + new BootStrapper ( replicationStrategy _ , FBUtilities . getLocalAddress ( ) , token , tokenMetadata _ ) . startBootstrap ( ) ; / / handles token update <nl> + } <nl> + <nl> public boolean isBootstrapMode ( ) <nl> { <nl> return isBootstrapMode ; <nl> @ @ - 935 , 7 + 939 , 7 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> return tokens ; <nl> } <nl> <nl> - public void decommission ( ) <nl> + public void decommission ( ) throws InterruptedException <nl> { <nl> if ( ! tokenMetadata _ . isMember ( FBUtilities . getLocalAddress ( ) ) ) <nl> throw new UnsupportedOperationException ( " local node is not a member of the token ring yet " ) ; <nl> @ @ - 947 , 15 + 951 , 22 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> logger _ . info ( " DECOMMISSIONING " ) ; <nl> Gossiper . instance ( ) . addApplicationState ( STATE _ LEAVING , new ApplicationState ( getLocalToken ( ) . toString ( ) ) ) ; <nl> logger _ . info ( " decommission sleeping " + Streaming . RING _ DELAY ) ; <nl> - try <nl> - { <nl> - Thread . sleep ( Streaming . RING _ DELAY ) ; <nl> - } <nl> - catch ( InterruptedException e ) <nl> + Thread . sleep ( Streaming . RING _ DELAY ) ; <nl> + <nl> + Runnable finishLeaving = new Runnable ( ) <nl> { <nl> - throw new AssertionError ( e ) ; <nl> - } <nl> + public void run ( ) <nl> + { <nl> + Gossiper . instance ( ) . stop ( ) ; <nl> + logger _ . info ( " DECOMMISSION FINISHED . " ) ; <nl> + / / let op be responsible for killing the process <nl> + } <nl> + } ; <nl> + unbootstrap ( finishLeaving ) ; <nl> + } <nl> <nl> + private void unbootstrap ( final Runnable onFinish ) <nl> + { <nl> Multimap < Range , InetAddress > rangesMM = getChangedRangesForLeaving ( FBUtilities . getLocalAddress ( ) ) ; <nl> if ( logger _ . isDebugEnabled ( ) ) <nl> logger _ . debug ( " Ranges needing transfer are [ " + StringUtils . join ( rangesMM . keySet ( ) , " , " ) + " ] " ) ; <nl> @ @ - 970 , 7 + 981 , 25 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> { <nl> pending . remove ( entry ) ; <nl> if ( pending . isEmpty ( ) ) <nl> - finishLeaving ( ) ; <nl> + { <nl> + SystemTable . setBootstrapped ( false ) ; <nl> + tokenMetadata _ . removeEndpoint ( FBUtilities . getLocalAddress ( ) ) ; <nl> + replicationStrategy _ . removeObsoletePendingRanges ( ) ; <nl> + <nl> + if ( logger _ . isDebugEnabled ( ) ) <nl> + logger _ . debug ( " " ) ; <nl> + Gossiper . instance ( ) . addApplicationState ( STATE _ LEFT , new ApplicationState ( getLocalToken ( ) . toString ( ) ) ) ; <nl> + try <nl> + { <nl> + Thread . sleep ( 2 * Gossiper . intervalInMillis _ ) ; <nl> + } <nl> + catch ( InterruptedException e ) <nl> + { <nl> + throw new AssertionError ( e ) ; <nl> + } <nl> + <nl> + onFinish . run ( ) ; <nl> + } <nl> } <nl> } ; <nl> StageManager . getStage ( streamStage _ ) . execute ( new Runnable ( ) <nl> @ @ - 984 , 6 + 1013 , 35 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> } <nl> } <nl> <nl> + public void move ( String newToken ) throws InterruptedException <nl> + { <nl> + if ( tokenMetadata _ . getPendingRanges ( FBUtilities . getLocalAddress ( ) ) . size ( ) > 0 ) <nl> + throw new UnsupportedOperationException ( " data is currently moving to this node ; unable to leave the ring " ) ; <nl> + <nl> + final Token token = partitioner _ . getTokenFactory ( ) . fromString ( newToken ) ; / / make sure it ' s valid <nl> + logger _ . info ( " moving to " + token ) ; <nl> + Gossiper . instance ( ) . addApplicationState ( STATE _ LEAVING , new ApplicationState ( getLocalToken ( ) . toString ( ) ) ) ; <nl> + logger _ . info ( " move sleeping " + Streaming . RING _ DELAY ) ; <nl> + Thread . sleep ( Streaming . RING _ DELAY ) ; <nl> + <nl> + Runnable finishMoving = new Runnable ( ) <nl> + { <nl> + public void run ( ) <nl> + { <nl> + try <nl> + { <nl> + logger _ . info ( " re - bootstrapping to new token " + token ) ; <nl> + startBootstrap ( token ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new IOError ( e ) ; <nl> + } <nl> + } <nl> + } ; <nl> + unbootstrap ( finishMoving ) ; <nl> + } <nl> + <nl> public < T > QuorumResponseHandler < T > getResponseHandler ( IResponseResolver < T > responseResolver , int blockFor , int consistency _ level ) <nl> { <nl> return replicationStrategy _ . getResponseHandler ( responseResolver , blockFor , consistency _ level ) ; <nl> @ @ - 994 , 20 + 1052 , 4 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> return replicationStrategy _ ; <nl> } <nl> <nl> - public void finishLeaving ( ) <nl> - { <nl> - SystemTable . setBootstrapped ( false ) ; <nl> - Gossiper . instance ( ) . addApplicationState ( STATE _ LEFT , new ApplicationState ( getLocalToken ( ) . toString ( ) ) ) ; <nl> - try <nl> - { <nl> - Thread . sleep ( 2 * Gossiper . intervalInMillis _ ) ; <nl> - } <nl> - catch ( InterruptedException e ) <nl> - { <nl> - throw new AssertionError ( e ) ; <nl> - } <nl> - Gossiper . instance ( ) . stop ( ) ; <nl> - logger _ . info ( " DECOMMISSION FINISHED . " ) ; <nl> - / / let op be responsible for killing the process <nl> - } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageServiceMBean . java b / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> index 01c9657 . . dc458fd 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageServiceMBean . java <nl> @ @ - 23 , 6 + 23 , 7 @ @ import java . net . UnknownHostException ; <nl> import java . util . List ; <nl> import java . util . Map ; <nl> import java . util . Set ; <nl> + import java . util . concurrent . FutureTask ; <nl> <nl> import org . apache . cassandra . dht . Range ; <nl> import java . net . InetAddress ; <nl> @ @ - 116 , 7 + 117 , 13 @ @ public interface StorageServiceMBean <nl> / * * <nl> * transfer this node ' s data to other machines and remove it from service . <nl> * / <nl> - public void decommission ( ) ; <nl> + public void decommission ( ) throws InterruptedException ; <nl> + <nl> + / * * <nl> + * @ param newToken token to move this node to . <nl> + * This node will unload its data onto its neighbors , and bootstrap to the new token . <nl> + * / <nl> + public void move ( String newToken ) throws InterruptedException ; <nl> <nl> / * * set the logging level at runtime * / <nl> public void setLog4jLevel ( String classQualifier , String level ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / TokenUpdateVerbHandler . java b / src / java / org / apache / cassandra / service / TokenUpdateVerbHandler . java <nl> deleted file mode 100644 <nl> index 7a4af4b . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / service / TokenUpdateVerbHandler . java <nl> + + + / dev / null <nl> @ @ - 1 , 56 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . service ; <nl> - <nl> - import java . io . IOException ; <nl> - <nl> - import org . apache . log4j . Logger ; <nl> - <nl> - import org . apache . cassandra . dht . Token ; <nl> - import org . apache . cassandra . io . DataInputBuffer ; <nl> - import org . apache . cassandra . net . IVerbHandler ; <nl> - import org . apache . cassandra . net . Message ; <nl> - import org . apache . cassandra . gms . Gossiper ; <nl> - import org . apache . cassandra . gms . ApplicationState ; <nl> - <nl> - public class TokenUpdateVerbHandler implements IVerbHandler <nl> - { <nl> - private static Logger logger _ = Logger . getLogger ( TokenUpdateVerbHandler . class ) ; <nl> - <nl> - public void doVerb ( Message message ) <nl> - { <nl> - if ( StorageService . instance ( ) . isBootstrapMode ( ) ) <nl> - throw new UnsupportedOperationException ( " Cannot set token during bootstrap " ) ; <nl> - <nl> - byte [ ] body = message . getMessageBody ( ) ; <nl> - DataInputBuffer bufIn = new DataInputBuffer ( ) ; <nl> - bufIn . reset ( body , body . length ) ; <nl> - try <nl> - { <nl> - Token token = Token . serializer ( ) . deserialize ( bufIn ) ; <nl> - StorageService . instance ( ) . setToken ( token ) ; <nl> - Gossiper . instance ( ) . addApplicationState ( StorageService . STATE _ NORMAL , new ApplicationState ( StorageService . getPartitioner ( ) . getTokenFactory ( ) . toString ( token ) ) ) ; <nl> - } <nl> - catch ( IOException ex ) <nl> - { <nl> - throw new RuntimeException ( ex ) ; <nl> - } <nl> - } <nl> - <nl> - } <nl> diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> index 28904d1 . . a1a109c 100644 <nl> - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java <nl> @ @ - 380 , 11 + 380 , 16 @ @ public class NodeProbe <nl> ssProxy . clearSnapshot ( ) ; <nl> } <nl> <nl> - public void decommission ( ) <nl> + public void decommission ( ) throws InterruptedException <nl> { <nl> ssProxy . decommission ( ) ; <nl> } <nl> <nl> + public void move ( String newToken ) throws InterruptedException <nl> + { <nl> + ssProxy . move ( newToken ) ; <nl> + } <nl> + <nl> / * * <nl> * Print out the size of the queues in the thread pools <nl> * <nl> @ @ - 480 , 7 + 485 , 7 @ @ public class NodeProbe <nl> HelpFormatter hf = new HelpFormatter ( ) ; <nl> String header = String . format ( <nl> " % nAvailable commands : ring , info , cleanup , compact , cfstats , snapshot [ name ] , clearsnapshot , " + <nl> - " tpstats , flush , decommission , " + <nl> + " tpstats , flush , decommission , move , " + <nl> " getcompactionthreshold , setcompactionthreshold [ minthreshold ] ( [ maxthreshold ] ) " ) ; <nl> String usage = String . format ( " java % s - host < arg > < command > % n " , NodeProbe . class . getName ( ) ) ; <nl> hf . printHelp ( usage , " " , options , header ) ; <nl> @ @ - 489 , 7 + 494 , 7 @ @ public class NodeProbe <nl> / * * <nl> * @ param args <nl> * / <nl> - public static void main ( String [ ] args ) throws IOException <nl> + public static void main ( String [ ] args ) throws IOException , InterruptedException <nl> { <nl> NodeProbe probe = null ; <nl> try <nl> @ @ - 543 , 6 + 548 , 14 @ @ public class NodeProbe <nl> { <nl> probe . decommission ( ) ; <nl> } <nl> + else if ( cmdName . equals ( " move " ) ) <nl> + { <nl> + if ( arguments . length < = 1 ) <nl> + { <nl> + System . err . println ( " missing token argument " ) ; <nl> + } <nl> + probe . move ( arguments [ 1 ] ) ; <nl> + } <nl> else if ( cmdName . equals ( " snapshot " ) ) <nl> { <nl> String snapshotName = " " ; <nl> diff - - git a / src / java / org / apache / cassandra / tools / TokenUpdater . java b / src / java / org / apache / cassandra / tools / TokenUpdater . java <nl> deleted file mode 100644 <nl> index 5a7c513 . . 0000000 <nl> - - - a / src / java / org / apache / cassandra / tools / TokenUpdater . java <nl> + + + / dev / null <nl> @ @ - 1 , 86 + 0 , 0 @ @ <nl> - / * * <nl> - * Licensed to the Apache Software Foundation ( ASF ) under one <nl> - * or more contributor license agreements . See the NOTICE file <nl> - * distributed with this work for additional information <nl> - * regarding copyright ownership . The ASF licenses this file <nl> - * to you under the Apache License , Version 2 . 0 ( the <nl> - * " License " ) ; you may not use this file except in compliance <nl> - * with the License . You may obtain a copy of the License at <nl> - * <nl> - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> - * <nl> - * Unless required by applicable law or agreed to in writing , software <nl> - * distributed under the License is distributed on an " AS IS " BASIS , <nl> - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> - * See the License for the specific language governing permissions and <nl> - * limitations under the License . <nl> - * / <nl> - <nl> - package org . apache . cassandra . tools ; <nl> - <nl> - import java . io . ByteArrayOutputStream ; <nl> - import java . io . DataOutputStream ; <nl> - <nl> - import org . apache . cassandra . dht . IPartitioner ; <nl> - import org . apache . cassandra . dht . Token ; <nl> - import java . net . InetAddress ; <nl> - import java . net . InetSocketAddress ; <nl> - <nl> - import org . apache . cassandra . net . Message ; <nl> - import org . apache . cassandra . net . MessagingService ; <nl> - import org . apache . cassandra . net . SelectorManager ; <nl> - import org . apache . cassandra . service . StorageService ; <nl> - import org . apache . cassandra . utils . FBUtilities ; <nl> - import org . apache . cassandra . utils . FileUtils ; <nl> - <nl> - public class TokenUpdater <nl> - { <nl> - private static final int port _ = 7000 ; <nl> - private static final long waitTime _ = 10000 ; <nl> - <nl> - public static void main ( String [ ] args ) throws Throwable <nl> - { <nl> - if ( args . length < 2 ) <nl> - { <nl> - System . out . println ( " Usage : java org . apache . cassandra . tools . TokenUpdater < ip : port > < token > " ) ; <nl> - System . exit ( 1 ) ; <nl> - } <nl> - <nl> - Thread selectorThread = SelectorManager . getSelectorManager ( ) ; <nl> - selectorThread . setDaemon ( true ) ; <nl> - selectorThread . start ( ) ; <nl> - <nl> - String ipPort = args [ 0 ] ; <nl> - IPartitioner p = StorageService . getPartitioner ( ) ; <nl> - Token token = p . getTokenFactory ( ) . fromString ( args [ 1 ] ) ; <nl> - System . out . println ( " Partitioner is " + p . getClass ( ) + " , token is : " + token ) ; <nl> - System . out . println ( p . getTokenFactory ( ) . getClass ( ) ) ; <nl> - <nl> - String [ ] ipPortPair = ipPort . split ( " : " ) ; <nl> - int port = 7000 ; <nl> - if ( ipPortPair . length > 1 ) <nl> - { <nl> - port = Integer . valueOf ( ipPortPair [ 1 ] ) ; <nl> - } <nl> - <nl> - InetSocketAddress target = new InetSocketAddress ( ipPortPair [ 0 ] , port ) ; <nl> - <nl> - ByteArrayOutputStream bos = new ByteArrayOutputStream ( ) ; <nl> - DataOutputStream dos = new DataOutputStream ( bos ) ; <nl> - Token . serializer ( ) . serialize ( token , dos ) ; <nl> - <nl> - / * Construct the token update message to be sent * / <nl> - Message tokenUpdateMessage = new Message ( target . getAddress ( ) , <nl> - " " , <nl> - StorageService . tokenVerbHandler _ , <nl> - bos . toByteArray ( ) ) ; <nl> - <nl> - System . out . println ( " Sending a token update message to " + target ) ; <nl> - MessagingService . instance ( ) . sendOneWay ( tokenUpdateMessage , target . getAddress ( ) ) ; <nl> - Thread . sleep ( TokenUpdater . waitTime _ ) ; <nl> - System . out . println ( " Done sending the update message " ) ; <nl> - <nl> - MessagingService . shutdown ( ) ; <nl> - FileUtils . shutdown ( ) ; <nl> - } <nl> - }
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 1648b76 . . 7df303f 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 72 , 7 + 72 , 7 @ @ 
+ * Select optimal CRC32 implementation at runtime ( CASSANDRA - 8614 ) 
+ * Evaluate MurmurHash of Token once per query ( CASSANDRA - 7096 ) 
+ * Generalize progress reporting ( CASSANDRA - 8901 ) 
+ - * Resumable bootstrap streaming ( CASSANDRA - 8838 ) 
+ + * Resumable bootstrap streaming ( CASSANDRA - 8838 , CASSANDRA - 8942 ) 
+ * Allow scrub for secondary index ( CASSANDRA - 5174 ) 
+ 
+ 2 . 1 . 4 
+ diff - - git a / NEWS . txt b / NEWS . txt 
+ index c742f08 . . 641be77 100644 
+ - - - a / NEWS . txt 
+ + + + b / NEWS . txt 
+ @ @ - 45 , 6 + 45 , 9 @ @ New features 
+ installed which is accessible by Cassandra . Old versions of 
+ libjna packages ( < 4 . 0 . 0 ) will cause problems - e . g . Debian Wheezy 
+ contains libjna versin 3 . 2 . x . 
+ + - The node now keeps up when streaming is failed during bootstrapping . You can 
+ + use new ` nodetool bootstrap resume ` command to continue streaming after resolving 
+ + an issue . 
+ 
+ 
+ Upgrading 
+ diff - - git a / src / java / org / apache / cassandra / dht / BootStrapper . java b / src / java / org / apache / cassandra / dht / BootStrapper . java 
+ index 9d9cf0f . . aca05f0 100644 
+ - - - a / src / java / org / apache / cassandra / dht / BootStrapper . java 
+ + + + b / src / java / org / apache / cassandra / dht / BootStrapper . java 
+ @ @ - 21 , 8 + 21 , 9 @ @ import java . io . DataInput ; 
+ import java . io . IOException ; 
+ import java . net . InetAddress ; 
+ import java . util . * ; 
+ - import java . util . concurrent . ExecutionException ; 
+ + import java . util . concurrent . atomic . AtomicInteger ; 
+ 
+ + import com . google . common . util . concurrent . ListenableFuture ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 37 , 8 + 38 , 12 @ @ import org . apache . cassandra . io . util . DataOutputPlus ; 
+ import org . apache . cassandra . locator . AbstractReplicationStrategy ; 
+ import org . apache . cassandra . locator . TokenMetadata ; 
+ import org . apache . cassandra . service . StorageService ; 
+ + import org . apache . cassandra . streaming . * ; 
+ + import org . apache . cassandra . utils . progress . ProgressEvent ; 
+ + import org . apache . cassandra . utils . progress . ProgressEventNotifierSupport ; 
+ + import org . apache . cassandra . utils . progress . ProgressEventType ; 
+ 
+ - public class BootStrapper 
+ + public class BootStrapper extends ProgressEventNotifierSupport 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( BootStrapper . class ) ; 
+ 
+ @ @ - 58 , 7 + 63 , 7 @ @ public class BootStrapper 
+ this . tokenMetadata = tmd ; 
+ } 
+ 
+ - public void bootstrap ( StreamStateStore stateStore , boolean useStrictConsistency ) 
+ + public ListenableFuture < StreamState > bootstrap ( StreamStateStore stateStore , boolean useStrictConsistency ) 
+ { 
+ logger . debug ( " Beginning bootstrap process " ) ; 
+ 
+ @ @ - 77 , 19 + 82 , 70 @ @ public class BootStrapper 
+ streamer . addRanges ( keyspaceName , strategy . getPendingAddressRanges ( tokenMetadata , tokens , address ) ) ; 
+ } 
+ 
+ - try 
+ + StreamResultFuture bootstrapStreamResult = streamer . fetchAsync ( ) ; 
+ + bootstrapStreamResult . addEventListener ( new StreamEventHandler ( ) 
+ { 
+ - streamer . fetchAsync ( ) . get ( ) ; 
+ - StorageService . instance . finishBootstrapping ( ) ; 
+ - } 
+ - catch ( InterruptedException e ) 
+ - { 
+ - throw new RuntimeException ( " Interrupted while waiting on bootstrap to complete . Bootstrap will have to be restarted . " ) ; 
+ - } 
+ - catch ( ExecutionException e ) 
+ - { 
+ - throw new RuntimeException ( " Error during bootstrap : " + e . getCause ( ) . getMessage ( ) , e . getCause ( ) ) ; 
+ - } 
+ + private final AtomicInteger receivedFiles = new AtomicInteger ( ) ; 
+ + private final AtomicInteger totalFilesToReceive = new AtomicInteger ( ) ; 
+ + 
+ + @ Override 
+ + public void handleStreamEvent ( StreamEvent event ) 
+ + { 
+ + switch ( event . eventType ) 
+ + { 
+ + case STREAM _ PREPARED : 
+ + StreamEvent . SessionPreparedEvent prepared = ( StreamEvent . SessionPreparedEvent ) event ; 
+ + int currentTotal = totalFilesToReceive . addAndGet ( ( int ) prepared . session . getTotalFilesToReceive ( ) ) ; 
+ + ProgressEvent prepareProgress = new ProgressEvent ( ProgressEventType . PROGRESS , receivedFiles . get ( ) , currentTotal , " prepare with " + prepared . session . peer + " complete " ) ; 
+ + fireProgressEvent ( " bootstrap " , prepareProgress ) ; 
+ + break ; 
+ + 
+ + case FILE _ PROGRESS : 
+ + StreamEvent . ProgressEvent progress = ( StreamEvent . ProgressEvent ) event ; 
+ + if ( progress . progress . isCompleted ( ) ) 
+ + { 
+ + int received = receivedFiles . incrementAndGet ( ) ; 
+ + ProgressEvent currentProgress = new ProgressEvent ( ProgressEventType . PROGRESS , received , totalFilesToReceive . get ( ) , " received file " + progress . progress . fileName ) ; 
+ + fireProgressEvent ( " bootstrap " , currentProgress ) ; 
+ + } 
+ + break ; 
+ + 
+ + case STREAM _ COMPLETE : 
+ + StreamEvent . SessionCompleteEvent completeEvent = ( StreamEvent . SessionCompleteEvent ) event ; 
+ + ProgressEvent completeProgress = new ProgressEvent ( ProgressEventType . PROGRESS , receivedFiles . get ( ) , totalFilesToReceive . get ( ) , " session with " + completeEvent . peer + " complete " ) ; 
+ + fireProgressEvent ( " bootstrap " , completeProgress ) ; 
+ + break ; 
+ + } 
+ + } 
+ + 
+ + @ Override 
+ + public void onSuccess ( StreamState streamState ) 
+ + { 
+ + ProgressEventType type ; 
+ + String message ; 
+ + 
+ + if ( streamState . hasFailedSession ( ) ) 
+ + { 
+ + type = ProgressEventType . ERROR ; 
+ + message = " Some bootstrap stream failed " ; 
+ + } 
+ + else 
+ + { 
+ + type = ProgressEventType . SUCCESS ; 
+ + message = " Bootstrap streaming success " ; 
+ + } 
+ + ProgressEvent currentProgress = new ProgressEvent ( type , receivedFiles . get ( ) , totalFilesToReceive . get ( ) , message ) ; 
+ + fireProgressEvent ( " bootstrap " , currentProgress ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void onFailure ( Throwable throwable ) 
+ + { 
+ + ProgressEvent currentProgress = new ProgressEvent ( ProgressEventType . ERROR , receivedFiles . get ( ) , totalFilesToReceive . get ( ) , throwable . getMessage ( ) ) ; 
+ + fireProgressEvent ( " bootstrap " , currentProgress ) ; 
+ + } 
+ + } ) ; 
+ + return bootstrapStreamResult ; 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index 1c82764 . . 996791e 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 70 , 6 + 70 , 8 @ @ import org . apache . cassandra . thrift . TokenRange ; 
+ import org . apache . cassandra . thrift . cassandraConstants ; 
+ import org . apache . cassandra . tracing . TraceKeyspace ; 
+ import org . apache . cassandra . utils . * ; 
+ + import org . apache . cassandra . utils . progress . ProgressEvent ; 
+ + import org . apache . cassandra . utils . progress . ProgressEventType ; 
+ import org . apache . cassandra . utils . progress . jmx . JMXProgressSupport ; 
+ 
+ import static java . nio . charset . StandardCharsets . ISO _ 8859 _ 1 ; 
+ @ @ - 135 , 7 + 137 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ private InetAddress removingNode ; 
+ 
+ / * Are we starting this node in bootstrap mode ? * / 
+ - private boolean isBootstrapMode ; 
+ + private volatile boolean isBootstrapMode ; 
+ 
+ / * we bootstrap but do NOT join the ring unless told to do so * / 
+ private boolean isSurveyMode = Boolean . parseBoolean ( System . getProperty ( " cassandra . write _ survey " , " false " ) ) ; 
+ @ @ - 168 , 11 + 170 , 6 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ 
+ private final StreamStateStore streamStateStore = new StreamStateStore ( ) ; 
+ 
+ - public void finishBootstrapping ( ) 
+ - { 
+ - isBootstrapMode = false ; 
+ - } 
+ - 
+ / * * This method updates the local token on disk * / 
+ public void setTokens ( Collection < Token > tokens ) 
+ { 
+ @ @ - 468 , 7 + 465 , 8 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ { 
+ logger . info ( " Cassandra version : { } " , FBUtilities . getReleaseVersionString ( ) ) ; 
+ logger . info ( " Thrift API version : { } " , cassandraConstants . VERSION ) ; 
+ - logger . info ( " CQL supported versions : { } ( default : { } ) " , StringUtils . join ( ClientState . getCQLSupportedVersion ( ) , " , " ) , ClientState . DEFAULT _ CQL _ VERSION ) ; 
+ + logger . info ( " CQL supported versions : { } ( default : { } ) " , 
+ + StringUtils . join ( ClientState . getCQLSupportedVersion ( ) , " , " ) , ClientState . DEFAULT _ CQL _ VERSION ) ; 
+ 
+ initialized = true ; 
+ 
+ @ @ - 671 , 13 + 669 , 20 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ / / We attempted to replace this with a schema - presence check , but you need a meaningful sleep 
+ / / to get schema info from gossip which defeats the purpose . See CASSANDRA - 4427 for the gory details . 
+ Set < InetAddress > current = new HashSet < > ( ) ; 
+ - logger . debug ( " Bootstrap variables : { } { } { } { } " , 
+ - DatabaseDescriptor . isAutoBootstrap ( ) , 
+ - SystemKeyspace . bootstrapInProgress ( ) , 
+ - SystemKeyspace . bootstrapComplete ( ) , 
+ - DatabaseDescriptor . getSeeds ( ) . contains ( FBUtilities . getBroadcastAddress ( ) ) ) ; 
+ + if ( logger . isDebugEnabled ( ) ) 
+ + { 
+ + logger . debug ( " Bootstrap variables : { } { } { } { } " , 
+ + DatabaseDescriptor . isAutoBootstrap ( ) , 
+ + SystemKeyspace . bootstrapInProgress ( ) , 
+ + SystemKeyspace . bootstrapComplete ( ) , 
+ + DatabaseDescriptor . getSeeds ( ) . contains ( FBUtilities . getBroadcastAddress ( ) ) ) ; 
+ + } 
+ if ( DatabaseDescriptor . isAutoBootstrap ( ) & & ! SystemKeyspace . bootstrapComplete ( ) & & DatabaseDescriptor . getSeeds ( ) . contains ( FBUtilities . getBroadcastAddress ( ) ) ) 
+ + { 
+ logger . info ( " This node will not auto bootstrap because it is configured to be a seed node . " ) ; 
+ + } 
+ + 
+ + boolean dataAvailable = true ; / / make this to false when bootstrap streaming failed 
+ if ( shouldBootstrap ( ) ) 
+ { 
+ if ( SystemKeyspace . bootstrapInProgress ( ) ) 
+ @ @ - 708 , 18 + 713 , 19 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ PendingRangeCalculatorService . instance . blockUntilFinished ( ) ; 
+ setMode ( Mode . JOINING , " calculation complete , ready to bootstrap " , true ) ; 
+ 
+ + logger . debug ( " . . . got ring + schema info " ) ; 
+ 
+ - if ( logger . isDebugEnabled ( ) ) 
+ - logger . debug ( " . . . got ring + schema info " ) ; 
+ - 
+ - if ( Boolean . parseBoolean ( System . getProperty ( " cassandra . consistent . rangemovement " , " true " ) ) & & 
+ + if ( useStrictConsistency & & 
+ ( 
+ tokenMetadata . getBootstrapTokens ( ) . valueSet ( ) . size ( ) > 0 | | 
+ tokenMetadata . getLeavingEndpoints ( ) . size ( ) > 0 | | 
+ tokenMetadata . getMovingEndpoints ( ) . size ( ) > 0 
+ ) ) 
+ + { 
+ throw new UnsupportedOperationException ( " Other bootstrapping / leaving / moving nodes detected , cannot bootstrap while cassandra . consistent . rangemovement is true " ) ; 
+ + } 
+ 
+ + / / get bootstrap tokens 
+ if ( ! replacing ) 
+ { 
+ if ( tokenMetadata . isMember ( FBUtilities . getBroadcastAddress ( ) ) ) 
+ @ @ - 777 , 8 + 783 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ setMode ( Mode . JOINING , " Replacing a node with token ( s ) : " + bootstrapTokens , true ) ; 
+ } 
+ 
+ - bootstrap ( bootstrapTokens ) ; 
+ - assert ! isBootstrapMode ; / / bootstrap will block until finished 
+ + dataAvailable = bootstrap ( bootstrapTokens ) ; 
+ } 
+ else 
+ { 
+ @ @ - 796 , 7 + 801 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ } 
+ else 
+ { 
+ - bootstrapTokens = new ArrayList < Token > ( initialTokens . size ( ) ) ; 
+ + bootstrapTokens = new ArrayList < > ( initialTokens . size ( ) ) ; 
+ for ( String token : initialTokens ) 
+ bootstrapTokens . add ( getPartitioner ( ) . getTokenFactory ( ) . fromString ( token ) ) ; 
+ logger . info ( " Saved tokens not found . Using configuration value : { } " , bootstrapTokens ) ; 
+ @ @ - 817 , 16 + 822 , 24 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ 
+ if ( ! isSurveyMode ) 
+ { 
+ - / / start participating in the ring . 
+ - SystemKeyspace . setBootstrapState ( SystemKeyspace . BootstrapState . COMPLETED ) ; 
+ - setTokens ( bootstrapTokens ) ; 
+ - / / remove the existing info about the replaced node . 
+ - if ( ! current . isEmpty ( ) ) 
+ - for ( InetAddress existing : current ) 
+ - Gossiper . instance . replacedEndpoint ( existing ) ; 
+ - assert tokenMetadata . sortedTokens ( ) . size ( ) > 0 ; 
+ - 
+ - doAuthSetup ( ) ; 
+ + if ( dataAvailable ) 
+ + { 
+ + / / start participating in the ring . 
+ + SystemKeyspace . setBootstrapState ( SystemKeyspace . BootstrapState . COMPLETED ) ; 
+ + setTokens ( bootstrapTokens ) ; 
+ + / / remove the existing info about the replaced node . 
+ + if ( ! current . isEmpty ( ) ) 
+ + { 
+ + for ( InetAddress existing : current ) 
+ + Gossiper . instance . replacedEndpoint ( existing ) ; 
+ + } 
+ + assert tokenMetadata . sortedTokens ( ) . size ( ) > 0 ; 
+ + doAuthSetup ( ) ; 
+ + } 
+ + else 
+ + { 
+ + logger . warn ( " Some data streaming failed . Use nodetool to check bootstrap state and resume . For more , see ` nodetool help bootstrap ` . { } " , SystemKeyspace . getBootstrapState ( ) ) ; 
+ + } 
+ } 
+ else 
+ { 
+ @ @ - 1009 , 7 + 1022 , 16 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ logger . debug ( logMsg ) ; 
+ } 
+ 
+ - private void bootstrap ( Collection < Token > tokens ) 
+ + / * * 
+ + * Bootstrap node by fetching data from other nodes . 
+ + * If node is bootstrapping as a new node , then this also announces bootstrapping to the cluster . 
+ + * 
+ + * This blocks until streaming is done . 
+ + * 
+ + * @ param tokens bootstrapping tokens 
+ + * @ return true if bootstrap succeeds . 
+ + * / 
+ + private boolean bootstrap ( final Collection < Token > tokens ) 
+ { 
+ isBootstrapMode = true ; 
+ SystemKeyspace . updateTokens ( tokens ) ; / / DON ' T use setToken , that makes us part of the ring locally which is incorrect until we are done bootstrapping 
+ @ @ - 1039 , 8 + 1061 , 86 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ } 
+ 
+ setMode ( Mode . JOINING , " Starting to bootstrap . . . " , true ) ; 
+ - new BootStrapper ( FBUtilities . getBroadcastAddress ( ) , tokens , tokenMetadata ) . bootstrap ( streamStateStore , ! replacing & & useStrictConsistency ) ; / / handles token update 
+ - logger . info ( " Bootstrap completed ! for the tokens { } " , tokens ) ; 
+ + BootStrapper bootstrapper = new BootStrapper ( FBUtilities . getBroadcastAddress ( ) , tokens , tokenMetadata ) ; 
+ + bootstrapper . addProgressListener ( progressSupport ) ; 
+ + ListenableFuture < StreamState > bootstrapStream = bootstrapper . bootstrap ( streamStateStore , ! replacing & & useStrictConsistency ) ; / / handles token update 
+ + Futures . addCallback ( bootstrapStream , new FutureCallback < StreamState > ( ) 
+ + { 
+ + @ Override 
+ + public void onSuccess ( StreamState streamState ) 
+ + { 
+ + isBootstrapMode = false ; 
+ + logger . info ( " Bootstrap completed ! for the tokens { } " , tokens ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void onFailure ( Throwable e ) 
+ + { 
+ + logger . warn ( " Error during bootstrap : " + e . getCause ( ) . getMessage ( ) , e . getCause ( ) ) ; 
+ + } 
+ + } ) ; 
+ + try 
+ + { 
+ + bootstrapStream . get ( ) ; 
+ + return true ; 
+ + } 
+ + catch ( Throwable e ) 
+ + { 
+ + logger . error ( " Error while waiting on bootstrap to complete . Bootstrap will have to be restarted . " , e ) ; 
+ + return false ; 
+ + } 
+ + } 
+ + 
+ + public boolean resumeBootstrap ( ) 
+ + { 
+ + if ( isBootstrapMode & & SystemKeyspace . bootstrapInProgress ( ) ) 
+ + { 
+ + logger . info ( " Resuming bootstrap . . . " ) ; 
+ + 
+ + / / get bootstrap tokens saved in system keyspace 
+ + final Collection < Token > tokens = SystemKeyspace . getSavedTokens ( ) ; 
+ + / / already bootstrapped ranges are filtered during bootstrap 
+ + BootStrapper bootstrapper = new BootStrapper ( FBUtilities . getBroadcastAddress ( ) , tokens , tokenMetadata ) ; 
+ + bootstrapper . addProgressListener ( progressSupport ) ; 
+ + ListenableFuture < StreamState > bootstrapStream = bootstrapper . bootstrap ( streamStateStore , ! replacing & & useStrictConsistency ) ; / / handles token update 
+ + Futures . addCallback ( bootstrapStream , new FutureCallback < StreamState > ( ) 
+ + { 
+ + @ Override 
+ + public void onSuccess ( StreamState streamState ) 
+ + { 
+ + isBootstrapMode = false ; 
+ + / / start participating in the ring . 
+ + / / pretend we are in survey mode so we can use joinRing ( ) here 
+ + isSurveyMode = true ; 
+ + try 
+ + { 
+ + progressSupport . progress ( " bootstrap " , ProgressEvent . createNotification ( " Joining ring . . . " ) ) ; 
+ + joinRing ( ) ; 
+ + } 
+ + catch ( IOException ignore ) 
+ + { 
+ + / / joinRing with survey mode does not throw IOException 
+ + } 
+ + progressSupport . progress ( " bootstrap " , new ProgressEvent ( ProgressEventType . COMPLETE , 1 , 1 , " Resume bootstrap complete " ) ) ; 
+ + logger . info ( " Resume complete " ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void onFailure ( Throwable e ) 
+ + { 
+ + String message = " Error during bootstrap : " + e . getCause ( ) . getMessage ( ) ; 
+ + logger . error ( message , e . getCause ( ) ) ; 
+ + progressSupport . progress ( " bootstrap " , new ProgressEvent ( ProgressEventType . ERROR , 1 , 1 , message ) ) ; 
+ + progressSupport . progress ( " bootstrap " , new ProgressEvent ( ProgressEventType . COMPLETE , 1 , 1 , " Resume bootstrap complete " ) ) ; 
+ + } 
+ + } ) ; 
+ + return true ; 
+ + } 
+ + else 
+ + { 
+ + logger . info ( " Resuming bootstrap is requested , but the node is already bootstrapped . " ) ; 
+ + return false ; 
+ + } 
+ } 
+ 
+ public boolean isBootstrapMode ( ) 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageServiceMBean . java b / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ index c533618 . . 3d04058 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ @ @ - 529 , 4 + 529 , 12 @ @ public interface StorageServiceMBean extends NotificationEmitter 
+ 
+ / * * Sets the hinted handoff throttle in kb per second , per delivery thread . * / 
+ public void setHintedHandoffThrottleInKB ( int throttleInKB ) ; 
+ + 
+ + / * * 
+ + * Resume bootstrap streaming when there is failed data streaming . 
+ + * 
+ + * 
+ + * @ return true if the node successfully starts resuming . ( this does not mean bootstrap streaming was success . ) 
+ + * / 
+ + public boolean resumeBootstrap ( ) ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / tools / BootstrapMonitor . java b / src / java / org / apache / cassandra / tools / BootstrapMonitor . java 
+ new file mode 100644 
+ index 0000000 . . 9719192 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / tools / BootstrapMonitor . java 
+ @ @ - 0 , 0 + 1 , 88 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . tools ; 
+ + 
+ + import java . io . IOException ; 
+ + import java . io . PrintStream ; 
+ + import java . text . SimpleDateFormat ; 
+ + import java . util . concurrent . locks . Condition ; 
+ + 
+ + import org . apache . cassandra . utils . concurrent . SimpleCondition ; 
+ + import org . apache . cassandra . utils . progress . ProgressEvent ; 
+ + import org . apache . cassandra . utils . progress . ProgressEventType ; 
+ + import org . apache . cassandra . utils . progress . jmx . JMXNotificationProgressListener ; 
+ + 
+ + public class BootstrapMonitor extends JMXNotificationProgressListener 
+ + { 
+ + private final SimpleDateFormat format = new SimpleDateFormat ( " yyyy - MM - dd HH : mm : ss , SSS " ) ; 
+ + private final PrintStream out ; 
+ + private final Condition condition = new SimpleCondition ( ) ; 
+ + 
+ + public BootstrapMonitor ( PrintStream out ) 
+ + { 
+ + this . out = out ; 
+ + } 
+ + 
+ + public void awaitCompletion ( ) throws InterruptedException 
+ + { 
+ + condition . await ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public boolean isInterestedIn ( String tag ) 
+ + { 
+ + return " bootstrap " . equals ( tag ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void handleNotificationLost ( long timestamp , String message ) 
+ + { 
+ + super . handleNotificationLost ( timestamp , message ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void handleConnectionClosed ( long timestamp , String message ) 
+ + { 
+ + handleConnectionFailed ( timestamp , message ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void handleConnectionFailed ( long timestamp , String message ) 
+ + { 
+ + Exception error = new IOException ( String . format ( " [ % s ] JMX connection closed . ( % s ) " , 
+ + format . format ( timestamp ) , message ) ) ; 
+ + out . println ( error . getMessage ( ) ) ; 
+ + condition . signalAll ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void progress ( String tag , ProgressEvent event ) 
+ + { 
+ + ProgressEventType type = event . getType ( ) ; 
+ + String message = String . format ( " [ % s ] % s " , format . format ( System . currentTimeMillis ( ) ) , event . getMessage ( ) ) ; 
+ + if ( type = = ProgressEventType . PROGRESS ) 
+ + { 
+ + message = message + " ( progress : " + ( int ) event . getProgressPercentage ( ) + " % ) " ; 
+ + } 
+ + out . println ( message ) ; 
+ + if ( type = = ProgressEventType . COMPLETE ) 
+ + { 
+ + condition . signalAll ( ) ; 
+ + } 
+ + } 
+ + } 
+ diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ index 5012ef5 . . edb2478 100644 
+ - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ @ @ - 1179 , 6 + 1179 , 41 @ @ public class NodeProbe implements AutoCloseable 
+ { 
+ return ssProxy . getLoggingLevels ( ) ; 
+ } 
+ + 
+ + public void resumeBootstrap ( PrintStream out ) throws IOException 
+ + { 
+ + BootstrapMonitor monitor = new BootstrapMonitor ( out ) ; 
+ + try 
+ + { 
+ + jmxc . addConnectionNotificationListener ( monitor , null , null ) ; 
+ + ssProxy . addNotificationListener ( monitor , null , null ) ; 
+ + if ( ssProxy . resumeBootstrap ( ) ) 
+ + { 
+ + out . println ( " Resuming bootstrap " ) ; 
+ + monitor . awaitCompletion ( ) ; 
+ + } 
+ + else 
+ + { 
+ + out . println ( " Node is already bootstrapped . " ) ; 
+ + } 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new IOException ( e ) ; 
+ + } 
+ + finally 
+ + { 
+ + try 
+ + { 
+ + ssProxy . removeNotificationListener ( monitor ) ; 
+ + jmxc . removeConnectionNotificationListener ( monitor ) ; 
+ + } 
+ + catch ( Throwable e ) 
+ + { 
+ + out . println ( " Exception occurred during clean - up . " + e ) ; 
+ + } 
+ + } 
+ + } 
+ } 
+ 
+ class ColumnFamilyStoreMBeanIterator implements Iterator < Map . Entry < String , ColumnFamilyStoreMBean > > 
+ diff - - git a / src / java / org / apache / cassandra / tools / NodeTool . java b / src / java / org / apache / cassandra / tools / NodeTool . java 
+ index 4b56a2c . . 9c804c0 100644 
+ - - - a / src / java / org / apache / cassandra / tools / NodeTool . java 
+ + + + b / src / java / org / apache / cassandra / tools / NodeTool . java 
+ @ @ - 156 , 11 + 156 , 19 @ @ public class NodeTool 
+ GetLoggingLevels . class 
+ ) ; 
+ 
+ - Cli < Runnable > parser = Cli . < Runnable > builder ( " nodetool " ) 
+ - . withDescription ( " Manage your Cassandra cluster " ) 
+ + Cli . CliBuilder < Runnable > builder = Cli . builder ( " nodetool " ) ; 
+ + 
+ + builder . withDescription ( " Manage your Cassandra cluster " ) 
+ + . withDefaultCommand ( Help . class ) 
+ + . withCommands ( commands ) ; 
+ + 
+ + / / bootstrap commands 
+ + builder . withGroup ( " bootstrap " ) 
+ + . withDescription ( " Monitor / manage node ' s bootstrap process " ) 
+ . withDefaultCommand ( Help . class ) 
+ - . withCommands ( commands ) 
+ - . build ( ) ; 
+ + . withCommand ( BootstrapResume . class ) ; 
+ + 
+ + Cli < Runnable > parser = builder . build ( ) ; 
+ 
+ int status = 0 ; 
+ try 
+ @ @ - 2700 , 4 + 2708 , 20 @ @ public class NodeTool 
+ } 
+ } 
+ 
+ + @ Command ( name = " resume " , description = " Resume bootstrap streaming " ) 
+ + public static class BootstrapResume extends NodeToolCmd 
+ + { 
+ + @ Override 
+ + protected void execute ( NodeProbe probe ) 
+ + { 
+ + try 
+ + { 
+ + probe . resumeBootstrap ( System . out ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + } 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / utils / progress / ProgressEventNotifierSupport . java b / src / java / org / apache / cassandra / utils / progress / ProgressEventNotifierSupport . java 
+ new file mode 100644 
+ index 0000000 . . f5fe795 
+ - - - / dev / null 
+ + + + b / src / java / org / apache / cassandra / utils / progress / ProgressEventNotifierSupport . java 
+ @ @ - 0 , 0 + 1 , 49 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + package org . apache . cassandra . utils . progress ; 
+ + 
+ + import java . util . List ; 
+ + import java . util . concurrent . CopyOnWriteArrayList ; 
+ + 
+ + / * * 
+ + * Provides basic , thread safe ProgressEvent notification support 
+ + * / 
+ + public abstract class ProgressEventNotifierSupport implements ProgressEventNotifier 
+ + { 
+ + private List < ProgressListener > listeners = new CopyOnWriteArrayList < > ( ) ; 
+ + 
+ + @ Override 
+ + public void addProgressListener ( ProgressListener listener ) 
+ + { 
+ + listeners . add ( listener ) ; 
+ + } 
+ + 
+ + @ Override 
+ + public void removeProgressListener ( ProgressListener listener ) 
+ + { 
+ + listeners . remove ( listener ) ; 
+ + } 
+ + 
+ + protected void fireProgressEvent ( String tag , ProgressEvent event ) 
+ + { 
+ + for ( ProgressListener listener : listeners ) 
+ + { 
+ + listener . progress ( tag , event ) ; 
+ + } 
+ + } 
+ + }
+
+NEAREST DIFF:
+diff - - git a / bin / tokenupdater b / bin / tokenupdater 
+ deleted file mode 100755 
+ index 12118e9 . . 0000000 
+ - - - a / bin / tokenupdater 
+ + + + / dev / null 
+ @ @ - 1 , 49 + 0 , 0 @ @ 
+ - # ! / bin / sh 
+ - # Licensed to the Apache Software Foundation ( ASF ) under one 
+ - # or more contributor license agreements . See the NOTICE file 
+ - # distributed with this work for additional information 
+ - # regarding copyright ownership . The ASF licenses this file 
+ - # to you under the Apache License , Version 2 . 0 ( the 
+ - # " License " ) ; you may not use this file except in compliance 
+ - # with the License . You may obtain a copy of the License at 
+ - # 
+ - # http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - # 
+ - # Unless required by applicable law or agreed to in writing , software 
+ - # distributed under the License is distributed on an " AS IS " BASIS , 
+ - # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - # See the License for the specific language governing permissions and 
+ - # limitations under the License . 
+ - 
+ - 
+ - if [ " x $ CASSANDRA _ INCLUDE " = " x " ] ; then 
+ - for include in / usr / share / cassandra / cassandra . in . sh \ 
+ - / usr / local / share / cassandra / cassandra . in . sh \ 
+ - / opt / cassandra / cassandra . in . sh \ 
+ - ` dirname $ 0 ` / cassandra . in . sh ; do 
+ - if [ - r $ include ] ; then 
+ - . $ include 
+ - break 
+ - fi 
+ - done 
+ - elif [ - r $ CASSANDRA _ INCLUDE ] ; then 
+ - . $ CASSANDRA _ INCLUDE 
+ - fi 
+ - 
+ - if [ - z $ CASSANDRA _ CONF - o - z $ CLASSPATH ] ; then 
+ - echo " You must set the CASSANDRA _ CONF and CLASSPATH vars " > & 2 
+ - exit 1 
+ - fi 
+ - 
+ - # Special - case path variables . 
+ - case " ` uname ` " in 
+ - CYGWIN * ) 
+ - CLASSPATH = ` cygpath - p - w " $ CLASSPATH " ` 
+ - CASSANDRA _ CONF = ` cygpath - p - w " $ CASSANDRA _ CONF " ` 
+ - ; ; 
+ - esac 
+ - 
+ - java - cp $ CLASSPATH - Dstorage - config = $ CASSANDRA _ CONF \ 
+ - org . apache . cassandra . tools . TokenUpdater $ @ 
+ - 
+ - # vi : ai sw = 4 ts = 4 tw = 0 et 
+ diff - - git a / src / java / org / apache / cassandra / db / SystemTable . java b / src / java / org / apache / cassandra / db / SystemTable . java 
+ index 61dbbdc . . c03535f 100644 
+ - - - a / src / java / org / apache / cassandra / db / SystemTable . java 
+ + + + b / src / java / org / apache / cassandra / db / SystemTable . java 
+ @ @ - 127 , 7 + 127 , 7 @ @ public class SystemTable 
+ if ( initialToken = = null ) 
+ token = p . getRandomToken ( ) ; 
+ else 
+ - token = p . getToken ( initialToken ) ; 
+ + token = p . getTokenFactory ( ) . fromString ( initialToken ) ; 
+ 
+ logger . info ( " Saved Token not found . Using " + token ) ; 
+ / / seconds - since - epoch isn ' t a foolproof new generation 
+ diff - - git a / src / java / org / apache / cassandra / dht / IPartitioner . java b / src / java / org / apache / cassandra / dht / IPartitioner . java 
+ index 27469d5 . . 6cb3135 100644 
+ - - - a / src / java / org / apache / cassandra / dht / IPartitioner . java 
+ + + + b / src / java / org / apache / cassandra / dht / IPartitioner . java 
+ @ @ - 72 , 6 + 72 , 8 @ @ public interface IPartitioner < T extends Token > 
+ 
+ / * * 
+ * @ return a Token that can be used to route a given key 
+ + * ( This is NOT a method to create a Token from its string representation ; 
+ + * for that , use TokenFactory . fromString . ) 
+ * / 
+ public T getToken ( String key ) ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / io / SSTable . java b / src / java / org / apache / cassandra / io / SSTable . java 
+ index 4f60c37 . . 43d41ca 100644 
+ - - - a / src / java / org / apache / cassandra / io / SSTable . java 
+ + + + b / src / java / org / apache / cassandra / io / SSTable . java 
+ @ @ - 50 , 6 + 50 , 7 @ @ public abstract class SSTable 
+ { 
+ private static final Logger logger = Logger . getLogger ( SSTable . class ) ; 
+ 
+ + public static final int FILES _ ON _ DISK = 3 ; / / data , index , and bloom filter 
+ 
+ protected String path ; 
+ protected IPartitioner partitioner ; 
+ diff - - git a / src / java / org / apache / cassandra / io / Streaming . java b / src / java / org / apache / cassandra / io / Streaming . java 
+ index 31f2a04 . . c3b00f0 100644 
+ - - - a / src / java / org / apache / cassandra / io / Streaming . java 
+ + + + b / src / java / org / apache / cassandra / io / Streaming . java 
+ @ @ - 72 , 7 + 72 , 7 @ @ public class Streaming 
+ if ( sstables . isEmpty ( ) ) 
+ return ; 
+ 
+ - StreamContextManager . StreamContext [ ] streamContexts = new StreamContextManager . StreamContext [ sstables . size ( ) ] ; 
+ + StreamContextManager . StreamContext [ ] streamContexts = new StreamContextManager . StreamContext [ SSTable . FILES _ ON _ DISK * sstables . size ( ) ] ; 
+ int i = 0 ; 
+ for ( SSTableReader sstable : sstables ) 
+ { 
+ @ @ - 130 , 7 + 130 , 6 @ @ public class Streaming 
+ StreamContextManager . StreamStatus streamStatus = new StreamContextManager . StreamStatus ( streamContext . getTargetFile ( ) , streamContext . getExpectedBytes ( ) ) ; 
+ String file = getNewFileNameFromOldContextAndNames ( fileNames , streamContext ) ; 
+ 
+ - / / String file = DatabaseDescriptor . getDataFileLocationForTable ( streamContext . getTable ( ) ) + File . separator + newFileName + " - Data . db " ; 
+ if ( logger . isDebugEnabled ( ) ) 
+ logger . debug ( " Received Data from : " + message . getFrom ( ) + " " + streamContext . getTargetFile ( ) + " " + file ) ; 
+ streamContext . setTargetFile ( file ) ; 
+ diff - - git a / src / java / org / apache / cassandra / locator / TokenMetadata . java b / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ index 5fd7eca . . 164d80f 100644 
+ - - - a / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ + + + b / src / java / org / apache / cassandra / locator / TokenMetadata . java 
+ @ @ - 88 , 6 + 88 , 7 @ @ public class TokenMetadata 
+ lock . writeLock ( ) . lock ( ) ; 
+ try 
+ { 
+ + tokenToEndPointMap . inverse ( ) . remove ( endpoint ) ; 
+ if ( ! endpoint . equals ( tokenToEndPointMap . put ( token , endpoint ) ) ) 
+ { 
+ sortedTokens = sortTokens ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / net / TcpConnection . java b / src / java / org / apache / cassandra / net / TcpConnection . java 
+ index 62a73a2 . . ae6601b 100644 
+ - - - a / src / java / org / apache / cassandra / net / TcpConnection . java 
+ + + + b / src / java / org / apache / cassandra / net / TcpConnection . java 
+ @ @ - 71 , 7 + 71 , 6 @ @ public class TcpConnection extends SelectionKeyHandler implements Comparable 
+ 
+ private TcpConnection ( InetAddress from , InetAddress to , TcpConnectionManager pool , boolean streaming ) throws IOException 
+ { 
+ - logger _ . debug ( " creating connection from " + from + " to " + to ) ; 
+ socketChannel _ = SocketChannel . open ( ) ; 
+ socketChannel _ . socket ( ) . bind ( new InetSocketAddress ( from , 0 ) ) ; 
+ socketChannel _ . configureBlocking ( false ) ; 
+ @ @ - 291 , 18 + 290 , 20 @ @ public class TcpConnection extends SelectionKeyHandler implements Comparable 
+ 
+ void closeSocket ( ) 
+ { 
+ - logger _ . warn ( " Closing down connection " + socketChannel _ + " with " + pendingWrites _ . size ( ) + " writes remaining . " ) ; 
+ + if ( pendingWrites _ . size ( ) > 0 ) 
+ + logger _ . error ( " Closing down connection " + socketChannel _ + " with " + pendingWrites _ . size ( ) + " writes remaining . " ) ; 
+ cancel ( key _ ) ; 
+ pendingWrites _ . clear ( ) ; 
+ } 
+ 
+ void errorClose ( ) 
+ { 
+ - logger _ . warn ( " Closing down connection " + socketChannel _ ) ; 
+ + logger _ . info ( " Closing errored connection " + socketChannel _ ) ; 
+ pendingWrites _ . clear ( ) ; 
+ cancel ( key _ ) ; 
+ pendingWrites _ . clear ( ) ; 
+ - pool _ . destroy ( this ) ; 
+ + if ( pool _ ! = null ) 
+ + pool _ . destroy ( this ) ; 
+ } 
+ 
+ private void cancel ( SelectionKey key ) 
+ diff - - git a / src / java / org / apache / cassandra / net / io / StreamContextManager . java b / src / java / org / apache / cassandra / net / io / StreamContextManager . java 
+ index 28bb4f3 . . 4723afc 100644 
+ - - - a / src / java / org / apache / cassandra / net / io / StreamContextManager . java 
+ + + + b / src / java / org / apache / cassandra / net / io / StreamContextManager . java 
+ @ @ - 261 , 7 + 261 , 7 @ @ public class StreamContextManager 
+ { 
+ List < StreamContext > context = ctxBag _ . get ( key ) ; 
+ if ( context = = null ) 
+ - throw new IllegalStateException ( " Streaming context has not been set . " ) ; 
+ + throw new IllegalStateException ( " Streaming context has not been set for " + key ) ; 
+ StreamContext streamContext = context . remove ( 0 ) ; 
+ if ( context . isEmpty ( ) ) 
+ ctxBag _ . remove ( key ) ; 
+ @ @ - 272 , 7 + 272 , 7 @ @ public class StreamContextManager 
+ { 
+ List < StreamStatus > status = streamStatusBag _ . get ( key ) ; 
+ if ( status = = null ) 
+ - throw new IllegalStateException ( " Streaming status has not been set . " ) ; 
+ + throw new IllegalStateException ( " Streaming status has not been set for " + key ) ; 
+ StreamStatus streamStatus = status . remove ( 0 ) ; 
+ if ( status . isEmpty ( ) ) 
+ streamStatusBag _ . remove ( key ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index 36c6ebc . . 6a51332 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 19 , 6 + 19 , 7 @ @ 
+ package org . apache . cassandra . service ; 
+ 
+ import java . io . IOException ; 
+ + import java . io . IOError ; 
+ import java . lang . management . ManagementFactory ; 
+ import java . lang . reflect . Constructor ; 
+ import java . util . * ; 
+ @ @ - 71 , 7 + 72 , 6 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ 
+ / * All verb handler identifiers * / 
+ public final static String mutationVerbHandler _ = " ROW - MUTATION - VERB - HANDLER " ; 
+ - public final static String tokenVerbHandler _ = " TOKEN - VERB - HANDLER " ; 
+ public final static String binaryVerbHandler _ = " BINARY - VERB - HANDLER " ; 
+ public final static String readRepairVerbHandler _ = " READ - REPAIR - VERB - HANDLER " ; 
+ public final static String readVerbHandler _ = " ROW - READ - VERB - HANDLER " ; 
+ @ @ - 165 , 7 + 165 , 7 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ { 
+ bootstrapSet . remove ( s ) ; 
+ if ( logger _ . isDebugEnabled ( ) ) 
+ - logger _ . debug ( " Removed " + s + " as a bootstrap source " ) ; 
+ + logger _ . debug ( " Removed " + s + " as a bootstrap source ; remaining is [ " + StringUtils . join ( bootstrapSet , " , " ) + " ] " ) ; 
+ 
+ if ( bootstrapSet . isEmpty ( ) ) 
+ { 
+ @ @ - 222 , 7 + 222 , 6 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ endPointSnitch _ = DatabaseDescriptor . getEndPointSnitch ( ) ; 
+ 
+ / * register the verb handlers * / 
+ - MessagingService . instance ( ) . registerVerbHandlers ( tokenVerbHandler _ , new TokenUpdateVerbHandler ( ) ) ; 
+ MessagingService . instance ( ) . registerVerbHandlers ( binaryVerbHandler _ , new BinaryVerbHandler ( ) ) ; 
+ MessagingService . instance ( ) . registerVerbHandlers ( mutationVerbHandler _ , new RowMutationVerbHandler ( ) ) ; 
+ MessagingService . instance ( ) . registerVerbHandlers ( readRepairVerbHandler _ , new ReadRepairVerbHandler ( ) ) ; 
+ @ @ - 258 , 8 + 257 , 6 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ public void start ( ) throws IOException 
+ { 
+ storageMetadata _ = SystemTable . initMetadata ( ) ; 
+ - isBootstrapMode = DatabaseDescriptor . isAutoBootstrap ( ) 
+ - & & ! ( DatabaseDescriptor . getSeeds ( ) . contains ( FBUtilities . getLocalAddress ( ) ) | | SystemTable . isBootstrapped ( ) ) ; 
+ 
+ / * Listen for application messages * / 
+ MessagingService . instance ( ) . listen ( FBUtilities . getLocalAddress ( ) ) ; 
+ @ @ - 277 , 15 + 274 , 14 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ Gossiper . instance ( ) . register ( this ) ; 
+ Gossiper . instance ( ) . start ( FBUtilities . getLocalAddress ( ) , storageMetadata _ . getGeneration ( ) ) ; 
+ 
+ - if ( isBootstrapMode ) 
+ + if ( DatabaseDescriptor . isAutoBootstrap ( ) 
+ + & & ! ( DatabaseDescriptor . getSeeds ( ) . contains ( FBUtilities . getLocalAddress ( ) ) | | SystemTable . isBootstrapped ( ) ) ) 
+ { 
+ logger _ . info ( " Starting in bootstrap mode ( first , sleeping to get load information ) " ) ; 
+ StorageLoadBalancer . instance ( ) . waitForLoadInfo ( ) ; 
+ logger _ . info ( " . . . got load info " ) ; 
+ Token token = BootStrapper . getBootstrapToken ( tokenMetadata _ , StorageLoadBalancer . instance ( ) . getLoadInfo ( ) ) ; 
+ - SystemTable . updateToken ( token ) ; / / DON ' T use setToken , that makes us part of the ring locally which is incorrect until we are done bootstrapping 
+ - Gossiper . instance ( ) . addApplicationState ( StorageService . STATE _ BOOTSTRAPPING , new ApplicationState ( partitioner _ . getTokenFactory ( ) . toString ( getLocalToken ( ) ) ) ) ; 
+ - new BootStrapper ( replicationStrategy _ , FBUtilities . getLocalAddress ( ) , getLocalToken ( ) , tokenMetadata _ ) . startBootstrap ( ) ; / / handles token update 
+ + startBootstrap ( token ) ; 
+ / / don ' t finish startup ( enabling thrift ) until after bootstrap is done 
+ while ( isBootstrapMode ) 
+ { 
+ @ @ - 303 , 13 + 299 , 21 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ { 
+ SystemTable . setBootstrapped ( true ) ; 
+ Token token = storageMetadata _ . getToken ( ) ; 
+ - setToken ( token ) ; 
+ + tokenMetadata _ . update ( token , FBUtilities . getLocalAddress ( ) ) ; 
+ Gossiper . instance ( ) . addApplicationState ( StorageService . STATE _ NORMAL , new ApplicationState ( partitioner _ . getTokenFactory ( ) . toString ( token ) ) ) ; 
+ } 
+ 
+ assert tokenMetadata _ . sortedTokens ( ) . size ( ) > 0 ; 
+ } 
+ 
+ + private void startBootstrap ( Token token ) throws IOException 
+ + { 
+ + isBootstrapMode = true ; 
+ + SystemTable . updateToken ( token ) ; / / DON ' T use setToken , that makes us part of the ring locally which is incorrect until we are done bootstrapping 
+ + Gossiper . instance ( ) . addApplicationState ( StorageService . STATE _ BOOTSTRAPPING , new ApplicationState ( partitioner _ . getTokenFactory ( ) . toString ( token ) ) ) ; 
+ + new BootStrapper ( replicationStrategy _ , FBUtilities . getLocalAddress ( ) , token , tokenMetadata _ ) . startBootstrap ( ) ; / / handles token update 
+ + } 
+ + 
+ public boolean isBootstrapMode ( ) 
+ { 
+ return isBootstrapMode ; 
+ @ @ - 935 , 7 + 939 , 7 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ return tokens ; 
+ } 
+ 
+ - public void decommission ( ) 
+ + public void decommission ( ) throws InterruptedException 
+ { 
+ if ( ! tokenMetadata _ . isMember ( FBUtilities . getLocalAddress ( ) ) ) 
+ throw new UnsupportedOperationException ( " local node is not a member of the token ring yet " ) ; 
+ @ @ - 947 , 15 + 951 , 22 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ logger _ . info ( " DECOMMISSIONING " ) ; 
+ Gossiper . instance ( ) . addApplicationState ( STATE _ LEAVING , new ApplicationState ( getLocalToken ( ) . toString ( ) ) ) ; 
+ logger _ . info ( " decommission sleeping " + Streaming . RING _ DELAY ) ; 
+ - try 
+ - { 
+ - Thread . sleep ( Streaming . RING _ DELAY ) ; 
+ - } 
+ - catch ( InterruptedException e ) 
+ + Thread . sleep ( Streaming . RING _ DELAY ) ; 
+ + 
+ + Runnable finishLeaving = new Runnable ( ) 
+ { 
+ - throw new AssertionError ( e ) ; 
+ - } 
+ + public void run ( ) 
+ + { 
+ + Gossiper . instance ( ) . stop ( ) ; 
+ + logger _ . info ( " DECOMMISSION FINISHED . " ) ; 
+ + / / let op be responsible for killing the process 
+ + } 
+ + } ; 
+ + unbootstrap ( finishLeaving ) ; 
+ + } 
+ 
+ + private void unbootstrap ( final Runnable onFinish ) 
+ + { 
+ Multimap < Range , InetAddress > rangesMM = getChangedRangesForLeaving ( FBUtilities . getLocalAddress ( ) ) ; 
+ if ( logger _ . isDebugEnabled ( ) ) 
+ logger _ . debug ( " Ranges needing transfer are [ " + StringUtils . join ( rangesMM . keySet ( ) , " , " ) + " ] " ) ; 
+ @ @ - 970 , 7 + 981 , 25 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ { 
+ pending . remove ( entry ) ; 
+ if ( pending . isEmpty ( ) ) 
+ - finishLeaving ( ) ; 
+ + { 
+ + SystemTable . setBootstrapped ( false ) ; 
+ + tokenMetadata _ . removeEndpoint ( FBUtilities . getLocalAddress ( ) ) ; 
+ + replicationStrategy _ . removeObsoletePendingRanges ( ) ; 
+ + 
+ + if ( logger _ . isDebugEnabled ( ) ) 
+ + logger _ . debug ( " " ) ; 
+ + Gossiper . instance ( ) . addApplicationState ( STATE _ LEFT , new ApplicationState ( getLocalToken ( ) . toString ( ) ) ) ; 
+ + try 
+ + { 
+ + Thread . sleep ( 2 * Gossiper . intervalInMillis _ ) ; 
+ + } 
+ + catch ( InterruptedException e ) 
+ + { 
+ + throw new AssertionError ( e ) ; 
+ + } 
+ + 
+ + onFinish . run ( ) ; 
+ + } 
+ } 
+ } ; 
+ StageManager . getStage ( streamStage _ ) . execute ( new Runnable ( ) 
+ @ @ - 984 , 6 + 1013 , 35 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ } 
+ } 
+ 
+ + public void move ( String newToken ) throws InterruptedException 
+ + { 
+ + if ( tokenMetadata _ . getPendingRanges ( FBUtilities . getLocalAddress ( ) ) . size ( ) > 0 ) 
+ + throw new UnsupportedOperationException ( " data is currently moving to this node ; unable to leave the ring " ) ; 
+ + 
+ + final Token token = partitioner _ . getTokenFactory ( ) . fromString ( newToken ) ; / / make sure it ' s valid 
+ + logger _ . info ( " moving to " + token ) ; 
+ + Gossiper . instance ( ) . addApplicationState ( STATE _ LEAVING , new ApplicationState ( getLocalToken ( ) . toString ( ) ) ) ; 
+ + logger _ . info ( " move sleeping " + Streaming . RING _ DELAY ) ; 
+ + Thread . sleep ( Streaming . RING _ DELAY ) ; 
+ + 
+ + Runnable finishMoving = new Runnable ( ) 
+ + { 
+ + public void run ( ) 
+ + { 
+ + try 
+ + { 
+ + logger _ . info ( " re - bootstrapping to new token " + token ) ; 
+ + startBootstrap ( token ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new IOError ( e ) ; 
+ + } 
+ + } 
+ + } ; 
+ + unbootstrap ( finishMoving ) ; 
+ + } 
+ + 
+ public < T > QuorumResponseHandler < T > getResponseHandler ( IResponseResolver < T > responseResolver , int blockFor , int consistency _ level ) 
+ { 
+ return replicationStrategy _ . getResponseHandler ( responseResolver , blockFor , consistency _ level ) ; 
+ @ @ - 994 , 20 + 1052 , 4 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ return replicationStrategy _ ; 
+ } 
+ 
+ - public void finishLeaving ( ) 
+ - { 
+ - SystemTable . setBootstrapped ( false ) ; 
+ - Gossiper . instance ( ) . addApplicationState ( STATE _ LEFT , new ApplicationState ( getLocalToken ( ) . toString ( ) ) ) ; 
+ - try 
+ - { 
+ - Thread . sleep ( 2 * Gossiper . intervalInMillis _ ) ; 
+ - } 
+ - catch ( InterruptedException e ) 
+ - { 
+ - throw new AssertionError ( e ) ; 
+ - } 
+ - Gossiper . instance ( ) . stop ( ) ; 
+ - logger _ . info ( " DECOMMISSION FINISHED . " ) ; 
+ - / / let op be responsible for killing the process 
+ - } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageServiceMBean . java b / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ index 01c9657 . . dc458fd 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageServiceMBean . java 
+ @ @ - 23 , 6 + 23 , 7 @ @ import java . net . UnknownHostException ; 
+ import java . util . List ; 
+ import java . util . Map ; 
+ import java . util . Set ; 
+ + import java . util . concurrent . FutureTask ; 
+ 
+ import org . apache . cassandra . dht . Range ; 
+ import java . net . InetAddress ; 
+ @ @ - 116 , 7 + 117 , 13 @ @ public interface StorageServiceMBean 
+ / * * 
+ * transfer this node ' s data to other machines and remove it from service . 
+ * / 
+ - public void decommission ( ) ; 
+ + public void decommission ( ) throws InterruptedException ; 
+ + 
+ + / * * 
+ + * @ param newToken token to move this node to . 
+ + * This node will unload its data onto its neighbors , and bootstrap to the new token . 
+ + * / 
+ + public void move ( String newToken ) throws InterruptedException ; 
+ 
+ / * * set the logging level at runtime * / 
+ public void setLog4jLevel ( String classQualifier , String level ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / TokenUpdateVerbHandler . java b / src / java / org / apache / cassandra / service / TokenUpdateVerbHandler . java 
+ deleted file mode 100644 
+ index 7a4af4b . . 0000000 
+ - - - a / src / java / org / apache / cassandra / service / TokenUpdateVerbHandler . java 
+ + + + / dev / null 
+ @ @ - 1 , 56 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . service ; 
+ - 
+ - import java . io . IOException ; 
+ - 
+ - import org . apache . log4j . Logger ; 
+ - 
+ - import org . apache . cassandra . dht . Token ; 
+ - import org . apache . cassandra . io . DataInputBuffer ; 
+ - import org . apache . cassandra . net . IVerbHandler ; 
+ - import org . apache . cassandra . net . Message ; 
+ - import org . apache . cassandra . gms . Gossiper ; 
+ - import org . apache . cassandra . gms . ApplicationState ; 
+ - 
+ - public class TokenUpdateVerbHandler implements IVerbHandler 
+ - { 
+ - private static Logger logger _ = Logger . getLogger ( TokenUpdateVerbHandler . class ) ; 
+ - 
+ - public void doVerb ( Message message ) 
+ - { 
+ - if ( StorageService . instance ( ) . isBootstrapMode ( ) ) 
+ - throw new UnsupportedOperationException ( " Cannot set token during bootstrap " ) ; 
+ - 
+ - byte [ ] body = message . getMessageBody ( ) ; 
+ - DataInputBuffer bufIn = new DataInputBuffer ( ) ; 
+ - bufIn . reset ( body , body . length ) ; 
+ - try 
+ - { 
+ - Token token = Token . serializer ( ) . deserialize ( bufIn ) ; 
+ - StorageService . instance ( ) . setToken ( token ) ; 
+ - Gossiper . instance ( ) . addApplicationState ( StorageService . STATE _ NORMAL , new ApplicationState ( StorageService . getPartitioner ( ) . getTokenFactory ( ) . toString ( token ) ) ) ; 
+ - } 
+ - catch ( IOException ex ) 
+ - { 
+ - throw new RuntimeException ( ex ) ; 
+ - } 
+ - } 
+ - 
+ - } 
+ diff - - git a / src / java / org / apache / cassandra / tools / NodeProbe . java b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ index 28904d1 . . a1a109c 100644 
+ - - - a / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ + + + b / src / java / org / apache / cassandra / tools / NodeProbe . java 
+ @ @ - 380 , 11 + 380 , 16 @ @ public class NodeProbe 
+ ssProxy . clearSnapshot ( ) ; 
+ } 
+ 
+ - public void decommission ( ) 
+ + public void decommission ( ) throws InterruptedException 
+ { 
+ ssProxy . decommission ( ) ; 
+ } 
+ 
+ + public void move ( String newToken ) throws InterruptedException 
+ + { 
+ + ssProxy . move ( newToken ) ; 
+ + } 
+ + 
+ / * * 
+ * Print out the size of the queues in the thread pools 
+ * 
+ @ @ - 480 , 7 + 485 , 7 @ @ public class NodeProbe 
+ HelpFormatter hf = new HelpFormatter ( ) ; 
+ String header = String . format ( 
+ " % nAvailable commands : ring , info , cleanup , compact , cfstats , snapshot [ name ] , clearsnapshot , " + 
+ - " tpstats , flush , decommission , " + 
+ + " tpstats , flush , decommission , move , " + 
+ " getcompactionthreshold , setcompactionthreshold [ minthreshold ] ( [ maxthreshold ] ) " ) ; 
+ String usage = String . format ( " java % s - host < arg > < command > % n " , NodeProbe . class . getName ( ) ) ; 
+ hf . printHelp ( usage , " " , options , header ) ; 
+ @ @ - 489 , 7 + 494 , 7 @ @ public class NodeProbe 
+ / * * 
+ * @ param args 
+ * / 
+ - public static void main ( String [ ] args ) throws IOException 
+ + public static void main ( String [ ] args ) throws IOException , InterruptedException 
+ { 
+ NodeProbe probe = null ; 
+ try 
+ @ @ - 543 , 6 + 548 , 14 @ @ public class NodeProbe 
+ { 
+ probe . decommission ( ) ; 
+ } 
+ + else if ( cmdName . equals ( " move " ) ) 
+ + { 
+ + if ( arguments . length < = 1 ) 
+ + { 
+ + System . err . println ( " missing token argument " ) ; 
+ + } 
+ + probe . move ( arguments [ 1 ] ) ; 
+ + } 
+ else if ( cmdName . equals ( " snapshot " ) ) 
+ { 
+ String snapshotName = " " ; 
+ diff - - git a / src / java / org / apache / cassandra / tools / TokenUpdater . java b / src / java / org / apache / cassandra / tools / TokenUpdater . java 
+ deleted file mode 100644 
+ index 5a7c513 . . 0000000 
+ - - - a / src / java / org / apache / cassandra / tools / TokenUpdater . java 
+ + + + / dev / null 
+ @ @ - 1 , 86 + 0 , 0 @ @ 
+ - / * * 
+ - * Licensed to the Apache Software Foundation ( ASF ) under one 
+ - * or more contributor license agreements . See the NOTICE file 
+ - * distributed with this work for additional information 
+ - * regarding copyright ownership . The ASF licenses this file 
+ - * to you under the Apache License , Version 2 . 0 ( the 
+ - * " License " ) ; you may not use this file except in compliance 
+ - * with the License . You may obtain a copy of the License at 
+ - * 
+ - * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ - * 
+ - * Unless required by applicable law or agreed to in writing , software 
+ - * distributed under the License is distributed on an " AS IS " BASIS , 
+ - * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ - * See the License for the specific language governing permissions and 
+ - * limitations under the License . 
+ - * / 
+ - 
+ - package org . apache . cassandra . tools ; 
+ - 
+ - import java . io . ByteArrayOutputStream ; 
+ - import java . io . DataOutputStream ; 
+ - 
+ - import org . apache . cassandra . dht . IPartitioner ; 
+ - import org . apache . cassandra . dht . Token ; 
+ - import java . net . InetAddress ; 
+ - import java . net . InetSocketAddress ; 
+ - 
+ - import org . apache . cassandra . net . Message ; 
+ - import org . apache . cassandra . net . MessagingService ; 
+ - import org . apache . cassandra . net . SelectorManager ; 
+ - import org . apache . cassandra . service . StorageService ; 
+ - import org . apache . cassandra . utils . FBUtilities ; 
+ - import org . apache . cassandra . utils . FileUtils ; 
+ - 
+ - public class TokenUpdater 
+ - { 
+ - private static final int port _ = 7000 ; 
+ - private static final long waitTime _ = 10000 ; 
+ - 
+ - public static void main ( String [ ] args ) throws Throwable 
+ - { 
+ - if ( args . length < 2 ) 
+ - { 
+ - System . out . println ( " Usage : java org . apache . cassandra . tools . TokenUpdater < ip : port > < token > " ) ; 
+ - System . exit ( 1 ) ; 
+ - } 
+ - 
+ - Thread selectorThread = SelectorManager . getSelectorManager ( ) ; 
+ - selectorThread . setDaemon ( true ) ; 
+ - selectorThread . start ( ) ; 
+ - 
+ - String ipPort = args [ 0 ] ; 
+ - IPartitioner p = StorageService . getPartitioner ( ) ; 
+ - Token token = p . getTokenFactory ( ) . fromString ( args [ 1 ] ) ; 
+ - System . out . println ( " Partitioner is " + p . getClass ( ) + " , token is : " + token ) ; 
+ - System . out . println ( p . getTokenFactory ( ) . getClass ( ) ) ; 
+ - 
+ - String [ ] ipPortPair = ipPort . split ( " : " ) ; 
+ - int port = 7000 ; 
+ - if ( ipPortPair . length > 1 ) 
+ - { 
+ - port = Integer . valueOf ( ipPortPair [ 1 ] ) ; 
+ - } 
+ - 
+ - InetSocketAddress target = new InetSocketAddress ( ipPortPair [ 0 ] , port ) ; 
+ - 
+ - ByteArrayOutputStream bos = new ByteArrayOutputStream ( ) ; 
+ - DataOutputStream dos = new DataOutputStream ( bos ) ; 
+ - Token . serializer ( ) . serialize ( token , dos ) ; 
+ - 
+ - / * Construct the token update message to be sent * / 
+ - Message tokenUpdateMessage = new Message ( target . getAddress ( ) , 
+ - " " , 
+ - StorageService . tokenVerbHandler _ , 
+ - bos . toByteArray ( ) ) ; 
+ - 
+ - System . out . println ( " Sending a token update message to " + target ) ; 
+ - MessagingService . instance ( ) . sendOneWay ( tokenUpdateMessage , target . getAddress ( ) ) ; 
+ - Thread . sleep ( TokenUpdater . waitTime _ ) ; 
+ - System . out . println ( " Done sending the update message " ) ; 
+ - 
+ - MessagingService . shutdown ( ) ; 
+ - FileUtils . shutdown ( ) ; 
+ - } 
+ - }

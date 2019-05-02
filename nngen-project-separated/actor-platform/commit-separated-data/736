@@ -1,0 +1,236 @@
+BLEU SCORE: 0.26529518334824453
+
+TEST MSG: feat ( server : session ) : send SeqUpdateTooLong if resend buffer is more than 200Kb ( by default )
+GENERATED MSG: fix ( server : session ) : fixed session resend buffer overflow
+
+TEST DIFF (one line): diff - - git a / actor - server / actor - session / src / main / resources / reference . conf b / actor - server / actor - session / src / main / resources / reference . conf < nl > index cdd896f . . b1160d1 100644 < nl > - - - a / actor - server / actor - session / src / main / resources / reference . conf < nl > + + + b / actor - server / actor - session / src / main / resources / reference . conf < nl > @ @ - 6 , 5 + 6 , 6 @ @ session { < nl > ack - timeout = 10 minutes < nl > max - resend - size = 1 KiB < nl > max - buffer - size = 1 MiB < nl > + max - push - buffer - size = 200KiB < nl > } < nl > } < nl > diff - - git a / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala b / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala < nl > index a898213 . . bff3ef4 100644 < nl > - - - a / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala < nl > + + + b / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala < nl > @ @ - 5 , 14 + 5 , 14 @ @ import java . util . concurrent . TimeUnit < nl > import akka . actor . { ActorLogging , ActorRef , Cancellable , Props } < nl > import akka . stream . actor . _ < nl > import com . typesafe . config . Config < nl > - import im . actor . api . rpc . { RpcResult ⇒ ApiRpcResult , UpdateBox } < nl > + import im . actor . api . rpc . { UpdateBox , RpcResult ⇒ ApiRpcResult } < nl > import im . actor . api . rpc . codecs . UpdateBoxCodec < nl > - import im . actor . api . rpc . sequence . { FatSeqUpdate , WeakUpdate , SeqUpdate , ApiUpdateOptimization } < nl > + import im . actor . api . rpc . sequence . _ < nl > import im . actor . server . api . rpc . RpcResultCodec < nl > import im . actor . server . mtproto . protocol . _ < nl > < nl > import scala . annotation . tailrec < nl > - import scala . collection . { mutable , immutable } < nl > + import scala . collection . { immutable , mutable } < nl > import scala . concurrent . duration . _ < nl > import scala . util . control . NoStackTrace < nl > < nl > @ @ - 36 , 14 + 36 , 15 @ @ private [ session ] object ReSenderMessage { < nl > final case class SetUpdateOptimizations ( updateOptimizations : Set [ ApiUpdateOptimization . Value ] ) extends ReSenderMessage < nl > } < nl > < nl > - private [ session ] case class ReSenderConfig ( ackTimeout : FiniteDuration , maxResendSize : Long , maxBufferSize : Long ) < nl > + private [ session ] case class ReSenderConfig ( ackTimeout : FiniteDuration , maxResendSize : Long , maxBufferSize : Long , maxPushBufferSize : Long ) < nl > < nl > private [ session ] object ReSenderConfig { < nl > def fromConfig ( config : Config ) : ReSenderConfig = { < nl > ReSenderConfig ( < nl > ackTimeout = config . getDuration ( " ack - timeout " , TimeUnit . SECONDS ) . seconds , < nl > maxResendSize = config . getBytes ( " max - resend - size " ) , < nl > - maxBufferSize = config . getBytes ( " max - buffer - size " ) < nl > + maxBufferSize = config . getBytes ( " max - buffer - size " ) , < nl > + maxPushBufferSize = config . getBytes ( " max - push - buffer - size " ) < nl > ) < nl > } < nl > } < nl > @ @ - 135 , 6 + 136 , 7 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > } < nl > < nl > private [ this ] var resendBufferSize = 0L < nl > + private [ this ] var resendPushBufferSize = 0L < nl > private [ this ] var updateOptimizations = Set . empty [ ApiUpdateOptimization . Value ] < nl > < nl > private [ this ] var newSessionBuffer : Option [ ( Long , NewSessionItem , Cancellable ) ] = None < nl > @ @ - 214 , 8 + 216 , 7 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > case ScheduledResend ( messageId , item ) ⇒ < nl > log . debug ( " Scheduled resend for messageId : { } , item : { } " , messageId , item ) < nl > < nl > - if ( item . size < = MaxResendSize ) < nl > - resendBufferSize - = item . size < nl > + decreaseBufferSize ( item ) < nl > < nl > item match { < nl > case ni : NewSessionItem ⇒ enqueueNewSession ( ni ) < nl > @ @ - 224 , 6 + 225 , 39 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > } < nl > } < nl > < nl > + private def increaseBufferSize ( item : ResendableItem ) : Unit = { < nl > + if ( item . size < = MaxResendSize ) { < nl > + this . resendBufferSize + = item . size < nl > + item match { < nl > + case p : PushItem ⇒ < nl > + this . resendPushBufferSize + = item . size < nl > + if ( this . resendPushBufferSize > config . maxPushBufferSize ) < nl > + clearPushBuffer ( ) < nl > + case _ ⇒ < nl > + } < nl > + } < nl > + } < nl > + < nl > + private def decreaseBufferSize ( item : ResendableItem ) : Unit = { < nl > + if ( item . size < = MaxResendSize ) this . resendBufferSize - = item . size < nl > + item match { < nl > + case _ : PushItem ⇒ this . resendPushBufferSize - = item . size < nl > + case _ ⇒ < nl > + } < nl > + } < nl > + < nl > + private def clearPushBuffer ( ) : Unit = { < nl > + pushBuffer foreach { < nl > + case ( messageId , ( pi : PushItem , resend ) ) ⇒ < nl > + pushBuffer - = messageId < nl > + decreaseBufferSize ( pi ) < nl > + resend . cancel ( ) < nl > + case _ ⇒ < nl > + } < nl > + < nl > + enqueueSeqUpdateTooLong ( ) < nl > + } < nl > + < nl > / / Publisher - related < nl > < nl > override val requestStrategy = WatermarkRequestStrategy ( 100 ) / / TODO : configurable < nl > @ @ - 282 , 8 + 316 , 7 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > private def scheduleResend ( item : ResendableItem , messageId : Long ) = { < nl > log . debug ( " Scheduling resend of messageId : { } , timeout : { } " , messageId , AckTimeout ) < nl > < nl > - if ( item . size < = MaxResendSize ) < nl > - this . resendBufferSize + = item . size < nl > + increaseBufferSize ( item ) < nl > < nl > / / FIXME : increase resendBufferSize by real Unsent < nl > < nl > @ @ - 299 , 8 + 332 , 7 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > ( ritem , resend ) ← pushBuffer . get ( msgId ) < nl > } yield { < nl > this . pushBuffer - = msgId < nl > - if ( ritem . size < = MaxResendSize ) < nl > - resendBufferSize - = ritem . size < nl > + decreaseBufferSize ( ritem ) < nl > resend . cancel ( ) < nl > } < nl > < nl > @ @ - 325 , 6 + 357 , 9 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > enqueue ( MessageBox ( messageId , item . newSession ) , Priority . NewSession ) < nl > } < nl > < nl > + private def enqueueSeqUpdateTooLong ( ) : Unit = < nl > + enqueue ( MessageBox ( nextMessageId ( ) , ProtoPush ( UpdateBoxCodec . encode ( SeqUpdateTooLong ) . require ) ) , Priority . SeqPush ) < nl > + < nl > private def enqueueRpc ( item : RpcItem , unsentMessageIdOpt : Option [ Long ] , isNewClient : Boolean = false ) : Unit = { < nl > val messageId = unsentMessageIdOpt . getOrElse ( nextMessageId ( ) ) < nl > scheduleResend ( item , messageId )
+NEAREST DIFF (one line): diff - - git a / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala b / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala < nl > index 74d0215 . . 47a56ac 100644 < nl > - - - a / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala < nl > + + + b / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala < nl > @ @ - 64 , 12 + 64 , 6 @ @ private [ session ] object ReSender { < nl > lazy val body = UpdateBoxCodec . encode ( ub ) . require < nl > override lazy val size = body . size < nl > } < nl > - / * private final case class WeakPushItem ( ub : UpdateBox , reduceKeyOpt : Option [ String ] ) extends NonResendableItem { < nl > - require ( ub . isInstanceOf [ WeakUpdate ] ) < nl > - < nl > - lazy val body = UpdateBoxCodec . encode ( ub ) . require < nl > - override lazy val size = body . size < nl > - } * / < nl > private final case class NewSessionItem ( newSession : NewSession ) extends ResendableItem { < nl > override val size = 0L < nl > } < nl > @ @ - 113 , 12 + 107 , 7 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > private val MaxBufferSize = config . maxBufferSize < nl > private val MaxResendSize = config . maxResendSize < nl > < nl > - def receive = waitingForFirstClient < nl > - < nl > - def waitingForFirstClient : Receive = subscriber . orElse ( publisher ) . orElse { < nl > - case NewClient ( _ ) ⇒ < nl > - context . become ( resendingToNewClients ) < nl > - } < nl > + def receive = resendingToNewClients < nl > < nl > def resendingToNewClients : Receive = subscriber . orElse ( publisher ) . orElse { < nl > case NewClient ( _ ) ⇒ < nl > @ @ - 163 , 6 + 152 , 11 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > enqueueNewSession ( NewSessionItem ( NewSession ( sessionId , firstMessageId ) ) ) < nl > } < nl > < nl > + override def preRestart ( reason : Throwable , message : Option [ Any ] ) : Unit = { < nl > + log . error ( reason , " An error occured while processing message : { } " , message ) < nl > + super . preRestart ( reason , message ) < nl > + } < nl > + < nl > / / Subscriber - related < nl > < nl > def subscriber : Receive = { < nl > @ @ - 172 , 7 + 166 , 8 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > messageIds foreach { messageId ⇒ < nl > getResendableItem ( messageId ) foreach { < nl > case ( item , scheduledResend ) ⇒ < nl > - resendBufferSize - = item . size < nl > + if ( item . size < = MaxResendSize ) < nl > + resendBufferSize - = item . size < nl > scheduledResend . cancel ( ) < nl > < nl > item match { < nl > @ @ - 219 , 7 + 214 , 9 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > case ScheduledResend ( messageId , item ) ⇒ < nl > log . debug ( " Scheduled resend for messageId : { } , item : { } " , messageId , item ) < nl > < nl > - resendBufferSize - = item . size < nl > + if ( item . size < = MaxResendSize ) < nl > + resendBufferSize - = item . size < nl > + < nl > item match { < nl > case ni : NewSessionItem ⇒ enqueueNewSession ( ni ) < nl > case pi : PushItem ⇒ enqueuePush ( pi , Some ( messageId ) ) < nl > @ @ - 285 , 7 + 282 , 11 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > private def scheduleResend ( item : ResendableItem , messageId : Long ) = { < nl > log . debug ( " Scheduling resend of messageId : { } , timeout : { } " , messageId , AckTimeout ) < nl > < nl > - this . resendBufferSize + = item . size < nl > + if ( item . size < = MaxResendSize ) < nl > + this . resendBufferSize + = item . size < nl > + < nl > + / / FIXME : increase resendBufferSize by real Unsent < nl > + < nl > if ( resendBufferSize < = MaxBufferSize ) { < nl > val delay = calcScheduleDelay ( ) < nl > val scheduled = context . system . scheduler . scheduleOnce ( delay , self , ScheduledResend ( messageId , item ) ) < nl > @ @ - 298 , 7 + 299 , 8 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L < nl > ( ritem , resend ) ← pushBuffer . get ( msgId ) < nl > } yield { < nl > this . pushBuffer - = msgId < nl > - resendBufferSize - = ritem . size < nl > + if ( ritem . size < = MaxResendSize ) < nl > + resendBufferSize - = ritem . size < nl > resend . cancel ( ) < nl > }
+
+TEST DIFF:
+diff - - git a / actor - server / actor - session / src / main / resources / reference . conf b / actor - server / actor - session / src / main / resources / reference . conf 
+ index cdd896f . . b1160d1 100644 
+ - - - a / actor - server / actor - session / src / main / resources / reference . conf 
+ + + + b / actor - server / actor - session / src / main / resources / reference . conf 
+ @ @ - 6 , 5 + 6 , 6 @ @ session { 
+ ack - timeout = 10 minutes 
+ max - resend - size = 1 KiB 
+ max - buffer - size = 1 MiB 
+ + max - push - buffer - size = 200KiB 
+ } 
+ } 
+ diff - - git a / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala b / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala 
+ index a898213 . . bff3ef4 100644 
+ - - - a / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala 
+ + + + b / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala 
+ @ @ - 5 , 14 + 5 , 14 @ @ import java . util . concurrent . TimeUnit 
+ import akka . actor . { ActorLogging , ActorRef , Cancellable , Props } 
+ import akka . stream . actor . _ 
+ import com . typesafe . config . Config 
+ - import im . actor . api . rpc . { RpcResult ⇒ ApiRpcResult , UpdateBox } 
+ + import im . actor . api . rpc . { UpdateBox , RpcResult ⇒ ApiRpcResult } 
+ import im . actor . api . rpc . codecs . UpdateBoxCodec 
+ - import im . actor . api . rpc . sequence . { FatSeqUpdate , WeakUpdate , SeqUpdate , ApiUpdateOptimization } 
+ + import im . actor . api . rpc . sequence . _ 
+ import im . actor . server . api . rpc . RpcResultCodec 
+ import im . actor . server . mtproto . protocol . _ 
+ 
+ import scala . annotation . tailrec 
+ - import scala . collection . { mutable , immutable } 
+ + import scala . collection . { immutable , mutable } 
+ import scala . concurrent . duration . _ 
+ import scala . util . control . NoStackTrace 
+ 
+ @ @ - 36 , 14 + 36 , 15 @ @ private [ session ] object ReSenderMessage { 
+ final case class SetUpdateOptimizations ( updateOptimizations : Set [ ApiUpdateOptimization . Value ] ) extends ReSenderMessage 
+ } 
+ 
+ - private [ session ] case class ReSenderConfig ( ackTimeout : FiniteDuration , maxResendSize : Long , maxBufferSize : Long ) 
+ + private [ session ] case class ReSenderConfig ( ackTimeout : FiniteDuration , maxResendSize : Long , maxBufferSize : Long , maxPushBufferSize : Long ) 
+ 
+ private [ session ] object ReSenderConfig { 
+ def fromConfig ( config : Config ) : ReSenderConfig = { 
+ ReSenderConfig ( 
+ ackTimeout = config . getDuration ( " ack - timeout " , TimeUnit . SECONDS ) . seconds , 
+ maxResendSize = config . getBytes ( " max - resend - size " ) , 
+ - maxBufferSize = config . getBytes ( " max - buffer - size " ) 
+ + maxBufferSize = config . getBytes ( " max - buffer - size " ) , 
+ + maxPushBufferSize = config . getBytes ( " max - push - buffer - size " ) 
+ ) 
+ } 
+ } 
+ @ @ - 135 , 6 + 136 , 7 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ } 
+ 
+ private [ this ] var resendBufferSize = 0L 
+ + private [ this ] var resendPushBufferSize = 0L 
+ private [ this ] var updateOptimizations = Set . empty [ ApiUpdateOptimization . Value ] 
+ 
+ private [ this ] var newSessionBuffer : Option [ ( Long , NewSessionItem , Cancellable ) ] = None 
+ @ @ - 214 , 8 + 216 , 7 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ case ScheduledResend ( messageId , item ) ⇒ 
+ log . debug ( " Scheduled resend for messageId : { } , item : { } " , messageId , item ) 
+ 
+ - if ( item . size < = MaxResendSize ) 
+ - resendBufferSize - = item . size 
+ + decreaseBufferSize ( item ) 
+ 
+ item match { 
+ case ni : NewSessionItem ⇒ enqueueNewSession ( ni ) 
+ @ @ - 224 , 6 + 225 , 39 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ } 
+ } 
+ 
+ + private def increaseBufferSize ( item : ResendableItem ) : Unit = { 
+ + if ( item . size < = MaxResendSize ) { 
+ + this . resendBufferSize + = item . size 
+ + item match { 
+ + case p : PushItem ⇒ 
+ + this . resendPushBufferSize + = item . size 
+ + if ( this . resendPushBufferSize > config . maxPushBufferSize ) 
+ + clearPushBuffer ( ) 
+ + case _ ⇒ 
+ + } 
+ + } 
+ + } 
+ + 
+ + private def decreaseBufferSize ( item : ResendableItem ) : Unit = { 
+ + if ( item . size < = MaxResendSize ) this . resendBufferSize - = item . size 
+ + item match { 
+ + case _ : PushItem ⇒ this . resendPushBufferSize - = item . size 
+ + case _ ⇒ 
+ + } 
+ + } 
+ + 
+ + private def clearPushBuffer ( ) : Unit = { 
+ + pushBuffer foreach { 
+ + case ( messageId , ( pi : PushItem , resend ) ) ⇒ 
+ + pushBuffer - = messageId 
+ + decreaseBufferSize ( pi ) 
+ + resend . cancel ( ) 
+ + case _ ⇒ 
+ + } 
+ + 
+ + enqueueSeqUpdateTooLong ( ) 
+ + } 
+ + 
+ / / Publisher - related 
+ 
+ override val requestStrategy = WatermarkRequestStrategy ( 100 ) / / TODO : configurable 
+ @ @ - 282 , 8 + 316 , 7 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ private def scheduleResend ( item : ResendableItem , messageId : Long ) = { 
+ log . debug ( " Scheduling resend of messageId : { } , timeout : { } " , messageId , AckTimeout ) 
+ 
+ - if ( item . size < = MaxResendSize ) 
+ - this . resendBufferSize + = item . size 
+ + increaseBufferSize ( item ) 
+ 
+ / / FIXME : increase resendBufferSize by real Unsent 
+ 
+ @ @ - 299 , 8 + 332 , 7 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ ( ritem , resend ) ← pushBuffer . get ( msgId ) 
+ } yield { 
+ this . pushBuffer - = msgId 
+ - if ( ritem . size < = MaxResendSize ) 
+ - resendBufferSize - = ritem . size 
+ + decreaseBufferSize ( ritem ) 
+ resend . cancel ( ) 
+ } 
+ 
+ @ @ - 325 , 6 + 357 , 9 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ enqueue ( MessageBox ( messageId , item . newSession ) , Priority . NewSession ) 
+ } 
+ 
+ + private def enqueueSeqUpdateTooLong ( ) : Unit = 
+ + enqueue ( MessageBox ( nextMessageId ( ) , ProtoPush ( UpdateBoxCodec . encode ( SeqUpdateTooLong ) . require ) ) , Priority . SeqPush ) 
+ + 
+ private def enqueueRpc ( item : RpcItem , unsentMessageIdOpt : Option [ Long ] , isNewClient : Boolean = false ) : Unit = { 
+ val messageId = unsentMessageIdOpt . getOrElse ( nextMessageId ( ) ) 
+ scheduleResend ( item , messageId )
+
+NEAREST DIFF:
+diff - - git a / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala b / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala 
+ index 74d0215 . . 47a56ac 100644 
+ - - - a / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala 
+ + + + b / actor - server / actor - session / src / main / scala / im / actor / server / session / Resender . scala 
+ @ @ - 64 , 12 + 64 , 6 @ @ private [ session ] object ReSender { 
+ lazy val body = UpdateBoxCodec . encode ( ub ) . require 
+ override lazy val size = body . size 
+ } 
+ - / * private final case class WeakPushItem ( ub : UpdateBox , reduceKeyOpt : Option [ String ] ) extends NonResendableItem { 
+ - require ( ub . isInstanceOf [ WeakUpdate ] ) 
+ - 
+ - lazy val body = UpdateBoxCodec . encode ( ub ) . require 
+ - override lazy val size = body . size 
+ - } * / 
+ private final case class NewSessionItem ( newSession : NewSession ) extends ResendableItem { 
+ override val size = 0L 
+ } 
+ @ @ - 113 , 12 + 107 , 7 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ private val MaxBufferSize = config . maxBufferSize 
+ private val MaxResendSize = config . maxResendSize 
+ 
+ - def receive = waitingForFirstClient 
+ - 
+ - def waitingForFirstClient : Receive = subscriber . orElse ( publisher ) . orElse { 
+ - case NewClient ( _ ) ⇒ 
+ - context . become ( resendingToNewClients ) 
+ - } 
+ + def receive = resendingToNewClients 
+ 
+ def resendingToNewClients : Receive = subscriber . orElse ( publisher ) . orElse { 
+ case NewClient ( _ ) ⇒ 
+ @ @ - 163 , 6 + 152 , 11 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ enqueueNewSession ( NewSessionItem ( NewSession ( sessionId , firstMessageId ) ) ) 
+ } 
+ 
+ + override def preRestart ( reason : Throwable , message : Option [ Any ] ) : Unit = { 
+ + log . error ( reason , " An error occured while processing message : { } " , message ) 
+ + super . preRestart ( reason , message ) 
+ + } 
+ + 
+ / / Subscriber - related 
+ 
+ def subscriber : Receive = { 
+ @ @ - 172 , 7 + 166 , 8 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ messageIds foreach { messageId ⇒ 
+ getResendableItem ( messageId ) foreach { 
+ case ( item , scheduledResend ) ⇒ 
+ - resendBufferSize - = item . size 
+ + if ( item . size < = MaxResendSize ) 
+ + resendBufferSize - = item . size 
+ scheduledResend . cancel ( ) 
+ 
+ item match { 
+ @ @ - 219 , 7 + 214 , 9 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ case ScheduledResend ( messageId , item ) ⇒ 
+ log . debug ( " Scheduled resend for messageId : { } , item : { } " , messageId , item ) 
+ 
+ - resendBufferSize - = item . size 
+ + if ( item . size < = MaxResendSize ) 
+ + resendBufferSize - = item . size 
+ + 
+ item match { 
+ case ni : NewSessionItem ⇒ enqueueNewSession ( ni ) 
+ case pi : PushItem ⇒ enqueuePush ( pi , Some ( messageId ) ) 
+ @ @ - 285 , 7 + 282 , 11 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ private def scheduleResend ( item : ResendableItem , messageId : Long ) = { 
+ log . debug ( " Scheduling resend of messageId : { } , timeout : { } " , messageId , AckTimeout ) 
+ 
+ - this . resendBufferSize + = item . size 
+ + if ( item . size < = MaxResendSize ) 
+ + this . resendBufferSize + = item . size 
+ + 
+ + / / FIXME : increase resendBufferSize by real Unsent 
+ + 
+ if ( resendBufferSize < = MaxBufferSize ) { 
+ val delay = calcScheduleDelay ( ) 
+ val scheduled = context . system . scheduler . scheduleOnce ( delay , self , ScheduledResend ( messageId , item ) ) 
+ @ @ - 298 , 7 + 299 , 8 @ @ private [ session ] class ReSender ( authId : Long , sessionId : Long , firstMessageId : L 
+ ( ritem , resend ) ← pushBuffer . get ( msgId ) 
+ } yield { 
+ this . pushBuffer - = msgId 
+ - resendBufferSize - = ritem . size 
+ + if ( ritem . size < = MaxResendSize ) 
+ + resendBufferSize - = ritem . size 
+ resend . cancel ( ) 
+ }

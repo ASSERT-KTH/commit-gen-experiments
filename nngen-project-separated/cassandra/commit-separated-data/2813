@@ -1,0 +1,262 @@
+BLEU SCORE: 0.08310415003234632
+
+TEST MSG: Paginate batchlog replay
+GENERATED MSG: Add example jmx auth file location
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index a5827d3 . . f550863 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 11 , 6 + 11 , 7 @ @ <nl> * Fix executing LOCAL _ QUORUM with SimpleStrategy ( CASSANDRA - 6545 ) <nl> * Avoid StackOverflow when using large IN queries ( CASSANDRA - 6567 ) <nl> * Nodetool upgradesstables includes secondary indexes ( CASSANDRA - 6589 ) <nl> + * Paginate batchlog replay ( CASSANDRA - 6569 ) <nl> <nl> <nl> 1 . 2 . 13 <nl> diff - - git a / src / java / org / apache / cassandra / db / BatchlogManager . java b / src / java / org / apache / cassandra / db / BatchlogManager . java <nl> index 1af4909 . . 90dfd47 100644 <nl> - - - a / src / java / org / apache / cassandra / db / BatchlogManager . java <nl> + + + b / src / java / org / apache / cassandra / db / BatchlogManager . java <nl> @ @ - 33 , 6 + 33 , 7 @ @ import java . util . concurrent . atomic . AtomicLong ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . ObjectName ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . collect . Iterables ; <nl> import com . google . common . collect . Lists ; <nl> import com . google . common . util . concurrent . RateLimiter ; <nl> @ @ - 45 , 6 + 46 , 7 @ @ import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . cql3 . QueryProcessor ; <nl> import org . apache . cassandra . cql3 . UntypedResultSet ; <nl> import org . apache . cassandra . db . compaction . CompactionManager ; <nl> + import org . apache . cassandra . db . filter . QueryPath ; <nl> import org . apache . cassandra . db . marshal . LongType ; <nl> import org . apache . cassandra . db . marshal . UTF8Type ; <nl> import org . apache . cassandra . db . marshal . UUIDType ; <nl> @ @ - 66 , 8 + 68 , 8 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> { <nl> private static final String MBEAN _ NAME = " org . apache . cassandra . db : type = BatchlogManager " ; <nl> private static final int VERSION = MessagingService . VERSION _ 12 ; <nl> - private static final long TIMEOUT = 2 * DatabaseDescriptor . getWriteRpcTimeout ( ) ; <nl> private static final long REPLAY _ INTERVAL = 60 * 1000 ; / / milliseconds <nl> + private static final int PAGE _ SIZE = 128 ; / / same as HHOM , for now , w / out using any heuristics . TODO : set based on avg batch size . <nl> <nl> private static final Logger logger = LoggerFactory . getLogger ( BatchlogManager . class ) ; <nl> public static final BatchlogManager instance = new BatchlogManager ( ) ; <nl> @ @ - 124 , 14 + 126 , 19 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> <nl> public static RowMutation getBatchlogMutationFor ( Collection < RowMutation > mutations , UUID uuid ) <nl> { <nl> - long timestamp = FBUtilities . timestampMicros ( ) ; <nl> - ByteBuffer writtenAt = LongType . instance . decompose ( timestamp / 1000 ) ; <nl> + return getBatchlogMutationFor ( mutations , uuid , FBUtilities . timestampMicros ( ) ) ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + static RowMutation getBatchlogMutationFor ( Collection < RowMutation > mutations , UUID uuid , long now ) <nl> + { <nl> + ByteBuffer writtenAt = LongType . instance . decompose ( now / 1000 ) ; <nl> ByteBuffer data = serializeRowMutations ( mutations ) ; <nl> <nl> ColumnFamily cf = ColumnFamily . create ( CFMetaData . BatchlogCf ) ; <nl> - cf . addColumn ( new Column ( columnName ( " " ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , timestamp ) ) ; <nl> - cf . addColumn ( new Column ( columnName ( " written _ at " ) , writtenAt , timestamp ) ) ; <nl> - cf . addColumn ( new Column ( columnName ( " data " ) , data , timestamp ) ) ; <nl> + cf . addColumn ( new Column ( columnName ( " " ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , now ) ) ; <nl> + cf . addColumn ( new Column ( columnName ( " written _ at " ) , writtenAt , now ) ) ; <nl> + cf . addColumn ( new Column ( columnName ( " data " ) , data , now ) ) ; <nl> RowMutation rm = new RowMutation ( Table . SYSTEM _ KS , UUIDType . instance . decompose ( uuid ) ) ; <nl> rm . add ( cf ) ; <nl> <nl> @ @ - 157 , 7 + 164 , 8 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> return ByteBuffer . wrap ( bos . toByteArray ( ) ) ; <nl> } <nl> <nl> - private void replayAllFailedBatches ( ) throws ExecutionException , InterruptedException <nl> + @ VisibleForTesting <nl> + void replayAllFailedBatches ( ) throws ExecutionException , InterruptedException <nl> { <nl> if ( ! isReplaying . compareAndSet ( false , true ) ) <nl> return ; <nl> @ @ - 171 , 9 + 179 , 25 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> <nl> try <nl> { <nl> - for ( UntypedResultSet . Row row : process ( " SELECT id , written _ at FROM % s . % s " , Table . SYSTEM _ KS , SystemTable . BATCHLOG _ CF ) ) <nl> - if ( System . currentTimeMillis ( ) > row . getLong ( " written _ at " ) + TIMEOUT ) <nl> - replayBatch ( row . getUUID ( " id " ) , rateLimiter ) ; <nl> + UntypedResultSet page = process ( " SELECT id , data , written _ at FROM % s . % s LIMIT % d " , <nl> + Table . SYSTEM _ KS , <nl> + SystemTable . BATCHLOG _ CF , <nl> + PAGE _ SIZE ) ; <nl> + <nl> + while ( ! page . isEmpty ( ) ) <nl> + { <nl> + UUID id = processBatchlogPage ( page , rateLimiter ) ; <nl> + <nl> + if ( page . size ( ) < PAGE _ SIZE ) <nl> + break ; / / we ' ve exhausted the batchlog , next query would be empty . <nl> + <nl> + page = process ( " SELECT id , data , written _ at FROM % s . % s WHERE token ( id ) > token ( % s ) LIMIT % d " , <nl> + Table . SYSTEM _ KS , <nl> + SystemTable . BATCHLOG _ CF , <nl> + id , <nl> + PAGE _ SIZE ) ; <nl> + } <nl> + <nl> cleanup ( ) ; <nl> } <nl> finally <nl> @ @ - 184 , 28 + 208 , 48 @ @ public class BatchlogManager implements BatchlogManagerMBean <nl> logger . debug ( " Finished replayAllFailedBatches " ) ; <nl> } <nl> <nl> - private void replayBatch ( UUID id , RateLimiter rateLimiter ) <nl> + / / returns the UUID of the last seen batch <nl> + private UUID processBatchlogPage ( UntypedResultSet page , RateLimiter rateLimiter ) <nl> { <nl> - logger . debug ( " Replaying batch { } " , id ) ; <nl> + UUID id = null ; <nl> + for ( UntypedResultSet . Row row : page ) <nl> + { <nl> + id = row . getUUID ( " id " ) ; <nl> + long writtenAt = row . getLong ( " written _ at " ) ; <nl> + / / enough time for the actual write + batchlog entry mutation delivery ( two separate requests ) . <nl> + long timeout = DatabaseDescriptor . getWriteRpcTimeout ( ) * 2 ; / / enough time for the actual write + BM removal mutation <nl> + if ( System . currentTimeMillis ( ) < writtenAt + timeout ) <nl> + continue ; / / not ready to replay yet , might still get a deletion . <nl> + replayBatch ( id , row . getBytes ( " data " ) , writtenAt , rateLimiter ) ; <nl> + } <nl> + return id ; <nl> + } <nl> <nl> - UntypedResultSet result = process ( " SELECT written _ at , data FROM % s . % s WHERE id = % s " , Table . SYSTEM _ KS , SystemTable . BATCHLOG _ CF , id ) ; <nl> - if ( result . isEmpty ( ) ) <nl> - return ; <nl> + private void replayBatch ( UUID id , ByteBuffer data , long writtenAt , RateLimiter rateLimiter ) <nl> + { <nl> + logger . debug ( " Replaying batch { } " , id ) ; <nl> <nl> try <nl> { <nl> - replaySerializedMutations ( result . one ( ) . getBytes ( " data " ) , result . one ( ) . getLong ( " written _ at " ) , rateLimiter ) ; <nl> + replaySerializedMutations ( data , writtenAt , rateLimiter ) ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> logger . warn ( " Skipped batch replay of { } due to { } " , id , e ) ; <nl> } <nl> <nl> - process ( " DELETE FROM % s . % s WHERE id = % s " , Table . SYSTEM _ KS , SystemTable . BATCHLOG _ CF , id ) ; <nl> + deleteBatch ( id ) ; <nl> <nl> totalBatchesReplayed . incrementAndGet ( ) ; <nl> } <nl> <nl> + private void deleteBatch ( UUID id ) <nl> + { <nl> + RowMutation mutation = new RowMutation ( Table . SYSTEM _ KS , UUIDType . instance . decompose ( id ) ) ; <nl> + mutation . delete ( new QueryPath ( SystemTable . BATCHLOG _ CF , null , null ) , System . currentTimeMillis ( ) ) ; <nl> + mutation . apply ( ) ; <nl> + } <nl> + <nl> private void replaySerializedMutations ( ByteBuffer data , long writtenAt , RateLimiter rateLimiter ) throws IOException <nl> { <nl> DataInputStream in = new DataInputStream ( ByteBufferUtil . inputStream ( data ) ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / db / BatchlogManagerTest . java b / test / unit / org / apache / cassandra / db / BatchlogManagerTest . java <nl> new file mode 100644 <nl> index 0000000 . . 637815b <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / db / BatchlogManagerTest . java <nl> @ @ - 0 , 0 + 1 , 82 @ @ <nl> + package org . apache . cassandra . db ; <nl> + <nl> + import java . net . InetAddress ; <nl> + import java . util . Collections ; <nl> + <nl> + import org . junit . Before ; <nl> + import org . junit . Test ; <nl> + <nl> + import org . apache . cassandra . SchemaLoader ; <nl> + import org . apache . cassandra . Util ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . cql3 . QueryProcessor ; <nl> + import org . apache . cassandra . cql3 . UntypedResultSet ; <nl> + import org . apache . cassandra . db . filter . QueryPath ; <nl> + import org . apache . cassandra . locator . TokenMetadata ; <nl> + import org . apache . cassandra . service . StorageService ; <nl> + import org . apache . cassandra . utils . UUIDGen ; <nl> + <nl> + import static org . junit . Assert . assertEquals ; <nl> + import static org . junit . Assert . assertTrue ; <nl> + <nl> + import static org . apache . cassandra . utils . ByteBufferUtil . bytes ; <nl> + <nl> + public class BatchlogManagerTest extends SchemaLoader <nl> + { <nl> + @ Before <nl> + public void setUp ( ) throws Exception <nl> + { <nl> + TokenMetadata metadata = StorageService . instance . getTokenMetadata ( ) ; <nl> + InetAddress localhost = InetAddress . getByName ( " 127 . 0 . 0 . 1 " ) ; <nl> + metadata . updateNormalToken ( Util . token ( " A " ) , localhost ) ; <nl> + metadata . updateHostId ( UUIDGen . getTimeUUID ( ) , localhost ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testReplay ( ) throws Exception <nl> + { <nl> + assertEquals ( 0 , BatchlogManager . instance . countAllBatches ( ) ) ; <nl> + assertEquals ( 0 , BatchlogManager . instance . getTotalBatchesReplayed ( ) ) ; <nl> + <nl> + / / Generate 1000 mutations and put them all into the batchlog . <nl> + / / Half ( 500 ) ready to be replayed , half not . <nl> + for ( int i = 0 ; i < 1000 ; i + + ) <nl> + { <nl> + RowMutation mutation = new RowMutation ( " Keyspace1 " , bytes ( i ) ) ; <nl> + mutation . add ( new QueryPath ( " Standard1 " , null , bytes ( i ) ) , bytes ( i ) , 0 ) ; <nl> + long timestamp = System . currentTimeMillis ( ) ; <nl> + if ( i < 500 ) <nl> + timestamp - = DatabaseDescriptor . getWriteRpcTimeout ( ) * 2 ; <nl> + BatchlogManager . getBatchlogMutationFor ( Collections . singleton ( mutation ) , UUIDGen . getTimeUUID ( ) , timestamp * 1000 ) . apply ( ) ; <nl> + } <nl> + <nl> + assertEquals ( 1000 , BatchlogManager . instance . countAllBatches ( ) ) ; <nl> + assertEquals ( 0 , BatchlogManager . instance . getTotalBatchesReplayed ( ) ) ; <nl> + <nl> + / / Force batchlog replay . <nl> + BatchlogManager . instance . replayAllFailedBatches ( ) ; <nl> + <nl> + / / Ensure that the first half , and only the first half , got replayed . <nl> + assertEquals ( 500 , BatchlogManager . instance . countAllBatches ( ) ) ; <nl> + assertEquals ( 500 , BatchlogManager . instance . getTotalBatchesReplayed ( ) ) ; <nl> + <nl> + for ( int i = 0 ; i < 1000 ; i + + ) <nl> + { <nl> + UntypedResultSet result = QueryProcessor . processInternal ( String . format ( " SELECT * FROM \ " Keyspace1 \ " . \ " Standard1 \ " WHERE key = intAsBlob ( % d ) " , i ) ) ; <nl> + if ( i < 500 ) <nl> + { <nl> + assertEquals ( bytes ( i ) , result . one ( ) . getBytes ( " key " ) ) ; <nl> + assertEquals ( bytes ( i ) , result . one ( ) . getBytes ( " column1 " ) ) ; <nl> + assertEquals ( bytes ( i ) , result . one ( ) . getBytes ( " value " ) ) ; <nl> + } <nl> + else <nl> + { <nl> + assertTrue ( result . isEmpty ( ) ) ; <nl> + } <nl> + } <nl> + <nl> + / / Ensure that no stray mutations got somehow applied . <nl> + UntypedResultSet result = QueryProcessor . processInternal ( String . format ( " SELECT count ( * ) FROM \ " Keyspace1 \ " . \ " Standard1 \ " " ) ) ; <nl> + assertEquals ( 500 , result . one ( ) . getLong ( " count " ) ) ; <nl> + } <nl> + }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index a5827d3 . . f550863 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 11 , 6 + 11 , 7 @ @ 
+ * Fix executing LOCAL _ QUORUM with SimpleStrategy ( CASSANDRA - 6545 ) 
+ * Avoid StackOverflow when using large IN queries ( CASSANDRA - 6567 ) 
+ * Nodetool upgradesstables includes secondary indexes ( CASSANDRA - 6589 ) 
+ + * Paginate batchlog replay ( CASSANDRA - 6569 ) 
+ 
+ 
+ 1 . 2 . 13 
+ diff - - git a / src / java / org / apache / cassandra / db / BatchlogManager . java b / src / java / org / apache / cassandra / db / BatchlogManager . java 
+ index 1af4909 . . 90dfd47 100644 
+ - - - a / src / java / org / apache / cassandra / db / BatchlogManager . java 
+ + + + b / src / java / org / apache / cassandra / db / BatchlogManager . java 
+ @ @ - 33 , 6 + 33 , 7 @ @ import java . util . concurrent . atomic . AtomicLong ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . ObjectName ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . collect . Iterables ; 
+ import com . google . common . collect . Lists ; 
+ import com . google . common . util . concurrent . RateLimiter ; 
+ @ @ - 45 , 6 + 46 , 7 @ @ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . cql3 . QueryProcessor ; 
+ import org . apache . cassandra . cql3 . UntypedResultSet ; 
+ import org . apache . cassandra . db . compaction . CompactionManager ; 
+ + import org . apache . cassandra . db . filter . QueryPath ; 
+ import org . apache . cassandra . db . marshal . LongType ; 
+ import org . apache . cassandra . db . marshal . UTF8Type ; 
+ import org . apache . cassandra . db . marshal . UUIDType ; 
+ @ @ - 66 , 8 + 68 , 8 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ { 
+ private static final String MBEAN _ NAME = " org . apache . cassandra . db : type = BatchlogManager " ; 
+ private static final int VERSION = MessagingService . VERSION _ 12 ; 
+ - private static final long TIMEOUT = 2 * DatabaseDescriptor . getWriteRpcTimeout ( ) ; 
+ private static final long REPLAY _ INTERVAL = 60 * 1000 ; / / milliseconds 
+ + private static final int PAGE _ SIZE = 128 ; / / same as HHOM , for now , w / out using any heuristics . TODO : set based on avg batch size . 
+ 
+ private static final Logger logger = LoggerFactory . getLogger ( BatchlogManager . class ) ; 
+ public static final BatchlogManager instance = new BatchlogManager ( ) ; 
+ @ @ - 124 , 14 + 126 , 19 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ 
+ public static RowMutation getBatchlogMutationFor ( Collection < RowMutation > mutations , UUID uuid ) 
+ { 
+ - long timestamp = FBUtilities . timestampMicros ( ) ; 
+ - ByteBuffer writtenAt = LongType . instance . decompose ( timestamp / 1000 ) ; 
+ + return getBatchlogMutationFor ( mutations , uuid , FBUtilities . timestampMicros ( ) ) ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + static RowMutation getBatchlogMutationFor ( Collection < RowMutation > mutations , UUID uuid , long now ) 
+ + { 
+ + ByteBuffer writtenAt = LongType . instance . decompose ( now / 1000 ) ; 
+ ByteBuffer data = serializeRowMutations ( mutations ) ; 
+ 
+ ColumnFamily cf = ColumnFamily . create ( CFMetaData . BatchlogCf ) ; 
+ - cf . addColumn ( new Column ( columnName ( " " ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , timestamp ) ) ; 
+ - cf . addColumn ( new Column ( columnName ( " written _ at " ) , writtenAt , timestamp ) ) ; 
+ - cf . addColumn ( new Column ( columnName ( " data " ) , data , timestamp ) ) ; 
+ + cf . addColumn ( new Column ( columnName ( " " ) , ByteBufferUtil . EMPTY _ BYTE _ BUFFER , now ) ) ; 
+ + cf . addColumn ( new Column ( columnName ( " written _ at " ) , writtenAt , now ) ) ; 
+ + cf . addColumn ( new Column ( columnName ( " data " ) , data , now ) ) ; 
+ RowMutation rm = new RowMutation ( Table . SYSTEM _ KS , UUIDType . instance . decompose ( uuid ) ) ; 
+ rm . add ( cf ) ; 
+ 
+ @ @ - 157 , 7 + 164 , 8 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ return ByteBuffer . wrap ( bos . toByteArray ( ) ) ; 
+ } 
+ 
+ - private void replayAllFailedBatches ( ) throws ExecutionException , InterruptedException 
+ + @ VisibleForTesting 
+ + void replayAllFailedBatches ( ) throws ExecutionException , InterruptedException 
+ { 
+ if ( ! isReplaying . compareAndSet ( false , true ) ) 
+ return ; 
+ @ @ - 171 , 9 + 179 , 25 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ 
+ try 
+ { 
+ - for ( UntypedResultSet . Row row : process ( " SELECT id , written _ at FROM % s . % s " , Table . SYSTEM _ KS , SystemTable . BATCHLOG _ CF ) ) 
+ - if ( System . currentTimeMillis ( ) > row . getLong ( " written _ at " ) + TIMEOUT ) 
+ - replayBatch ( row . getUUID ( " id " ) , rateLimiter ) ; 
+ + UntypedResultSet page = process ( " SELECT id , data , written _ at FROM % s . % s LIMIT % d " , 
+ + Table . SYSTEM _ KS , 
+ + SystemTable . BATCHLOG _ CF , 
+ + PAGE _ SIZE ) ; 
+ + 
+ + while ( ! page . isEmpty ( ) ) 
+ + { 
+ + UUID id = processBatchlogPage ( page , rateLimiter ) ; 
+ + 
+ + if ( page . size ( ) < PAGE _ SIZE ) 
+ + break ; / / we ' ve exhausted the batchlog , next query would be empty . 
+ + 
+ + page = process ( " SELECT id , data , written _ at FROM % s . % s WHERE token ( id ) > token ( % s ) LIMIT % d " , 
+ + Table . SYSTEM _ KS , 
+ + SystemTable . BATCHLOG _ CF , 
+ + id , 
+ + PAGE _ SIZE ) ; 
+ + } 
+ + 
+ cleanup ( ) ; 
+ } 
+ finally 
+ @ @ - 184 , 28 + 208 , 48 @ @ public class BatchlogManager implements BatchlogManagerMBean 
+ logger . debug ( " Finished replayAllFailedBatches " ) ; 
+ } 
+ 
+ - private void replayBatch ( UUID id , RateLimiter rateLimiter ) 
+ + / / returns the UUID of the last seen batch 
+ + private UUID processBatchlogPage ( UntypedResultSet page , RateLimiter rateLimiter ) 
+ { 
+ - logger . debug ( " Replaying batch { } " , id ) ; 
+ + UUID id = null ; 
+ + for ( UntypedResultSet . Row row : page ) 
+ + { 
+ + id = row . getUUID ( " id " ) ; 
+ + long writtenAt = row . getLong ( " written _ at " ) ; 
+ + / / enough time for the actual write + batchlog entry mutation delivery ( two separate requests ) . 
+ + long timeout = DatabaseDescriptor . getWriteRpcTimeout ( ) * 2 ; / / enough time for the actual write + BM removal mutation 
+ + if ( System . currentTimeMillis ( ) < writtenAt + timeout ) 
+ + continue ; / / not ready to replay yet , might still get a deletion . 
+ + replayBatch ( id , row . getBytes ( " data " ) , writtenAt , rateLimiter ) ; 
+ + } 
+ + return id ; 
+ + } 
+ 
+ - UntypedResultSet result = process ( " SELECT written _ at , data FROM % s . % s WHERE id = % s " , Table . SYSTEM _ KS , SystemTable . BATCHLOG _ CF , id ) ; 
+ - if ( result . isEmpty ( ) ) 
+ - return ; 
+ + private void replayBatch ( UUID id , ByteBuffer data , long writtenAt , RateLimiter rateLimiter ) 
+ + { 
+ + logger . debug ( " Replaying batch { } " , id ) ; 
+ 
+ try 
+ { 
+ - replaySerializedMutations ( result . one ( ) . getBytes ( " data " ) , result . one ( ) . getLong ( " written _ at " ) , rateLimiter ) ; 
+ + replaySerializedMutations ( data , writtenAt , rateLimiter ) ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ logger . warn ( " Skipped batch replay of { } due to { } " , id , e ) ; 
+ } 
+ 
+ - process ( " DELETE FROM % s . % s WHERE id = % s " , Table . SYSTEM _ KS , SystemTable . BATCHLOG _ CF , id ) ; 
+ + deleteBatch ( id ) ; 
+ 
+ totalBatchesReplayed . incrementAndGet ( ) ; 
+ } 
+ 
+ + private void deleteBatch ( UUID id ) 
+ + { 
+ + RowMutation mutation = new RowMutation ( Table . SYSTEM _ KS , UUIDType . instance . decompose ( id ) ) ; 
+ + mutation . delete ( new QueryPath ( SystemTable . BATCHLOG _ CF , null , null ) , System . currentTimeMillis ( ) ) ; 
+ + mutation . apply ( ) ; 
+ + } 
+ + 
+ private void replaySerializedMutations ( ByteBuffer data , long writtenAt , RateLimiter rateLimiter ) throws IOException 
+ { 
+ DataInputStream in = new DataInputStream ( ByteBufferUtil . inputStream ( data ) ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / db / BatchlogManagerTest . java b / test / unit / org / apache / cassandra / db / BatchlogManagerTest . java 
+ new file mode 100644 
+ index 0000000 . . 637815b 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / db / BatchlogManagerTest . java 
+ @ @ - 0 , 0 + 1 , 82 @ @ 
+ + package org . apache . cassandra . db ; 
+ + 
+ + import java . net . InetAddress ; 
+ + import java . util . Collections ; 
+ + 
+ + import org . junit . Before ; 
+ + import org . junit . Test ; 
+ + 
+ + import org . apache . cassandra . SchemaLoader ; 
+ + import org . apache . cassandra . Util ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . cql3 . QueryProcessor ; 
+ + import org . apache . cassandra . cql3 . UntypedResultSet ; 
+ + import org . apache . cassandra . db . filter . QueryPath ; 
+ + import org . apache . cassandra . locator . TokenMetadata ; 
+ + import org . apache . cassandra . service . StorageService ; 
+ + import org . apache . cassandra . utils . UUIDGen ; 
+ + 
+ + import static org . junit . Assert . assertEquals ; 
+ + import static org . junit . Assert . assertTrue ; 
+ + 
+ + import static org . apache . cassandra . utils . ByteBufferUtil . bytes ; 
+ + 
+ + public class BatchlogManagerTest extends SchemaLoader 
+ + { 
+ + @ Before 
+ + public void setUp ( ) throws Exception 
+ + { 
+ + TokenMetadata metadata = StorageService . instance . getTokenMetadata ( ) ; 
+ + InetAddress localhost = InetAddress . getByName ( " 127 . 0 . 0 . 1 " ) ; 
+ + metadata . updateNormalToken ( Util . token ( " A " ) , localhost ) ; 
+ + metadata . updateHostId ( UUIDGen . getTimeUUID ( ) , localhost ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testReplay ( ) throws Exception 
+ + { 
+ + assertEquals ( 0 , BatchlogManager . instance . countAllBatches ( ) ) ; 
+ + assertEquals ( 0 , BatchlogManager . instance . getTotalBatchesReplayed ( ) ) ; 
+ + 
+ + / / Generate 1000 mutations and put them all into the batchlog . 
+ + / / Half ( 500 ) ready to be replayed , half not . 
+ + for ( int i = 0 ; i < 1000 ; i + + ) 
+ + { 
+ + RowMutation mutation = new RowMutation ( " Keyspace1 " , bytes ( i ) ) ; 
+ + mutation . add ( new QueryPath ( " Standard1 " , null , bytes ( i ) ) , bytes ( i ) , 0 ) ; 
+ + long timestamp = System . currentTimeMillis ( ) ; 
+ + if ( i < 500 ) 
+ + timestamp - = DatabaseDescriptor . getWriteRpcTimeout ( ) * 2 ; 
+ + BatchlogManager . getBatchlogMutationFor ( Collections . singleton ( mutation ) , UUIDGen . getTimeUUID ( ) , timestamp * 1000 ) . apply ( ) ; 
+ + } 
+ + 
+ + assertEquals ( 1000 , BatchlogManager . instance . countAllBatches ( ) ) ; 
+ + assertEquals ( 0 , BatchlogManager . instance . getTotalBatchesReplayed ( ) ) ; 
+ + 
+ + / / Force batchlog replay . 
+ + BatchlogManager . instance . replayAllFailedBatches ( ) ; 
+ + 
+ + / / Ensure that the first half , and only the first half , got replayed . 
+ + assertEquals ( 500 , BatchlogManager . instance . countAllBatches ( ) ) ; 
+ + assertEquals ( 500 , BatchlogManager . instance . getTotalBatchesReplayed ( ) ) ; 
+ + 
+ + for ( int i = 0 ; i < 1000 ; i + + ) 
+ + { 
+ + UntypedResultSet result = QueryProcessor . processInternal ( String . format ( " SELECT * FROM \ " Keyspace1 \ " . \ " Standard1 \ " WHERE key = intAsBlob ( % d ) " , i ) ) ; 
+ + if ( i < 500 ) 
+ + { 
+ + assertEquals ( bytes ( i ) , result . one ( ) . getBytes ( " key " ) ) ; 
+ + assertEquals ( bytes ( i ) , result . one ( ) . getBytes ( " column1 " ) ) ; 
+ + assertEquals ( bytes ( i ) , result . one ( ) . getBytes ( " value " ) ) ; 
+ + } 
+ + else 
+ + { 
+ + assertTrue ( result . isEmpty ( ) ) ; 
+ + } 
+ + } 
+ + 
+ + / / Ensure that no stray mutations got somehow applied . 
+ + UntypedResultSet result = QueryProcessor . processInternal ( String . format ( " SELECT count ( * ) FROM \ " Keyspace1 \ " . \ " Standard1 \ " " ) ) ; 
+ + assertEquals ( 500 , result . one ( ) . getLong ( " count " ) ) ; 
+ + } 
+ + }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

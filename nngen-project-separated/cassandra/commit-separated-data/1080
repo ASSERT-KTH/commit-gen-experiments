@@ -1,0 +1,273 @@
+BLEU SCORE: 0.040583489434387374
+
+TEST MSG: Fix regression of CASSANDRA - 7392
+GENERATED MSG: Never return more columns than requested
+
+TEST DIFF (one line): diff - - git a / src / java / org / apache / cassandra / db / ReadCommand . java b / src / java / org / apache / cassandra / db / ReadCommand . java <nl> index 959085b . . 90372dd 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ReadCommand . java <nl> + + + b / src / java / org / apache / cassandra / db / ReadCommand . java <nl> @ @ - 479 , 23 + 479 , 32 @ @ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery <nl> { <nl> protected BaseRowIterator < ? > applyToPartition ( BaseRowIterator partition ) <nl> { <nl> - maybeAbort ( ) ; <nl> + if ( maybeAbort ( ) ) <nl> + { <nl> + partition . close ( ) ; <nl> + return null ; <nl> + } <nl> + <nl> return partition ; <nl> } <nl> <nl> protected Row applyToRow ( Row row ) <nl> { <nl> - maybeAbort ( ) ; <nl> - return row ; <nl> + return maybeAbort ( ) ? null : row ; <nl> } <nl> <nl> - private void maybeAbort ( ) <nl> + private boolean maybeAbort ( ) <nl> { <nl> + if ( TEST _ ITERATION _ DELAY _ MILLIS > 0 ) <nl> + maybeDelayForTesting ( ) ; <nl> + <nl> if ( isAborted ( ) ) <nl> + { <nl> stop ( ) ; <nl> + return true ; <nl> + } <nl> <nl> - if ( TEST _ ITERATION _ DELAY _ MILLIS > 0 ) <nl> - maybeDelayForTesting ( ) ; <nl> + return false ; <nl> } <nl> } <nl>
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 83d33b3 . . 58e00e0 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 17 , 6 + 17 , 7 @ @ <nl> * add JMX call to clean ( failed ) repair sessions ( CASSANDRA - 3316 ) <nl> * fix sstableloader reference acquisition bug ( CASSANDRA - 3438 ) <nl> * fix estimated row size regression ( CASSANDRA - 3451 ) <nl> + * make sure we don ' t return more columns than asked ( CASSANDRA - 3303 , 3395 ) <nl> Merged from 0 . 8 : <nl> * acquire compactionlock during truncate ( CASSANDRA - 3399 ) <nl> * fix displaying cfdef entries for super columnfamilies ( CASSANDRA - 3415 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ReadCommand . java b / src / java / org / apache / cassandra / db / ReadCommand . java <nl> index 7a1dc6a . . 5ebb244 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ReadCommand . java <nl> + + + b / src / java / org / apache / cassandra / db / ReadCommand . java <nl> @ @ - 31 , 6 + 31 , 7 @ @ import org . apache . cassandra . io . IVersionedSerializer ; <nl> import org . apache . cassandra . net . Message ; <nl> import org . apache . cassandra . net . MessageProducer ; <nl> import org . apache . cassandra . service . IReadCommand ; <nl> + import org . apache . cassandra . service . RepairCallback ; <nl> import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> @ @ - 66 , 7 + 67 , 7 @ @ public abstract class ReadCommand implements MessageProducer , IReadCommand <nl> this . queryPath = queryPath ; <nl> this . commandType = cmdType ; <nl> } <nl> - <nl> + <nl> public boolean isDigestQuery ( ) <nl> { <nl> return isDigestQuery ; <nl> @ @ - 81 , 7 + 82 , 7 @ @ public abstract class ReadCommand implements MessageProducer , IReadCommand <nl> { <nl> return queryPath . columnFamilyName ; <nl> } <nl> - <nl> + <nl> public abstract ReadCommand copy ( ) ; <nl> <nl> public abstract Row getRow ( Table table ) throws IOException ; <nl> @ @ - 95 , 6 + 96 , 18 @ @ public abstract class ReadCommand implements MessageProducer , IReadCommand <nl> { <nl> return table ; <nl> } <nl> + <nl> + / / maybeGenerateRetryCommand is used to generate a retry for short reads <nl> + public ReadCommand maybeGenerateRetryCommand ( RepairCallback handler , Row row ) <nl> + { <nl> + return null ; <nl> + } <nl> + <nl> + / / maybeTrim removes columns from a response that is too long <nl> + public void maybeTrim ( Row row ) <nl> + { <nl> + / / noop <nl> + } <nl> } <nl> <nl> class ReadCommandSerializer implements IVersionedSerializer < ReadCommand > <nl> diff - - git a / src / java / org / apache / cassandra / db / SliceFromReadCommand . java b / src / java / org / apache / cassandra / db / SliceFromReadCommand . java <nl> index d9d7263 . . 51c1602 100644 <nl> - - - a / src / java / org / apache / cassandra / db / SliceFromReadCommand . java <nl> + + + b / src / java / org / apache / cassandra / db / SliceFromReadCommand . java <nl> @ @ - 19 , 17 + 19 , 25 @ @ package org . apache . cassandra . db ; <nl> <nl> import java . io . * ; <nl> import java . nio . ByteBuffer ; <nl> + import java . util . Collection ; <nl> + import java . util . HashSet ; <nl> + import java . util . Iterator ; <nl> <nl> import org . apache . cassandra . db . filter . QueryFilter ; <nl> import org . apache . cassandra . db . filter . QueryPath ; <nl> import org . apache . cassandra . io . IVersionedSerializer ; <nl> + import org . apache . cassandra . service . RepairCallback ; <nl> import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . thrift . ColumnParent ; <nl> import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> <nl> public class SliceFromReadCommand extends ReadCommand <nl> { <nl> + static final Logger logger = LoggerFactory . getLogger ( SliceFromReadCommand . class ) ; <nl> + <nl> public final ByteBuffer start , finish ; <nl> public final boolean reversed ; <nl> public final int count ; <nl> @ @ - 62 , 6 + 70 , 64 @ @ public class SliceFromReadCommand extends ReadCommand <nl> } <nl> <nl> @ Override <nl> + public ReadCommand maybeGenerateRetryCommand ( RepairCallback handler , Row row ) <nl> + { <nl> + int maxLiveColumns = handler . getMaxLiveColumns ( ) ; <nl> + int liveColumnsInRow = row ! = null ? row . cf . getLiveColumnCount ( ) : 0 ; <nl> + <nl> + assert maxLiveColumns < = count ; <nl> + if ( ( maxLiveColumns = = count ) & & ( liveColumnsInRow < count ) ) <nl> + { <nl> + int retryCount = count + count - liveColumnsInRow ; <nl> + return new RetriedSliceFromReadCommand ( table , key , queryPath , start , finish , reversed , count , retryCount ) ; <nl> + } <nl> + <nl> + return null ; <nl> + } <nl> + <nl> + @ Override <nl> + public void maybeTrim ( Row row ) <nl> + { <nl> + if ( ( row = = null ) | | ( row . cf = = null ) ) <nl> + return ; <nl> + <nl> + int liveColumnsInRow = row . cf . getLiveColumnCount ( ) ; <nl> + <nl> + if ( liveColumnsInRow > getRequestedCount ( ) ) <nl> + { <nl> + int columnsToTrim = liveColumnsInRow - getRequestedCount ( ) ; <nl> + <nl> + logger . debug ( " trimming { } live columns to the originally requested { } " , row . cf . getLiveColumnCount ( ) , getRequestedCount ( ) ) ; <nl> + <nl> + Collection < IColumn > columns ; <nl> + if ( reversed ) <nl> + columns = row . cf . getSortedColumns ( ) ; <nl> + else <nl> + columns = row . cf . getReverseSortedColumns ( ) ; <nl> + <nl> + Collection < ByteBuffer > toRemove = new HashSet < ByteBuffer > ( ) ; <nl> + <nl> + Iterator < IColumn > columnIterator = columns . iterator ( ) ; <nl> + while ( columnIterator . hasNext ( ) & & ( toRemove . size ( ) < columnsToTrim ) ) <nl> + { <nl> + IColumn column = columnIterator . next ( ) ; <nl> + if ( column . isLive ( ) ) <nl> + toRemove . add ( column . name ( ) ) ; <nl> + } <nl> + <nl> + for ( ByteBuffer columnName : toRemove ) <nl> + { <nl> + row . cf . remove ( columnName ) ; <nl> + } <nl> + } <nl> + } <nl> + <nl> + protected int getRequestedCount ( ) <nl> + { <nl> + return count ; <nl> + } <nl> + <nl> + @ Override <nl> public String toString ( ) <nl> { <nl> return " SliceFromReadCommand ( " + <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index 1e31348 . . 1c056cf 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 685 , 7 + 685 , 10 @ @ public class StorageProxy implements StorageProxyMBean <nl> long startTime2 = System . currentTimeMillis ( ) ; <nl> Row row = handler . get ( ) ; <nl> if ( row ! = null ) <nl> + { <nl> + command . maybeTrim ( row ) ; <nl> rows . add ( row ) ; <nl> + } <nl> <nl> if ( logger . isDebugEnabled ( ) ) <nl> logger . debug ( " Read : " + ( System . currentTimeMillis ( ) - startTime2 ) + " ms . " ) ; <nl> @ @ - 739 , 35 + 742 , 21 @ @ public class StorageProxy implements StorageProxyMBean <nl> throw new AssertionError ( e ) ; / / full data requested from each node here , no digests should be sent <nl> } <nl> <nl> - / / retry short reads , otherwise add the row to our resultset <nl> - if ( command instanceof SliceFromReadCommand ) <nl> + ReadCommand retryCommand = command . maybeGenerateRetryCommand ( handler , row ) ; <nl> + if ( retryCommand ! = null ) <nl> { <nl> - / / short reads are only possible on SliceFromReadCommand <nl> - SliceFromReadCommand sliceCommand = ( SliceFromReadCommand ) command ; <nl> - int maxLiveColumns = handler . getMaxLiveColumns ( ) ; <nl> - int liveColumnsInRow = row ! = null ? row . cf . getLiveColumnCount ( ) : 0 ; <nl> + logger . debug ( " issuing retry for read command " ) ; <nl> + if ( commandsToRetry = = Collections . EMPTY _ LIST ) <nl> + commandsToRetry = new ArrayList < ReadCommand > ( ) ; <nl> + commandsToRetry . add ( retryCommand ) ; <nl> + continue ; <nl> + } <nl> <nl> - assert maxLiveColumns < = sliceCommand . count ; <nl> - if ( ( maxLiveColumns = = sliceCommand . count ) & & ( liveColumnsInRow < sliceCommand . count ) ) <nl> - { <nl> - logger . debug ( " detected short read : expected { } columns , but only resolved { } columns " , <nl> - sliceCommand . count , liveColumnsInRow ) ; <nl> - <nl> - int retryCount = sliceCommand . count + sliceCommand . count - liveColumnsInRow ; <nl> - SliceFromReadCommand retryCommand = new SliceFromReadCommand ( command . table , <nl> - command . key , <nl> - command . queryPath , <nl> - sliceCommand . start , <nl> - sliceCommand . finish , <nl> - sliceCommand . reversed , <nl> - retryCount ) ; <nl> - if ( commandsToRetry = = Collections . EMPTY _ LIST ) <nl> - commandsToRetry = new ArrayList < ReadCommand > ( ) ; <nl> - commandsToRetry . add ( retryCommand ) ; <nl> - continue ; <nl> - } <nl> + if ( row ! = null ) <nl> + { <nl> + command . maybeTrim ( row ) ; <nl> + rows . add ( row ) ; <nl> } <nl> - rows . add ( row ) ; <nl> } <nl> } <nl> } while ( ! commandsToRetry . isEmpty ( ) ) ;
+
+TEST DIFF:
+diff - - git a / src / java / org / apache / cassandra / db / ReadCommand . java b / src / java / org / apache / cassandra / db / ReadCommand . java 
+ index 959085b . . 90372dd 100644 
+ - - - a / src / java / org / apache / cassandra / db / ReadCommand . java 
+ + + + b / src / java / org / apache / cassandra / db / ReadCommand . java 
+ @ @ - 479 , 23 + 479 , 32 @ @ public abstract class ReadCommand extends MonitorableImpl implements ReadQuery 
+ { 
+ protected BaseRowIterator < ? > applyToPartition ( BaseRowIterator partition ) 
+ { 
+ - maybeAbort ( ) ; 
+ + if ( maybeAbort ( ) ) 
+ + { 
+ + partition . close ( ) ; 
+ + return null ; 
+ + } 
+ + 
+ return partition ; 
+ } 
+ 
+ protected Row applyToRow ( Row row ) 
+ { 
+ - maybeAbort ( ) ; 
+ - return row ; 
+ + return maybeAbort ( ) ? null : row ; 
+ } 
+ 
+ - private void maybeAbort ( ) 
+ + private boolean maybeAbort ( ) 
+ { 
+ + if ( TEST _ ITERATION _ DELAY _ MILLIS > 0 ) 
+ + maybeDelayForTesting ( ) ; 
+ + 
+ if ( isAborted ( ) ) 
+ + { 
+ stop ( ) ; 
+ + return true ; 
+ + } 
+ 
+ - if ( TEST _ ITERATION _ DELAY _ MILLIS > 0 ) 
+ - maybeDelayForTesting ( ) ; 
+ + return false ; 
+ } 
+ } 
+
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 83d33b3 . . 58e00e0 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 17 , 6 + 17 , 7 @ @ 
+ * add JMX call to clean ( failed ) repair sessions ( CASSANDRA - 3316 ) 
+ * fix sstableloader reference acquisition bug ( CASSANDRA - 3438 ) 
+ * fix estimated row size regression ( CASSANDRA - 3451 ) 
+ + * make sure we don ' t return more columns than asked ( CASSANDRA - 3303 , 3395 ) 
+ Merged from 0 . 8 : 
+ * acquire compactionlock during truncate ( CASSANDRA - 3399 ) 
+ * fix displaying cfdef entries for super columnfamilies ( CASSANDRA - 3415 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ReadCommand . java b / src / java / org / apache / cassandra / db / ReadCommand . java 
+ index 7a1dc6a . . 5ebb244 100644 
+ - - - a / src / java / org / apache / cassandra / db / ReadCommand . java 
+ + + + b / src / java / org / apache / cassandra / db / ReadCommand . java 
+ @ @ - 31 , 6 + 31 , 7 @ @ import org . apache . cassandra . io . IVersionedSerializer ; 
+ import org . apache . cassandra . net . Message ; 
+ import org . apache . cassandra . net . MessageProducer ; 
+ import org . apache . cassandra . service . IReadCommand ; 
+ + import org . apache . cassandra . service . RepairCallback ; 
+ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ @ @ - 66 , 7 + 67 , 7 @ @ public abstract class ReadCommand implements MessageProducer , IReadCommand 
+ this . queryPath = queryPath ; 
+ this . commandType = cmdType ; 
+ } 
+ - 
+ + 
+ public boolean isDigestQuery ( ) 
+ { 
+ return isDigestQuery ; 
+ @ @ - 81 , 7 + 82 , 7 @ @ public abstract class ReadCommand implements MessageProducer , IReadCommand 
+ { 
+ return queryPath . columnFamilyName ; 
+ } 
+ - 
+ + 
+ public abstract ReadCommand copy ( ) ; 
+ 
+ public abstract Row getRow ( Table table ) throws IOException ; 
+ @ @ - 95 , 6 + 96 , 18 @ @ public abstract class ReadCommand implements MessageProducer , IReadCommand 
+ { 
+ return table ; 
+ } 
+ + 
+ + / / maybeGenerateRetryCommand is used to generate a retry for short reads 
+ + public ReadCommand maybeGenerateRetryCommand ( RepairCallback handler , Row row ) 
+ + { 
+ + return null ; 
+ + } 
+ + 
+ + / / maybeTrim removes columns from a response that is too long 
+ + public void maybeTrim ( Row row ) 
+ + { 
+ + / / noop 
+ + } 
+ } 
+ 
+ class ReadCommandSerializer implements IVersionedSerializer < ReadCommand > 
+ diff - - git a / src / java / org / apache / cassandra / db / SliceFromReadCommand . java b / src / java / org / apache / cassandra / db / SliceFromReadCommand . java 
+ index d9d7263 . . 51c1602 100644 
+ - - - a / src / java / org / apache / cassandra / db / SliceFromReadCommand . java 
+ + + + b / src / java / org / apache / cassandra / db / SliceFromReadCommand . java 
+ @ @ - 19 , 17 + 19 , 25 @ @ package org . apache . cassandra . db ; 
+ 
+ import java . io . * ; 
+ import java . nio . ByteBuffer ; 
+ + import java . util . Collection ; 
+ + import java . util . HashSet ; 
+ + import java . util . Iterator ; 
+ 
+ import org . apache . cassandra . db . filter . QueryFilter ; 
+ import org . apache . cassandra . db . filter . QueryPath ; 
+ import org . apache . cassandra . io . IVersionedSerializer ; 
+ + import org . apache . cassandra . service . RepairCallback ; 
+ import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . thrift . ColumnParent ; 
+ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ 
+ public class SliceFromReadCommand extends ReadCommand 
+ { 
+ + static final Logger logger = LoggerFactory . getLogger ( SliceFromReadCommand . class ) ; 
+ + 
+ public final ByteBuffer start , finish ; 
+ public final boolean reversed ; 
+ public final int count ; 
+ @ @ - 62 , 6 + 70 , 64 @ @ public class SliceFromReadCommand extends ReadCommand 
+ } 
+ 
+ @ Override 
+ + public ReadCommand maybeGenerateRetryCommand ( RepairCallback handler , Row row ) 
+ + { 
+ + int maxLiveColumns = handler . getMaxLiveColumns ( ) ; 
+ + int liveColumnsInRow = row ! = null ? row . cf . getLiveColumnCount ( ) : 0 ; 
+ + 
+ + assert maxLiveColumns < = count ; 
+ + if ( ( maxLiveColumns = = count ) & & ( liveColumnsInRow < count ) ) 
+ + { 
+ + int retryCount = count + count - liveColumnsInRow ; 
+ + return new RetriedSliceFromReadCommand ( table , key , queryPath , start , finish , reversed , count , retryCount ) ; 
+ + } 
+ + 
+ + return null ; 
+ + } 
+ + 
+ + @ Override 
+ + public void maybeTrim ( Row row ) 
+ + { 
+ + if ( ( row = = null ) | | ( row . cf = = null ) ) 
+ + return ; 
+ + 
+ + int liveColumnsInRow = row . cf . getLiveColumnCount ( ) ; 
+ + 
+ + if ( liveColumnsInRow > getRequestedCount ( ) ) 
+ + { 
+ + int columnsToTrim = liveColumnsInRow - getRequestedCount ( ) ; 
+ + 
+ + logger . debug ( " trimming { } live columns to the originally requested { } " , row . cf . getLiveColumnCount ( ) , getRequestedCount ( ) ) ; 
+ + 
+ + Collection < IColumn > columns ; 
+ + if ( reversed ) 
+ + columns = row . cf . getSortedColumns ( ) ; 
+ + else 
+ + columns = row . cf . getReverseSortedColumns ( ) ; 
+ + 
+ + Collection < ByteBuffer > toRemove = new HashSet < ByteBuffer > ( ) ; 
+ + 
+ + Iterator < IColumn > columnIterator = columns . iterator ( ) ; 
+ + while ( columnIterator . hasNext ( ) & & ( toRemove . size ( ) < columnsToTrim ) ) 
+ + { 
+ + IColumn column = columnIterator . next ( ) ; 
+ + if ( column . isLive ( ) ) 
+ + toRemove . add ( column . name ( ) ) ; 
+ + } 
+ + 
+ + for ( ByteBuffer columnName : toRemove ) 
+ + { 
+ + row . cf . remove ( columnName ) ; 
+ + } 
+ + } 
+ + } 
+ + 
+ + protected int getRequestedCount ( ) 
+ + { 
+ + return count ; 
+ + } 
+ + 
+ + @ Override 
+ public String toString ( ) 
+ { 
+ return " SliceFromReadCommand ( " + 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index 1e31348 . . 1c056cf 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 685 , 7 + 685 , 10 @ @ public class StorageProxy implements StorageProxyMBean 
+ long startTime2 = System . currentTimeMillis ( ) ; 
+ Row row = handler . get ( ) ; 
+ if ( row ! = null ) 
+ + { 
+ + command . maybeTrim ( row ) ; 
+ rows . add ( row ) ; 
+ + } 
+ 
+ if ( logger . isDebugEnabled ( ) ) 
+ logger . debug ( " Read : " + ( System . currentTimeMillis ( ) - startTime2 ) + " ms . " ) ; 
+ @ @ - 739 , 35 + 742 , 21 @ @ public class StorageProxy implements StorageProxyMBean 
+ throw new AssertionError ( e ) ; / / full data requested from each node here , no digests should be sent 
+ } 
+ 
+ - / / retry short reads , otherwise add the row to our resultset 
+ - if ( command instanceof SliceFromReadCommand ) 
+ + ReadCommand retryCommand = command . maybeGenerateRetryCommand ( handler , row ) ; 
+ + if ( retryCommand ! = null ) 
+ { 
+ - / / short reads are only possible on SliceFromReadCommand 
+ - SliceFromReadCommand sliceCommand = ( SliceFromReadCommand ) command ; 
+ - int maxLiveColumns = handler . getMaxLiveColumns ( ) ; 
+ - int liveColumnsInRow = row ! = null ? row . cf . getLiveColumnCount ( ) : 0 ; 
+ + logger . debug ( " issuing retry for read command " ) ; 
+ + if ( commandsToRetry = = Collections . EMPTY _ LIST ) 
+ + commandsToRetry = new ArrayList < ReadCommand > ( ) ; 
+ + commandsToRetry . add ( retryCommand ) ; 
+ + continue ; 
+ + } 
+ 
+ - assert maxLiveColumns < = sliceCommand . count ; 
+ - if ( ( maxLiveColumns = = sliceCommand . count ) & & ( liveColumnsInRow < sliceCommand . count ) ) 
+ - { 
+ - logger . debug ( " detected short read : expected { } columns , but only resolved { } columns " , 
+ - sliceCommand . count , liveColumnsInRow ) ; 
+ - 
+ - int retryCount = sliceCommand . count + sliceCommand . count - liveColumnsInRow ; 
+ - SliceFromReadCommand retryCommand = new SliceFromReadCommand ( command . table , 
+ - command . key , 
+ - command . queryPath , 
+ - sliceCommand . start , 
+ - sliceCommand . finish , 
+ - sliceCommand . reversed , 
+ - retryCount ) ; 
+ - if ( commandsToRetry = = Collections . EMPTY _ LIST ) 
+ - commandsToRetry = new ArrayList < ReadCommand > ( ) ; 
+ - commandsToRetry . add ( retryCommand ) ; 
+ - continue ; 
+ - } 
+ + if ( row ! = null ) 
+ + { 
+ + command . maybeTrim ( row ) ; 
+ + rows . add ( row ) ; 
+ } 
+ - rows . add ( row ) ; 
+ } 
+ } 
+ } while ( ! commandsToRetry . isEmpty ( ) ) ;

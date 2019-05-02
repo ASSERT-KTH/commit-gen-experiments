@@ -1,0 +1,779 @@
+BLEU SCORE: 0.08310415003234632
+
+TEST MSG: Fix flaky LongBufferPoolTest
+GENERATED MSG: Introduce test - burn ant target
+
+TEST DIFF (one line): diff - - git a / build . xml b / build . xml <nl> index d7e5444 . . d7e6c4b 100644 <nl> - - - a / build . xml <nl> + + + b / build . xml <nl> @ @ - 1345 , 6 + 1345 , 14 @ @ <nl> < / testmacro > <nl> < / target > <nl> <nl> + < ! - - Use this with an FQDN for test class , and a csv list of methods like this : <nl> + ant burn - testsome - Dtest . name = org . apache . cassandra . utils . memory . LongBufferPoolTest - Dtest . methods = testAllocate <nl> + - - > <nl> + < target name = " burn - testsome " depends = " build - test " description = " Execute specific burn unit tests " > <nl> + < testmacro inputdir = " $ { test . burn . src } " timeout = " $ { test . burn . timeout } " > <nl> + < test name = " $ { test . name } " methods = " $ { test . methods } " / > <nl> + < / testmacro > <nl> + < / target > <nl> < target name = " test - compression " depends = " build - test " description = " Execute unit tests with sstable compression enabled " > <nl> < property name = " compressed _ yaml " value = " $ { build . test . dir } / cassandra . compressed . yaml " / > <nl> < concat destfile = " $ { compressed _ yaml } " > <nl> @ @ - 1742 , 6 + 1750 , 31 @ @ <nl> < / java > <nl> < / target > <nl> <nl> + < ! - - run arbitrary mains in tests , for example to run the long running memory tests with lots of memory pressure <nl> + ant run - main - Dmainclass = org . apache . cassandra . utils . memory . LongBufferPoolTest - Dvmargs = " - Xmx30m - XX : - UseGCOverheadLimit " <nl> + - - > <nl> + < target name = " run - main " depends = " build - test " > <nl> + < property name = " mainclass " value = " " / > <nl> + < property name = " vmargs " value = " " / > <nl> + < property name = " args " value = " " / > <nl> + < java classname = " $ { mainclass } " <nl> + fork = " true " <nl> + failonerror = " true " > <nl> + < jvmarg value = " - server " / > <nl> + < jvmarg value = " - ea " / > <nl> + < jvmarg line = " $ { vmargs } " / > <nl> + < arg line = " $ { args } " / > <nl> + < classpath > <nl> + < path refid = " cassandra . classpath " / > <nl> + < pathelement location = " $ { test . classes } " / > <nl> + < pathelement location = " $ { test . conf } " / > <nl> + < fileset dir = " $ { test . lib } " > <nl> + < include name = " * * / * . jar " / > <nl> + < / fileset > <nl> + < / classpath > <nl> + < / java > <nl> + < / target > <nl> + <nl> < ! - - Generate IDEA project description files - - > <nl> < target name = " generate - idea - files " depends = " build - test " description = " Generate IDEA files " > <nl> < mkdir dir = " . idea " / > <nl> diff - - git a / test / burn / org / apache / cassandra / utils / memory / LongBufferPoolTest . java b / test / burn / org / apache / cassandra / utils / memory / LongBufferPoolTest . java <nl> index 17ac569 . . 66abe5a 100644 <nl> - - - a / test / burn / org / apache / cassandra / utils / memory / LongBufferPoolTest . java <nl> + + + b / test / burn / org / apache / cassandra / utils / memory / LongBufferPoolTest . java <nl> @ @ - 36 , 10 + 36 , 36 @ @ import org . apache . cassandra . utils . DynamicList ; <nl> <nl> import static org . junit . Assert . * ; <nl> <nl> + / * * <nl> + * Long BufferPool test - make sure that the BufferPool allocates and recycles <nl> + * ByteBuffers under heavy concurrent usage . <nl> + * <nl> + * The test creates two groups of threads <nl> + * <nl> + * - the burn producer / consumer pair that allocates 1 / 10 poolSize and then returns <nl> + * all the memory to the pool . 50 % is freed by the producer , 50 % passed to the consumer thread . <nl> + * <nl> + * - a ring of worker threads that allocate buffers and either immediately free them , <nl> + * or pass to the next worker thread for it to be freed on it ' s behalf . Periodically <nl> + * all memory is freed by the thread . <nl> + * <nl> + * While the burn / worker threads run , the original main thread checks that all of the threads are still <nl> + * making progress every 10s ( no locking issues , or exits from assertion failures ) , <nl> + * and that every chunk has been freed at least once during the previous cycle ( if that was possible ) . <nl> + * <nl> + * The test does not expect to survive out - of - memory errors , so needs sufficient heap memory <nl> + * for non - direct buffers and the debug tracking objects that check the allocate buffers . <nl> + * ( The timing is very interesting when Xmx is lowered to increase garbage collection pauses , but do <nl> + * not set it too low ) . <nl> + * / <nl> public class LongBufferPoolTest <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( LongBufferPoolTest . class ) ; <nl> <nl> + private static final int AVG _ BUFFER _ SIZE = 16 < < 10 ; <nl> + private static final int STDEV _ BUFFER _ SIZE = 10 < < 10 ; / / picked to ensure exceeding buffer size is rare , but occurs <nl> + private static final DateFormat DATE _ FORMAT = new SimpleDateFormat ( " yyyy / MM / dd HH : mm : ss " ) ; <nl> + <nl> @ Test <nl> public void testAllocate ( ) throws InterruptedException , ExecutionException <nl> { <nl> @ @ - 73 , 299 + 99 , 393 @ @ public class LongBufferPoolTest <nl> } <nl> } <nl> <nl> - public void testAllocate ( int threadCount , long duration , int poolSize ) throws InterruptedException , ExecutionException <nl> + private static final class TestEnvironment <nl> { <nl> - final int avgBufferSize = 16 < < 10 ; <nl> - final int stdevBufferSize = 10 < < 10 ; / / picked to ensure exceeding buffer size is rare , but occurs <nl> - final DateFormat dateFormat = new SimpleDateFormat ( " yyyy / MM / dd HH : mm : ss " ) ; <nl> + final int threadCount ; <nl> + final long duration ; <nl> + final int poolSize ; <nl> + final long until ; <nl> + final CountDownLatch latch ; <nl> + final SPSCQueue < BufferCheck > [ ] sharedRecycle ; <nl> + final AtomicBoolean [ ] makingProgress ; <nl> + final AtomicBoolean burnFreed ; <nl> + final AtomicBoolean [ ] freedAllMemory ; <nl> + final ExecutorService executorService ; <nl> + final List < Future < Boolean > > threadResultFuture ; <nl> + final int targetSizeQuanta ; <nl> + <nl> + TestEnvironment ( int threadCount , long duration , int poolSize ) <nl> + { <nl> + this . threadCount = threadCount ; <nl> + this . duration = duration ; <nl> + this . poolSize = poolSize ; <nl> + until = System . nanoTime ( ) + duration ; <nl> + latch = new CountDownLatch ( threadCount ) ; <nl> + sharedRecycle = new SPSCQueue [ threadCount ] ; <nl> + makingProgress = new AtomicBoolean [ threadCount ] ; <nl> + burnFreed = new AtomicBoolean ( false ) ; <nl> + freedAllMemory = new AtomicBoolean [ threadCount ] ; <nl> + executorService = Executors . newFixedThreadPool ( threadCount + 2 ) ; <nl> + threadResultFuture = new ArrayList < > ( threadCount ) ; <nl> + <nl> + for ( int i = 0 ; i < sharedRecycle . length ; i + + ) <nl> + { <nl> + sharedRecycle [ i ] = new SPSCQueue < > ( ) ; <nl> + makingProgress [ i ] = new AtomicBoolean ( false ) ; <nl> + freedAllMemory [ i ] = new AtomicBoolean ( false ) ; <nl> + } <nl> <nl> - System . out . println ( String . format ( " % s - testing % d threads for % dm " , <nl> - dateFormat . format ( new Date ( ) ) , <nl> - threadCount , <nl> - TimeUnit . NANOSECONDS . toMinutes ( duration ) ) ) ; <nl> + / / Divide the poolSize across our threads , deliberately over - subscribing it . Threads <nl> + / / allocate a different amount of memory each - 1 * quanta , 2 * quanta , . . . N * quanta . <nl> + / / Thread0 is always going to be a single CHUNK , then to allocate increasing amounts <nl> + / / using their own algorithm the targetSize should be poolSize / targetSizeQuanta . <nl> + / / <nl> + / / This should divide double the poolSize across the working threads , <nl> + / / plus CHUNK _ SIZE for thread0 and 1 / 10 poolSize for the burn producer / consumer pair . <nl> + targetSizeQuanta = 2 * poolSize / sum1toN ( threadCount - 1 ) ; <nl> + } <nl> <nl> - final long until = System . nanoTime ( ) + duration ; <nl> - final CountDownLatch latch = new CountDownLatch ( threadCount ) ; <nl> - final SPSCQueue < BufferCheck > [ ] sharedRecycle = new SPSCQueue [ threadCount ] ; <nl> - final AtomicBoolean [ ] makingProgress = new AtomicBoolean [ threadCount ] ; <nl> - for ( int i = 0 ; i < sharedRecycle . length ; i + + ) <nl> + void addCheckedFuture ( Future < Boolean > future ) <nl> { <nl> - sharedRecycle [ i ] = new SPSCQueue < > ( ) ; <nl> - makingProgress [ i ] = new AtomicBoolean ( true ) ; <nl> + threadResultFuture . add ( future ) ; <nl> } <nl> <nl> - ExecutorService executorService = Executors . newFixedThreadPool ( threadCount + 2 ) ; <nl> - List < Future < Boolean > > ret = new ArrayList < > ( threadCount ) ; <nl> - long prevPoolSize = BufferPool . MEMORY _ USAGE _ THRESHOLD ; <nl> - BufferPool . MEMORY _ USAGE _ THRESHOLD = poolSize ; <nl> - BufferPool . DEBUG = true ; <nl> - / / sum ( 1 . . n ) = n / 2 * ( n + 1 ) ; we set zero to CHUNK _ SIZE , so have n = threadCount - 1 <nl> - int targetSizeQuanta = ( ( threadCount ) * ( threadCount - 1 ) ) / 2 ; <nl> - / / fix targetSizeQuanta at 1 / 64th our poolSize , so that we only consciously exceed our pool size limit <nl> - targetSizeQuanta = ( targetSizeQuanta * poolSize ) / 64 ; <nl> - <nl> + int countStalledThreads ( ) <nl> { <nl> - / / setup some high churn allocate / deallocate , without any checking <nl> - final SPSCQueue < ByteBuffer > burn = new SPSCQueue < > ( ) ; <nl> - final CountDownLatch doneAdd = new CountDownLatch ( 1 ) ; <nl> - executorService . submit ( new TestUntil ( until ) <nl> + int stalledThreads = 0 ; <nl> + <nl> + for ( AtomicBoolean progress : makingProgress ) <nl> { <nl> - int count = 0 ; <nl> - void testOne ( ) throws Exception <nl> - { <nl> - if ( count * BufferPool . CHUNK _ SIZE > = poolSize / 10 ) <nl> - { <nl> - if ( burn . exhausted ) <nl> - count = 0 ; <nl> - else <nl> - Thread . yield ( ) ; <nl> - return ; <nl> - } <nl> + if ( ! progress . getAndSet ( false ) ) <nl> + stalledThreads + + ; <nl> + } <nl> + return stalledThreads ; <nl> + } <nl> <nl> - ByteBuffer buffer = BufferPool . tryGet ( BufferPool . CHUNK _ SIZE ) ; <nl> - if ( buffer = = null ) <nl> - { <nl> - Thread . yield ( ) ; <nl> - return ; <nl> - } <nl> + int countDoneThreads ( ) <nl> + { <nl> + int doneThreads = 0 ; <nl> + for ( Future < Boolean > r : threadResultFuture ) <nl> + { <nl> + if ( r . isDone ( ) ) <nl> + doneThreads + + ; <nl> + } <nl> + return doneThreads ; <nl> + } <nl> <nl> - BufferPool . put ( buffer ) ; <nl> - burn . add ( buffer ) ; <nl> - count + + ; <nl> - } <nl> - void cleanup ( ) <nl> - { <nl> - doneAdd . countDown ( ) ; <nl> - } <nl> - } ) ; <nl> - executorService . submit ( new TestUntil ( until ) <nl> + void assertCheckedThreadsSucceeded ( ) <nl> + { <nl> + try <nl> { <nl> - void testOne ( ) throws Exception <nl> - { <nl> - ByteBuffer buffer = burn . poll ( ) ; <nl> - if ( buffer = = null ) <nl> - { <nl> - Thread . yield ( ) ; <nl> - return ; <nl> - } <nl> - BufferPool . put ( buffer ) ; <nl> - } <nl> - void cleanup ( ) <nl> - { <nl> - Uninterruptibles . awaitUninterruptibly ( doneAdd ) ; <nl> - } <nl> - } ) ; <nl> + for ( Future < Boolean > r : threadResultFuture ) <nl> + assertTrue ( r . get ( ) ) ; <nl> + } <nl> + catch ( InterruptedException ex ) <nl> + { <nl> + / / If interrupted while checking , restart and check everything . <nl> + assertCheckedThreadsSucceeded ( ) ; <nl> + } <nl> + catch ( ExecutionException ex ) <nl> + { <nl> + fail ( " Checked thread threw exception : " + ex . toString ( ) ) ; <nl> + } <nl> } <nl> + } <nl> + <nl> + public void testAllocate ( int threadCount , long duration , int poolSize ) throws InterruptedException , ExecutionException <nl> + { <nl> + System . out . println ( String . format ( " % s - testing % d threads for % dm " , <nl> + DATE _ FORMAT . format ( new Date ( ) ) , <nl> + threadCount , <nl> + TimeUnit . NANOSECONDS . toMinutes ( duration ) ) ) ; <nl> + long prevPoolSize = BufferPool . MEMORY _ USAGE _ THRESHOLD ; <nl> + logger . info ( " Overriding configured BufferPool . MEMORY _ USAGE _ THRESHOLD = { } and enabling BufferPool . DEBUG " , poolSize ) ; <nl> + BufferPool . MEMORY _ USAGE _ THRESHOLD = poolSize ; <nl> + BufferPool . DEBUG = true ; <nl> + <nl> + TestEnvironment testEnv = new TestEnvironment ( threadCount , duration , poolSize ) ; <nl> + <nl> + startBurnerThreads ( testEnv ) ; <nl> <nl> - for ( int t = 0 ; t < threadCount ; t + + ) <nl> + for ( int threadIdx = 0 ; threadIdx < threadCount ; threadIdx + + ) <nl> + testEnv . addCheckedFuture ( startWorkerThread ( testEnv , threadIdx ) ) ; <nl> + <nl> + while ( ! testEnv . latch . await ( 10L , TimeUnit . SECONDS ) ) <nl> { <nl> - final int threadIdx = t ; <nl> - final int targetSize = t = = 0 ? BufferPool . CHUNK _ SIZE : targetSizeQuanta * t ; <nl> + int stalledThreads = testEnv . countStalledThreads ( ) ; <nl> + int doneThreads = testEnv . countDoneThreads ( ) ; <nl> + <nl> + if ( doneThreads = = 0 ) / / If any threads have completed , they will stop making progress / recycling buffers . <nl> + { / / Assertions failures on the threads will be caught below . <nl> + assert stalledThreads = = 0 ; <nl> + boolean allFreed = testEnv . burnFreed . getAndSet ( false ) ; <nl> + for ( AtomicBoolean freedMemory : testEnv . freedAllMemory ) <nl> + allFreed = allFreed & & freedMemory . getAndSet ( false ) ; <nl> + if ( allFreed ) <nl> + BufferPool . assertAllRecycled ( ) ; <nl> + else <nl> + logger . info ( " All threads did not free all memory in this time slot - skipping buffer recycle check " ) ; <nl> + } <nl> + } <nl> <nl> - ret . add ( executorService . submit ( new TestUntil ( until ) <nl> + for ( SPSCQueue < BufferCheck > queue : testEnv . sharedRecycle ) <nl> + { <nl> + BufferCheck check ; <nl> + while ( null ! = ( check = queue . poll ( ) ) ) <nl> { <nl> - final SPSCQueue < BufferCheck > shareFrom = sharedRecycle [ threadIdx ] ; <nl> - final DynamicList < BufferCheck > checks = new DynamicList < > ( ( int ) Math . max ( 1 , targetSize / ( 1 < < 10 ) ) ) ; <nl> - final SPSCQueue < BufferCheck > shareTo = sharedRecycle [ ( threadIdx + 1 ) % threadCount ] ; <nl> - final ThreadLocalRandom rand = ThreadLocalRandom . current ( ) ; <nl> - int totalSize = 0 ; <nl> - int freeingSize = 0 ; <nl> - int size = 0 ; <nl> - <nl> - void checkpoint ( ) <nl> - { <nl> - if ( ! makingProgress [ threadIdx ] . get ( ) ) <nl> - makingProgress [ threadIdx ] . set ( true ) ; <nl> - } <nl> + check . validate ( ) ; <nl> + BufferPool . put ( check . buffer ) ; <nl> + } <nl> + } <nl> <nl> - void testOne ( ) throws Exception <nl> - { <nl> + assertEquals ( 0 , testEnv . executorService . shutdownNow ( ) . size ( ) ) ; <nl> <nl> - long currentTargetSize = rand . nextInt ( poolSize / 1024 ) = = 0 ? 0 : targetSize ; <nl> - int spinCount = 0 ; <nl> - while ( totalSize > currentTargetSize - freeingSize ) <nl> - { <nl> - / / free buffers until we ' re below our target size <nl> - if ( checks . size ( ) = = 0 ) <nl> - { <nl> - / / if we ' re out of buffers to free , we ' re waiting on our neighbour to free them ; <nl> - / / first check if the consuming neighbour has caught up , and if so mark that free <nl> - if ( shareTo . exhausted ) <nl> - { <nl> - totalSize - = freeingSize ; <nl> - freeingSize = 0 ; <nl> - } <nl> - else if ( ! recycleFromNeighbour ( ) ) <nl> - { <nl> - if ( + + spinCount > 1000 & & System . nanoTime ( ) > until ) <nl> - return ; <nl> - / / otherwise , free one of our other neighbour ' s buffers if can ; and otherwise yield <nl> - Thread . yield ( ) ; <nl> - } <nl> - continue ; <nl> - } <nl> + logger . info ( " Reverting BufferPool . MEMORY _ USAGE _ THRESHOLD = { } " , prevPoolSize ) ; <nl> + BufferPool . MEMORY _ USAGE _ THRESHOLD = prevPoolSize ; <nl> + BufferPool . DEBUG = false ; <nl> <nl> - / / pick a random buffer , with preference going to earlier ones <nl> - BufferCheck check = sample ( ) ; <nl> - checks . remove ( check . listnode ) ; <nl> - check . validate ( ) ; <nl> + testEnv . assertCheckedThreadsSucceeded ( ) ; <nl> <nl> - size = BufferPool . roundUpNormal ( check . buffer . capacity ( ) ) ; <nl> - if ( size > BufferPool . CHUNK _ SIZE ) <nl> - size = 0 ; <nl> + System . out . println ( String . format ( " % s - finished . " , <nl> + DATE _ FORMAT . format ( new Date ( ) ) ) ) ; <nl> + } <nl> <nl> - / / either share to free , or free immediately <nl> - if ( rand . nextBoolean ( ) ) <nl> + private Future < Boolean > startWorkerThread ( TestEnvironment testEnv , final int threadIdx ) <nl> + { <nl> + return testEnv . executorService . submit ( new TestUntil ( testEnv . until ) <nl> + { <nl> + final int targetSize = threadIdx = = 0 ? BufferPool . CHUNK _ SIZE : testEnv . targetSizeQuanta * threadIdx ; <nl> + final SPSCQueue < BufferCheck > shareFrom = testEnv . sharedRecycle [ threadIdx ] ; <nl> + final DynamicList < BufferCheck > checks = new DynamicList < > ( ( int ) Math . max ( 1 , targetSize / ( 1 < < 10 ) ) ) ; <nl> + final SPSCQueue < BufferCheck > shareTo = testEnv . sharedRecycle [ ( threadIdx + 1 ) % testEnv . threadCount ] ; <nl> + final ThreadLocalRandom rand = ThreadLocalRandom . current ( ) ; <nl> + int totalSize = 0 ; <nl> + int freeingSize = 0 ; <nl> + int size = 0 ; <nl> + <nl> + void checkpoint ( ) <nl> + { <nl> + if ( ! testEnv . makingProgress [ threadIdx ] . get ( ) ) <nl> + testEnv . makingProgress [ threadIdx ] . set ( true ) ; <nl> + } <nl> + <nl> + void testOne ( ) throws Exception <nl> + { <nl> + <nl> + long currentTargetSize = ( rand . nextInt ( testEnv . poolSize / 1024 ) = = 0 | | ! testEnv . freedAllMemory [ threadIdx ] . get ( ) ) ? 0 : targetSize ; <nl> + int spinCount = 0 ; <nl> + while ( totalSize > currentTargetSize - freeingSize ) <nl> + { <nl> + / / free buffers until we ' re below our target size <nl> + if ( checks . size ( ) = = 0 ) <nl> + { <nl> + / / if we ' re out of buffers to free , we ' re waiting on our neighbour to free them ; <nl> + / / first check if the consuming neighbour has caught up , and if so mark that free <nl> + if ( shareTo . exhausted ) <nl> { <nl> - shareTo . add ( check ) ; <nl> - freeingSize + = size ; <nl> - / / interleave this with potentially messing with the other neighbour ' s stuff <nl> - recycleFromNeighbour ( ) ; <nl> + totalSize - = freeingSize ; <nl> + freeingSize = 0 ; <nl> } <nl> - else <nl> + else if ( ! recycleFromNeighbour ( ) ) <nl> { <nl> - check . validate ( ) ; <nl> - BufferPool . put ( check . buffer ) ; <nl> - totalSize - = size ; <nl> + if ( + + spinCount > 1000 & & System . nanoTime ( ) > until ) <nl> + return ; <nl> + / / otherwise , free one of our other neighbour ' s buffers if can ; and otherwise yield <nl> + Thread . yield ( ) ; <nl> } <nl> + continue ; <nl> } <nl> <nl> - / / allocate a new buffer <nl> - size = ( int ) Math . max ( 1 , avgBufferSize + ( stdevBufferSize * rand . nextGaussian ( ) ) ) ; <nl> - if ( size < = BufferPool . CHUNK _ SIZE ) <nl> - { <nl> - totalSize + = BufferPool . roundUpNormal ( size ) ; <nl> - allocate ( size ) ; <nl> - } <nl> - else if ( rand . nextBoolean ( ) ) <nl> + / / pick a random buffer , with preference going to earlier ones <nl> + BufferCheck check = sample ( ) ; <nl> + checks . remove ( check . listnode ) ; <nl> + check . validate ( ) ; <nl> + <nl> + size = BufferPool . roundUpNormal ( check . buffer . capacity ( ) ) ; <nl> + if ( size > BufferPool . CHUNK _ SIZE ) <nl> + size = 0 ; <nl> + <nl> + / / either share to free , or free immediately <nl> + if ( rand . nextBoolean ( ) ) <nl> { <nl> - allocate ( size ) ; <nl> + shareTo . add ( check ) ; <nl> + freeingSize + = size ; <nl> + / / interleave this with potentially messing with the other neighbour ' s stuff <nl> + recycleFromNeighbour ( ) ; <nl> } <nl> else <nl> { <nl> - / / perform a burst allocation to exhaust all available memory <nl> - while ( totalSize < poolSize ) <nl> - { <nl> - size = ( int ) Math . max ( 1 , avgBufferSize + ( stdevBufferSize * rand . nextGaussian ( ) ) ) ; <nl> - if ( size < = BufferPool . CHUNK _ SIZE ) <nl> - { <nl> - allocate ( size ) ; <nl> - totalSize + = BufferPool . roundUpNormal ( size ) ; <nl> - } <nl> - } <nl> + check . validate ( ) ; <nl> + BufferPool . put ( check . buffer ) ; <nl> + totalSize - = size ; <nl> } <nl> + } <nl> <nl> - / / validate a random buffer we have stashed <nl> - checks . get ( rand . nextInt ( checks . size ( ) ) ) . validate ( ) ; <nl> + if ( currentTargetSize = = 0 ) <nl> + testEnv . freedAllMemory [ threadIdx ] . compareAndSet ( false , true ) ; <nl> <nl> - / / free all of our neighbour ' s remaining shared buffers <nl> - while ( recycleFromNeighbour ( ) ) ; <nl> + / / allocate a new buffer <nl> + size = ( int ) Math . max ( 1 , AVG _ BUFFER _ SIZE + ( STDEV _ BUFFER _ SIZE * rand . nextGaussian ( ) ) ) ; <nl> + if ( size < = BufferPool . CHUNK _ SIZE ) <nl> + { <nl> + totalSize + = BufferPool . roundUpNormal ( size ) ; <nl> + allocate ( size ) ; <nl> } <nl> - <nl> - void cleanup ( ) <nl> + else if ( rand . nextBoolean ( ) ) <nl> + { <nl> + allocate ( size ) ; <nl> + } <nl> + else <nl> { <nl> - while ( checks . size ( ) > 0 ) <nl> + / / perform a burst allocation to exhaust all available memory <nl> + while ( totalSize < testEnv . poolSize ) <nl> { <nl> - BufferCheck check = checks . get ( 0 ) ; <nl> - BufferPool . put ( check . buffer ) ; <nl> - checks . remove ( check . listnode ) ; <nl> + size = ( int ) Math . max ( 1 , AVG _ BUFFER _ SIZE + ( STDEV _ BUFFER _ SIZE * rand . nextGaussian ( ) ) ) ; <nl> + if ( size < = BufferPool . CHUNK _ SIZE ) <nl> + { <nl> + allocate ( size ) ; <nl> + totalSize + = BufferPool . roundUpNormal ( size ) ; <nl> + } <nl> } <nl> - latch . countDown ( ) ; <nl> } <nl> <nl> - boolean recycleFromNeighbour ( ) <nl> + / / validate a random buffer we have stashed <nl> + checks . get ( rand . nextInt ( checks . size ( ) ) ) . validate ( ) ; <nl> + <nl> + / / free all of our neighbour ' s remaining shared buffers <nl> + while ( recycleFromNeighbour ( ) ) ; <nl> + } <nl> + <nl> + void cleanup ( ) <nl> + { <nl> + while ( checks . size ( ) > 0 ) <nl> { <nl> - BufferCheck check = shareFrom . poll ( ) ; <nl> - if ( check = = null ) <nl> - return false ; <nl> - check . validate ( ) ; <nl> + BufferCheck check = checks . get ( 0 ) ; <nl> BufferPool . put ( check . buffer ) ; <nl> - return true ; <nl> + checks . remove ( check . listnode ) ; <nl> } <nl> + testEnv . latch . countDown ( ) ; <nl> + } <nl> <nl> - BufferCheck allocate ( int size ) <nl> - { <nl> - ByteBuffer buffer = BufferPool . get ( size ) ; <nl> - assertNotNull ( buffer ) ; <nl> - BufferCheck check = new BufferCheck ( buffer , rand . nextLong ( ) ) ; <nl> - assertEquals ( size , buffer . capacity ( ) ) ; <nl> - assertEquals ( 0 , buffer . position ( ) ) ; <nl> - check . init ( ) ; <nl> - check . listnode = checks . append ( check ) ; <nl> - return check ; <nl> - } <nl> + boolean recycleFromNeighbour ( ) <nl> + { <nl> + BufferCheck check = shareFrom . poll ( ) ; <nl> + if ( check = = null ) <nl> + return false ; <nl> + check . validate ( ) ; <nl> + BufferPool . put ( check . buffer ) ; <nl> + return true ; <nl> + } <nl> <nl> - BufferCheck sample ( ) <nl> + BufferCheck allocate ( int size ) <nl> + { <nl> + ByteBuffer buffer = BufferPool . get ( size ) ; <nl> + assertNotNull ( buffer ) ; <nl> + BufferCheck check = new BufferCheck ( buffer , rand . nextLong ( ) ) ; <nl> + assertEquals ( size , buffer . capacity ( ) ) ; <nl> + assertEquals ( 0 , buffer . position ( ) ) ; <nl> + check . init ( ) ; <nl> + check . listnode = checks . append ( check ) ; <nl> + return check ; <nl> + } <nl> + <nl> + BufferCheck sample ( ) <nl> + { <nl> + / / sample with preference to first elements : <nl> + / / element at index n will be selected with likelihood ( size - n ) / sum1ToN ( size ) <nl> + int size = checks . size ( ) ; <nl> + <nl> + / / pick a random number between 1 and sum1toN ( size ) <nl> + int sampleRange = sum1toN ( size ) ; <nl> + int sampleIndex = rand . nextInt ( sampleRange ) ; <nl> + <nl> + / / then binary search for the N , such that [ sum1ToN ( N ) , sum1ToN ( N + 1 ) ) contains this random number <nl> + int moveBy = Math . max ( size / 4 , 1 ) ; <nl> + int index = size / 2 ; <nl> + while ( true ) <nl> { <nl> - / / sample with preference to first elements : <nl> - / / element at index n will be selected with likelihood ( size - n ) / sum1ToN ( size ) <nl> - int size = checks . size ( ) ; <nl> - <nl> - / / pick a random number between 1 and sum1toN ( size ) <nl> - int sampleRange = sum1toN ( size ) ; <nl> - int sampleIndex = rand . nextInt ( sampleRange ) ; <nl> - <nl> - / / then binary search for the N , such that [ sum1ToN ( N ) , sum1ToN ( N + 1 ) ) contains this random number <nl> - int moveBy = Math . max ( size / 4 , 1 ) ; <nl> - int index = size / 2 ; <nl> - while ( true ) <nl> + int baseSampleIndex = sum1toN ( index ) ; <nl> + int endOfSampleIndex = sum1toN ( index + 1 ) ; <nl> + if ( sampleIndex > = baseSampleIndex ) <nl> { <nl> - int baseSampleIndex = sum1toN ( index ) ; <nl> - int endOfSampleIndex = sum1toN ( index + 1 ) ; <nl> - if ( sampleIndex > = baseSampleIndex ) <nl> - { <nl> - if ( sampleIndex < endOfSampleIndex ) <nl> - break ; <nl> - index + = moveBy ; <nl> - } <nl> - else index - = moveBy ; <nl> - moveBy = Math . max ( moveBy / 2 , 1 ) ; <nl> + if ( sampleIndex < endOfSampleIndex ) <nl> + break ; <nl> + index + = moveBy ; <nl> } <nl> + else index - = moveBy ; <nl> + moveBy = Math . max ( moveBy / 2 , 1 ) ; <nl> + } <nl> <nl> - / / this gives us the inverse of our desired value , so just subtract it from the last index <nl> - index = size - ( index + 1 ) ; <nl> + / / this gives us the inverse of our desired value , so just subtract it from the last index <nl> + index = size - ( index + 1 ) ; <nl> <nl> - return checks . get ( index ) ; <nl> + return checks . get ( index ) ; <nl> + } <nl> + } ) ; <nl> + } <nl> + <nl> + private void startBurnerThreads ( TestEnvironment testEnv ) <nl> + { <nl> + / / setup some high churn allocate / deallocate , without any checking <nl> + final SPSCQueue < ByteBuffer > burn = new SPSCQueue < > ( ) ; <nl> + final CountDownLatch doneAdd = new CountDownLatch ( 1 ) ; <nl> + testEnv . addCheckedFuture ( testEnv . executorService . submit ( new TestUntil ( testEnv . until ) <nl> + { <nl> + int count = 0 ; <nl> + final ThreadLocalRandom rand = ThreadLocalRandom . current ( ) ; <nl> + void testOne ( ) throws Exception <nl> + { <nl> + if ( count * BufferPool . CHUNK _ SIZE > = testEnv . poolSize / 10 ) <nl> + { <nl> + if ( burn . exhausted ) <nl> + { <nl> + count = 0 ; <nl> + testEnv . burnFreed . compareAndSet ( false , true ) ; <nl> + } else <nl> + { <nl> + Thread . yield ( ) ; <nl> + } <nl> + return ; <nl> } <nl> <nl> - private int sum1toN ( int n ) <nl> + ByteBuffer buffer = BufferPool . tryGet ( BufferPool . CHUNK _ SIZE ) ; <nl> + if ( buffer = = null ) <nl> { <nl> - return ( n * ( n + 1 ) ) / 2 ; <nl> + Thread . yield ( ) ; <nl> + return ; <nl> } <nl> - } ) ) ; <nl> - } <nl> <nl> - boolean first = true ; <nl> - while ( ! latch . await ( 10L , TimeUnit . SECONDS ) ) <nl> - { <nl> - if ( ! first ) <nl> - BufferPool . assertAllRecycled ( ) ; <nl> - first = false ; <nl> - for ( AtomicBoolean progress : makingProgress ) <nl> + / / 50 / 50 chance of returning the buffer from the producer thread , or <nl> + / / pass it on to the consumer . <nl> + if ( rand . nextBoolean ( ) ) <nl> + BufferPool . put ( buffer ) ; <nl> + else <nl> + burn . add ( buffer ) ; <nl> + <nl> + count + + ; <nl> + } <nl> + void cleanup ( ) <nl> { <nl> - assert progress . get ( ) ; <nl> - progress . set ( false ) ; <nl> + doneAdd . countDown ( ) ; <nl> } <nl> - } <nl> - <nl> - for ( SPSCQueue < BufferCheck > queue : sharedRecycle ) <nl> + } ) ) ; <nl> + testEnv . threadResultFuture . add ( testEnv . executorService . submit ( new TestUntil ( testEnv . until ) <nl> { <nl> - BufferCheck check ; <nl> - while ( null ! = ( check = queue . poll ( ) ) ) <nl> + void testOne ( ) throws Exception <nl> { <nl> - check . validate ( ) ; <nl> - BufferPool . put ( check . buffer ) ; <nl> + ByteBuffer buffer = burn . poll ( ) ; <nl> + if ( buffer = = null ) <nl> + { <nl> + Thread . yield ( ) ; <nl> + return ; <nl> + } <nl> + BufferPool . put ( buffer ) ; <nl> } <nl> - } <nl> - <nl> - assertEquals ( 0 , executorService . shutdownNow ( ) . size ( ) ) ; <nl> - <nl> - BufferPool . MEMORY _ USAGE _ THRESHOLD = prevPoolSize ; <nl> - for ( Future < Boolean > r : ret ) <nl> - assertTrue ( r . get ( ) ) ; <nl> - <nl> - System . out . println ( String . format ( " % s - finished . " , <nl> - dateFormat . format ( new Date ( ) ) ) ) ; <nl> + void cleanup ( ) <nl> + { <nl> + Uninterruptibles . awaitUninterruptibly ( doneAdd ) ; <nl> + } <nl> + } ) ) ; <nl> } <nl> <nl> static abstract class TestUntil implements Callable < Boolean > <nl> @ @ - 399 , 6 + 519 , 14 @ @ public class LongBufferPoolTest <nl> ex . printStackTrace ( ) ; <nl> return false ; <nl> } <nl> + catch ( Throwable tr ) / / for java . lang . OutOfMemoryError <nl> + { <nl> + logger . error ( " Got throwable { } , current chunk { } " , <nl> + tr . getMessage ( ) , <nl> + BufferPool . currentChunk ( ) ) ; <nl> + tr . printStackTrace ( ) ; <nl> + return false ; <nl> + } <nl> finally <nl> { <nl> cleanup ( ) ; <nl> @ @ - 407 , 9 + 535 , 19 @ @ public class LongBufferPoolTest <nl> } <nl> } <nl> <nl> - public static void main ( String [ ] args ) throws InterruptedException , ExecutionException <nl> + public static void main ( String [ ] args ) <nl> { <nl> - new LongBufferPoolTest ( ) . testAllocate ( Runtime . getRuntime ( ) . availableProcessors ( ) , TimeUnit . HOURS . toNanos ( 2L ) , 16 < < 20 ) ; <nl> + try <nl> + { <nl> + new LongBufferPoolTest ( ) . testAllocate ( Runtime . getRuntime ( ) . availableProcessors ( ) , <nl> + TimeUnit . HOURS . toNanos ( 2L ) , 16 < < 20 ) ; <nl> + System . exit ( 0 ) ; <nl> + } <nl> + catch ( Throwable tr ) <nl> + { <nl> + System . out . println ( String . format ( " Test failed - % s " , tr . getMessage ( ) ) ) ; <nl> + System . exit ( 1 ) ; / / Force exit so that non - daemon threads like REQUEST - SCHEDULER do not hang the process on failure <nl> + } <nl> } <nl> <nl> / * * <nl> @ @ - 451 , 4 + 589 , 8 @ @ public class LongBufferPoolTest <nl> } <nl> } <nl> <nl> - } <nl> \ No newline at end of file <nl> + private static int sum1toN ( int n ) <nl> + { <nl> + return ( n * ( n + 1 ) ) / 2 ; <nl> + } <nl> + }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / build . xml b / build . xml 
+ index d7e5444 . . d7e6c4b 100644 
+ - - - a / build . xml 
+ + + + b / build . xml 
+ @ @ - 1345 , 6 + 1345 , 14 @ @ 
+ < / testmacro > 
+ < / target > 
+ 
+ + < ! - - Use this with an FQDN for test class , and a csv list of methods like this : 
+ + ant burn - testsome - Dtest . name = org . apache . cassandra . utils . memory . LongBufferPoolTest - Dtest . methods = testAllocate 
+ + - - > 
+ + < target name = " burn - testsome " depends = " build - test " description = " Execute specific burn unit tests " > 
+ + < testmacro inputdir = " $ { test . burn . src } " timeout = " $ { test . burn . timeout } " > 
+ + < test name = " $ { test . name } " methods = " $ { test . methods } " / > 
+ + < / testmacro > 
+ + < / target > 
+ < target name = " test - compression " depends = " build - test " description = " Execute unit tests with sstable compression enabled " > 
+ < property name = " compressed _ yaml " value = " $ { build . test . dir } / cassandra . compressed . yaml " / > 
+ < concat destfile = " $ { compressed _ yaml } " > 
+ @ @ - 1742 , 6 + 1750 , 31 @ @ 
+ < / java > 
+ < / target > 
+ 
+ + < ! - - run arbitrary mains in tests , for example to run the long running memory tests with lots of memory pressure 
+ + ant run - main - Dmainclass = org . apache . cassandra . utils . memory . LongBufferPoolTest - Dvmargs = " - Xmx30m - XX : - UseGCOverheadLimit " 
+ + - - > 
+ + < target name = " run - main " depends = " build - test " > 
+ + < property name = " mainclass " value = " " / > 
+ + < property name = " vmargs " value = " " / > 
+ + < property name = " args " value = " " / > 
+ + < java classname = " $ { mainclass } " 
+ + fork = " true " 
+ + failonerror = " true " > 
+ + < jvmarg value = " - server " / > 
+ + < jvmarg value = " - ea " / > 
+ + < jvmarg line = " $ { vmargs } " / > 
+ + < arg line = " $ { args } " / > 
+ + < classpath > 
+ + < path refid = " cassandra . classpath " / > 
+ + < pathelement location = " $ { test . classes } " / > 
+ + < pathelement location = " $ { test . conf } " / > 
+ + < fileset dir = " $ { test . lib } " > 
+ + < include name = " * * / * . jar " / > 
+ + < / fileset > 
+ + < / classpath > 
+ + < / java > 
+ + < / target > 
+ + 
+ < ! - - Generate IDEA project description files - - > 
+ < target name = " generate - idea - files " depends = " build - test " description = " Generate IDEA files " > 
+ < mkdir dir = " . idea " / > 
+ diff - - git a / test / burn / org / apache / cassandra / utils / memory / LongBufferPoolTest . java b / test / burn / org / apache / cassandra / utils / memory / LongBufferPoolTest . java 
+ index 17ac569 . . 66abe5a 100644 
+ - - - a / test / burn / org / apache / cassandra / utils / memory / LongBufferPoolTest . java 
+ + + + b / test / burn / org / apache / cassandra / utils / memory / LongBufferPoolTest . java 
+ @ @ - 36 , 10 + 36 , 36 @ @ import org . apache . cassandra . utils . DynamicList ; 
+ 
+ import static org . junit . Assert . * ; 
+ 
+ + / * * 
+ + * Long BufferPool test - make sure that the BufferPool allocates and recycles 
+ + * ByteBuffers under heavy concurrent usage . 
+ + * 
+ + * The test creates two groups of threads 
+ + * 
+ + * - the burn producer / consumer pair that allocates 1 / 10 poolSize and then returns 
+ + * all the memory to the pool . 50 % is freed by the producer , 50 % passed to the consumer thread . 
+ + * 
+ + * - a ring of worker threads that allocate buffers and either immediately free them , 
+ + * or pass to the next worker thread for it to be freed on it ' s behalf . Periodically 
+ + * all memory is freed by the thread . 
+ + * 
+ + * While the burn / worker threads run , the original main thread checks that all of the threads are still 
+ + * making progress every 10s ( no locking issues , or exits from assertion failures ) , 
+ + * and that every chunk has been freed at least once during the previous cycle ( if that was possible ) . 
+ + * 
+ + * The test does not expect to survive out - of - memory errors , so needs sufficient heap memory 
+ + * for non - direct buffers and the debug tracking objects that check the allocate buffers . 
+ + * ( The timing is very interesting when Xmx is lowered to increase garbage collection pauses , but do 
+ + * not set it too low ) . 
+ + * / 
+ public class LongBufferPoolTest 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( LongBufferPoolTest . class ) ; 
+ 
+ + private static final int AVG _ BUFFER _ SIZE = 16 < < 10 ; 
+ + private static final int STDEV _ BUFFER _ SIZE = 10 < < 10 ; / / picked to ensure exceeding buffer size is rare , but occurs 
+ + private static final DateFormat DATE _ FORMAT = new SimpleDateFormat ( " yyyy / MM / dd HH : mm : ss " ) ; 
+ + 
+ @ Test 
+ public void testAllocate ( ) throws InterruptedException , ExecutionException 
+ { 
+ @ @ - 73 , 299 + 99 , 393 @ @ public class LongBufferPoolTest 
+ } 
+ } 
+ 
+ - public void testAllocate ( int threadCount , long duration , int poolSize ) throws InterruptedException , ExecutionException 
+ + private static final class TestEnvironment 
+ { 
+ - final int avgBufferSize = 16 < < 10 ; 
+ - final int stdevBufferSize = 10 < < 10 ; / / picked to ensure exceeding buffer size is rare , but occurs 
+ - final DateFormat dateFormat = new SimpleDateFormat ( " yyyy / MM / dd HH : mm : ss " ) ; 
+ + final int threadCount ; 
+ + final long duration ; 
+ + final int poolSize ; 
+ + final long until ; 
+ + final CountDownLatch latch ; 
+ + final SPSCQueue < BufferCheck > [ ] sharedRecycle ; 
+ + final AtomicBoolean [ ] makingProgress ; 
+ + final AtomicBoolean burnFreed ; 
+ + final AtomicBoolean [ ] freedAllMemory ; 
+ + final ExecutorService executorService ; 
+ + final List < Future < Boolean > > threadResultFuture ; 
+ + final int targetSizeQuanta ; 
+ + 
+ + TestEnvironment ( int threadCount , long duration , int poolSize ) 
+ + { 
+ + this . threadCount = threadCount ; 
+ + this . duration = duration ; 
+ + this . poolSize = poolSize ; 
+ + until = System . nanoTime ( ) + duration ; 
+ + latch = new CountDownLatch ( threadCount ) ; 
+ + sharedRecycle = new SPSCQueue [ threadCount ] ; 
+ + makingProgress = new AtomicBoolean [ threadCount ] ; 
+ + burnFreed = new AtomicBoolean ( false ) ; 
+ + freedAllMemory = new AtomicBoolean [ threadCount ] ; 
+ + executorService = Executors . newFixedThreadPool ( threadCount + 2 ) ; 
+ + threadResultFuture = new ArrayList < > ( threadCount ) ; 
+ + 
+ + for ( int i = 0 ; i < sharedRecycle . length ; i + + ) 
+ + { 
+ + sharedRecycle [ i ] = new SPSCQueue < > ( ) ; 
+ + makingProgress [ i ] = new AtomicBoolean ( false ) ; 
+ + freedAllMemory [ i ] = new AtomicBoolean ( false ) ; 
+ + } 
+ 
+ - System . out . println ( String . format ( " % s - testing % d threads for % dm " , 
+ - dateFormat . format ( new Date ( ) ) , 
+ - threadCount , 
+ - TimeUnit . NANOSECONDS . toMinutes ( duration ) ) ) ; 
+ + / / Divide the poolSize across our threads , deliberately over - subscribing it . Threads 
+ + / / allocate a different amount of memory each - 1 * quanta , 2 * quanta , . . . N * quanta . 
+ + / / Thread0 is always going to be a single CHUNK , then to allocate increasing amounts 
+ + / / using their own algorithm the targetSize should be poolSize / targetSizeQuanta . 
+ + / / 
+ + / / This should divide double the poolSize across the working threads , 
+ + / / plus CHUNK _ SIZE for thread0 and 1 / 10 poolSize for the burn producer / consumer pair . 
+ + targetSizeQuanta = 2 * poolSize / sum1toN ( threadCount - 1 ) ; 
+ + } 
+ 
+ - final long until = System . nanoTime ( ) + duration ; 
+ - final CountDownLatch latch = new CountDownLatch ( threadCount ) ; 
+ - final SPSCQueue < BufferCheck > [ ] sharedRecycle = new SPSCQueue [ threadCount ] ; 
+ - final AtomicBoolean [ ] makingProgress = new AtomicBoolean [ threadCount ] ; 
+ - for ( int i = 0 ; i < sharedRecycle . length ; i + + ) 
+ + void addCheckedFuture ( Future < Boolean > future ) 
+ { 
+ - sharedRecycle [ i ] = new SPSCQueue < > ( ) ; 
+ - makingProgress [ i ] = new AtomicBoolean ( true ) ; 
+ + threadResultFuture . add ( future ) ; 
+ } 
+ 
+ - ExecutorService executorService = Executors . newFixedThreadPool ( threadCount + 2 ) ; 
+ - List < Future < Boolean > > ret = new ArrayList < > ( threadCount ) ; 
+ - long prevPoolSize = BufferPool . MEMORY _ USAGE _ THRESHOLD ; 
+ - BufferPool . MEMORY _ USAGE _ THRESHOLD = poolSize ; 
+ - BufferPool . DEBUG = true ; 
+ - / / sum ( 1 . . n ) = n / 2 * ( n + 1 ) ; we set zero to CHUNK _ SIZE , so have n = threadCount - 1 
+ - int targetSizeQuanta = ( ( threadCount ) * ( threadCount - 1 ) ) / 2 ; 
+ - / / fix targetSizeQuanta at 1 / 64th our poolSize , so that we only consciously exceed our pool size limit 
+ - targetSizeQuanta = ( targetSizeQuanta * poolSize ) / 64 ; 
+ - 
+ + int countStalledThreads ( ) 
+ { 
+ - / / setup some high churn allocate / deallocate , without any checking 
+ - final SPSCQueue < ByteBuffer > burn = new SPSCQueue < > ( ) ; 
+ - final CountDownLatch doneAdd = new CountDownLatch ( 1 ) ; 
+ - executorService . submit ( new TestUntil ( until ) 
+ + int stalledThreads = 0 ; 
+ + 
+ + for ( AtomicBoolean progress : makingProgress ) 
+ { 
+ - int count = 0 ; 
+ - void testOne ( ) throws Exception 
+ - { 
+ - if ( count * BufferPool . CHUNK _ SIZE > = poolSize / 10 ) 
+ - { 
+ - if ( burn . exhausted ) 
+ - count = 0 ; 
+ - else 
+ - Thread . yield ( ) ; 
+ - return ; 
+ - } 
+ + if ( ! progress . getAndSet ( false ) ) 
+ + stalledThreads + + ; 
+ + } 
+ + return stalledThreads ; 
+ + } 
+ 
+ - ByteBuffer buffer = BufferPool . tryGet ( BufferPool . CHUNK _ SIZE ) ; 
+ - if ( buffer = = null ) 
+ - { 
+ - Thread . yield ( ) ; 
+ - return ; 
+ - } 
+ + int countDoneThreads ( ) 
+ + { 
+ + int doneThreads = 0 ; 
+ + for ( Future < Boolean > r : threadResultFuture ) 
+ + { 
+ + if ( r . isDone ( ) ) 
+ + doneThreads + + ; 
+ + } 
+ + return doneThreads ; 
+ + } 
+ 
+ - BufferPool . put ( buffer ) ; 
+ - burn . add ( buffer ) ; 
+ - count + + ; 
+ - } 
+ - void cleanup ( ) 
+ - { 
+ - doneAdd . countDown ( ) ; 
+ - } 
+ - } ) ; 
+ - executorService . submit ( new TestUntil ( until ) 
+ + void assertCheckedThreadsSucceeded ( ) 
+ + { 
+ + try 
+ { 
+ - void testOne ( ) throws Exception 
+ - { 
+ - ByteBuffer buffer = burn . poll ( ) ; 
+ - if ( buffer = = null ) 
+ - { 
+ - Thread . yield ( ) ; 
+ - return ; 
+ - } 
+ - BufferPool . put ( buffer ) ; 
+ - } 
+ - void cleanup ( ) 
+ - { 
+ - Uninterruptibles . awaitUninterruptibly ( doneAdd ) ; 
+ - } 
+ - } ) ; 
+ + for ( Future < Boolean > r : threadResultFuture ) 
+ + assertTrue ( r . get ( ) ) ; 
+ + } 
+ + catch ( InterruptedException ex ) 
+ + { 
+ + / / If interrupted while checking , restart and check everything . 
+ + assertCheckedThreadsSucceeded ( ) ; 
+ + } 
+ + catch ( ExecutionException ex ) 
+ + { 
+ + fail ( " Checked thread threw exception : " + ex . toString ( ) ) ; 
+ + } 
+ } 
+ + } 
+ + 
+ + public void testAllocate ( int threadCount , long duration , int poolSize ) throws InterruptedException , ExecutionException 
+ + { 
+ + System . out . println ( String . format ( " % s - testing % d threads for % dm " , 
+ + DATE _ FORMAT . format ( new Date ( ) ) , 
+ + threadCount , 
+ + TimeUnit . NANOSECONDS . toMinutes ( duration ) ) ) ; 
+ + long prevPoolSize = BufferPool . MEMORY _ USAGE _ THRESHOLD ; 
+ + logger . info ( " Overriding configured BufferPool . MEMORY _ USAGE _ THRESHOLD = { } and enabling BufferPool . DEBUG " , poolSize ) ; 
+ + BufferPool . MEMORY _ USAGE _ THRESHOLD = poolSize ; 
+ + BufferPool . DEBUG = true ; 
+ + 
+ + TestEnvironment testEnv = new TestEnvironment ( threadCount , duration , poolSize ) ; 
+ + 
+ + startBurnerThreads ( testEnv ) ; 
+ 
+ - for ( int t = 0 ; t < threadCount ; t + + ) 
+ + for ( int threadIdx = 0 ; threadIdx < threadCount ; threadIdx + + ) 
+ + testEnv . addCheckedFuture ( startWorkerThread ( testEnv , threadIdx ) ) ; 
+ + 
+ + while ( ! testEnv . latch . await ( 10L , TimeUnit . SECONDS ) ) 
+ { 
+ - final int threadIdx = t ; 
+ - final int targetSize = t = = 0 ? BufferPool . CHUNK _ SIZE : targetSizeQuanta * t ; 
+ + int stalledThreads = testEnv . countStalledThreads ( ) ; 
+ + int doneThreads = testEnv . countDoneThreads ( ) ; 
+ + 
+ + if ( doneThreads = = 0 ) / / If any threads have completed , they will stop making progress / recycling buffers . 
+ + { / / Assertions failures on the threads will be caught below . 
+ + assert stalledThreads = = 0 ; 
+ + boolean allFreed = testEnv . burnFreed . getAndSet ( false ) ; 
+ + for ( AtomicBoolean freedMemory : testEnv . freedAllMemory ) 
+ + allFreed = allFreed & & freedMemory . getAndSet ( false ) ; 
+ + if ( allFreed ) 
+ + BufferPool . assertAllRecycled ( ) ; 
+ + else 
+ + logger . info ( " All threads did not free all memory in this time slot - skipping buffer recycle check " ) ; 
+ + } 
+ + } 
+ 
+ - ret . add ( executorService . submit ( new TestUntil ( until ) 
+ + for ( SPSCQueue < BufferCheck > queue : testEnv . sharedRecycle ) 
+ + { 
+ + BufferCheck check ; 
+ + while ( null ! = ( check = queue . poll ( ) ) ) 
+ { 
+ - final SPSCQueue < BufferCheck > shareFrom = sharedRecycle [ threadIdx ] ; 
+ - final DynamicList < BufferCheck > checks = new DynamicList < > ( ( int ) Math . max ( 1 , targetSize / ( 1 < < 10 ) ) ) ; 
+ - final SPSCQueue < BufferCheck > shareTo = sharedRecycle [ ( threadIdx + 1 ) % threadCount ] ; 
+ - final ThreadLocalRandom rand = ThreadLocalRandom . current ( ) ; 
+ - int totalSize = 0 ; 
+ - int freeingSize = 0 ; 
+ - int size = 0 ; 
+ - 
+ - void checkpoint ( ) 
+ - { 
+ - if ( ! makingProgress [ threadIdx ] . get ( ) ) 
+ - makingProgress [ threadIdx ] . set ( true ) ; 
+ - } 
+ + check . validate ( ) ; 
+ + BufferPool . put ( check . buffer ) ; 
+ + } 
+ + } 
+ 
+ - void testOne ( ) throws Exception 
+ - { 
+ + assertEquals ( 0 , testEnv . executorService . shutdownNow ( ) . size ( ) ) ; 
+ 
+ - long currentTargetSize = rand . nextInt ( poolSize / 1024 ) = = 0 ? 0 : targetSize ; 
+ - int spinCount = 0 ; 
+ - while ( totalSize > currentTargetSize - freeingSize ) 
+ - { 
+ - / / free buffers until we ' re below our target size 
+ - if ( checks . size ( ) = = 0 ) 
+ - { 
+ - / / if we ' re out of buffers to free , we ' re waiting on our neighbour to free them ; 
+ - / / first check if the consuming neighbour has caught up , and if so mark that free 
+ - if ( shareTo . exhausted ) 
+ - { 
+ - totalSize - = freeingSize ; 
+ - freeingSize = 0 ; 
+ - } 
+ - else if ( ! recycleFromNeighbour ( ) ) 
+ - { 
+ - if ( + + spinCount > 1000 & & System . nanoTime ( ) > until ) 
+ - return ; 
+ - / / otherwise , free one of our other neighbour ' s buffers if can ; and otherwise yield 
+ - Thread . yield ( ) ; 
+ - } 
+ - continue ; 
+ - } 
+ + logger . info ( " Reverting BufferPool . MEMORY _ USAGE _ THRESHOLD = { } " , prevPoolSize ) ; 
+ + BufferPool . MEMORY _ USAGE _ THRESHOLD = prevPoolSize ; 
+ + BufferPool . DEBUG = false ; 
+ 
+ - / / pick a random buffer , with preference going to earlier ones 
+ - BufferCheck check = sample ( ) ; 
+ - checks . remove ( check . listnode ) ; 
+ - check . validate ( ) ; 
+ + testEnv . assertCheckedThreadsSucceeded ( ) ; 
+ 
+ - size = BufferPool . roundUpNormal ( check . buffer . capacity ( ) ) ; 
+ - if ( size > BufferPool . CHUNK _ SIZE ) 
+ - size = 0 ; 
+ + System . out . println ( String . format ( " % s - finished . " , 
+ + DATE _ FORMAT . format ( new Date ( ) ) ) ) ; 
+ + } 
+ 
+ - / / either share to free , or free immediately 
+ - if ( rand . nextBoolean ( ) ) 
+ + private Future < Boolean > startWorkerThread ( TestEnvironment testEnv , final int threadIdx ) 
+ + { 
+ + return testEnv . executorService . submit ( new TestUntil ( testEnv . until ) 
+ + { 
+ + final int targetSize = threadIdx = = 0 ? BufferPool . CHUNK _ SIZE : testEnv . targetSizeQuanta * threadIdx ; 
+ + final SPSCQueue < BufferCheck > shareFrom = testEnv . sharedRecycle [ threadIdx ] ; 
+ + final DynamicList < BufferCheck > checks = new DynamicList < > ( ( int ) Math . max ( 1 , targetSize / ( 1 < < 10 ) ) ) ; 
+ + final SPSCQueue < BufferCheck > shareTo = testEnv . sharedRecycle [ ( threadIdx + 1 ) % testEnv . threadCount ] ; 
+ + final ThreadLocalRandom rand = ThreadLocalRandom . current ( ) ; 
+ + int totalSize = 0 ; 
+ + int freeingSize = 0 ; 
+ + int size = 0 ; 
+ + 
+ + void checkpoint ( ) 
+ + { 
+ + if ( ! testEnv . makingProgress [ threadIdx ] . get ( ) ) 
+ + testEnv . makingProgress [ threadIdx ] . set ( true ) ; 
+ + } 
+ + 
+ + void testOne ( ) throws Exception 
+ + { 
+ + 
+ + long currentTargetSize = ( rand . nextInt ( testEnv . poolSize / 1024 ) = = 0 | | ! testEnv . freedAllMemory [ threadIdx ] . get ( ) ) ? 0 : targetSize ; 
+ + int spinCount = 0 ; 
+ + while ( totalSize > currentTargetSize - freeingSize ) 
+ + { 
+ + / / free buffers until we ' re below our target size 
+ + if ( checks . size ( ) = = 0 ) 
+ + { 
+ + / / if we ' re out of buffers to free , we ' re waiting on our neighbour to free them ; 
+ + / / first check if the consuming neighbour has caught up , and if so mark that free 
+ + if ( shareTo . exhausted ) 
+ { 
+ - shareTo . add ( check ) ; 
+ - freeingSize + = size ; 
+ - / / interleave this with potentially messing with the other neighbour ' s stuff 
+ - recycleFromNeighbour ( ) ; 
+ + totalSize - = freeingSize ; 
+ + freeingSize = 0 ; 
+ } 
+ - else 
+ + else if ( ! recycleFromNeighbour ( ) ) 
+ { 
+ - check . validate ( ) ; 
+ - BufferPool . put ( check . buffer ) ; 
+ - totalSize - = size ; 
+ + if ( + + spinCount > 1000 & & System . nanoTime ( ) > until ) 
+ + return ; 
+ + / / otherwise , free one of our other neighbour ' s buffers if can ; and otherwise yield 
+ + Thread . yield ( ) ; 
+ } 
+ + continue ; 
+ } 
+ 
+ - / / allocate a new buffer 
+ - size = ( int ) Math . max ( 1 , avgBufferSize + ( stdevBufferSize * rand . nextGaussian ( ) ) ) ; 
+ - if ( size < = BufferPool . CHUNK _ SIZE ) 
+ - { 
+ - totalSize + = BufferPool . roundUpNormal ( size ) ; 
+ - allocate ( size ) ; 
+ - } 
+ - else if ( rand . nextBoolean ( ) ) 
+ + / / pick a random buffer , with preference going to earlier ones 
+ + BufferCheck check = sample ( ) ; 
+ + checks . remove ( check . listnode ) ; 
+ + check . validate ( ) ; 
+ + 
+ + size = BufferPool . roundUpNormal ( check . buffer . capacity ( ) ) ; 
+ + if ( size > BufferPool . CHUNK _ SIZE ) 
+ + size = 0 ; 
+ + 
+ + / / either share to free , or free immediately 
+ + if ( rand . nextBoolean ( ) ) 
+ { 
+ - allocate ( size ) ; 
+ + shareTo . add ( check ) ; 
+ + freeingSize + = size ; 
+ + / / interleave this with potentially messing with the other neighbour ' s stuff 
+ + recycleFromNeighbour ( ) ; 
+ } 
+ else 
+ { 
+ - / / perform a burst allocation to exhaust all available memory 
+ - while ( totalSize < poolSize ) 
+ - { 
+ - size = ( int ) Math . max ( 1 , avgBufferSize + ( stdevBufferSize * rand . nextGaussian ( ) ) ) ; 
+ - if ( size < = BufferPool . CHUNK _ SIZE ) 
+ - { 
+ - allocate ( size ) ; 
+ - totalSize + = BufferPool . roundUpNormal ( size ) ; 
+ - } 
+ - } 
+ + check . validate ( ) ; 
+ + BufferPool . put ( check . buffer ) ; 
+ + totalSize - = size ; 
+ } 
+ + } 
+ 
+ - / / validate a random buffer we have stashed 
+ - checks . get ( rand . nextInt ( checks . size ( ) ) ) . validate ( ) ; 
+ + if ( currentTargetSize = = 0 ) 
+ + testEnv . freedAllMemory [ threadIdx ] . compareAndSet ( false , true ) ; 
+ 
+ - / / free all of our neighbour ' s remaining shared buffers 
+ - while ( recycleFromNeighbour ( ) ) ; 
+ + / / allocate a new buffer 
+ + size = ( int ) Math . max ( 1 , AVG _ BUFFER _ SIZE + ( STDEV _ BUFFER _ SIZE * rand . nextGaussian ( ) ) ) ; 
+ + if ( size < = BufferPool . CHUNK _ SIZE ) 
+ + { 
+ + totalSize + = BufferPool . roundUpNormal ( size ) ; 
+ + allocate ( size ) ; 
+ } 
+ - 
+ - void cleanup ( ) 
+ + else if ( rand . nextBoolean ( ) ) 
+ + { 
+ + allocate ( size ) ; 
+ + } 
+ + else 
+ { 
+ - while ( checks . size ( ) > 0 ) 
+ + / / perform a burst allocation to exhaust all available memory 
+ + while ( totalSize < testEnv . poolSize ) 
+ { 
+ - BufferCheck check = checks . get ( 0 ) ; 
+ - BufferPool . put ( check . buffer ) ; 
+ - checks . remove ( check . listnode ) ; 
+ + size = ( int ) Math . max ( 1 , AVG _ BUFFER _ SIZE + ( STDEV _ BUFFER _ SIZE * rand . nextGaussian ( ) ) ) ; 
+ + if ( size < = BufferPool . CHUNK _ SIZE ) 
+ + { 
+ + allocate ( size ) ; 
+ + totalSize + = BufferPool . roundUpNormal ( size ) ; 
+ + } 
+ } 
+ - latch . countDown ( ) ; 
+ } 
+ 
+ - boolean recycleFromNeighbour ( ) 
+ + / / validate a random buffer we have stashed 
+ + checks . get ( rand . nextInt ( checks . size ( ) ) ) . validate ( ) ; 
+ + 
+ + / / free all of our neighbour ' s remaining shared buffers 
+ + while ( recycleFromNeighbour ( ) ) ; 
+ + } 
+ + 
+ + void cleanup ( ) 
+ + { 
+ + while ( checks . size ( ) > 0 ) 
+ { 
+ - BufferCheck check = shareFrom . poll ( ) ; 
+ - if ( check = = null ) 
+ - return false ; 
+ - check . validate ( ) ; 
+ + BufferCheck check = checks . get ( 0 ) ; 
+ BufferPool . put ( check . buffer ) ; 
+ - return true ; 
+ + checks . remove ( check . listnode ) ; 
+ } 
+ + testEnv . latch . countDown ( ) ; 
+ + } 
+ 
+ - BufferCheck allocate ( int size ) 
+ - { 
+ - ByteBuffer buffer = BufferPool . get ( size ) ; 
+ - assertNotNull ( buffer ) ; 
+ - BufferCheck check = new BufferCheck ( buffer , rand . nextLong ( ) ) ; 
+ - assertEquals ( size , buffer . capacity ( ) ) ; 
+ - assertEquals ( 0 , buffer . position ( ) ) ; 
+ - check . init ( ) ; 
+ - check . listnode = checks . append ( check ) ; 
+ - return check ; 
+ - } 
+ + boolean recycleFromNeighbour ( ) 
+ + { 
+ + BufferCheck check = shareFrom . poll ( ) ; 
+ + if ( check = = null ) 
+ + return false ; 
+ + check . validate ( ) ; 
+ + BufferPool . put ( check . buffer ) ; 
+ + return true ; 
+ + } 
+ 
+ - BufferCheck sample ( ) 
+ + BufferCheck allocate ( int size ) 
+ + { 
+ + ByteBuffer buffer = BufferPool . get ( size ) ; 
+ + assertNotNull ( buffer ) ; 
+ + BufferCheck check = new BufferCheck ( buffer , rand . nextLong ( ) ) ; 
+ + assertEquals ( size , buffer . capacity ( ) ) ; 
+ + assertEquals ( 0 , buffer . position ( ) ) ; 
+ + check . init ( ) ; 
+ + check . listnode = checks . append ( check ) ; 
+ + return check ; 
+ + } 
+ + 
+ + BufferCheck sample ( ) 
+ + { 
+ + / / sample with preference to first elements : 
+ + / / element at index n will be selected with likelihood ( size - n ) / sum1ToN ( size ) 
+ + int size = checks . size ( ) ; 
+ + 
+ + / / pick a random number between 1 and sum1toN ( size ) 
+ + int sampleRange = sum1toN ( size ) ; 
+ + int sampleIndex = rand . nextInt ( sampleRange ) ; 
+ + 
+ + / / then binary search for the N , such that [ sum1ToN ( N ) , sum1ToN ( N + 1 ) ) contains this random number 
+ + int moveBy = Math . max ( size / 4 , 1 ) ; 
+ + int index = size / 2 ; 
+ + while ( true ) 
+ { 
+ - / / sample with preference to first elements : 
+ - / / element at index n will be selected with likelihood ( size - n ) / sum1ToN ( size ) 
+ - int size = checks . size ( ) ; 
+ - 
+ - / / pick a random number between 1 and sum1toN ( size ) 
+ - int sampleRange = sum1toN ( size ) ; 
+ - int sampleIndex = rand . nextInt ( sampleRange ) ; 
+ - 
+ - / / then binary search for the N , such that [ sum1ToN ( N ) , sum1ToN ( N + 1 ) ) contains this random number 
+ - int moveBy = Math . max ( size / 4 , 1 ) ; 
+ - int index = size / 2 ; 
+ - while ( true ) 
+ + int baseSampleIndex = sum1toN ( index ) ; 
+ + int endOfSampleIndex = sum1toN ( index + 1 ) ; 
+ + if ( sampleIndex > = baseSampleIndex ) 
+ { 
+ - int baseSampleIndex = sum1toN ( index ) ; 
+ - int endOfSampleIndex = sum1toN ( index + 1 ) ; 
+ - if ( sampleIndex > = baseSampleIndex ) 
+ - { 
+ - if ( sampleIndex < endOfSampleIndex ) 
+ - break ; 
+ - index + = moveBy ; 
+ - } 
+ - else index - = moveBy ; 
+ - moveBy = Math . max ( moveBy / 2 , 1 ) ; 
+ + if ( sampleIndex < endOfSampleIndex ) 
+ + break ; 
+ + index + = moveBy ; 
+ } 
+ + else index - = moveBy ; 
+ + moveBy = Math . max ( moveBy / 2 , 1 ) ; 
+ + } 
+ 
+ - / / this gives us the inverse of our desired value , so just subtract it from the last index 
+ - index = size - ( index + 1 ) ; 
+ + / / this gives us the inverse of our desired value , so just subtract it from the last index 
+ + index = size - ( index + 1 ) ; 
+ 
+ - return checks . get ( index ) ; 
+ + return checks . get ( index ) ; 
+ + } 
+ + } ) ; 
+ + } 
+ + 
+ + private void startBurnerThreads ( TestEnvironment testEnv ) 
+ + { 
+ + / / setup some high churn allocate / deallocate , without any checking 
+ + final SPSCQueue < ByteBuffer > burn = new SPSCQueue < > ( ) ; 
+ + final CountDownLatch doneAdd = new CountDownLatch ( 1 ) ; 
+ + testEnv . addCheckedFuture ( testEnv . executorService . submit ( new TestUntil ( testEnv . until ) 
+ + { 
+ + int count = 0 ; 
+ + final ThreadLocalRandom rand = ThreadLocalRandom . current ( ) ; 
+ + void testOne ( ) throws Exception 
+ + { 
+ + if ( count * BufferPool . CHUNK _ SIZE > = testEnv . poolSize / 10 ) 
+ + { 
+ + if ( burn . exhausted ) 
+ + { 
+ + count = 0 ; 
+ + testEnv . burnFreed . compareAndSet ( false , true ) ; 
+ + } else 
+ + { 
+ + Thread . yield ( ) ; 
+ + } 
+ + return ; 
+ } 
+ 
+ - private int sum1toN ( int n ) 
+ + ByteBuffer buffer = BufferPool . tryGet ( BufferPool . CHUNK _ SIZE ) ; 
+ + if ( buffer = = null ) 
+ { 
+ - return ( n * ( n + 1 ) ) / 2 ; 
+ + Thread . yield ( ) ; 
+ + return ; 
+ } 
+ - } ) ) ; 
+ - } 
+ 
+ - boolean first = true ; 
+ - while ( ! latch . await ( 10L , TimeUnit . SECONDS ) ) 
+ - { 
+ - if ( ! first ) 
+ - BufferPool . assertAllRecycled ( ) ; 
+ - first = false ; 
+ - for ( AtomicBoolean progress : makingProgress ) 
+ + / / 50 / 50 chance of returning the buffer from the producer thread , or 
+ + / / pass it on to the consumer . 
+ + if ( rand . nextBoolean ( ) ) 
+ + BufferPool . put ( buffer ) ; 
+ + else 
+ + burn . add ( buffer ) ; 
+ + 
+ + count + + ; 
+ + } 
+ + void cleanup ( ) 
+ { 
+ - assert progress . get ( ) ; 
+ - progress . set ( false ) ; 
+ + doneAdd . countDown ( ) ; 
+ } 
+ - } 
+ - 
+ - for ( SPSCQueue < BufferCheck > queue : sharedRecycle ) 
+ + } ) ) ; 
+ + testEnv . threadResultFuture . add ( testEnv . executorService . submit ( new TestUntil ( testEnv . until ) 
+ { 
+ - BufferCheck check ; 
+ - while ( null ! = ( check = queue . poll ( ) ) ) 
+ + void testOne ( ) throws Exception 
+ { 
+ - check . validate ( ) ; 
+ - BufferPool . put ( check . buffer ) ; 
+ + ByteBuffer buffer = burn . poll ( ) ; 
+ + if ( buffer = = null ) 
+ + { 
+ + Thread . yield ( ) ; 
+ + return ; 
+ + } 
+ + BufferPool . put ( buffer ) ; 
+ } 
+ - } 
+ - 
+ - assertEquals ( 0 , executorService . shutdownNow ( ) . size ( ) ) ; 
+ - 
+ - BufferPool . MEMORY _ USAGE _ THRESHOLD = prevPoolSize ; 
+ - for ( Future < Boolean > r : ret ) 
+ - assertTrue ( r . get ( ) ) ; 
+ - 
+ - System . out . println ( String . format ( " % s - finished . " , 
+ - dateFormat . format ( new Date ( ) ) ) ) ; 
+ + void cleanup ( ) 
+ + { 
+ + Uninterruptibles . awaitUninterruptibly ( doneAdd ) ; 
+ + } 
+ + } ) ) ; 
+ } 
+ 
+ static abstract class TestUntil implements Callable < Boolean > 
+ @ @ - 399 , 6 + 519 , 14 @ @ public class LongBufferPoolTest 
+ ex . printStackTrace ( ) ; 
+ return false ; 
+ } 
+ + catch ( Throwable tr ) / / for java . lang . OutOfMemoryError 
+ + { 
+ + logger . error ( " Got throwable { } , current chunk { } " , 
+ + tr . getMessage ( ) , 
+ + BufferPool . currentChunk ( ) ) ; 
+ + tr . printStackTrace ( ) ; 
+ + return false ; 
+ + } 
+ finally 
+ { 
+ cleanup ( ) ; 
+ @ @ - 407 , 9 + 535 , 19 @ @ public class LongBufferPoolTest 
+ } 
+ } 
+ 
+ - public static void main ( String [ ] args ) throws InterruptedException , ExecutionException 
+ + public static void main ( String [ ] args ) 
+ { 
+ - new LongBufferPoolTest ( ) . testAllocate ( Runtime . getRuntime ( ) . availableProcessors ( ) , TimeUnit . HOURS . toNanos ( 2L ) , 16 < < 20 ) ; 
+ + try 
+ + { 
+ + new LongBufferPoolTest ( ) . testAllocate ( Runtime . getRuntime ( ) . availableProcessors ( ) , 
+ + TimeUnit . HOURS . toNanos ( 2L ) , 16 < < 20 ) ; 
+ + System . exit ( 0 ) ; 
+ + } 
+ + catch ( Throwable tr ) 
+ + { 
+ + System . out . println ( String . format ( " Test failed - % s " , tr . getMessage ( ) ) ) ; 
+ + System . exit ( 1 ) ; / / Force exit so that non - daemon threads like REQUEST - SCHEDULER do not hang the process on failure 
+ + } 
+ } 
+ 
+ / * * 
+ @ @ - 451 , 4 + 589 , 8 @ @ public class LongBufferPoolTest 
+ } 
+ } 
+ 
+ - } 
+ \ No newline at end of file 
+ + private static int sum1toN ( int n ) 
+ + { 
+ + return ( n * ( n + 1 ) ) / 2 ; 
+ + } 
+ + }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

@@ -1,0 +1,333 @@
+BLEU SCORE: 0.05522397783539471
+
+TEST MSG: Fail parent repair session if repair coordinator dies
+GENERATED MSG: Wait for all repair sessions to finish
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 8dfa02a . . f73db6e 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 15 <nl> + * Clear out parent repair session if repair coordinator dies ( CASSANDRA - 11824 ) <nl> * Set default streaming _ socket _ timeout _ in _ ms to 24 hours ( CASSANDRA - 11840 ) <nl> * Do not consider local node a valid source during replace ( CASSANDRA - 11848 ) <nl> * Avoid holding SSTableReaders for duration of incremental repair ( CASSANDRA - 11739 ) <nl> diff - - git a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java <nl> index fd4ac28 . . 7debc93 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java <nl> + + + b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java <nl> @ @ - 71 , 8 + 71 , 9 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > <nl> columnFamilyStores . add ( columnFamilyStore ) ; <nl> } <nl> ActiveRepairService . instance . registerParentRepairSession ( prepareMessage . parentRepairSession , <nl> - columnFamilyStores , <nl> - prepareMessage . ranges ) ; <nl> + message . from , <nl> + columnFamilyStores , <nl> + prepareMessage . ranges ) ; <nl> MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; <nl> break ; <nl> <nl> diff - - git a / src / java / org / apache / cassandra / service / ActiveRepairService . java b / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> index 5297ce3 . . f8975f9 100644 <nl> - - - a / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> + + + b / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> @ @ - 35 , 12 + 35 , 18 @ @ import org . slf4j . LoggerFactory ; <nl> <nl> import org . apache . cassandra . concurrent . JMXConfigurableThreadPoolExecutor ; <nl> import org . apache . cassandra . concurrent . NamedThreadFactory ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . db . compaction . CompactionManager ; <nl> import org . apache . cassandra . dht . Range ; <nl> import org . apache . cassandra . dht . Token ; <nl> + import org . apache . cassandra . gms . ApplicationState ; <nl> + import org . apache . cassandra . gms . EndpointState ; <nl> import org . apache . cassandra . gms . FailureDetector ; <nl> import org . apache . cassandra . gms . Gossiper ; <nl> + import org . apache . cassandra . gms . IEndpointStateChangeSubscriber ; <nl> + import org . apache . cassandra . gms . IFailureDetectionEventListener ; <nl> + import org . apache . cassandra . gms . VersionedValue ; <nl> import org . apache . cassandra . io . sstable . SSTableReader ; <nl> import org . apache . cassandra . locator . TokenMetadata ; <nl> import org . apache . cassandra . net . IAsyncCallbackWithFailure ; <nl> @ @ - 72 , 7 + 78 , 7 @ @ import org . apache . cassandra . utils . concurrent . Refs ; <nl> * The creation of a repair session is done through the submitRepairSession that <nl> * returns a future on the completion of that session . <nl> * / <nl> - public class ActiveRepairService <nl> + public class ActiveRepairService implements IEndpointStateChangeSubscriber , IFailureDetectionEventListener <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( ActiveRepairService . class ) ; <nl> / / singleton enforcement <nl> @ @ - 81 , 6 + 87 , 8 @ @ public class ActiveRepairService <nl> public static final long UNREPAIRED _ SSTABLE = 0 ; <nl> <nl> private static final ThreadPoolExecutor executor ; <nl> + private boolean registeredForEndpointChanges = false ; <nl> + <nl> static <nl> { <nl> executor = new JMXConfigurableThreadPoolExecutor ( 4 , <nl> @ @ - 244 , 10 + 252 , 10 @ @ public class ActiveRepairService <nl> return neighbors ; <nl> } <nl> <nl> - public synchronized UUID prepareForRepair ( Set < InetAddress > endpoints , Collection < Range < Token > > ranges , List < ColumnFamilyStore > columnFamilyStores ) <nl> + public synchronized UUID prepareForRepair ( InetAddress coordinator , Set < InetAddress > endpoints , Collection < Range < Token > > ranges , List < ColumnFamilyStore > columnFamilyStores ) <nl> { <nl> UUID parentRepairSession = UUIDGen . getTimeUUID ( ) ; <nl> - registerParentRepairSession ( parentRepairSession , columnFamilyStores , ranges ) ; <nl> + registerParentRepairSession ( parentRepairSession , coordinator , columnFamilyStores , ranges ) ; <nl> final CountDownLatch prepareLatch = new CountDownLatch ( endpoints . size ( ) ) ; <nl> final AtomicBoolean status = new AtomicBoolean ( true ) ; <nl> final Set < String > failedNodes = Collections . synchronizedSet ( new HashSet < String > ( ) ) ; <nl> @ @ - 309 , 9 + 317 , 36 @ @ public class ActiveRepairService <nl> return parentRepairSession ; <nl> } <nl> <nl> - public synchronized void registerParentRepairSession ( UUID parentRepairSession , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges ) <nl> + public synchronized void registerParentRepairSession ( UUID parentRepairSession , InetAddress coordinator , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges ) <nl> { <nl> - parentRepairSessions . put ( parentRepairSession , new ParentRepairSession ( columnFamilyStores , ranges , System . currentTimeMillis ( ) ) ) ; <nl> + if ( ! registeredForEndpointChanges ) <nl> + { <nl> + Gossiper . instance . register ( this ) ; <nl> + FailureDetector . instance . registerFailureDetectionEventListener ( this ) ; <nl> + registeredForEndpointChanges = true ; <nl> + } <nl> + <nl> + cleanupOldParentRepairSessions ( ) ; <nl> + <nl> + parentRepairSessions . put ( parentRepairSession , new ParentRepairSession ( coordinator , columnFamilyStores , ranges , System . currentTimeMillis ( ) ) ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Cleans up old failed parent repair sessions - if it is 24h old , we remove it from the map <nl> + * / <nl> + private void cleanupOldParentRepairSessions ( ) <nl> + { <nl> + long currentTime = System . currentTimeMillis ( ) ; <nl> + <nl> + Set < UUID > expired = new HashSet < > ( ) ; <nl> + for ( Map . Entry < UUID , ParentRepairSession > entry : parentRepairSessions . entrySet ( ) ) <nl> + { <nl> + ParentRepairSession session = entry . getValue ( ) ; <nl> + if ( session . failed & & currentTime - session . repairedAt > TimeUnit . HOURS . toMillis ( 24 ) ) <nl> + expired . add ( entry . getKey ( ) ) ; <nl> + } <nl> + for ( UUID remove : expired ) <nl> + parentRepairSessions . remove ( remove ) ; <nl> } <nl> <nl> public Set < SSTableReader > currentlyRepairing ( UUID cfId , UUID parentRepairSession ) <nl> @ @ - 359 , 7 + 394 , 13 @ @ public class ActiveRepairService <nl> <nl> public ParentRepairSession getParentRepairSession ( UUID parentSessionId ) <nl> { <nl> - return parentRepairSessions . get ( parentSessionId ) ; <nl> + ParentRepairSession session = parentRepairSessions . get ( parentSessionId ) ; <nl> + / / this can happen if a node thinks that the coordinator was down , but that coordinator got back before noticing <nl> + / / that it was down itself . <nl> + if ( session ! = null & & session . failed ) <nl> + throw new RuntimeException ( " Parent repair session with id = " + parentSessionId + " has failed . " ) ; <nl> + <nl> + return session ; <nl> } <nl> <nl> public synchronized ParentRepairSession removeParentRepairSession ( UUID parentSessionId ) <nl> @ @ - 427 , 17 + 468 , 34 @ @ public class ActiveRepairService <nl> public final Map < UUID , ColumnFamilyStore > columnFamilyStores = new HashMap < > ( ) ; <nl> public final Collection < Range < Token > > ranges ; <nl> public final Map < UUID , Set < String > > sstableMap = new HashMap < > ( ) ; <nl> + / * * <nl> + * used as fail time if failed is true <nl> + * / <nl> public final long repairedAt ; <nl> - <nl> - public ParentRepairSession ( List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , long repairedAt ) <nl> + public final InetAddress coordinator ; <nl> + / * * <nl> + * Used to mark a repair as failed - if the coordinator thinks that the repair is still ongoing and sends a <nl> + * request , we need to fail the coordinator as well . <nl> + * / <nl> + public final boolean failed ; <nl> + <nl> + public ParentRepairSession ( InetAddress coordinator , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , long repairedAt , boolean failed ) <nl> { <nl> + this . coordinator = coordinator ; <nl> for ( ColumnFamilyStore cfs : columnFamilyStores ) <nl> { <nl> + <nl> this . columnFamilyStores . put ( cfs . metadata . cfId , cfs ) ; <nl> sstableMap . put ( cfs . metadata . cfId , new HashSet < String > ( ) ) ; <nl> } <nl> this . ranges = ranges ; <nl> this . repairedAt = repairedAt ; <nl> + this . failed = failed ; <nl> + } <nl> + <nl> + public ParentRepairSession ( InetAddress coordinator , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , long repairedAt ) <nl> + { <nl> + this ( coordinator , columnFamilyStores , ranges , repairedAt , false ) ; <nl> } <nl> <nl> @ SuppressWarnings ( " resource " ) <nl> @ @ - 457 , 6 + 515 , 8 @ @ public class ActiveRepairService <nl> <nl> private Set < SSTableReader > getActiveSSTables ( UUID cfId ) <nl> { <nl> + if ( failed ) <nl> + return Collections . emptySet ( ) ; <nl> Set < String > repairedSSTables = sstableMap . get ( cfId ) ; <nl> Set < SSTableReader > activeSSTables = new HashSet < > ( ) ; <nl> Set < String > activeSSTableNames = new HashSet < > ( ) ; <nl> @ @ - 480 , 6 + 540 , 10 @ @ public class ActiveRepairService <nl> } <nl> } <nl> <nl> + public ParentRepairSession asFailed ( ) <nl> + { <nl> + return new ParentRepairSession ( coordinator , Collections . < ColumnFamilyStore > emptyList ( ) , Collections . < Range < Token > > emptyList ( ) , System . currentTimeMillis ( ) , true ) ; <nl> + } <nl> @ Override <nl> public String toString ( ) <nl> { <nl> @ @ - 491 , 4 + 555 , 61 @ @ public class ActiveRepairService <nl> ' } ' ; <nl> } <nl> } <nl> + <nl> + / * <nl> + If the coordinator node dies we should remove the parent repair session from the other nodes . <nl> + This uses the same notifications as we get in RepairSession <nl> + * / <nl> + public void onJoin ( InetAddress endpoint , EndpointState epState ) { } <nl> + public void beforeChange ( InetAddress endpoint , EndpointState currentState , ApplicationState newStateKey , VersionedValue newValue ) { } <nl> + public void onChange ( InetAddress endpoint , ApplicationState state , VersionedValue value ) { } <nl> + public void onAlive ( InetAddress endpoint , EndpointState state ) { } <nl> + public void onDead ( InetAddress endpoint , EndpointState state ) { } <nl> + <nl> + public void onRemove ( InetAddress endpoint ) <nl> + { <nl> + convict ( endpoint , Double . MAX _ VALUE ) ; <nl> + } <nl> + <nl> + public void onRestart ( InetAddress endpoint , EndpointState state ) <nl> + { <nl> + convict ( endpoint , Double . MAX _ VALUE ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Something has happened to a remote node - if that node is a coordinator , we mark the parent repair session id as failed . <nl> + * <nl> + * The fail marker is kept in the map for 24h to make sure that if the coordinator does not agree <nl> + * that the repair failed , we need to fail the entire repair session <nl> + * <nl> + * @ param ep endpoint to be convicted <nl> + * @ param phi the value of phi with with ep was convicted <nl> + * / <nl> + public void convict ( InetAddress ep , double phi ) <nl> + { <nl> + / / We want a higher confidence in the failure detection than usual because failing a repair wrongly has a high cost . <nl> + if ( phi < 2 * DatabaseDescriptor . getPhiConvictThreshold ( ) | | parentRepairSessions . isEmpty ( ) ) <nl> + return ; <nl> + <nl> + Set < UUID > toRemove = new HashSet < > ( ) ; <nl> + <nl> + for ( Map . Entry < UUID , ParentRepairSession > repairSessionEntry : parentRepairSessions . entrySet ( ) ) <nl> + { <nl> + if ( repairSessionEntry . getValue ( ) . coordinator . equals ( ep ) ) <nl> + { <nl> + toRemove . add ( repairSessionEntry . getKey ( ) ) ; <nl> + } <nl> + } <nl> + <nl> + if ( ! toRemove . isEmpty ( ) ) <nl> + { <nl> + logger . debug ( " Failing { } in parent repair sessions " , toRemove ) ; <nl> + for ( UUID id : toRemove ) <nl> + { <nl> + ParentRepairSession failed = parentRepairSessions . get ( id ) ; <nl> + parentRepairSessions . replace ( id , failed , failed . asFailed ( ) ) ; <nl> + } <nl> + } <nl> + } <nl> + <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index 507aedb . . eea4556 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 3013 , 7 + 3013 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> { <nl> try <nl> { <nl> - parentSession = ActiveRepairService . instance . prepareForRepair ( allNeighbors , ranges , columnFamilyStores ) ; <nl> + parentSession = ActiveRepairService . instance . prepareForRepair ( FBUtilities . getBroadcastAddress ( ) , allNeighbors , ranges , columnFamilyStores ) ; <nl> } <nl> catch ( Throwable t ) <nl> { <nl> diff - - git a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java <nl> index 749056c . . 6ec4c7b 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java <nl> @ @ - 108 , 7 + 108 , 7 @ @ public class LeveledCompactionStrategyTest extends SchemaLoader <nl> Range < Token > range = new Range < > ( Util . token ( " " ) , Util . token ( " " ) ) ; <nl> int gcBefore = keyspace . getColumnFamilyStore ( cfname ) . gcBefore ( System . currentTimeMillis ( ) ) ; <nl> UUID parentRepSession = UUID . randomUUID ( ) ; <nl> - ActiveRepairService . instance . registerParentRepairSession ( parentRepSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; <nl> + ActiveRepairService . instance . registerParentRepairSession ( parentRepSession , FBUtilities . getBroadcastAddress ( ) , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; <nl> RepairJobDesc desc = new RepairJobDesc ( parentRepSession , UUID . randomUUID ( ) , ksname , cfname , range ) ; <nl> Validator validator = new Validator ( desc , FBUtilities . getBroadcastAddress ( ) , gcBefore ) ; <nl> CompactionManager . instance . submitValidation ( cfs , validator ) . get ( ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / repair / DifferencerTest . java b / test / unit / org / apache / cassandra / repair / DifferencerTest . java <nl> index bc0f0de . . 3229c58 100644 <nl> - - - a / test / unit / org / apache / cassandra / repair / DifferencerTest . java <nl> + + + b / test / unit / org / apache / cassandra / repair / DifferencerTest . java <nl> @ @ - 41 , 6 + 41 , 7 @ @ import org . apache . cassandra . sink . IMessageSink ; <nl> import org . apache . cassandra . sink . SinkManager ; <nl> import org . apache . cassandra . repair . messages . RepairMessage ; <nl> import org . apache . cassandra . repair . messages . SyncComplete ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . MerkleTree ; <nl> <nl> import static org . junit . Assert . assertEquals ; <nl> @ @ - 109 , 7 + 110 , 7 @ @ public class DifferencerTest extends SchemaLoader <nl> Keyspace keyspace = Keyspace . open ( " Keyspace1 " ) ; <nl> ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( " Standard1 " ) ; <nl> <nl> - ActiveRepairService . instance . registerParentRepairSession ( parentRepairSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; <nl> + ActiveRepairService . instance . registerParentRepairSession ( parentRepairSession , FBUtilities . getBroadcastAddress ( ) , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; <nl> <nl> RepairJobDesc desc = new RepairJobDesc ( parentRepairSession , UUID . randomUUID ( ) , " Keyspace1 " , " Standard1 " , range ) ; <nl> <nl> diff - - git a / test / unit / org / apache / cassandra / service / ActiveRepairServiceTest . java b / test / unit / org / apache / cassandra / service / ActiveRepairServiceTest . java <nl> index 419ea1a . . 26e5126 100644 <nl> - - - a / test / unit / org / apache / cassandra / service / ActiveRepairServiceTest . java <nl> + + + b / test / unit / org / apache / cassandra / service / ActiveRepairServiceTest . java <nl> @ @ - 37 , 6 + 37 , 7 @ @ import org . apache . cassandra . db . Keyspace ; <nl> import org . apache . cassandra . db . Mutation ; <nl> import org . apache . cassandra . io . sstable . SSTableReader ; <nl> import org . apache . cassandra . utils . ByteBufferUtil ; <nl> + import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . concurrent . Refs ; <nl> <nl> import static org . junit . Assert . assertEquals ; <nl> @ @ - 55 , 7 + 56 , 7 @ @ public class ActiveRepairServiceTest extends SchemaLoader <nl> Set < SSTableReader > original = store . getUnrepairedSSTables ( ) ; <nl> <nl> UUID prsId = UUID . randomUUID ( ) ; <nl> - ActiveRepairService . instance . registerParentRepairSession ( prsId , Collections . singletonList ( store ) , null ) ; <nl> + ActiveRepairService . instance . registerParentRepairSession ( prsId , FBUtilities . getBroadcastAddress ( ) , Collections . singletonList ( store ) , null ) ; <nl> ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( prsId ) ; <nl> <nl> / / add all sstables to parent repair session
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 8dfa02a . . f73db6e 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 15 
+ + * Clear out parent repair session if repair coordinator dies ( CASSANDRA - 11824 ) 
+ * Set default streaming _ socket _ timeout _ in _ ms to 24 hours ( CASSANDRA - 11840 ) 
+ * Do not consider local node a valid source during replace ( CASSANDRA - 11848 ) 
+ * Avoid holding SSTableReaders for duration of incremental repair ( CASSANDRA - 11739 ) 
+ diff - - git a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java 
+ index fd4ac28 . . 7debc93 100644 
+ - - - a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java 
+ + + + b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java 
+ @ @ - 71 , 8 + 71 , 9 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > 
+ columnFamilyStores . add ( columnFamilyStore ) ; 
+ } 
+ ActiveRepairService . instance . registerParentRepairSession ( prepareMessage . parentRepairSession , 
+ - columnFamilyStores , 
+ - prepareMessage . ranges ) ; 
+ + message . from , 
+ + columnFamilyStores , 
+ + prepareMessage . ranges ) ; 
+ MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; 
+ break ; 
+ 
+ diff - - git a / src / java / org / apache / cassandra / service / ActiveRepairService . java b / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ index 5297ce3 . . f8975f9 100644 
+ - - - a / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ + + + b / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ @ @ - 35 , 12 + 35 , 18 @ @ import org . slf4j . LoggerFactory ; 
+ 
+ import org . apache . cassandra . concurrent . JMXConfigurableThreadPoolExecutor ; 
+ import org . apache . cassandra . concurrent . NamedThreadFactory ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . db . compaction . CompactionManager ; 
+ import org . apache . cassandra . dht . Range ; 
+ import org . apache . cassandra . dht . Token ; 
+ + import org . apache . cassandra . gms . ApplicationState ; 
+ + import org . apache . cassandra . gms . EndpointState ; 
+ import org . apache . cassandra . gms . FailureDetector ; 
+ import org . apache . cassandra . gms . Gossiper ; 
+ + import org . apache . cassandra . gms . IEndpointStateChangeSubscriber ; 
+ + import org . apache . cassandra . gms . IFailureDetectionEventListener ; 
+ + import org . apache . cassandra . gms . VersionedValue ; 
+ import org . apache . cassandra . io . sstable . SSTableReader ; 
+ import org . apache . cassandra . locator . TokenMetadata ; 
+ import org . apache . cassandra . net . IAsyncCallbackWithFailure ; 
+ @ @ - 72 , 7 + 78 , 7 @ @ import org . apache . cassandra . utils . concurrent . Refs ; 
+ * The creation of a repair session is done through the submitRepairSession that 
+ * returns a future on the completion of that session . 
+ * / 
+ - public class ActiveRepairService 
+ + public class ActiveRepairService implements IEndpointStateChangeSubscriber , IFailureDetectionEventListener 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( ActiveRepairService . class ) ; 
+ / / singleton enforcement 
+ @ @ - 81 , 6 + 87 , 8 @ @ public class ActiveRepairService 
+ public static final long UNREPAIRED _ SSTABLE = 0 ; 
+ 
+ private static final ThreadPoolExecutor executor ; 
+ + private boolean registeredForEndpointChanges = false ; 
+ + 
+ static 
+ { 
+ executor = new JMXConfigurableThreadPoolExecutor ( 4 , 
+ @ @ - 244 , 10 + 252 , 10 @ @ public class ActiveRepairService 
+ return neighbors ; 
+ } 
+ 
+ - public synchronized UUID prepareForRepair ( Set < InetAddress > endpoints , Collection < Range < Token > > ranges , List < ColumnFamilyStore > columnFamilyStores ) 
+ + public synchronized UUID prepareForRepair ( InetAddress coordinator , Set < InetAddress > endpoints , Collection < Range < Token > > ranges , List < ColumnFamilyStore > columnFamilyStores ) 
+ { 
+ UUID parentRepairSession = UUIDGen . getTimeUUID ( ) ; 
+ - registerParentRepairSession ( parentRepairSession , columnFamilyStores , ranges ) ; 
+ + registerParentRepairSession ( parentRepairSession , coordinator , columnFamilyStores , ranges ) ; 
+ final CountDownLatch prepareLatch = new CountDownLatch ( endpoints . size ( ) ) ; 
+ final AtomicBoolean status = new AtomicBoolean ( true ) ; 
+ final Set < String > failedNodes = Collections . synchronizedSet ( new HashSet < String > ( ) ) ; 
+ @ @ - 309 , 9 + 317 , 36 @ @ public class ActiveRepairService 
+ return parentRepairSession ; 
+ } 
+ 
+ - public synchronized void registerParentRepairSession ( UUID parentRepairSession , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges ) 
+ + public synchronized void registerParentRepairSession ( UUID parentRepairSession , InetAddress coordinator , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges ) 
+ { 
+ - parentRepairSessions . put ( parentRepairSession , new ParentRepairSession ( columnFamilyStores , ranges , System . currentTimeMillis ( ) ) ) ; 
+ + if ( ! registeredForEndpointChanges ) 
+ + { 
+ + Gossiper . instance . register ( this ) ; 
+ + FailureDetector . instance . registerFailureDetectionEventListener ( this ) ; 
+ + registeredForEndpointChanges = true ; 
+ + } 
+ + 
+ + cleanupOldParentRepairSessions ( ) ; 
+ + 
+ + parentRepairSessions . put ( parentRepairSession , new ParentRepairSession ( coordinator , columnFamilyStores , ranges , System . currentTimeMillis ( ) ) ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Cleans up old failed parent repair sessions - if it is 24h old , we remove it from the map 
+ + * / 
+ + private void cleanupOldParentRepairSessions ( ) 
+ + { 
+ + long currentTime = System . currentTimeMillis ( ) ; 
+ + 
+ + Set < UUID > expired = new HashSet < > ( ) ; 
+ + for ( Map . Entry < UUID , ParentRepairSession > entry : parentRepairSessions . entrySet ( ) ) 
+ + { 
+ + ParentRepairSession session = entry . getValue ( ) ; 
+ + if ( session . failed & & currentTime - session . repairedAt > TimeUnit . HOURS . toMillis ( 24 ) ) 
+ + expired . add ( entry . getKey ( ) ) ; 
+ + } 
+ + for ( UUID remove : expired ) 
+ + parentRepairSessions . remove ( remove ) ; 
+ } 
+ 
+ public Set < SSTableReader > currentlyRepairing ( UUID cfId , UUID parentRepairSession ) 
+ @ @ - 359 , 7 + 394 , 13 @ @ public class ActiveRepairService 
+ 
+ public ParentRepairSession getParentRepairSession ( UUID parentSessionId ) 
+ { 
+ - return parentRepairSessions . get ( parentSessionId ) ; 
+ + ParentRepairSession session = parentRepairSessions . get ( parentSessionId ) ; 
+ + / / this can happen if a node thinks that the coordinator was down , but that coordinator got back before noticing 
+ + / / that it was down itself . 
+ + if ( session ! = null & & session . failed ) 
+ + throw new RuntimeException ( " Parent repair session with id = " + parentSessionId + " has failed . " ) ; 
+ + 
+ + return session ; 
+ } 
+ 
+ public synchronized ParentRepairSession removeParentRepairSession ( UUID parentSessionId ) 
+ @ @ - 427 , 17 + 468 , 34 @ @ public class ActiveRepairService 
+ public final Map < UUID , ColumnFamilyStore > columnFamilyStores = new HashMap < > ( ) ; 
+ public final Collection < Range < Token > > ranges ; 
+ public final Map < UUID , Set < String > > sstableMap = new HashMap < > ( ) ; 
+ + / * * 
+ + * used as fail time if failed is true 
+ + * / 
+ public final long repairedAt ; 
+ - 
+ - public ParentRepairSession ( List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , long repairedAt ) 
+ + public final InetAddress coordinator ; 
+ + / * * 
+ + * Used to mark a repair as failed - if the coordinator thinks that the repair is still ongoing and sends a 
+ + * request , we need to fail the coordinator as well . 
+ + * / 
+ + public final boolean failed ; 
+ + 
+ + public ParentRepairSession ( InetAddress coordinator , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , long repairedAt , boolean failed ) 
+ { 
+ + this . coordinator = coordinator ; 
+ for ( ColumnFamilyStore cfs : columnFamilyStores ) 
+ { 
+ + 
+ this . columnFamilyStores . put ( cfs . metadata . cfId , cfs ) ; 
+ sstableMap . put ( cfs . metadata . cfId , new HashSet < String > ( ) ) ; 
+ } 
+ this . ranges = ranges ; 
+ this . repairedAt = repairedAt ; 
+ + this . failed = failed ; 
+ + } 
+ + 
+ + public ParentRepairSession ( InetAddress coordinator , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , long repairedAt ) 
+ + { 
+ + this ( coordinator , columnFamilyStores , ranges , repairedAt , false ) ; 
+ } 
+ 
+ @ SuppressWarnings ( " resource " ) 
+ @ @ - 457 , 6 + 515 , 8 @ @ public class ActiveRepairService 
+ 
+ private Set < SSTableReader > getActiveSSTables ( UUID cfId ) 
+ { 
+ + if ( failed ) 
+ + return Collections . emptySet ( ) ; 
+ Set < String > repairedSSTables = sstableMap . get ( cfId ) ; 
+ Set < SSTableReader > activeSSTables = new HashSet < > ( ) ; 
+ Set < String > activeSSTableNames = new HashSet < > ( ) ; 
+ @ @ - 480 , 6 + 540 , 10 @ @ public class ActiveRepairService 
+ } 
+ } 
+ 
+ + public ParentRepairSession asFailed ( ) 
+ + { 
+ + return new ParentRepairSession ( coordinator , Collections . < ColumnFamilyStore > emptyList ( ) , Collections . < Range < Token > > emptyList ( ) , System . currentTimeMillis ( ) , true ) ; 
+ + } 
+ @ Override 
+ public String toString ( ) 
+ { 
+ @ @ - 491 , 4 + 555 , 61 @ @ public class ActiveRepairService 
+ ' } ' ; 
+ } 
+ } 
+ + 
+ + / * 
+ + If the coordinator node dies we should remove the parent repair session from the other nodes . 
+ + This uses the same notifications as we get in RepairSession 
+ + * / 
+ + public void onJoin ( InetAddress endpoint , EndpointState epState ) { } 
+ + public void beforeChange ( InetAddress endpoint , EndpointState currentState , ApplicationState newStateKey , VersionedValue newValue ) { } 
+ + public void onChange ( InetAddress endpoint , ApplicationState state , VersionedValue value ) { } 
+ + public void onAlive ( InetAddress endpoint , EndpointState state ) { } 
+ + public void onDead ( InetAddress endpoint , EndpointState state ) { } 
+ + 
+ + public void onRemove ( InetAddress endpoint ) 
+ + { 
+ + convict ( endpoint , Double . MAX _ VALUE ) ; 
+ + } 
+ + 
+ + public void onRestart ( InetAddress endpoint , EndpointState state ) 
+ + { 
+ + convict ( endpoint , Double . MAX _ VALUE ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Something has happened to a remote node - if that node is a coordinator , we mark the parent repair session id as failed . 
+ + * 
+ + * The fail marker is kept in the map for 24h to make sure that if the coordinator does not agree 
+ + * that the repair failed , we need to fail the entire repair session 
+ + * 
+ + * @ param ep endpoint to be convicted 
+ + * @ param phi the value of phi with with ep was convicted 
+ + * / 
+ + public void convict ( InetAddress ep , double phi ) 
+ + { 
+ + / / We want a higher confidence in the failure detection than usual because failing a repair wrongly has a high cost . 
+ + if ( phi < 2 * DatabaseDescriptor . getPhiConvictThreshold ( ) | | parentRepairSessions . isEmpty ( ) ) 
+ + return ; 
+ + 
+ + Set < UUID > toRemove = new HashSet < > ( ) ; 
+ + 
+ + for ( Map . Entry < UUID , ParentRepairSession > repairSessionEntry : parentRepairSessions . entrySet ( ) ) 
+ + { 
+ + if ( repairSessionEntry . getValue ( ) . coordinator . equals ( ep ) ) 
+ + { 
+ + toRemove . add ( repairSessionEntry . getKey ( ) ) ; 
+ + } 
+ + } 
+ + 
+ + if ( ! toRemove . isEmpty ( ) ) 
+ + { 
+ + logger . debug ( " Failing { } in parent repair sessions " , toRemove ) ; 
+ + for ( UUID id : toRemove ) 
+ + { 
+ + ParentRepairSession failed = parentRepairSessions . get ( id ) ; 
+ + parentRepairSessions . replace ( id , failed , failed . asFailed ( ) ) ; 
+ + } 
+ + } 
+ + } 
+ + 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index 507aedb . . eea4556 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 3013 , 7 + 3013 , 7 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ { 
+ try 
+ { 
+ - parentSession = ActiveRepairService . instance . prepareForRepair ( allNeighbors , ranges , columnFamilyStores ) ; 
+ + parentSession = ActiveRepairService . instance . prepareForRepair ( FBUtilities . getBroadcastAddress ( ) , allNeighbors , ranges , columnFamilyStores ) ; 
+ } 
+ catch ( Throwable t ) 
+ { 
+ diff - - git a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java 
+ index 749056c . . 6ec4c7b 100644 
+ - - - a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java 
+ @ @ - 108 , 7 + 108 , 7 @ @ public class LeveledCompactionStrategyTest extends SchemaLoader 
+ Range < Token > range = new Range < > ( Util . token ( " " ) , Util . token ( " " ) ) ; 
+ int gcBefore = keyspace . getColumnFamilyStore ( cfname ) . gcBefore ( System . currentTimeMillis ( ) ) ; 
+ UUID parentRepSession = UUID . randomUUID ( ) ; 
+ - ActiveRepairService . instance . registerParentRepairSession ( parentRepSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; 
+ + ActiveRepairService . instance . registerParentRepairSession ( parentRepSession , FBUtilities . getBroadcastAddress ( ) , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; 
+ RepairJobDesc desc = new RepairJobDesc ( parentRepSession , UUID . randomUUID ( ) , ksname , cfname , range ) ; 
+ Validator validator = new Validator ( desc , FBUtilities . getBroadcastAddress ( ) , gcBefore ) ; 
+ CompactionManager . instance . submitValidation ( cfs , validator ) . get ( ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / repair / DifferencerTest . java b / test / unit / org / apache / cassandra / repair / DifferencerTest . java 
+ index bc0f0de . . 3229c58 100644 
+ - - - a / test / unit / org / apache / cassandra / repair / DifferencerTest . java 
+ + + + b / test / unit / org / apache / cassandra / repair / DifferencerTest . java 
+ @ @ - 41 , 6 + 41 , 7 @ @ import org . apache . cassandra . sink . IMessageSink ; 
+ import org . apache . cassandra . sink . SinkManager ; 
+ import org . apache . cassandra . repair . messages . RepairMessage ; 
+ import org . apache . cassandra . repair . messages . SyncComplete ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . MerkleTree ; 
+ 
+ import static org . junit . Assert . assertEquals ; 
+ @ @ - 109 , 7 + 110 , 7 @ @ public class DifferencerTest extends SchemaLoader 
+ Keyspace keyspace = Keyspace . open ( " Keyspace1 " ) ; 
+ ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( " Standard1 " ) ; 
+ 
+ - ActiveRepairService . instance . registerParentRepairSession ( parentRepairSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; 
+ + ActiveRepairService . instance . registerParentRepairSession ( parentRepairSession , FBUtilities . getBroadcastAddress ( ) , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; 
+ 
+ RepairJobDesc desc = new RepairJobDesc ( parentRepairSession , UUID . randomUUID ( ) , " Keyspace1 " , " Standard1 " , range ) ; 
+ 
+ diff - - git a / test / unit / org / apache / cassandra / service / ActiveRepairServiceTest . java b / test / unit / org / apache / cassandra / service / ActiveRepairServiceTest . java 
+ index 419ea1a . . 26e5126 100644 
+ - - - a / test / unit / org / apache / cassandra / service / ActiveRepairServiceTest . java 
+ + + + b / test / unit / org / apache / cassandra / service / ActiveRepairServiceTest . java 
+ @ @ - 37 , 6 + 37 , 7 @ @ import org . apache . cassandra . db . Keyspace ; 
+ import org . apache . cassandra . db . Mutation ; 
+ import org . apache . cassandra . io . sstable . SSTableReader ; 
+ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ + import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . concurrent . Refs ; 
+ 
+ import static org . junit . Assert . assertEquals ; 
+ @ @ - 55 , 7 + 56 , 7 @ @ public class ActiveRepairServiceTest extends SchemaLoader 
+ Set < SSTableReader > original = store . getUnrepairedSSTables ( ) ; 
+ 
+ UUID prsId = UUID . randomUUID ( ) ; 
+ - ActiveRepairService . instance . registerParentRepairSession ( prsId , Collections . singletonList ( store ) , null ) ; 
+ + ActiveRepairService . instance . registerParentRepairSession ( prsId , FBUtilities . getBroadcastAddress ( ) , Collections . singletonList ( store ) , null ) ; 
+ ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( prsId ) ; 
+ 
+ / / add all sstables to parent repair session
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

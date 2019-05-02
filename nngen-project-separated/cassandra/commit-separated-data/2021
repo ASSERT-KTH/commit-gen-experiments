@@ -1,0 +1,730 @@
+BLEU SCORE: 0.03283637368030199
+
+TEST MSG: Mark sstables as repaired after full repair
+GENERATED MSG: merge from 0 . 7
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index db3b091 . . 3a8ada2 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 <nl> + * Mark sstables as repaired after full repair ( CASSANDRA - 7586 ) <nl> * Extend Descriptor to include a format value and refactor reader / writer apis ( CASSANDRA - 7443 ) <nl> * Integrate JMH for microbenchmarks ( CASSANDRA - 8151 ) <nl> * Keep sstable levels when bootstrapping ( CASSANDRA - 7460 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index 0e3131c . . 2a61b39 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 2151 , 8 + 2151 , 9 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> snapshotWithoutFlush ( snapshotName , null ) ; <nl> } <nl> <nl> - public void snapshotWithoutFlush ( String snapshotName , Predicate < SSTableReader > predicate ) <nl> + public Set < SSTableReader > snapshotWithoutFlush ( String snapshotName , Predicate < SSTableReader > predicate ) <nl> { <nl> + Set < SSTableReader > snapshottedSSTables = new HashSet < > ( ) ; <nl> for ( ColumnFamilyStore cfs : concatWithIndexes ( ) ) <nl> { <nl> DataTracker . View currentView = cfs . markCurrentViewReferenced ( ) ; <nl> @ @ - 2171 , 6 + 2172 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> filesJSONArr . add ( ssTable . descriptor . relativeFilenameFor ( Component . DATA ) ) ; <nl> if ( logger . isDebugEnabled ( ) ) <nl> logger . debug ( " Snapshot for { } keyspace data file { } created in { } " , keyspace , ssTable . getFilename ( ) , snapshotDirectory ) ; <nl> + snapshottedSSTables . add ( ssTable ) ; <nl> } <nl> <nl> writeSnapshotManifest ( filesJSONArr , snapshotName ) ; <nl> @ @ - 2180 , 6 + 2182 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> SSTableReader . releaseReferences ( currentView . sstables ) ; <nl> } <nl> } <nl> + return snapshottedSSTables ; <nl> } <nl> <nl> private void writeSnapshotManifest ( final JSONArray filesJSONArr , final String snapshotName ) <nl> @ @ - 2216 , 15 + 2219 , 15 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean <nl> * <nl> * @ param snapshotName the name of the associated with the snapshot <nl> * / <nl> - public void snapshot ( String snapshotName ) <nl> + public Set < SSTableReader > snapshot ( String snapshotName ) <nl> { <nl> - snapshot ( snapshotName , null ) ; <nl> + return snapshot ( snapshotName , null ) ; <nl> } <nl> <nl> - public void snapshot ( String snapshotName , Predicate < SSTableReader > predicate ) <nl> + public Set < SSTableReader > snapshot ( String snapshotName , Predicate < SSTableReader > predicate ) <nl> { <nl> forceBlockingFlush ( ) ; <nl> - snapshotWithoutFlush ( snapshotName , predicate ) ; <nl> + return snapshotWithoutFlush ( snapshotName , predicate ) ; <nl> } <nl> <nl> public boolean snapshotExists ( String snapshotName ) <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> index 18ad7ae . . 3ee36cd 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java <nl> @ @ - 903 , 8 + 903 , 11 @ @ public class CompactionManager implements CompactionManagerMBean <nl> if ( isSnapshotValidation ) <nl> { <nl> / / If there is a snapshot created for the session then read from there . <nl> + / / note that we populate the parent repair session when creating the snapshot , meaning the sstables in the snapshot are the ones we <nl> + / / are supposed to validate . <nl> sstables = cfs . getSnapshotSSTableReader ( snapshotName ) ; <nl> <nl> + <nl> / / Computing gcbefore based on the current time wouldn ' t be very good because we know each replica will execute <nl> / / this at a different time ( that ' s the whole purpose of repair with snaphsot ) . So instead we take the creation <nl> / / time of the snapshot , which should give us roughtly the same time on each replica ( roughtly being in that case <nl> @ @ - 915 , 12 + 918 , 21 @ @ public class CompactionManager implements CompactionManagerMBean <nl> { <nl> / / flush first so everyone is validating data that is as similar as possible <nl> StorageService . instance . forceKeyspaceFlush ( cfs . keyspace . getName ( ) , cfs . name ) ; <nl> - / / we don ' t mark validating sstables as compacting in DataTracker , so we have to mark them referenced <nl> - / / instead so they won ' t be cleaned up if they do get compacted during the validation <nl> - if ( validator . desc . parentSessionId = = null | | ActiveRepairService . instance . getParentRepairSession ( validator . desc . parentSessionId ) = = null ) <nl> - sstables = cfs . markCurrentSSTablesReferenced ( ) ; <nl> - else <nl> - sstables = ActiveRepairService . instance . getParentRepairSession ( validator . desc . parentSessionId ) . getAndReferenceSSTables ( cfs . metadata . cfId ) ; <nl> + ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( validator . desc . parentSessionId ) ; <nl> + Set < SSTableReader > sstablesToValidate = new HashSet < > ( ) ; <nl> + for ( SSTableReader sstable : cfs . getSSTables ( ) ) <nl> + { <nl> + if ( new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Arrays . asList ( validator . desc . range ) ) ) <nl> + { <nl> + if ( ! prs . isIncremental | | ! sstable . isRepaired ( ) ) <nl> + { <nl> + sstablesToValidate . add ( sstable ) ; <nl> + } <nl> + } <nl> + } <nl> + prs . addSSTables ( cfs . metadata . cfId , sstablesToValidate ) ; <nl> + <nl> + sstables = prs . getAndReferenceSSTablesInRange ( cfs . metadata . cfId , validator . desc . range ) ; <nl> <nl> if ( validator . gcBefore > 0 ) <nl> gcBefore = validator . gcBefore ; <nl> diff - - git a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java <nl> index 2ad8dc2 . . f9180c2 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java <nl> + + + b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java <nl> @ @ - 18 , 12 + 18 , 18 @ @ <nl> package org . apache . cassandra . repair ; <nl> <nl> import java . util . ArrayList ; <nl> + import java . util . Collection ; <nl> import java . util . Collections ; <nl> import java . util . List ; <nl> + import java . util . Set ; <nl> import java . util . UUID ; <nl> import java . util . concurrent . Future ; <nl> <nl> import com . google . common . base . Predicate ; <nl> + <nl> + import org . apache . cassandra . dht . Bounds ; <nl> + import org . apache . cassandra . dht . Range ; <nl> + import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . io . sstable . format . SSTableReader ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 32 , 10 + 38 , 7 @ @ import org . apache . cassandra . config . Schema ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . db . Keyspace ; <nl> import org . apache . cassandra . db . compaction . CompactionManager ; <nl> - import org . apache . cassandra . dht . Bounds ; <nl> import org . apache . cassandra . dht . LocalPartitioner ; <nl> - import org . apache . cassandra . dht . Range ; <nl> - import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . net . IVerbHandler ; <nl> import org . apache . cassandra . net . MessageIn ; <nl> import org . apache . cassandra . net . MessageOut ; <nl> @ @ - 61 , 6 + 64 , 7 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > <nl> { <nl> case PREPARE _ MESSAGE : <nl> PrepareMessage prepareMessage = ( PrepareMessage ) message . payload ; <nl> + logger . debug ( " Preparing , { } " , prepareMessage ) ; <nl> List < ColumnFamilyStore > columnFamilyStores = new ArrayList < > ( prepareMessage . cfIds . size ( ) ) ; <nl> for ( UUID cfId : prepareMessage . cfIds ) <nl> { <nl> @ @ - 70 , 14 + 74 , 16 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > <nl> } <nl> ActiveRepairService . instance . registerParentRepairSession ( prepareMessage . parentRepairSession , <nl> columnFamilyStores , <nl> - prepareMessage . ranges ) ; <nl> + prepareMessage . ranges , <nl> + prepareMessage . isIncremental ) ; <nl> MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; <nl> break ; <nl> <nl> case SNAPSHOT : <nl> + logger . debug ( " Snapshotting { } " , desc ) ; <nl> ColumnFamilyStore cfs = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; <nl> final Range < Token > repairingRange = desc . range ; <nl> - cfs . snapshot ( desc . sessionId . toString ( ) , new Predicate < SSTableReader > ( ) <nl> + Set < SSTableReader > snapshottedSSSTables = cfs . snapshot ( desc . sessionId . toString ( ) , new Predicate < SSTableReader > ( ) <nl> { <nl> public boolean apply ( SSTableReader sstable ) <nl> { <nl> @ @ - 86 , 13 + 92 , 14 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > <nl> new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Collections . singleton ( repairingRange ) ) ; <nl> } <nl> } ) ; <nl> - <nl> + ActiveRepairService . instance . getParentRepairSession ( desc . parentSessionId ) . addSSTables ( cfs . metadata . cfId , snapshottedSSSTables ) ; <nl> logger . debug ( " Enqueuing response to snapshot request { } to { } " , desc . sessionId , message . from ) ; <nl> MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; <nl> break ; <nl> <nl> case VALIDATION _ REQUEST : <nl> ValidationRequest validationRequest = ( ValidationRequest ) message . payload ; <nl> + logger . debug ( " Validating { } " , validationRequest ) ; <nl> / / trigger read - only compaction <nl> ColumnFamilyStore store = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; <nl> <nl> @ @ - 103 , 7 + 110 , 7 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > <nl> case SYNC _ REQUEST : <nl> / / forwarded sync request <nl> SyncRequest request = ( SyncRequest ) message . payload ; <nl> - <nl> + logger . debug ( " Syncing { } " , request ) ; <nl> long repairedAt = ActiveRepairService . UNREPAIRED _ SSTABLE ; <nl> if ( desc . parentSessionId ! = null & & ActiveRepairService . instance . getParentRepairSession ( desc . parentSessionId ) ! = null ) <nl> repairedAt = ActiveRepairService . instance . getParentRepairSession ( desc . parentSessionId ) . repairedAt ; <nl> @ @ - 113 , 8 + 120 , 8 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > <nl> break ; <nl> <nl> case ANTICOMPACTION _ REQUEST : <nl> - logger . debug ( " Got anticompaction request " ) ; <nl> AnticompactionRequest anticompactionRequest = ( AnticompactionRequest ) message . payload ; <nl> + logger . debug ( " Got anticompaction request { } " , anticompactionRequest ) ; <nl> try <nl> { <nl> List < Future < ? > > futures = ActiveRepairService . instance . doAntiCompaction ( anticompactionRequest . parentRepairSession ) ; <nl> diff - - git a / src / java / org / apache / cassandra / repair / messages / AnticompactionRequest . java b / src / java / org / apache / cassandra / repair / messages / AnticompactionRequest . java <nl> index 34ea5a5 . . 1a13ad1 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / messages / AnticompactionRequest . java <nl> + + + b / src / java / org / apache / cassandra / repair / messages / AnticompactionRequest . java <nl> @ @ - 53 , 4 + 53 , 12 @ @ public class AnticompactionRequest extends RepairMessage <nl> return UUIDSerializer . serializer . serializedSize ( message . parentRepairSession , version ) ; <nl> } <nl> } <nl> + <nl> + @ Override <nl> + public String toString ( ) <nl> + { <nl> + return " AnticompactionRequest { " + <nl> + " parentRepairSession = " + parentRepairSession + <nl> + " } " + super . toString ( ) ; <nl> + } <nl> } <nl> \ No newline at end of file <nl> diff - - git a / src / java / org / apache / cassandra / repair / messages / PrepareMessage . java b / src / java / org / apache / cassandra / repair / messages / PrepareMessage . java <nl> index 5699677 . . 035ccc4 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / messages / PrepareMessage . java <nl> + + + b / src / java / org / apache / cassandra / repair / messages / PrepareMessage . java <nl> @ @ - 38 , 13 + 38 , 15 @ @ public class PrepareMessage extends RepairMessage <nl> public final Collection < Range < Token > > ranges ; <nl> <nl> public final UUID parentRepairSession ; <nl> + public final boolean isIncremental ; <nl> <nl> - public PrepareMessage ( UUID parentRepairSession , List < UUID > cfIds , Collection < Range < Token > > ranges ) <nl> + public PrepareMessage ( UUID parentRepairSession , List < UUID > cfIds , Collection < Range < Token > > ranges , boolean isIncremental ) <nl> { <nl> super ( Type . PREPARE _ MESSAGE , null ) ; <nl> this . parentRepairSession = parentRepairSession ; <nl> this . cfIds = cfIds ; <nl> this . ranges = ranges ; <nl> + this . isIncremental = isIncremental ; <nl> } <nl> <nl> public static class PrepareMessageSerializer implements MessageSerializer < PrepareMessage > <nl> @ @ - 58 , 6 + 60 , 7 @ @ public class PrepareMessage extends RepairMessage <nl> out . writeInt ( message . ranges . size ( ) ) ; <nl> for ( Range r : message . ranges ) <nl> Range . serializer . serialize ( r , out , version ) ; <nl> + out . writeBoolean ( message . isIncremental ) ; <nl> } <nl> <nl> public PrepareMessage deserialize ( DataInput in , int version ) throws IOException <nl> @ @ - 71 , 7 + 74 , 8 @ @ public class PrepareMessage extends RepairMessage <nl> List < Range < Token > > ranges = new ArrayList < > ( rangeCount ) ; <nl> for ( int i = 0 ; i < rangeCount ; i + + ) <nl> ranges . add ( ( Range < Token > ) Range . serializer . deserialize ( in , version ) . toTokenBounds ( ) ) ; <nl> - return new PrepareMessage ( parentRepairSession , cfIds , ranges ) ; <nl> + boolean isIncremental = in . readBoolean ( ) ; <nl> + return new PrepareMessage ( parentRepairSession , cfIds , ranges , isIncremental ) ; <nl> } <nl> <nl> public long serializedSize ( PrepareMessage message , int version ) <nl> @ @ - 85 , 6 + 89 , 7 @ @ public class PrepareMessage extends RepairMessage <nl> size + = sizes . sizeof ( message . ranges . size ( ) ) ; <nl> for ( Range r : message . ranges ) <nl> size + = Range . serializer . serializedSize ( r , version ) ; <nl> + size + = sizes . sizeof ( message . isIncremental ) ; <nl> return size ; <nl> } <nl> } <nl> @ @ - 96 , 6 + 101 , 7 @ @ public class PrepareMessage extends RepairMessage <nl> " cfIds = ' " + cfIds + ' \ ' ' + <nl> " , ranges = " + ranges + <nl> " , parentRepairSession = " + parentRepairSession + <nl> + " , isIncremental = " + isIncremental + <nl> ' } ' ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / repair / messages / RepairOption . java b / src / java / org / apache / cassandra / repair / messages / RepairOption . java <nl> index ca02365 . . 63446e5 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / messages / RepairOption . java <nl> + + + b / src / java / org / apache / cassandra / repair / messages / RepairOption . java <nl> @ @ - 211 , 13 + 211 , 6 @ @ public class RepairOption <nl> <nl> public RepairOption ( boolean sequential , boolean primaryRange , boolean incremental , int jobThreads , Collection < Range < Token > > ranges ) <nl> { <nl> - if ( sequential & & incremental ) <nl> - { <nl> - String message = " It is not possible to mix sequential repair and incremental repairs . " ; <nl> - logger . error ( message ) ; <nl> - throw new IllegalArgumentException ( message ) ; <nl> - } <nl> - <nl> if ( ! FBUtilities . isUnix ( ) & & sequential ) <nl> { <nl> logger . warn ( " Snapshot - based repair is not yet supported on Windows . Reverting to parallel repair . " ) ; <nl> diff - - git a / src / java / org / apache / cassandra / repair / messages / SyncRequest . java b / src / java / org / apache / cassandra / repair / messages / SyncRequest . java <nl> index e677cd8 . . c4d0ab6 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / messages / SyncRequest . java <nl> + + + b / src / java / org / apache / cassandra / repair / messages / SyncRequest . java <nl> @ @ - 92 , 4 + 92 , 15 @ @ public class SyncRequest extends RepairMessage <nl> return size ; <nl> } <nl> } <nl> + <nl> + @ Override <nl> + public String toString ( ) <nl> + { <nl> + return " SyncRequest { " + <nl> + " initiator = " + initiator + <nl> + " , src = " + src + <nl> + " , dst = " + dst + <nl> + " , ranges = " + ranges + <nl> + " } " + super . toString ( ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / repair / messages / ValidationRequest . java b / src / java / org / apache / cassandra / repair / messages / ValidationRequest . java <nl> index c73b708 . . 43bcf23 100644 <nl> - - - a / src / java / org / apache / cassandra / repair / messages / ValidationRequest . java <nl> + + + b / src / java / org / apache / cassandra / repair / messages / ValidationRequest . java <nl> @ @ - 42 , 6 + 42 , 14 @ @ public class ValidationRequest extends RepairMessage <nl> } <nl> <nl> @ Override <nl> + public String toString ( ) <nl> + { <nl> + return " ValidationRequest { " + <nl> + " gcBefore = " + gcBefore + <nl> + " } " + super . toString ( ) ; <nl> + } <nl> + <nl> + @ Override <nl> public boolean equals ( Object o ) <nl> { <nl> if ( this = = o ) return true ; <nl> diff - - git a / src / java / org / apache / cassandra / service / ActiveRepairService . java b / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> index fa354e6 . . 08cef5c 100644 <nl> - - - a / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> + + + b / src / java / org / apache / cassandra / service / ActiveRepairService . java <nl> @ @ - 228 , 10 + 228 , 10 @ @ public class ActiveRepairService <nl> return neighbors ; <nl> } <nl> <nl> - public UUID prepareForRepair ( Set < InetAddress > endpoints , Collection < Range < Token > > ranges , List < ColumnFamilyStore > columnFamilyStores ) <nl> + public UUID prepareForRepair ( Set < InetAddress > endpoints , RepairOption options , List < ColumnFamilyStore > columnFamilyStores ) <nl> { <nl> UUID parentRepairSession = UUIDGen . getTimeUUID ( ) ; <nl> - registerParentRepairSession ( parentRepairSession , columnFamilyStores , ranges ) ; <nl> + registerParentRepairSession ( parentRepairSession , columnFamilyStores , options . getRanges ( ) , options . isIncremental ( ) ) ; <nl> final CountDownLatch prepareLatch = new CountDownLatch ( endpoints . size ( ) ) ; <nl> final AtomicBoolean status = new AtomicBoolean ( true ) ; <nl> IAsyncCallbackWithFailure callback = new IAsyncCallbackWithFailure ( ) <nl> @ @ - 259 , 7 + 259 , 7 @ @ public class ActiveRepairService <nl> <nl> for ( InetAddress neighbour : endpoints ) <nl> { <nl> - PrepareMessage message = new PrepareMessage ( parentRepairSession , cfIds , ranges ) ; <nl> + PrepareMessage message = new PrepareMessage ( parentRepairSession , cfIds , options . getRanges ( ) , options . isIncremental ( ) ) ; <nl> MessageOut < RepairMessage > msg = message . createMessage ( ) ; <nl> MessagingService . instance ( ) . sendRRWithFailure ( msg , neighbour , callback ) ; <nl> } <nl> @ @ - 282 , 25 + 282 , 9 @ @ public class ActiveRepairService <nl> return parentRepairSession ; <nl> } <nl> <nl> - public void registerParentRepairSession ( UUID parentRepairSession , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges ) <nl> + public void registerParentRepairSession ( UUID parentRepairSession , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , boolean isIncremental ) <nl> { <nl> - Map < UUID , Set < SSTableReader > > sstablesToRepair = new HashMap < > ( ) ; <nl> - for ( ColumnFamilyStore cfs : columnFamilyStores ) <nl> - { <nl> - Set < SSTableReader > sstables = new HashSet < > ( ) ; <nl> - for ( SSTableReader sstable : cfs . getSSTables ( ) ) <nl> - { <nl> - if ( new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( ranges ) ) <nl> - { <nl> - if ( ! sstable . isRepaired ( ) ) <nl> - { <nl> - sstables . add ( sstable ) ; <nl> - } <nl> - } <nl> - } <nl> - sstablesToRepair . put ( cfs . metadata . cfId , sstables ) ; <nl> - } <nl> - parentRepairSessions . put ( parentRepairSession , new ParentRepairSession ( columnFamilyStores , ranges , sstablesToRepair , System . currentTimeMillis ( ) ) ) ; <nl> + parentRepairSessions . put ( parentRepairSession , new ParentRepairSession ( columnFamilyStores , ranges , isIncremental , System . currentTimeMillis ( ) ) ) ; <nl> } <nl> <nl> public void finishParentSession ( UUID parentSession , Set < InetAddress > neighbors ) <nl> @ @ - 379 , 18 + 363 , 28 @ @ public class ActiveRepairService <nl> <nl> public static class ParentRepairSession <nl> { <nl> - public final Map < UUID , ColumnFamilyStore > columnFamilyStores = new HashMap < > ( ) ; <nl> - public final Collection < Range < Token > > ranges ; <nl> - public final Map < UUID , Set < SSTableReader > > sstableMap ; <nl> + private final Map < UUID , ColumnFamilyStore > columnFamilyStores = new HashMap < > ( ) ; <nl> + private final Collection < Range < Token > > ranges ; <nl> + private final Map < UUID , Set < SSTableReader > > sstableMap = new HashMap < > ( ) ; <nl> public final long repairedAt ; <nl> + public final boolean isIncremental ; <nl> <nl> - public ParentRepairSession ( List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , Map < UUID , Set < SSTableReader > > sstables , long repairedAt ) <nl> + public ParentRepairSession ( List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , boolean isIncremental , long repairedAt ) <nl> { <nl> for ( ColumnFamilyStore cfs : columnFamilyStores ) <nl> this . columnFamilyStores . put ( cfs . metadata . cfId , cfs ) ; <nl> this . ranges = ranges ; <nl> - this . sstableMap = sstables ; <nl> this . repairedAt = repairedAt ; <nl> + this . isIncremental = isIncremental ; <nl> + } <nl> + <nl> + public void addSSTables ( UUID cfId , Set < SSTableReader > sstables ) <nl> + { <nl> + Set < SSTableReader > existingSSTables = this . sstableMap . get ( cfId ) ; <nl> + if ( existingSSTables = = null ) <nl> + existingSSTables = new HashSet < > ( ) ; <nl> + existingSSTables . addAll ( sstables ) ; <nl> + this . sstableMap . put ( cfId , sstables ) ; <nl> } <nl> <nl> public synchronized Collection < SSTableReader > getAndReferenceSSTables ( UUID cfId ) <nl> @ @ - 412 , 5 + 406 , 20 @ @ public class ActiveRepairService <nl> } <nl> return sstables ; <nl> } <nl> + <nl> + public synchronized Set < SSTableReader > getAndReferenceSSTablesInRange ( UUID cfId , Range < Token > range ) <nl> + { <nl> + Collection < SSTableReader > allSSTables = getAndReferenceSSTables ( cfId ) ; <nl> + Set < SSTableReader > sstables = new HashSet < > ( ) ; <nl> + for ( SSTableReader sstable : allSSTables ) <nl> + { <nl> + if ( new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Arrays . asList ( range ) ) ) <nl> + sstables . add ( sstable ) ; <nl> + else <nl> + sstable . releaseReference ( ) ; <nl> + } <nl> + return sstables ; <nl> + <nl> + } <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index a26858a . . ea21f3d 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 2624 , 14 + 2624 , 6 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> logger . info ( message ) ; <nl> sendNotification ( " repair " , message , new int [ ] { cmd , ActiveRepairService . Status . STARTED . ordinal ( ) } ) ; <nl> <nl> - if ( options . isSequential ( ) & & options . isIncremental ( ) ) <nl> - { <nl> - message = " It is not possible to mix sequential repair and incremental repairs . " ; <nl> - logger . error ( message ) ; <nl> - sendNotification ( " repair " , message , new int [ ] { cmd , ActiveRepairService . Status . FINISHED . ordinal ( ) } ) ; <nl> - return ; <nl> - } <nl> - <nl> final Set < InetAddress > allNeighbors = new HashSet < > ( ) ; <nl> Map < Range , Set < InetAddress > > rangeToNeighbors = new HashMap < > ( ) ; <nl> for ( Range < Token > range : options . getRanges ( ) ) <nl> @ @ - 2664 , 23 + 2656 , 16 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> } <nl> <nl> final UUID parentSession ; <nl> - long repairedAt = ActiveRepairService . UNREPAIRED _ SSTABLE ; <nl> - if ( options . isIncremental ( ) ) <nl> + long repairedAt ; <nl> + try <nl> { <nl> - try <nl> - { <nl> - parentSession = ActiveRepairService . instance . prepareForRepair ( allNeighbors , options . getRanges ( ) , columnFamilyStores ) ; <nl> - repairedAt = ActiveRepairService . instance . getParentRepairSession ( parentSession ) . repairedAt ; <nl> - } <nl> - catch ( Throwable t ) <nl> - { <nl> - sendNotification ( " repair " , String . format ( " Repair failed with error % s " , t . getMessage ( ) ) , new int [ ] { cmd , ActiveRepairService . Status . FINISHED . ordinal ( ) } ) ; <nl> - return ; <nl> - } <nl> + parentSession = ActiveRepairService . instance . prepareForRepair ( allNeighbors , options , columnFamilyStores ) ; <nl> + repairedAt = ActiveRepairService . instance . getParentRepairSession ( parentSession ) . repairedAt ; <nl> } <nl> - else <nl> + catch ( Throwable t ) <nl> { <nl> - parentSession = null ; <nl> + sendNotification ( " repair " , String . format ( " Repair failed with error % s " , t . getMessage ( ) ) , new int [ ] { cmd , ActiveRepairService . Status . FINISHED . ordinal ( ) } ) ; <nl> + return ; <nl> } <nl> <nl> / / Set up RepairJob executor for this repair command . <nl> @ @ - 2736 , 16 + 2721 , 13 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> { <nl> public void onSuccess ( @ Nullable Object result ) <nl> { <nl> - if ( options . isIncremental ( ) ) <nl> + try <nl> { <nl> - try <nl> - { <nl> - ActiveRepairService . instance . finishParentSession ( parentSession , allNeighbors ) ; <nl> - } <nl> - catch ( Exception e ) <nl> - { <nl> - logger . error ( " Error in incremental repair " , e ) ; <nl> - } <nl> + ActiveRepairService . instance . finishParentSession ( parentSession , allNeighbors ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + logger . error ( " Error in incremental repair " , e ) ; <nl> } <nl> repairComplete ( ) ; <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java <nl> index a999025 . . 3cd2ea8 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java <nl> @ @ - 175 , 7 + 175 , 7 @ @ public class LeveledCompactionStrategyTest <nl> Range < Token > range = new Range < > ( Util . token ( " " ) , Util . token ( " " ) ) ; <nl> int gcBefore = keyspace . getColumnFamilyStore ( CF _ STANDARDDLEVELED ) . gcBefore ( System . currentTimeMillis ( ) ) ; <nl> UUID parentRepSession = UUID . randomUUID ( ) ; <nl> - ActiveRepairService . instance . registerParentRepairSession ( parentRepSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; <nl> + ActiveRepairService . instance . registerParentRepairSession ( parentRepSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) , false ) ; <nl> RepairJobDesc desc = new RepairJobDesc ( parentRepSession , UUID . randomUUID ( ) , KEYSPACE1 , CF _ STANDARDDLEVELED , range ) ; <nl> Validator validator = new Validator ( desc , FBUtilities . getBroadcastAddress ( ) , gcBefore ) ; <nl> CompactionManager . instance . submitValidation ( cfs , validator ) . get ( ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / repair / LocalSyncTaskTest . java b / test / unit / org / apache / cassandra / repair / LocalSyncTaskTest . java <nl> index b3d333a . . 1d11334 100644 <nl> - - - a / test / unit / org / apache / cassandra / repair / LocalSyncTaskTest . java <nl> + + + b / test / unit / org / apache / cassandra / repair / LocalSyncTaskTest . java <nl> @ @ - 89 , 7 + 89 , 7 @ @ public class LocalSyncTaskTest extends SchemaLoader <nl> Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; <nl> ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( " Standard1 " ) ; <nl> <nl> - ActiveRepairService . instance . registerParentRepairSession ( parentRepairSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; <nl> + ActiveRepairService . instance . registerParentRepairSession ( parentRepairSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) , false ) ; <nl> <nl> RepairJobDesc desc = new RepairJobDesc ( parentRepairSession , UUID . randomUUID ( ) , KEYSPACE1 , " Standard1 " , range ) ; <nl>
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index eec904a . . 982454c 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 59 , 6 + 59 , 8 @ @ <nl> the old ones ( CASSANDRA - 1644 ) <nl> * upgrade to Thrift 0 . 5 ( CASSANDRA - 1367 ) <nl> * renamed CL . DCQUORUM to LOCAL _ QUORUM and DCQUORUMSYNC to EACH _ QUORUM <nl> + * cli truncate support ( CASSANDRA - 1653 ) <nl> + * update GC settings in cassandra . bat ( CASSANDRA - 1636 ) <nl> <nl> <nl> 0 . 7 - beta2 <nl> diff - - git a / src / java / org / apache / cassandra / cli / Cli . g b / src / java / org / apache / cassandra / cli / Cli . g <nl> index e59c608 . . a9229ee 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / Cli . g <nl> + + + b / src / java / org / apache / cassandra / cli / Cli . g <nl> @ @ - 55 , 6 + 55 , 7 @ @ tokens { <nl> NODE _ UPDATE _ KEYSPACE ; <nl> NODE _ UPDATE _ COLUMN _ FAMILY ; <nl> NODE _ LIST ; <nl> + NODE _ TRUNCATE ; <nl> <nl> / / Internal Nodes . <nl> NODE _ COLUMN _ ACCESS ; <nl> @ @ - 123 , 6 + 124 , 7 @ @ statement <nl> | setStatement <nl> | showStatement <nl> | listStatement <nl> + | truncateStatement <nl> | - > ^ ( NODE _ NO _ OP ) <nl> ; <nl> <nl> @ @ - 174 , 6 + 176 , 8 @ @ helpStatement <nl> - > ^ ( NODE _ HELP NODE _ THRIFT _ COUNT ) <nl> | K _ HELP K _ LIST <nl> - > ^ ( NODE _ HELP NODE _ LIST ) <nl> + | K _ HELP K _ TRUNCATE <nl> + - > ^ ( NODE _ HELP NODE _ TRUNCATE ) <nl> | K _ HELP <nl> - > ^ ( NODE _ HELP ) <nl> | ' ? ' <nl> @ @ - 231 , 6 + 235 , 11 @ @ listStatement <nl> - > ^ ( NODE _ LIST columnFamily keyRangeExpr ? ^ ( NODE _ LIMIT $ limit ) ? ) <nl> ; <nl> <nl> + truncateStatement <nl> + : K _ TRUNCATE columnFamily <nl> + - > ^ ( NODE _ TRUNCATE columnFamily ) <nl> + ; <nl> + <nl> showClusterName <nl> : K _ SHOW K _ CLUSTER K _ NAME <nl> - > ^ ( NODE _ SHOW _ CLUSTER _ NAME ) <nl> @ @ - 430 , 6 + 439 , 7 @ @ K _ AND : ' AND ' ; <nl> K _ UPDATE : ' UPDATE ' ; <nl> K _ LIST : ' LIST ' ; <nl> K _ LIMIT : ' LIMIT ' ; <nl> + K _ TRUNCATE : ' TRUNCATE ' ; <nl> <nl> / / private syntactic rules <nl> fragment <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliClient . java b / src / java / org / apache / cassandra / cli / CliClient . java <nl> index b6ace98 . . b63105a 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliClient . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliClient . java <nl> @ @ - 171 , 6 + 171 , 9 @ @ public class CliClient extends CliUserHelp <nl> case CliParser . NODE _ LIST : <nl> executeList ( tree ) ; <nl> break ; <nl> + case CliParser . NODE _ TRUNCATE : <nl> + executeTruncate ( tree . getChild ( 0 ) . getText ( ) ) ; <nl> + break ; <nl> case CliParser . NODE _ NO _ OP : <nl> / / comment lines come here ; they are treated as no ops . <nl> break ; <nl> @ @ - 943 , 6 + 946 , 30 @ @ public class CliClient extends CliUserHelp <nl> printSliceList ( columnFamilyDef , keySlices ) ; <nl> } <nl> <nl> + / / TRUNCATE < columnFamily > <nl> + private void executeTruncate ( String columnFamily ) <nl> + { <nl> + if ( ! CliMain . isConnected ( ) | | ! hasKeySpace ( ) ) <nl> + return ; <nl> + <nl> + / / getting CfDef , it will fail if there is no such column family in current keySpace . <nl> + CfDef cfDef = getCfDef ( columnFamily ) ; <nl> + <nl> + try <nl> + { <nl> + thriftClient . truncate ( cfDef . getName ( ) ) ; <nl> + sessionState . out . println ( columnFamily + " truncated . " ) ; <nl> + } <nl> + catch ( InvalidRequestException e ) <nl> + { <nl> + throw new RuntimeException ( e . getWhy ( ) ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new RuntimeException ( e . getMessage ( ) ) ; <nl> + } <nl> + } <nl> + <nl> / / SHOW API VERSION <nl> private void executeShowVersion ( ) throws TException <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliCompleter . java b / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> index f541fe5 . . b033d8f 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> @ @ - 55 , 12 + 55 , 16 @ @ public class CliCompleter extends SimpleCompletor <nl> " help set " , <nl> " help del " , <nl> " help count " , <nl> + " help list " , <nl> + " help truncate " <nl> } ; <nl> private static String [ ] keyspaceCommands = { <nl> " get " , <nl> " set " , <nl> " count " , <nl> - " del " <nl> + " del " , <nl> + " list " , <nl> + " truncate " <nl> } ; <nl> <nl> public CliCompleter ( ) <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliUserHelp . java b / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> index 7c512e2 . . db6a779 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> @ @ - 281 , 6 + 281 , 13 @ @ public class CliUserHelp { <nl> state . out . println ( " list Users [ j : ] limit 40 " ) ; <nl> break ; <nl> <nl> + case CliParser . NODE _ TRUNCATE : <nl> + state . out . println ( " truncate < column _ family > " ) ; <nl> + state . out . println ( " Truncate specified column family . \ n " ) ; <nl> + state . out . println ( " example : " ) ; <nl> + state . out . println ( " truncate Category " ) ; <nl> + break ; <nl> + <nl> default : <nl> state . out . println ( " ? " ) ; <nl> break ; <nl> @ @ - 324 , 7 + 331 , 8 @ @ public class CliUserHelp { <nl> state . out . println ( " del < cf > [ ' < key > ' ] [ ' < super > ' ] [ ' < col > ' ] Delete sub column . " ) ; <nl> state . out . println ( " count < cf > [ ' < key > ' ] Count columns in record . " ) ; <nl> state . out . println ( " count < cf > [ ' < key > ' ] [ ' < super > ' ] Count columns in a super column . " ) ; <nl> - state . out . println ( " list < cf > List all rows in the column family . " ) ; <nl> + state . out . println ( " truncate < column _ family > Truncate specified column family . " ) ; <nl> + state . out . println ( " list < cf > List all rows in the column family . " ) ; <nl> state . out . println ( " list < cf > [ < startKey > : ] " ) ; <nl> state . out . println ( " List rows in the column family beginning with < startKey > . " ) ; <nl> state . out . println ( " list < cf > [ < startKey > : < endKey > ] " ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / cli / CliTest . java b / test / unit / org / apache / cassandra / cli / CliTest . java <nl> index 24a3de0 . . eddcafd 100644 <nl> - - - a / test / unit / org / apache / cassandra / cli / CliTest . java <nl> + + + b / test / unit / org / apache / cassandra / cli / CliTest . java <nl> @ @ - 52 , 6 + 52 , 7 @ @ public class CliTest extends TestCase <nl> " list CF3 [ h : ] " , <nl> " list CF3 limit 10 " , <nl> " list CF3 [ h : g ] limit 10 " , <nl> + " truncate CF1 " , <nl> " update keyspace TestKeySpace with placement _ strategy = ' org . apache . cassandra . locator . LocalStrategy ' " , <nl> " update keyspace TestKeySpace with replication _ factor = 1 and strategy _ options = [ { DC1 : 3 , DC2 : 4 , DC5 : 1 } ] " <nl> } ; <nl> @ @ - 101 , 6 + 102 , 10 @ @ public class CliTest extends TestCase <nl> assertTrue ( result . startsWith ( " = > ( column = " ) ) ; <nl> } <nl> } <nl> + else if ( statement . startsWith ( " truncate " ) ) <nl> + { <nl> + assertTrue ( result . contains ( " truncated . " ) ) ; <nl> + } <nl> <nl> outStream . reset ( ) ; / / reset stream so we have only output from next statement all the time <nl> errStream . reset ( ) ; / / no errors to the end user .
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index db3b091 . . 3a8ada2 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 
+ + * Mark sstables as repaired after full repair ( CASSANDRA - 7586 ) 
+ * Extend Descriptor to include a format value and refactor reader / writer apis ( CASSANDRA - 7443 ) 
+ * Integrate JMH for microbenchmarks ( CASSANDRA - 8151 ) 
+ * Keep sstable levels when bootstrapping ( CASSANDRA - 7460 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index 0e3131c . . 2a61b39 100644 
+ - - - a / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / java / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 2151 , 8 + 2151 , 9 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ snapshotWithoutFlush ( snapshotName , null ) ; 
+ } 
+ 
+ - public void snapshotWithoutFlush ( String snapshotName , Predicate < SSTableReader > predicate ) 
+ + public Set < SSTableReader > snapshotWithoutFlush ( String snapshotName , Predicate < SSTableReader > predicate ) 
+ { 
+ + Set < SSTableReader > snapshottedSSTables = new HashSet < > ( ) ; 
+ for ( ColumnFamilyStore cfs : concatWithIndexes ( ) ) 
+ { 
+ DataTracker . View currentView = cfs . markCurrentViewReferenced ( ) ; 
+ @ @ - 2171 , 6 + 2172 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ filesJSONArr . add ( ssTable . descriptor . relativeFilenameFor ( Component . DATA ) ) ; 
+ if ( logger . isDebugEnabled ( ) ) 
+ logger . debug ( " Snapshot for { } keyspace data file { } created in { } " , keyspace , ssTable . getFilename ( ) , snapshotDirectory ) ; 
+ + snapshottedSSTables . add ( ssTable ) ; 
+ } 
+ 
+ writeSnapshotManifest ( filesJSONArr , snapshotName ) ; 
+ @ @ - 2180 , 6 + 2182 , 7 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ SSTableReader . releaseReferences ( currentView . sstables ) ; 
+ } 
+ } 
+ + return snapshottedSSTables ; 
+ } 
+ 
+ private void writeSnapshotManifest ( final JSONArray filesJSONArr , final String snapshotName ) 
+ @ @ - 2216 , 15 + 2219 , 15 @ @ public class ColumnFamilyStore implements ColumnFamilyStoreMBean 
+ * 
+ * @ param snapshotName the name of the associated with the snapshot 
+ * / 
+ - public void snapshot ( String snapshotName ) 
+ + public Set < SSTableReader > snapshot ( String snapshotName ) 
+ { 
+ - snapshot ( snapshotName , null ) ; 
+ + return snapshot ( snapshotName , null ) ; 
+ } 
+ 
+ - public void snapshot ( String snapshotName , Predicate < SSTableReader > predicate ) 
+ + public Set < SSTableReader > snapshot ( String snapshotName , Predicate < SSTableReader > predicate ) 
+ { 
+ forceBlockingFlush ( ) ; 
+ - snapshotWithoutFlush ( snapshotName , predicate ) ; 
+ + return snapshotWithoutFlush ( snapshotName , predicate ) ; 
+ } 
+ 
+ public boolean snapshotExists ( String snapshotName ) 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ index 18ad7ae . . 3ee36cd 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / CompactionManager . java 
+ @ @ - 903 , 8 + 903 , 11 @ @ public class CompactionManager implements CompactionManagerMBean 
+ if ( isSnapshotValidation ) 
+ { 
+ / / If there is a snapshot created for the session then read from there . 
+ + / / note that we populate the parent repair session when creating the snapshot , meaning the sstables in the snapshot are the ones we 
+ + / / are supposed to validate . 
+ sstables = cfs . getSnapshotSSTableReader ( snapshotName ) ; 
+ 
+ + 
+ / / Computing gcbefore based on the current time wouldn ' t be very good because we know each replica will execute 
+ / / this at a different time ( that ' s the whole purpose of repair with snaphsot ) . So instead we take the creation 
+ / / time of the snapshot , which should give us roughtly the same time on each replica ( roughtly being in that case 
+ @ @ - 915 , 12 + 918 , 21 @ @ public class CompactionManager implements CompactionManagerMBean 
+ { 
+ / / flush first so everyone is validating data that is as similar as possible 
+ StorageService . instance . forceKeyspaceFlush ( cfs . keyspace . getName ( ) , cfs . name ) ; 
+ - / / we don ' t mark validating sstables as compacting in DataTracker , so we have to mark them referenced 
+ - / / instead so they won ' t be cleaned up if they do get compacted during the validation 
+ - if ( validator . desc . parentSessionId = = null | | ActiveRepairService . instance . getParentRepairSession ( validator . desc . parentSessionId ) = = null ) 
+ - sstables = cfs . markCurrentSSTablesReferenced ( ) ; 
+ - else 
+ - sstables = ActiveRepairService . instance . getParentRepairSession ( validator . desc . parentSessionId ) . getAndReferenceSSTables ( cfs . metadata . cfId ) ; 
+ + ActiveRepairService . ParentRepairSession prs = ActiveRepairService . instance . getParentRepairSession ( validator . desc . parentSessionId ) ; 
+ + Set < SSTableReader > sstablesToValidate = new HashSet < > ( ) ; 
+ + for ( SSTableReader sstable : cfs . getSSTables ( ) ) 
+ + { 
+ + if ( new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Arrays . asList ( validator . desc . range ) ) ) 
+ + { 
+ + if ( ! prs . isIncremental | | ! sstable . isRepaired ( ) ) 
+ + { 
+ + sstablesToValidate . add ( sstable ) ; 
+ + } 
+ + } 
+ + } 
+ + prs . addSSTables ( cfs . metadata . cfId , sstablesToValidate ) ; 
+ + 
+ + sstables = prs . getAndReferenceSSTablesInRange ( cfs . metadata . cfId , validator . desc . range ) ; 
+ 
+ if ( validator . gcBefore > 0 ) 
+ gcBefore = validator . gcBefore ; 
+ diff - - git a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java 
+ index 2ad8dc2 . . f9180c2 100644 
+ - - - a / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java 
+ + + + b / src / java / org / apache / cassandra / repair / RepairMessageVerbHandler . java 
+ @ @ - 18 , 12 + 18 , 18 @ @ 
+ package org . apache . cassandra . repair ; 
+ 
+ import java . util . ArrayList ; 
+ + import java . util . Collection ; 
+ import java . util . Collections ; 
+ import java . util . List ; 
+ + import java . util . Set ; 
+ import java . util . UUID ; 
+ import java . util . concurrent . Future ; 
+ 
+ import com . google . common . base . Predicate ; 
+ + 
+ + import org . apache . cassandra . dht . Bounds ; 
+ + import org . apache . cassandra . dht . Range ; 
+ + import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . io . sstable . format . SSTableReader ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 32 , 10 + 38 , 7 @ @ import org . apache . cassandra . config . Schema ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . db . Keyspace ; 
+ import org . apache . cassandra . db . compaction . CompactionManager ; 
+ - import org . apache . cassandra . dht . Bounds ; 
+ import org . apache . cassandra . dht . LocalPartitioner ; 
+ - import org . apache . cassandra . dht . Range ; 
+ - import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . net . IVerbHandler ; 
+ import org . apache . cassandra . net . MessageIn ; 
+ import org . apache . cassandra . net . MessageOut ; 
+ @ @ - 61 , 6 + 64 , 7 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > 
+ { 
+ case PREPARE _ MESSAGE : 
+ PrepareMessage prepareMessage = ( PrepareMessage ) message . payload ; 
+ + logger . debug ( " Preparing , { } " , prepareMessage ) ; 
+ List < ColumnFamilyStore > columnFamilyStores = new ArrayList < > ( prepareMessage . cfIds . size ( ) ) ; 
+ for ( UUID cfId : prepareMessage . cfIds ) 
+ { 
+ @ @ - 70 , 14 + 74 , 16 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > 
+ } 
+ ActiveRepairService . instance . registerParentRepairSession ( prepareMessage . parentRepairSession , 
+ columnFamilyStores , 
+ - prepareMessage . ranges ) ; 
+ + prepareMessage . ranges , 
+ + prepareMessage . isIncremental ) ; 
+ MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; 
+ break ; 
+ 
+ case SNAPSHOT : 
+ + logger . debug ( " Snapshotting { } " , desc ) ; 
+ ColumnFamilyStore cfs = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; 
+ final Range < Token > repairingRange = desc . range ; 
+ - cfs . snapshot ( desc . sessionId . toString ( ) , new Predicate < SSTableReader > ( ) 
+ + Set < SSTableReader > snapshottedSSSTables = cfs . snapshot ( desc . sessionId . toString ( ) , new Predicate < SSTableReader > ( ) 
+ { 
+ public boolean apply ( SSTableReader sstable ) 
+ { 
+ @ @ - 86 , 13 + 92 , 14 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > 
+ new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Collections . singleton ( repairingRange ) ) ; 
+ } 
+ } ) ; 
+ - 
+ + ActiveRepairService . instance . getParentRepairSession ( desc . parentSessionId ) . addSSTables ( cfs . metadata . cfId , snapshottedSSSTables ) ; 
+ logger . debug ( " Enqueuing response to snapshot request { } to { } " , desc . sessionId , message . from ) ; 
+ MessagingService . instance ( ) . sendReply ( new MessageOut ( MessagingService . Verb . INTERNAL _ RESPONSE ) , id , message . from ) ; 
+ break ; 
+ 
+ case VALIDATION _ REQUEST : 
+ ValidationRequest validationRequest = ( ValidationRequest ) message . payload ; 
+ + logger . debug ( " Validating { } " , validationRequest ) ; 
+ / / trigger read - only compaction 
+ ColumnFamilyStore store = Keyspace . open ( desc . keyspace ) . getColumnFamilyStore ( desc . columnFamily ) ; 
+ 
+ @ @ - 103 , 7 + 110 , 7 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > 
+ case SYNC _ REQUEST : 
+ / / forwarded sync request 
+ SyncRequest request = ( SyncRequest ) message . payload ; 
+ - 
+ + logger . debug ( " Syncing { } " , request ) ; 
+ long repairedAt = ActiveRepairService . UNREPAIRED _ SSTABLE ; 
+ if ( desc . parentSessionId ! = null & & ActiveRepairService . instance . getParentRepairSession ( desc . parentSessionId ) ! = null ) 
+ repairedAt = ActiveRepairService . instance . getParentRepairSession ( desc . parentSessionId ) . repairedAt ; 
+ @ @ - 113 , 8 + 120 , 8 @ @ public class RepairMessageVerbHandler implements IVerbHandler < RepairMessage > 
+ break ; 
+ 
+ case ANTICOMPACTION _ REQUEST : 
+ - logger . debug ( " Got anticompaction request " ) ; 
+ AnticompactionRequest anticompactionRequest = ( AnticompactionRequest ) message . payload ; 
+ + logger . debug ( " Got anticompaction request { } " , anticompactionRequest ) ; 
+ try 
+ { 
+ List < Future < ? > > futures = ActiveRepairService . instance . doAntiCompaction ( anticompactionRequest . parentRepairSession ) ; 
+ diff - - git a / src / java / org / apache / cassandra / repair / messages / AnticompactionRequest . java b / src / java / org / apache / cassandra / repair / messages / AnticompactionRequest . java 
+ index 34ea5a5 . . 1a13ad1 100644 
+ - - - a / src / java / org / apache / cassandra / repair / messages / AnticompactionRequest . java 
+ + + + b / src / java / org / apache / cassandra / repair / messages / AnticompactionRequest . java 
+ @ @ - 53 , 4 + 53 , 12 @ @ public class AnticompactionRequest extends RepairMessage 
+ return UUIDSerializer . serializer . serializedSize ( message . parentRepairSession , version ) ; 
+ } 
+ } 
+ + 
+ + @ Override 
+ + public String toString ( ) 
+ + { 
+ + return " AnticompactionRequest { " + 
+ + " parentRepairSession = " + parentRepairSession + 
+ + " } " + super . toString ( ) ; 
+ + } 
+ } 
+ \ No newline at end of file 
+ diff - - git a / src / java / org / apache / cassandra / repair / messages / PrepareMessage . java b / src / java / org / apache / cassandra / repair / messages / PrepareMessage . java 
+ index 5699677 . . 035ccc4 100644 
+ - - - a / src / java / org / apache / cassandra / repair / messages / PrepareMessage . java 
+ + + + b / src / java / org / apache / cassandra / repair / messages / PrepareMessage . java 
+ @ @ - 38 , 13 + 38 , 15 @ @ public class PrepareMessage extends RepairMessage 
+ public final Collection < Range < Token > > ranges ; 
+ 
+ public final UUID parentRepairSession ; 
+ + public final boolean isIncremental ; 
+ 
+ - public PrepareMessage ( UUID parentRepairSession , List < UUID > cfIds , Collection < Range < Token > > ranges ) 
+ + public PrepareMessage ( UUID parentRepairSession , List < UUID > cfIds , Collection < Range < Token > > ranges , boolean isIncremental ) 
+ { 
+ super ( Type . PREPARE _ MESSAGE , null ) ; 
+ this . parentRepairSession = parentRepairSession ; 
+ this . cfIds = cfIds ; 
+ this . ranges = ranges ; 
+ + this . isIncremental = isIncremental ; 
+ } 
+ 
+ public static class PrepareMessageSerializer implements MessageSerializer < PrepareMessage > 
+ @ @ - 58 , 6 + 60 , 7 @ @ public class PrepareMessage extends RepairMessage 
+ out . writeInt ( message . ranges . size ( ) ) ; 
+ for ( Range r : message . ranges ) 
+ Range . serializer . serialize ( r , out , version ) ; 
+ + out . writeBoolean ( message . isIncremental ) ; 
+ } 
+ 
+ public PrepareMessage deserialize ( DataInput in , int version ) throws IOException 
+ @ @ - 71 , 7 + 74 , 8 @ @ public class PrepareMessage extends RepairMessage 
+ List < Range < Token > > ranges = new ArrayList < > ( rangeCount ) ; 
+ for ( int i = 0 ; i < rangeCount ; i + + ) 
+ ranges . add ( ( Range < Token > ) Range . serializer . deserialize ( in , version ) . toTokenBounds ( ) ) ; 
+ - return new PrepareMessage ( parentRepairSession , cfIds , ranges ) ; 
+ + boolean isIncremental = in . readBoolean ( ) ; 
+ + return new PrepareMessage ( parentRepairSession , cfIds , ranges , isIncremental ) ; 
+ } 
+ 
+ public long serializedSize ( PrepareMessage message , int version ) 
+ @ @ - 85 , 6 + 89 , 7 @ @ public class PrepareMessage extends RepairMessage 
+ size + = sizes . sizeof ( message . ranges . size ( ) ) ; 
+ for ( Range r : message . ranges ) 
+ size + = Range . serializer . serializedSize ( r , version ) ; 
+ + size + = sizes . sizeof ( message . isIncremental ) ; 
+ return size ; 
+ } 
+ } 
+ @ @ - 96 , 6 + 101 , 7 @ @ public class PrepareMessage extends RepairMessage 
+ " cfIds = ' " + cfIds + ' \ ' ' + 
+ " , ranges = " + ranges + 
+ " , parentRepairSession = " + parentRepairSession + 
+ + " , isIncremental = " + isIncremental + 
+ ' } ' ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / repair / messages / RepairOption . java b / src / java / org / apache / cassandra / repair / messages / RepairOption . java 
+ index ca02365 . . 63446e5 100644 
+ - - - a / src / java / org / apache / cassandra / repair / messages / RepairOption . java 
+ + + + b / src / java / org / apache / cassandra / repair / messages / RepairOption . java 
+ @ @ - 211 , 13 + 211 , 6 @ @ public class RepairOption 
+ 
+ public RepairOption ( boolean sequential , boolean primaryRange , boolean incremental , int jobThreads , Collection < Range < Token > > ranges ) 
+ { 
+ - if ( sequential & & incremental ) 
+ - { 
+ - String message = " It is not possible to mix sequential repair and incremental repairs . " ; 
+ - logger . error ( message ) ; 
+ - throw new IllegalArgumentException ( message ) ; 
+ - } 
+ - 
+ if ( ! FBUtilities . isUnix ( ) & & sequential ) 
+ { 
+ logger . warn ( " Snapshot - based repair is not yet supported on Windows . Reverting to parallel repair . " ) ; 
+ diff - - git a / src / java / org / apache / cassandra / repair / messages / SyncRequest . java b / src / java / org / apache / cassandra / repair / messages / SyncRequest . java 
+ index e677cd8 . . c4d0ab6 100644 
+ - - - a / src / java / org / apache / cassandra / repair / messages / SyncRequest . java 
+ + + + b / src / java / org / apache / cassandra / repair / messages / SyncRequest . java 
+ @ @ - 92 , 4 + 92 , 15 @ @ public class SyncRequest extends RepairMessage 
+ return size ; 
+ } 
+ } 
+ + 
+ + @ Override 
+ + public String toString ( ) 
+ + { 
+ + return " SyncRequest { " + 
+ + " initiator = " + initiator + 
+ + " , src = " + src + 
+ + " , dst = " + dst + 
+ + " , ranges = " + ranges + 
+ + " } " + super . toString ( ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / repair / messages / ValidationRequest . java b / src / java / org / apache / cassandra / repair / messages / ValidationRequest . java 
+ index c73b708 . . 43bcf23 100644 
+ - - - a / src / java / org / apache / cassandra / repair / messages / ValidationRequest . java 
+ + + + b / src / java / org / apache / cassandra / repair / messages / ValidationRequest . java 
+ @ @ - 42 , 6 + 42 , 14 @ @ public class ValidationRequest extends RepairMessage 
+ } 
+ 
+ @ Override 
+ + public String toString ( ) 
+ + { 
+ + return " ValidationRequest { " + 
+ + " gcBefore = " + gcBefore + 
+ + " } " + super . toString ( ) ; 
+ + } 
+ + 
+ + @ Override 
+ public boolean equals ( Object o ) 
+ { 
+ if ( this = = o ) return true ; 
+ diff - - git a / src / java / org / apache / cassandra / service / ActiveRepairService . java b / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ index fa354e6 . . 08cef5c 100644 
+ - - - a / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ + + + b / src / java / org / apache / cassandra / service / ActiveRepairService . java 
+ @ @ - 228 , 10 + 228 , 10 @ @ public class ActiveRepairService 
+ return neighbors ; 
+ } 
+ 
+ - public UUID prepareForRepair ( Set < InetAddress > endpoints , Collection < Range < Token > > ranges , List < ColumnFamilyStore > columnFamilyStores ) 
+ + public UUID prepareForRepair ( Set < InetAddress > endpoints , RepairOption options , List < ColumnFamilyStore > columnFamilyStores ) 
+ { 
+ UUID parentRepairSession = UUIDGen . getTimeUUID ( ) ; 
+ - registerParentRepairSession ( parentRepairSession , columnFamilyStores , ranges ) ; 
+ + registerParentRepairSession ( parentRepairSession , columnFamilyStores , options . getRanges ( ) , options . isIncremental ( ) ) ; 
+ final CountDownLatch prepareLatch = new CountDownLatch ( endpoints . size ( ) ) ; 
+ final AtomicBoolean status = new AtomicBoolean ( true ) ; 
+ IAsyncCallbackWithFailure callback = new IAsyncCallbackWithFailure ( ) 
+ @ @ - 259 , 7 + 259 , 7 @ @ public class ActiveRepairService 
+ 
+ for ( InetAddress neighbour : endpoints ) 
+ { 
+ - PrepareMessage message = new PrepareMessage ( parentRepairSession , cfIds , ranges ) ; 
+ + PrepareMessage message = new PrepareMessage ( parentRepairSession , cfIds , options . getRanges ( ) , options . isIncremental ( ) ) ; 
+ MessageOut < RepairMessage > msg = message . createMessage ( ) ; 
+ MessagingService . instance ( ) . sendRRWithFailure ( msg , neighbour , callback ) ; 
+ } 
+ @ @ - 282 , 25 + 282 , 9 @ @ public class ActiveRepairService 
+ return parentRepairSession ; 
+ } 
+ 
+ - public void registerParentRepairSession ( UUID parentRepairSession , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges ) 
+ + public void registerParentRepairSession ( UUID parentRepairSession , List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , boolean isIncremental ) 
+ { 
+ - Map < UUID , Set < SSTableReader > > sstablesToRepair = new HashMap < > ( ) ; 
+ - for ( ColumnFamilyStore cfs : columnFamilyStores ) 
+ - { 
+ - Set < SSTableReader > sstables = new HashSet < > ( ) ; 
+ - for ( SSTableReader sstable : cfs . getSSTables ( ) ) 
+ - { 
+ - if ( new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( ranges ) ) 
+ - { 
+ - if ( ! sstable . isRepaired ( ) ) 
+ - { 
+ - sstables . add ( sstable ) ; 
+ - } 
+ - } 
+ - } 
+ - sstablesToRepair . put ( cfs . metadata . cfId , sstables ) ; 
+ - } 
+ - parentRepairSessions . put ( parentRepairSession , new ParentRepairSession ( columnFamilyStores , ranges , sstablesToRepair , System . currentTimeMillis ( ) ) ) ; 
+ + parentRepairSessions . put ( parentRepairSession , new ParentRepairSession ( columnFamilyStores , ranges , isIncremental , System . currentTimeMillis ( ) ) ) ; 
+ } 
+ 
+ public void finishParentSession ( UUID parentSession , Set < InetAddress > neighbors ) 
+ @ @ - 379 , 18 + 363 , 28 @ @ public class ActiveRepairService 
+ 
+ public static class ParentRepairSession 
+ { 
+ - public final Map < UUID , ColumnFamilyStore > columnFamilyStores = new HashMap < > ( ) ; 
+ - public final Collection < Range < Token > > ranges ; 
+ - public final Map < UUID , Set < SSTableReader > > sstableMap ; 
+ + private final Map < UUID , ColumnFamilyStore > columnFamilyStores = new HashMap < > ( ) ; 
+ + private final Collection < Range < Token > > ranges ; 
+ + private final Map < UUID , Set < SSTableReader > > sstableMap = new HashMap < > ( ) ; 
+ public final long repairedAt ; 
+ + public final boolean isIncremental ; 
+ 
+ - public ParentRepairSession ( List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , Map < UUID , Set < SSTableReader > > sstables , long repairedAt ) 
+ + public ParentRepairSession ( List < ColumnFamilyStore > columnFamilyStores , Collection < Range < Token > > ranges , boolean isIncremental , long repairedAt ) 
+ { 
+ for ( ColumnFamilyStore cfs : columnFamilyStores ) 
+ this . columnFamilyStores . put ( cfs . metadata . cfId , cfs ) ; 
+ this . ranges = ranges ; 
+ - this . sstableMap = sstables ; 
+ this . repairedAt = repairedAt ; 
+ + this . isIncremental = isIncremental ; 
+ + } 
+ + 
+ + public void addSSTables ( UUID cfId , Set < SSTableReader > sstables ) 
+ + { 
+ + Set < SSTableReader > existingSSTables = this . sstableMap . get ( cfId ) ; 
+ + if ( existingSSTables = = null ) 
+ + existingSSTables = new HashSet < > ( ) ; 
+ + existingSSTables . addAll ( sstables ) ; 
+ + this . sstableMap . put ( cfId , sstables ) ; 
+ } 
+ 
+ public synchronized Collection < SSTableReader > getAndReferenceSSTables ( UUID cfId ) 
+ @ @ - 412 , 5 + 406 , 20 @ @ public class ActiveRepairService 
+ } 
+ return sstables ; 
+ } 
+ + 
+ + public synchronized Set < SSTableReader > getAndReferenceSSTablesInRange ( UUID cfId , Range < Token > range ) 
+ + { 
+ + Collection < SSTableReader > allSSTables = getAndReferenceSSTables ( cfId ) ; 
+ + Set < SSTableReader > sstables = new HashSet < > ( ) ; 
+ + for ( SSTableReader sstable : allSSTables ) 
+ + { 
+ + if ( new Bounds < > ( sstable . first . getToken ( ) , sstable . last . getToken ( ) ) . intersects ( Arrays . asList ( range ) ) ) 
+ + sstables . add ( sstable ) ; 
+ + else 
+ + sstable . releaseReference ( ) ; 
+ + } 
+ + return sstables ; 
+ + 
+ + } 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index a26858a . . ea21f3d 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 2624 , 14 + 2624 , 6 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ logger . info ( message ) ; 
+ sendNotification ( " repair " , message , new int [ ] { cmd , ActiveRepairService . Status . STARTED . ordinal ( ) } ) ; 
+ 
+ - if ( options . isSequential ( ) & & options . isIncremental ( ) ) 
+ - { 
+ - message = " It is not possible to mix sequential repair and incremental repairs . " ; 
+ - logger . error ( message ) ; 
+ - sendNotification ( " repair " , message , new int [ ] { cmd , ActiveRepairService . Status . FINISHED . ordinal ( ) } ) ; 
+ - return ; 
+ - } 
+ - 
+ final Set < InetAddress > allNeighbors = new HashSet < > ( ) ; 
+ Map < Range , Set < InetAddress > > rangeToNeighbors = new HashMap < > ( ) ; 
+ for ( Range < Token > range : options . getRanges ( ) ) 
+ @ @ - 2664 , 23 + 2656 , 16 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ } 
+ 
+ final UUID parentSession ; 
+ - long repairedAt = ActiveRepairService . UNREPAIRED _ SSTABLE ; 
+ - if ( options . isIncremental ( ) ) 
+ + long repairedAt ; 
+ + try 
+ { 
+ - try 
+ - { 
+ - parentSession = ActiveRepairService . instance . prepareForRepair ( allNeighbors , options . getRanges ( ) , columnFamilyStores ) ; 
+ - repairedAt = ActiveRepairService . instance . getParentRepairSession ( parentSession ) . repairedAt ; 
+ - } 
+ - catch ( Throwable t ) 
+ - { 
+ - sendNotification ( " repair " , String . format ( " Repair failed with error % s " , t . getMessage ( ) ) , new int [ ] { cmd , ActiveRepairService . Status . FINISHED . ordinal ( ) } ) ; 
+ - return ; 
+ - } 
+ + parentSession = ActiveRepairService . instance . prepareForRepair ( allNeighbors , options , columnFamilyStores ) ; 
+ + repairedAt = ActiveRepairService . instance . getParentRepairSession ( parentSession ) . repairedAt ; 
+ } 
+ - else 
+ + catch ( Throwable t ) 
+ { 
+ - parentSession = null ; 
+ + sendNotification ( " repair " , String . format ( " Repair failed with error % s " , t . getMessage ( ) ) , new int [ ] { cmd , ActiveRepairService . Status . FINISHED . ordinal ( ) } ) ; 
+ + return ; 
+ } 
+ 
+ / / Set up RepairJob executor for this repair command . 
+ @ @ - 2736 , 16 + 2721 , 13 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ { 
+ public void onSuccess ( @ Nullable Object result ) 
+ { 
+ - if ( options . isIncremental ( ) ) 
+ + try 
+ { 
+ - try 
+ - { 
+ - ActiveRepairService . instance . finishParentSession ( parentSession , allNeighbors ) ; 
+ - } 
+ - catch ( Exception e ) 
+ - { 
+ - logger . error ( " Error in incremental repair " , e ) ; 
+ - } 
+ + ActiveRepairService . instance . finishParentSession ( parentSession , allNeighbors ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + logger . error ( " Error in incremental repair " , e ) ; 
+ } 
+ repairComplete ( ) ; 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java 
+ index a999025 . . 3cd2ea8 100644 
+ - - - a / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / compaction / LeveledCompactionStrategyTest . java 
+ @ @ - 175 , 7 + 175 , 7 @ @ public class LeveledCompactionStrategyTest 
+ Range < Token > range = new Range < > ( Util . token ( " " ) , Util . token ( " " ) ) ; 
+ int gcBefore = keyspace . getColumnFamilyStore ( CF _ STANDARDDLEVELED ) . gcBefore ( System . currentTimeMillis ( ) ) ; 
+ UUID parentRepSession = UUID . randomUUID ( ) ; 
+ - ActiveRepairService . instance . registerParentRepairSession ( parentRepSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; 
+ + ActiveRepairService . instance . registerParentRepairSession ( parentRepSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) , false ) ; 
+ RepairJobDesc desc = new RepairJobDesc ( parentRepSession , UUID . randomUUID ( ) , KEYSPACE1 , CF _ STANDARDDLEVELED , range ) ; 
+ Validator validator = new Validator ( desc , FBUtilities . getBroadcastAddress ( ) , gcBefore ) ; 
+ CompactionManager . instance . submitValidation ( cfs , validator ) . get ( ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / repair / LocalSyncTaskTest . java b / test / unit / org / apache / cassandra / repair / LocalSyncTaskTest . java 
+ index b3d333a . . 1d11334 100644 
+ - - - a / test / unit / org / apache / cassandra / repair / LocalSyncTaskTest . java 
+ + + + b / test / unit / org / apache / cassandra / repair / LocalSyncTaskTest . java 
+ @ @ - 89 , 7 + 89 , 7 @ @ public class LocalSyncTaskTest extends SchemaLoader 
+ Keyspace keyspace = Keyspace . open ( KEYSPACE1 ) ; 
+ ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( " Standard1 " ) ; 
+ 
+ - ActiveRepairService . instance . registerParentRepairSession ( parentRepairSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) ) ; 
+ + ActiveRepairService . instance . registerParentRepairSession ( parentRepairSession , Arrays . asList ( cfs ) , Arrays . asList ( range ) , false ) ; 
+ 
+ RepairJobDesc desc = new RepairJobDesc ( parentRepairSession , UUID . randomUUID ( ) , KEYSPACE1 , " Standard1 " , range ) ; 
+
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index eec904a . . 982454c 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 59 , 6 + 59 , 8 @ @ 
+ the old ones ( CASSANDRA - 1644 ) 
+ * upgrade to Thrift 0 . 5 ( CASSANDRA - 1367 ) 
+ * renamed CL . DCQUORUM to LOCAL _ QUORUM and DCQUORUMSYNC to EACH _ QUORUM 
+ + * cli truncate support ( CASSANDRA - 1653 ) 
+ + * update GC settings in cassandra . bat ( CASSANDRA - 1636 ) 
+ 
+ 
+ 0 . 7 - beta2 
+ diff - - git a / src / java / org / apache / cassandra / cli / Cli . g b / src / java / org / apache / cassandra / cli / Cli . g 
+ index e59c608 . . a9229ee 100644 
+ - - - a / src / java / org / apache / cassandra / cli / Cli . g 
+ + + + b / src / java / org / apache / cassandra / cli / Cli . g 
+ @ @ - 55 , 6 + 55 , 7 @ @ tokens { 
+ NODE _ UPDATE _ KEYSPACE ; 
+ NODE _ UPDATE _ COLUMN _ FAMILY ; 
+ NODE _ LIST ; 
+ + NODE _ TRUNCATE ; 
+ 
+ / / Internal Nodes . 
+ NODE _ COLUMN _ ACCESS ; 
+ @ @ - 123 , 6 + 124 , 7 @ @ statement 
+ | setStatement 
+ | showStatement 
+ | listStatement 
+ + | truncateStatement 
+ | - > ^ ( NODE _ NO _ OP ) 
+ ; 
+ 
+ @ @ - 174 , 6 + 176 , 8 @ @ helpStatement 
+ - > ^ ( NODE _ HELP NODE _ THRIFT _ COUNT ) 
+ | K _ HELP K _ LIST 
+ - > ^ ( NODE _ HELP NODE _ LIST ) 
+ + | K _ HELP K _ TRUNCATE 
+ + - > ^ ( NODE _ HELP NODE _ TRUNCATE ) 
+ | K _ HELP 
+ - > ^ ( NODE _ HELP ) 
+ | ' ? ' 
+ @ @ - 231 , 6 + 235 , 11 @ @ listStatement 
+ - > ^ ( NODE _ LIST columnFamily keyRangeExpr ? ^ ( NODE _ LIMIT $ limit ) ? ) 
+ ; 
+ 
+ + truncateStatement 
+ + : K _ TRUNCATE columnFamily 
+ + - > ^ ( NODE _ TRUNCATE columnFamily ) 
+ + ; 
+ + 
+ showClusterName 
+ : K _ SHOW K _ CLUSTER K _ NAME 
+ - > ^ ( NODE _ SHOW _ CLUSTER _ NAME ) 
+ @ @ - 430 , 6 + 439 , 7 @ @ K _ AND : ' AND ' ; 
+ K _ UPDATE : ' UPDATE ' ; 
+ K _ LIST : ' LIST ' ; 
+ K _ LIMIT : ' LIMIT ' ; 
+ + K _ TRUNCATE : ' TRUNCATE ' ; 
+ 
+ / / private syntactic rules 
+ fragment 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliClient . java b / src / java / org / apache / cassandra / cli / CliClient . java 
+ index b6ace98 . . b63105a 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliClient . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliClient . java 
+ @ @ - 171 , 6 + 171 , 9 @ @ public class CliClient extends CliUserHelp 
+ case CliParser . NODE _ LIST : 
+ executeList ( tree ) ; 
+ break ; 
+ + case CliParser . NODE _ TRUNCATE : 
+ + executeTruncate ( tree . getChild ( 0 ) . getText ( ) ) ; 
+ + break ; 
+ case CliParser . NODE _ NO _ OP : 
+ / / comment lines come here ; they are treated as no ops . 
+ break ; 
+ @ @ - 943 , 6 + 946 , 30 @ @ public class CliClient extends CliUserHelp 
+ printSliceList ( columnFamilyDef , keySlices ) ; 
+ } 
+ 
+ + / / TRUNCATE < columnFamily > 
+ + private void executeTruncate ( String columnFamily ) 
+ + { 
+ + if ( ! CliMain . isConnected ( ) | | ! hasKeySpace ( ) ) 
+ + return ; 
+ + 
+ + / / getting CfDef , it will fail if there is no such column family in current keySpace . 
+ + CfDef cfDef = getCfDef ( columnFamily ) ; 
+ + 
+ + try 
+ + { 
+ + thriftClient . truncate ( cfDef . getName ( ) ) ; 
+ + sessionState . out . println ( columnFamily + " truncated . " ) ; 
+ + } 
+ + catch ( InvalidRequestException e ) 
+ + { 
+ + throw new RuntimeException ( e . getWhy ( ) ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new RuntimeException ( e . getMessage ( ) ) ; 
+ + } 
+ + } 
+ + 
+ / / SHOW API VERSION 
+ private void executeShowVersion ( ) throws TException 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliCompleter . java b / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ index f541fe5 . . b033d8f 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ @ @ - 55 , 12 + 55 , 16 @ @ public class CliCompleter extends SimpleCompletor 
+ " help set " , 
+ " help del " , 
+ " help count " , 
+ + " help list " , 
+ + " help truncate " 
+ } ; 
+ private static String [ ] keyspaceCommands = { 
+ " get " , 
+ " set " , 
+ " count " , 
+ - " del " 
+ + " del " , 
+ + " list " , 
+ + " truncate " 
+ } ; 
+ 
+ public CliCompleter ( ) 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliUserHelp . java b / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ index 7c512e2 . . db6a779 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ @ @ - 281 , 6 + 281 , 13 @ @ public class CliUserHelp { 
+ state . out . println ( " list Users [ j : ] limit 40 " ) ; 
+ break ; 
+ 
+ + case CliParser . NODE _ TRUNCATE : 
+ + state . out . println ( " truncate < column _ family > " ) ; 
+ + state . out . println ( " Truncate specified column family . \ n " ) ; 
+ + state . out . println ( " example : " ) ; 
+ + state . out . println ( " truncate Category " ) ; 
+ + break ; 
+ + 
+ default : 
+ state . out . println ( " ? " ) ; 
+ break ; 
+ @ @ - 324 , 7 + 331 , 8 @ @ public class CliUserHelp { 
+ state . out . println ( " del < cf > [ ' < key > ' ] [ ' < super > ' ] [ ' < col > ' ] Delete sub column . " ) ; 
+ state . out . println ( " count < cf > [ ' < key > ' ] Count columns in record . " ) ; 
+ state . out . println ( " count < cf > [ ' < key > ' ] [ ' < super > ' ] Count columns in a super column . " ) ; 
+ - state . out . println ( " list < cf > List all rows in the column family . " ) ; 
+ + state . out . println ( " truncate < column _ family > Truncate specified column family . " ) ; 
+ + state . out . println ( " list < cf > List all rows in the column family . " ) ; 
+ state . out . println ( " list < cf > [ < startKey > : ] " ) ; 
+ state . out . println ( " List rows in the column family beginning with < startKey > . " ) ; 
+ state . out . println ( " list < cf > [ < startKey > : < endKey > ] " ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / cli / CliTest . java b / test / unit / org / apache / cassandra / cli / CliTest . java 
+ index 24a3de0 . . eddcafd 100644 
+ - - - a / test / unit / org / apache / cassandra / cli / CliTest . java 
+ + + + b / test / unit / org / apache / cassandra / cli / CliTest . java 
+ @ @ - 52 , 6 + 52 , 7 @ @ public class CliTest extends TestCase 
+ " list CF3 [ h : ] " , 
+ " list CF3 limit 10 " , 
+ " list CF3 [ h : g ] limit 10 " , 
+ + " truncate CF1 " , 
+ " update keyspace TestKeySpace with placement _ strategy = ' org . apache . cassandra . locator . LocalStrategy ' " , 
+ " update keyspace TestKeySpace with replication _ factor = 1 and strategy _ options = [ { DC1 : 3 , DC2 : 4 , DC5 : 1 } ] " 
+ } ; 
+ @ @ - 101 , 6 + 102 , 10 @ @ public class CliTest extends TestCase 
+ assertTrue ( result . startsWith ( " = > ( column = " ) ) ; 
+ } 
+ } 
+ + else if ( statement . startsWith ( " truncate " ) ) 
+ + { 
+ + assertTrue ( result . contains ( " truncated . " ) ) ; 
+ + } 
+ 
+ outStream . reset ( ) ; / / reset stream so we have only output from next statement all the time 
+ errStream . reset ( ) ; / / no errors to the end user .

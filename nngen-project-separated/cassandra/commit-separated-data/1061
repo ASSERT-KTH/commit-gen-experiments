@@ -1,0 +1,506 @@
+BLEU SCORE: 0.05522397783539471
+
+TEST MSG: Revert CASSANDRA - 10012 and add more loggings
+GENERATED MSG: Fix error streaming section more than 2GB
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 4b87ed0 . . 3d84a30 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 13 <nl> + * Revert CASSANDRA - 10012 and add more logging ( CASSANDRA - 10961 ) <nl> * Allow simultaneous bootstrapping with strict consistency when no vnodes are used ( CASSANDRA - 11005 ) <nl> * Log a message when major compaction does not result in a single file ( CASSANDRA - 10847 ) <nl> * ( cqlsh ) fix cqlsh _ copy _ tests when vnodes are disabled ( CASSANDRA - 10997 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / composites / AbstractCType . java b / src / java / org / apache / cassandra / db / composites / AbstractCType . java <nl> index 5af7458 . . fecc847 100644 <nl> - - - a / src / java / org / apache / cassandra / db / composites / AbstractCType . java <nl> + + + b / src / java / org / apache / cassandra / db / composites / AbstractCType . java <nl> @ @ - 375 , 7 + 375 , 8 @ @ public abstract class AbstractCType implements CType <nl> protected static void checkRemaining ( ByteBuffer bb , int offs , int length ) <nl> { <nl> if ( offs + length > bb . limit ( ) ) <nl> - throw new IllegalArgumentException ( " Not enough bytes " ) ; <nl> + throw new IllegalArgumentException ( String . format ( " Not enough bytes . Offset : % d . Length : % d . Buffer size : % d " , <nl> + offs , length , bb . limit ( ) ) ) ; <nl> } <nl> <nl> private static class Serializer implements CType . Serializer <nl> diff - - git a / src / java / org / apache / cassandra / streaming / ConnectionHandler . java b / src / java / org / apache / cassandra / streaming / ConnectionHandler . java <nl> index aa3504a . . ac267f9 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / ConnectionHandler . java <nl> + + + b / src / java / org / apache / cassandra / streaming / ConnectionHandler . java <nl> @ @ - 248 , 11 + 248 , 11 @ @ public class ConnectionHandler <nl> { <nl> / / receive message <nl> StreamMessage message = StreamMessage . deserialize ( in , protocolVersion , session ) ; <nl> + logger . debug ( " [ Stream # { } ] Received { } " , session . planId ( ) , message ) ; <nl> / / Might be null if there is an error during streaming ( see FileMessage . deserialize ) . It ' s ok <nl> / / to ignore here since we ' ll have asked for a retry . <nl> if ( message ! = null ) <nl> { <nl> - logger . debug ( " [ Stream # { } ] Received { } " , session . planId ( ) , message ) ; <nl> session . messageReceived ( message ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamReader . java b / src / java / org / apache / cassandra / streaming / StreamReader . java <nl> index 18013fe . . 1e3ba7f 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamReader . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamReader . java <nl> @ @ - 58 , 6 + 58 , 7 @ @ public class StreamReader <nl> protected final StreamSession session ; <nl> protected final Descriptor . Version inputVersion ; <nl> protected final long repairedAt ; <nl> + protected final int fileSeqNum ; <nl> <nl> protected Descriptor desc ; <nl> <nl> @ @ - 69 , 6 + 70 , 7 @ @ public class StreamReader <nl> this . sections = header . sections ; <nl> this . inputVersion = new Descriptor . Version ( header . version ) ; <nl> this . repairedAt = header . repairedAt ; <nl> + this . fileSeqNum = header . sequenceNumber ; <nl> } <nl> <nl> / * * <nl> @ @ - 78 , 33 + 80 , 46 @ @ public class StreamReader <nl> * / <nl> public SSTableWriter read ( ReadableByteChannel channel ) throws IOException <nl> { <nl> - logger . debug ( " reading file from { } , repairedAt = { } " , session . peer , repairedAt ) ; <nl> long totalSize = totalSize ( ) ; <nl> <nl> Pair < String , String > kscf = Schema . instance . getCF ( cfId ) ; <nl> - if ( kscf = = null ) <nl> + ColumnFamilyStore cfs = null ; <nl> + if ( kscf ! = null ) <nl> + cfs = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; <nl> + <nl> + if ( kscf = = null | | cfs = = null ) <nl> { <nl> / / schema was dropped during streaming <nl> throw new IOException ( " CF " + cfId + " was dropped during streaming " ) ; <nl> } <nl> - ColumnFamilyStore cfs = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; <nl> + <nl> + logger . debug ( " [ Stream # { } ] Start receiving file # { } from { } , repairedAt = { } , size = { } , ks = ' { } ' , table = ' { } ' . " , <nl> + session . planId ( ) , fileSeqNum , session . peer , repairedAt , totalSize , cfs . keyspace . getName ( ) , <nl> + cfs . getColumnFamilyName ( ) ) ; <nl> <nl> DataInputStream dis = new DataInputStream ( new LZFInputStream ( Channels . newInputStream ( channel ) ) ) ; <nl> BytesReadTracker in = new BytesReadTracker ( dis ) ; <nl> SSTableWriter writer = null ; <nl> + DecoratedKey key = null ; <nl> try <nl> { <nl> writer = createWriter ( cfs , totalSize , repairedAt ) ; <nl> while ( in . getBytesRead ( ) < totalSize ) <nl> { <nl> - writeRow ( writer , in , cfs ) ; <nl> + key = StorageService . getPartitioner ( ) . decorateKey ( ByteBufferUtil . readWithShortLength ( in ) ) ; <nl> + writeRow ( key , writer , in , cfs ) ; <nl> / / TODO move this to BytesReadTracker <nl> session . progress ( desc , ProgressInfo . Direction . IN , in . getBytesRead ( ) , totalSize ) ; <nl> } <nl> + logger . debug ( " [ Stream # { } ] Finished receiving file # { } from { } readBytes = { } , totalSize = { } " , <nl> + session . planId ( ) , fileSeqNum , session . peer , in . getBytesRead ( ) , totalSize ) ; <nl> return writer ; <nl> } <nl> catch ( Throwable e ) <nl> { <nl> + if ( key ! = null ) <nl> + logger . warn ( " [ Stream { } ] Error while reading partition { } from stream on ks = ' { } ' and table = ' { } ' . " , <nl> + session . planId ( ) , key , cfs . keyspace . getName ( ) , cfs . getColumnFamilyName ( ) ) ; <nl> if ( writer ! = null ) <nl> { <nl> try <nl> @ @ - 162 , 9 + 177 , 8 @ @ public class StreamReader <nl> return size ; <nl> } <nl> <nl> - protected void writeRow ( SSTableWriter writer , DataInput in , ColumnFamilyStore cfs ) throws IOException <nl> + protected void writeRow ( DecoratedKey key , SSTableWriter writer , DataInput in , ColumnFamilyStore cfs ) throws IOException <nl> { <nl> - DecoratedKey key = StorageService . getPartitioner ( ) . decorateKey ( ByteBufferUtil . readWithShortLength ( in ) ) ; <nl> writer . appendFromStream ( key , cfs . metadata , in , inputVersion ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / streaming / StreamWriter . java b / src / java / org / apache / cassandra / streaming / StreamWriter . java <nl> index 43bc26a . . 2579414 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / StreamWriter . java <nl> + + + b / src / java / org / apache / cassandra / streaming / StreamWriter . java <nl> @ @ - 24 , 6 + 24 , 9 @ @ import java . nio . channels . Channels ; <nl> import java . nio . channels . WritableByteChannel ; <nl> import java . util . Collection ; <nl> <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> + <nl> import com . ning . compress . lzf . LZFOutputStream ; <nl> <nl> import org . apache . cassandra . io . sstable . Component ; <nl> @ @ - 42 , 6 + 45 , 8 @ @ public class StreamWriter <nl> { <nl> private static final int DEFAULT _ CHUNK _ SIZE = 64 * 1024 ; <nl> <nl> + private static final Logger logger = LoggerFactory . getLogger ( StreamWriter . class ) ; <nl> + <nl> protected final SSTableReader sstable ; <nl> protected final Collection < Pair < Long , Long > > sections ; <nl> protected final StreamRateLimiter limiter ; <nl> @ @ - 71 , 6 + 76 , 8 @ @ public class StreamWriter <nl> public void write ( WritableByteChannel channel ) throws IOException <nl> { <nl> long totalSize = totalSize ( ) ; <nl> + logger . debug ( " [ Stream # { } ] Start streaming file { } to { } , repairedAt = { } , totalSize = { } " , session . planId ( ) , <nl> + sstable . getFilename ( ) , session . peer , sstable . getSSTableMetadata ( ) . repairedAt , totalSize ) ; <nl> RandomAccessReader file = sstable . openDataReader ( ) ; <nl> ChecksumValidator validator = new File ( sstable . descriptor . filenameFor ( Component . CRC ) ) . exists ( ) <nl> ? DataIntegrityMetadata . checksumValidator ( sstable . descriptor ) <nl> @ @ - 109 , 6 + 116 , 8 @ @ public class StreamWriter <nl> / / make sure that current section is send <nl> compressedOutput . flush ( ) ; <nl> } <nl> + logger . debug ( " [ Stream # { } ] Finished streaming file { } to { } , bytesTransferred = { } , totalSize = { } " , <nl> + session . planId ( ) , sstable . getFilename ( ) , session . peer , progress , totalSize ) ; <nl> } <nl> finally <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java b / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java <nl> index b4a3065 . . 6280ccd 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java <nl> + + + b / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java <nl> @ @ - 31 , 6 + 31 , 9 @ @ import java . util . zip . Checksum ; <nl> import com . google . common . collect . Iterators ; <nl> import com . google . common . primitives . Ints ; <nl> <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> + <nl> import org . apache . cassandra . io . compress . CompressionMetadata ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . WrappedRunnable ; <nl> @ @ - 40 , 12 + 43 , 15 @ @ import org . apache . cassandra . utils . WrappedRunnable ; <nl> * / <nl> public class CompressedInputStream extends InputStream <nl> { <nl> + <nl> + private static final Logger logger = LoggerFactory . getLogger ( CompressedInputStream . class ) ; <nl> + <nl> private final CompressionInfo info ; <nl> / / chunk buffer <nl> private final BlockingQueue < byte [ ] > dataBuffer ; <nl> <nl> / / uncompressed bytes <nl> - private final byte [ ] buffer ; <nl> + private byte [ ] buffer ; <nl> <nl> / / offset from the beginning of the buffer <nl> protected long bufferOffset = 0 ; <nl> @ @ - 64 , 8 + 70 , 6 @ @ public class CompressedInputStream extends InputStream <nl> private long totalCompressedBytesRead ; <nl> private final boolean hasPostCompressionAdlerChecksums ; <nl> <nl> - private Thread readerThread ; <nl> - <nl> / * * <nl> * @ param source Input source to read compressed data from <nl> * @ param info Compression info <nl> @ @ - 77 , 10 + 81 , 9 @ @ public class CompressedInputStream extends InputStream <nl> this . hasPostCompressionAdlerChecksums = hasPostCompressionAdlerChecksums ; <nl> this . buffer = new byte [ info . parameters . chunkLength ( ) ] ; <nl> / / buffer is limited to store up to 1024 chunks <nl> - this . dataBuffer = new ArrayBlockingQueue < > ( Math . min ( info . chunks . length , 1024 ) ) ; <nl> + this . dataBuffer = new ArrayBlockingQueue < byte [ ] > ( Math . min ( info . chunks . length , 1024 ) ) ; <nl> <nl> - readerThread = new Thread ( new Reader ( source , info , dataBuffer ) ) ; <nl> - readerThread . start ( ) ; <nl> + new Thread ( new Reader ( source , info , dataBuffer ) ) . start ( ) ; <nl> } <nl> <nl> public int read ( ) throws IOException <nl> @ @ - 146 , 7 + 149 , 7 @ @ public class CompressedInputStream extends InputStream <nl> return totalCompressedBytesRead ; <nl> } <nl> <nl> - class Reader extends WrappedRunnable <nl> + static class Reader extends WrappedRunnable <nl> { <nl> private final InputStream source ; <nl> private final Iterator < CompressionMetadata . Chunk > chunks ; <nl> @ @ - 162 , 7 + 165 , 7 @ @ public class CompressedInputStream extends InputStream <nl> protected void runMayThrow ( ) throws Exception <nl> { <nl> byte [ ] compressedWithCRC ; <nl> - while ( ! Thread . currentThread ( ) . isInterrupted ( ) & & chunks . hasNext ( ) ) <nl> + while ( chunks . hasNext ( ) ) <nl> { <nl> CompressionMetadata . Chunk chunk = chunks . next ( ) ; <nl> <nl> @ @ - 172 , 43 + 175 , 25 @ @ public class CompressedInputStream extends InputStream <nl> int bufferRead = 0 ; <nl> while ( bufferRead < readLength ) <nl> { <nl> - int r ; <nl> try <nl> { <nl> - r = source . read ( compressedWithCRC , bufferRead , readLength - bufferRead ) ; <nl> + int r = source . read ( compressedWithCRC , bufferRead , readLength - bufferRead ) ; <nl> if ( r < 0 ) <nl> { <nl> dataBuffer . put ( POISON _ PILL ) ; <nl> return ; / / throw exception where we consume dataBuffer <nl> } <nl> + bufferRead + = r ; <nl> } <nl> catch ( IOException e ) <nl> { <nl> + logger . warn ( " Error while reading compressed input stream . " , e ) ; <nl> dataBuffer . put ( POISON _ PILL ) ; <nl> - throw e ; <nl> + return ; / / throw exception where we consume dataBuffer <nl> } <nl> - bufferRead + = r ; <nl> } <nl> dataBuffer . put ( compressedWithCRC ) ; <nl> } <nl> - synchronized ( CompressedInputStream . this ) <nl> - { <nl> - readerThread = null ; <nl> - } <nl> - } <nl> - } <nl> - <nl> - @ Override <nl> - public void close ( ) throws IOException <nl> - { <nl> - synchronized ( this ) <nl> - { <nl> - if ( readerThread ! = null ) <nl> - { <nl> - readerThread . interrupt ( ) ; <nl> - readerThread = null ; <nl> - } <nl> } <nl> } <nl> - <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java <nl> index 4f60773 . . fd0d9c8 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java <nl> + + + b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java <nl> @ @ - 24 , 6 + 24 , 7 @ @ import java . nio . channels . ReadableByteChannel ; <nl> <nl> import com . google . common . base . Throwables ; <nl> <nl> + import org . apache . cassandra . db . DecoratedKey ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 32 , 10 + 33 , 12 @ @ import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . db . Keyspace ; <nl> import org . apache . cassandra . io . compress . CompressionMetadata ; <nl> import org . apache . cassandra . io . sstable . SSTableWriter ; <nl> + import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . streaming . ProgressInfo ; <nl> import org . apache . cassandra . streaming . StreamReader ; <nl> import org . apache . cassandra . streaming . StreamSession ; <nl> import org . apache . cassandra . streaming . messages . FileMessageHeader ; <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . BytesReadTracker ; <nl> import org . apache . cassandra . utils . Pair ; <nl> <nl> @ @ - 61 , 40 + 64 , 56 @ @ public class CompressedStreamReader extends StreamReader <nl> @ Override <nl> public SSTableWriter read ( ReadableByteChannel channel ) throws IOException <nl> { <nl> - logger . debug ( " reading file from { } , repairedAt = { } " , session . peer , repairedAt ) ; <nl> long totalSize = totalSize ( ) ; <nl> <nl> Pair < String , String > kscf = Schema . instance . getCF ( cfId ) ; <nl> - if ( kscf = = null ) <nl> + ColumnFamilyStore cfs = null ; <nl> + if ( kscf ! = null ) <nl> + cfs = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; <nl> + <nl> + if ( kscf = = null | | cfs = = null ) <nl> { <nl> / / schema was dropped during streaming <nl> throw new IOException ( " CF " + cfId + " was dropped during streaming " ) ; <nl> } <nl> - ColumnFamilyStore cfs = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; <nl> + <nl> + logger . debug ( " [ Stream # { } ] Start receiving file # { } from { } , repairedAt = { } , size = { } , ks = ' { } ' , table = ' { } ' . " , <nl> + session . planId ( ) , fileSeqNum , session . peer , repairedAt , totalSize , cfs . keyspace . getName ( ) , <nl> + cfs . getColumnFamilyName ( ) ) ; <nl> <nl> CompressedInputStream cis = new CompressedInputStream ( Channels . newInputStream ( channel ) , compressionInfo , inputVersion . hasPostCompressionAdlerChecksums ) ; <nl> BytesReadTracker in = new BytesReadTracker ( new DataInputStream ( cis ) ) ; <nl> SSTableWriter writer = null ; <nl> + DecoratedKey key = null ; <nl> try <nl> { <nl> writer = createWriter ( cfs , totalSize , repairedAt ) ; <nl> + int sectionIdx = 0 ; <nl> for ( Pair < Long , Long > section : sections ) <nl> { <nl> long length = section . right - section . left ; <nl> / / skip to beginning of section inside chunk <nl> cis . position ( section . left ) ; <nl> in . reset ( 0 ) ; <nl> + logger . trace ( " [ Stream # { } ] Reading section { } with length { } from stream . " , session . planId ( ) , sectionIdx + + , length ) ; <nl> while ( in . getBytesRead ( ) < length ) <nl> { <nl> - writeRow ( writer , in , cfs ) ; <nl> + key = StorageService . getPartitioner ( ) . decorateKey ( ByteBufferUtil . readWithShortLength ( in ) ) ; <nl> + writeRow ( key , writer , in , cfs ) ; <nl> + <nl> / / when compressed , report total bytes of compressed chunks read since remoteFile . size is the sum of chunks transferred <nl> session . progress ( desc , ProgressInfo . Direction . IN , cis . getTotalCompressedBytesRead ( ) , totalSize ) ; <nl> } <nl> } <nl> + logger . debug ( " [ Stream # { } ] Finished receiving file # { } from { } readBytes = { } , totalSize = { } " , session . planId ( ) , fileSeqNum , <nl> + session . peer , cis . getTotalCompressedBytesRead ( ) , totalSize ) ; <nl> return writer ; <nl> } <nl> catch ( Throwable e ) <nl> { <nl> + if ( key ! = null ) <nl> + logger . warn ( " [ Stream { } ] Error while reading partition { } from stream on ks = ' { } ' and table = ' { } ' . " , <nl> + session . planId ( ) , key , cfs . keyspace . getName ( ) , cfs . getColumnFamilyName ( ) ) ; <nl> if ( writer ! = null ) <nl> { <nl> try <nl> @ @ - 113 , 10 + 132 , 6 @ @ public class CompressedStreamReader extends StreamReader <nl> else <nl> throw Throwables . propagate ( e ) ; <nl> } <nl> - finally <nl> - { <nl> - cis . close ( ) ; <nl> - } <nl> } <nl> <nl> @ Override <nl> diff - - git a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamWriter . java b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamWriter . java <nl> index 001c927 . . 6fe08e6 100644 <nl> - - - a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamWriter . java <nl> + + + b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamWriter . java <nl> @ @ - 24 , 6 + 24 , 9 @ @ import java . util . ArrayList ; <nl> import java . util . Collection ; <nl> import java . util . List ; <nl> <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> + <nl> import org . apache . cassandra . io . compress . CompressionMetadata ; <nl> import org . apache . cassandra . io . sstable . SSTableReader ; <nl> import org . apache . cassandra . io . util . FileUtils ; <nl> @ @ - 40 , 6 + 43 , 8 @ @ public class CompressedStreamWriter extends StreamWriter <nl> { <nl> public static final int CHUNK _ SIZE = 10 * 1024 * 1024 ; <nl> <nl> + private static final Logger logger = LoggerFactory . getLogger ( CompressedStreamWriter . class ) ; <nl> + <nl> private final CompressionInfo compressionInfo ; <nl> <nl> public CompressedStreamWriter ( SSTableReader sstable , Collection < Pair < Long , Long > > sections , CompressionInfo compressionInfo , StreamSession session ) <nl> @ @ - 52 , 12 + 57 , 15 @ @ public class CompressedStreamWriter extends StreamWriter <nl> public void write ( WritableByteChannel channel ) throws IOException <nl> { <nl> long totalSize = totalSize ( ) ; <nl> + logger . debug ( " [ Stream # { } ] Start streaming file { } to { } , repairedAt = { } , totalSize = { } " , session . planId ( ) , <nl> + sstable . getFilename ( ) , session . peer , sstable . getSSTableMetadata ( ) . repairedAt , totalSize ) ; <nl> RandomAccessReader file = sstable . openDataReader ( ) ; <nl> FileChannel fc = file . getChannel ( ) ; <nl> <nl> long progress = 0L ; <nl> / / calculate chunks to transfer . we want to send continuous chunks altogether . <nl> List < Pair < Long , Long > > sections = getTransferSections ( compressionInfo . chunks ) ; <nl> + int sectionIdx = 0 ; <nl> try <nl> { <nl> / / stream each of the required sections of the file <nl> @ @ - 65 , 6 + 73 , 8 @ @ public class CompressedStreamWriter extends StreamWriter <nl> { <nl> / / length of the section to stream <nl> long length = section . right - section . left ; <nl> + logger . trace ( " [ Stream # { } ] Writing section { } with length { } to stream . " , session . planId ( ) , sectionIdx + + , length ) ; <nl> + <nl> / / tracks write progress <nl> long bytesTransferred = 0 ; <nl> while ( bytesTransferred < length ) <nl> @ @ - 77 , 6 + 87 , 8 @ @ public class CompressedStreamWriter extends StreamWriter <nl> session . progress ( sstable . descriptor , ProgressInfo . Direction . OUT , progress , totalSize ) ; <nl> } <nl> } <nl> + logger . debug ( " [ Stream # { } ] Finished streaming file { } to { } , bytesTransferred = { } , totalSize = { } " , <nl> + session . planId ( ) , sstable . getFilename ( ) , session . peer , progress , totalSize ) ; <nl> } <nl> finally <nl> { <nl> diff - - git a / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java b / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java <nl> index 87e0003 . . c70b932 100644 <nl> - - - a / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java <nl> + + + b / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java <nl> @ @ - 58 , 52 + 58 , 6 @ @ public class CompressedInputStreamTest <nl> } <nl> <nl> / * * <nl> - * Test CompressedInputStream not hang when closed while reading <nl> - * @ throws Exception <nl> - * / <nl> - @ Test ( expected = EOFException . class ) <nl> - public void testClose ( ) throws Exception <nl> - { <nl> - CompressionParameters param = new CompressionParameters ( SnappyCompressor . instance , 32 , Collections . < String , String > emptyMap ( ) ) ; <nl> - CompressionMetadata . Chunk [ ] chunks = { new CompressionMetadata . Chunk ( 0 , 100 ) } ; <nl> - final SynchronousQueue < Integer > blocker = new SynchronousQueue < > ( ) ; <nl> - InputStream blockingInput = new InputStream ( ) <nl> - { <nl> - @ Override <nl> - public int read ( ) throws IOException <nl> - { <nl> - try <nl> - { <nl> - / / 10 second cut off not to stop other test in case <nl> - return Objects . requireNonNull ( blocker . poll ( 10 , TimeUnit . SECONDS ) ) ; <nl> - } <nl> - catch ( InterruptedException e ) <nl> - { <nl> - throw new IOException ( " Interrupted as expected " , e ) ; <nl> - } <nl> - } <nl> - } ; <nl> - CompressionInfo info = new CompressionInfo ( chunks , param ) ; <nl> - try ( CompressedInputStream cis = new CompressedInputStream ( blockingInput , info , true ) ) <nl> - { <nl> - new Thread ( new Runnable ( ) <nl> - { <nl> - @ Override <nl> - public void run ( ) <nl> - { <nl> - try <nl> - { <nl> - cis . close ( ) ; <nl> - } <nl> - catch ( Exception ignore ) { } <nl> - } <nl> - } ) . start ( ) ; <nl> - / / block here <nl> - cis . read ( ) ; <nl> - } <nl> - } <nl> - <nl> - / * * <nl> * @ param valuesToCheck array of longs of range ( 0 - 999 ) <nl> * @ throws Exception <nl> * /
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 4b87ed0 . . 3d84a30 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 13 
+ + * Revert CASSANDRA - 10012 and add more logging ( CASSANDRA - 10961 ) 
+ * Allow simultaneous bootstrapping with strict consistency when no vnodes are used ( CASSANDRA - 11005 ) 
+ * Log a message when major compaction does not result in a single file ( CASSANDRA - 10847 ) 
+ * ( cqlsh ) fix cqlsh _ copy _ tests when vnodes are disabled ( CASSANDRA - 10997 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / composites / AbstractCType . java b / src / java / org / apache / cassandra / db / composites / AbstractCType . java 
+ index 5af7458 . . fecc847 100644 
+ - - - a / src / java / org / apache / cassandra / db / composites / AbstractCType . java 
+ + + + b / src / java / org / apache / cassandra / db / composites / AbstractCType . java 
+ @ @ - 375 , 7 + 375 , 8 @ @ public abstract class AbstractCType implements CType 
+ protected static void checkRemaining ( ByteBuffer bb , int offs , int length ) 
+ { 
+ if ( offs + length > bb . limit ( ) ) 
+ - throw new IllegalArgumentException ( " Not enough bytes " ) ; 
+ + throw new IllegalArgumentException ( String . format ( " Not enough bytes . Offset : % d . Length : % d . Buffer size : % d " , 
+ + offs , length , bb . limit ( ) ) ) ; 
+ } 
+ 
+ private static class Serializer implements CType . Serializer 
+ diff - - git a / src / java / org / apache / cassandra / streaming / ConnectionHandler . java b / src / java / org / apache / cassandra / streaming / ConnectionHandler . java 
+ index aa3504a . . ac267f9 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / ConnectionHandler . java 
+ + + + b / src / java / org / apache / cassandra / streaming / ConnectionHandler . java 
+ @ @ - 248 , 11 + 248 , 11 @ @ public class ConnectionHandler 
+ { 
+ / / receive message 
+ StreamMessage message = StreamMessage . deserialize ( in , protocolVersion , session ) ; 
+ + logger . debug ( " [ Stream # { } ] Received { } " , session . planId ( ) , message ) ; 
+ / / Might be null if there is an error during streaming ( see FileMessage . deserialize ) . It ' s ok 
+ / / to ignore here since we ' ll have asked for a retry . 
+ if ( message ! = null ) 
+ { 
+ - logger . debug ( " [ Stream # { } ] Received { } " , session . planId ( ) , message ) ; 
+ session . messageReceived ( message ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamReader . java b / src / java / org / apache / cassandra / streaming / StreamReader . java 
+ index 18013fe . . 1e3ba7f 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamReader . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamReader . java 
+ @ @ - 58 , 6 + 58 , 7 @ @ public class StreamReader 
+ protected final StreamSession session ; 
+ protected final Descriptor . Version inputVersion ; 
+ protected final long repairedAt ; 
+ + protected final int fileSeqNum ; 
+ 
+ protected Descriptor desc ; 
+ 
+ @ @ - 69 , 6 + 70 , 7 @ @ public class StreamReader 
+ this . sections = header . sections ; 
+ this . inputVersion = new Descriptor . Version ( header . version ) ; 
+ this . repairedAt = header . repairedAt ; 
+ + this . fileSeqNum = header . sequenceNumber ; 
+ } 
+ 
+ / * * 
+ @ @ - 78 , 33 + 80 , 46 @ @ public class StreamReader 
+ * / 
+ public SSTableWriter read ( ReadableByteChannel channel ) throws IOException 
+ { 
+ - logger . debug ( " reading file from { } , repairedAt = { } " , session . peer , repairedAt ) ; 
+ long totalSize = totalSize ( ) ; 
+ 
+ Pair < String , String > kscf = Schema . instance . getCF ( cfId ) ; 
+ - if ( kscf = = null ) 
+ + ColumnFamilyStore cfs = null ; 
+ + if ( kscf ! = null ) 
+ + cfs = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; 
+ + 
+ + if ( kscf = = null | | cfs = = null ) 
+ { 
+ / / schema was dropped during streaming 
+ throw new IOException ( " CF " + cfId + " was dropped during streaming " ) ; 
+ } 
+ - ColumnFamilyStore cfs = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; 
+ + 
+ + logger . debug ( " [ Stream # { } ] Start receiving file # { } from { } , repairedAt = { } , size = { } , ks = ' { } ' , table = ' { } ' . " , 
+ + session . planId ( ) , fileSeqNum , session . peer , repairedAt , totalSize , cfs . keyspace . getName ( ) , 
+ + cfs . getColumnFamilyName ( ) ) ; 
+ 
+ DataInputStream dis = new DataInputStream ( new LZFInputStream ( Channels . newInputStream ( channel ) ) ) ; 
+ BytesReadTracker in = new BytesReadTracker ( dis ) ; 
+ SSTableWriter writer = null ; 
+ + DecoratedKey key = null ; 
+ try 
+ { 
+ writer = createWriter ( cfs , totalSize , repairedAt ) ; 
+ while ( in . getBytesRead ( ) < totalSize ) 
+ { 
+ - writeRow ( writer , in , cfs ) ; 
+ + key = StorageService . getPartitioner ( ) . decorateKey ( ByteBufferUtil . readWithShortLength ( in ) ) ; 
+ + writeRow ( key , writer , in , cfs ) ; 
+ / / TODO move this to BytesReadTracker 
+ session . progress ( desc , ProgressInfo . Direction . IN , in . getBytesRead ( ) , totalSize ) ; 
+ } 
+ + logger . debug ( " [ Stream # { } ] Finished receiving file # { } from { } readBytes = { } , totalSize = { } " , 
+ + session . planId ( ) , fileSeqNum , session . peer , in . getBytesRead ( ) , totalSize ) ; 
+ return writer ; 
+ } 
+ catch ( Throwable e ) 
+ { 
+ + if ( key ! = null ) 
+ + logger . warn ( " [ Stream { } ] Error while reading partition { } from stream on ks = ' { } ' and table = ' { } ' . " , 
+ + session . planId ( ) , key , cfs . keyspace . getName ( ) , cfs . getColumnFamilyName ( ) ) ; 
+ if ( writer ! = null ) 
+ { 
+ try 
+ @ @ - 162 , 9 + 177 , 8 @ @ public class StreamReader 
+ return size ; 
+ } 
+ 
+ - protected void writeRow ( SSTableWriter writer , DataInput in , ColumnFamilyStore cfs ) throws IOException 
+ + protected void writeRow ( DecoratedKey key , SSTableWriter writer , DataInput in , ColumnFamilyStore cfs ) throws IOException 
+ { 
+ - DecoratedKey key = StorageService . getPartitioner ( ) . decorateKey ( ByteBufferUtil . readWithShortLength ( in ) ) ; 
+ writer . appendFromStream ( key , cfs . metadata , in , inputVersion ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / streaming / StreamWriter . java b / src / java / org / apache / cassandra / streaming / StreamWriter . java 
+ index 43bc26a . . 2579414 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / StreamWriter . java 
+ + + + b / src / java / org / apache / cassandra / streaming / StreamWriter . java 
+ @ @ - 24 , 6 + 24 , 9 @ @ import java . nio . channels . Channels ; 
+ import java . nio . channels . WritableByteChannel ; 
+ import java . util . Collection ; 
+ 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ + 
+ import com . ning . compress . lzf . LZFOutputStream ; 
+ 
+ import org . apache . cassandra . io . sstable . Component ; 
+ @ @ - 42 , 6 + 45 , 8 @ @ public class StreamWriter 
+ { 
+ private static final int DEFAULT _ CHUNK _ SIZE = 64 * 1024 ; 
+ 
+ + private static final Logger logger = LoggerFactory . getLogger ( StreamWriter . class ) ; 
+ + 
+ protected final SSTableReader sstable ; 
+ protected final Collection < Pair < Long , Long > > sections ; 
+ protected final StreamRateLimiter limiter ; 
+ @ @ - 71 , 6 + 76 , 8 @ @ public class StreamWriter 
+ public void write ( WritableByteChannel channel ) throws IOException 
+ { 
+ long totalSize = totalSize ( ) ; 
+ + logger . debug ( " [ Stream # { } ] Start streaming file { } to { } , repairedAt = { } , totalSize = { } " , session . planId ( ) , 
+ + sstable . getFilename ( ) , session . peer , sstable . getSSTableMetadata ( ) . repairedAt , totalSize ) ; 
+ RandomAccessReader file = sstable . openDataReader ( ) ; 
+ ChecksumValidator validator = new File ( sstable . descriptor . filenameFor ( Component . CRC ) ) . exists ( ) 
+ ? DataIntegrityMetadata . checksumValidator ( sstable . descriptor ) 
+ @ @ - 109 , 6 + 116 , 8 @ @ public class StreamWriter 
+ / / make sure that current section is send 
+ compressedOutput . flush ( ) ; 
+ } 
+ + logger . debug ( " [ Stream # { } ] Finished streaming file { } to { } , bytesTransferred = { } , totalSize = { } " , 
+ + session . planId ( ) , sstable . getFilename ( ) , session . peer , progress , totalSize ) ; 
+ } 
+ finally 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java b / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java 
+ index b4a3065 . . 6280ccd 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java 
+ + + + b / src / java / org / apache / cassandra / streaming / compress / CompressedInputStream . java 
+ @ @ - 31 , 6 + 31 , 9 @ @ import java . util . zip . Checksum ; 
+ import com . google . common . collect . Iterators ; 
+ import com . google . common . primitives . Ints ; 
+ 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ + 
+ import org . apache . cassandra . io . compress . CompressionMetadata ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . WrappedRunnable ; 
+ @ @ - 40 , 12 + 43 , 15 @ @ import org . apache . cassandra . utils . WrappedRunnable ; 
+ * / 
+ public class CompressedInputStream extends InputStream 
+ { 
+ + 
+ + private static final Logger logger = LoggerFactory . getLogger ( CompressedInputStream . class ) ; 
+ + 
+ private final CompressionInfo info ; 
+ / / chunk buffer 
+ private final BlockingQueue < byte [ ] > dataBuffer ; 
+ 
+ / / uncompressed bytes 
+ - private final byte [ ] buffer ; 
+ + private byte [ ] buffer ; 
+ 
+ / / offset from the beginning of the buffer 
+ protected long bufferOffset = 0 ; 
+ @ @ - 64 , 8 + 70 , 6 @ @ public class CompressedInputStream extends InputStream 
+ private long totalCompressedBytesRead ; 
+ private final boolean hasPostCompressionAdlerChecksums ; 
+ 
+ - private Thread readerThread ; 
+ - 
+ / * * 
+ * @ param source Input source to read compressed data from 
+ * @ param info Compression info 
+ @ @ - 77 , 10 + 81 , 9 @ @ public class CompressedInputStream extends InputStream 
+ this . hasPostCompressionAdlerChecksums = hasPostCompressionAdlerChecksums ; 
+ this . buffer = new byte [ info . parameters . chunkLength ( ) ] ; 
+ / / buffer is limited to store up to 1024 chunks 
+ - this . dataBuffer = new ArrayBlockingQueue < > ( Math . min ( info . chunks . length , 1024 ) ) ; 
+ + this . dataBuffer = new ArrayBlockingQueue < byte [ ] > ( Math . min ( info . chunks . length , 1024 ) ) ; 
+ 
+ - readerThread = new Thread ( new Reader ( source , info , dataBuffer ) ) ; 
+ - readerThread . start ( ) ; 
+ + new Thread ( new Reader ( source , info , dataBuffer ) ) . start ( ) ; 
+ } 
+ 
+ public int read ( ) throws IOException 
+ @ @ - 146 , 7 + 149 , 7 @ @ public class CompressedInputStream extends InputStream 
+ return totalCompressedBytesRead ; 
+ } 
+ 
+ - class Reader extends WrappedRunnable 
+ + static class Reader extends WrappedRunnable 
+ { 
+ private final InputStream source ; 
+ private final Iterator < CompressionMetadata . Chunk > chunks ; 
+ @ @ - 162 , 7 + 165 , 7 @ @ public class CompressedInputStream extends InputStream 
+ protected void runMayThrow ( ) throws Exception 
+ { 
+ byte [ ] compressedWithCRC ; 
+ - while ( ! Thread . currentThread ( ) . isInterrupted ( ) & & chunks . hasNext ( ) ) 
+ + while ( chunks . hasNext ( ) ) 
+ { 
+ CompressionMetadata . Chunk chunk = chunks . next ( ) ; 
+ 
+ @ @ - 172 , 43 + 175 , 25 @ @ public class CompressedInputStream extends InputStream 
+ int bufferRead = 0 ; 
+ while ( bufferRead < readLength ) 
+ { 
+ - int r ; 
+ try 
+ { 
+ - r = source . read ( compressedWithCRC , bufferRead , readLength - bufferRead ) ; 
+ + int r = source . read ( compressedWithCRC , bufferRead , readLength - bufferRead ) ; 
+ if ( r < 0 ) 
+ { 
+ dataBuffer . put ( POISON _ PILL ) ; 
+ return ; / / throw exception where we consume dataBuffer 
+ } 
+ + bufferRead + = r ; 
+ } 
+ catch ( IOException e ) 
+ { 
+ + logger . warn ( " Error while reading compressed input stream . " , e ) ; 
+ dataBuffer . put ( POISON _ PILL ) ; 
+ - throw e ; 
+ + return ; / / throw exception where we consume dataBuffer 
+ } 
+ - bufferRead + = r ; 
+ } 
+ dataBuffer . put ( compressedWithCRC ) ; 
+ } 
+ - synchronized ( CompressedInputStream . this ) 
+ - { 
+ - readerThread = null ; 
+ - } 
+ - } 
+ - } 
+ - 
+ - @ Override 
+ - public void close ( ) throws IOException 
+ - { 
+ - synchronized ( this ) 
+ - { 
+ - if ( readerThread ! = null ) 
+ - { 
+ - readerThread . interrupt ( ) ; 
+ - readerThread = null ; 
+ - } 
+ } 
+ } 
+ - 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java 
+ index 4f60773 . . fd0d9c8 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java 
+ + + + b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamReader . java 
+ @ @ - 24 , 6 + 24 , 7 @ @ import java . nio . channels . ReadableByteChannel ; 
+ 
+ import com . google . common . base . Throwables ; 
+ 
+ + import org . apache . cassandra . db . DecoratedKey ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 32 , 10 + 33 , 12 @ @ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . db . Keyspace ; 
+ import org . apache . cassandra . io . compress . CompressionMetadata ; 
+ import org . apache . cassandra . io . sstable . SSTableWriter ; 
+ + import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . streaming . ProgressInfo ; 
+ import org . apache . cassandra . streaming . StreamReader ; 
+ import org . apache . cassandra . streaming . StreamSession ; 
+ import org . apache . cassandra . streaming . messages . FileMessageHeader ; 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . BytesReadTracker ; 
+ import org . apache . cassandra . utils . Pair ; 
+ 
+ @ @ - 61 , 40 + 64 , 56 @ @ public class CompressedStreamReader extends StreamReader 
+ @ Override 
+ public SSTableWriter read ( ReadableByteChannel channel ) throws IOException 
+ { 
+ - logger . debug ( " reading file from { } , repairedAt = { } " , session . peer , repairedAt ) ; 
+ long totalSize = totalSize ( ) ; 
+ 
+ Pair < String , String > kscf = Schema . instance . getCF ( cfId ) ; 
+ - if ( kscf = = null ) 
+ + ColumnFamilyStore cfs = null ; 
+ + if ( kscf ! = null ) 
+ + cfs = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; 
+ + 
+ + if ( kscf = = null | | cfs = = null ) 
+ { 
+ / / schema was dropped during streaming 
+ throw new IOException ( " CF " + cfId + " was dropped during streaming " ) ; 
+ } 
+ - ColumnFamilyStore cfs = Keyspace . open ( kscf . left ) . getColumnFamilyStore ( kscf . right ) ; 
+ + 
+ + logger . debug ( " [ Stream # { } ] Start receiving file # { } from { } , repairedAt = { } , size = { } , ks = ' { } ' , table = ' { } ' . " , 
+ + session . planId ( ) , fileSeqNum , session . peer , repairedAt , totalSize , cfs . keyspace . getName ( ) , 
+ + cfs . getColumnFamilyName ( ) ) ; 
+ 
+ CompressedInputStream cis = new CompressedInputStream ( Channels . newInputStream ( channel ) , compressionInfo , inputVersion . hasPostCompressionAdlerChecksums ) ; 
+ BytesReadTracker in = new BytesReadTracker ( new DataInputStream ( cis ) ) ; 
+ SSTableWriter writer = null ; 
+ + DecoratedKey key = null ; 
+ try 
+ { 
+ writer = createWriter ( cfs , totalSize , repairedAt ) ; 
+ + int sectionIdx = 0 ; 
+ for ( Pair < Long , Long > section : sections ) 
+ { 
+ long length = section . right - section . left ; 
+ / / skip to beginning of section inside chunk 
+ cis . position ( section . left ) ; 
+ in . reset ( 0 ) ; 
+ + logger . trace ( " [ Stream # { } ] Reading section { } with length { } from stream . " , session . planId ( ) , sectionIdx + + , length ) ; 
+ while ( in . getBytesRead ( ) < length ) 
+ { 
+ - writeRow ( writer , in , cfs ) ; 
+ + key = StorageService . getPartitioner ( ) . decorateKey ( ByteBufferUtil . readWithShortLength ( in ) ) ; 
+ + writeRow ( key , writer , in , cfs ) ; 
+ + 
+ / / when compressed , report total bytes of compressed chunks read since remoteFile . size is the sum of chunks transferred 
+ session . progress ( desc , ProgressInfo . Direction . IN , cis . getTotalCompressedBytesRead ( ) , totalSize ) ; 
+ } 
+ } 
+ + logger . debug ( " [ Stream # { } ] Finished receiving file # { } from { } readBytes = { } , totalSize = { } " , session . planId ( ) , fileSeqNum , 
+ + session . peer , cis . getTotalCompressedBytesRead ( ) , totalSize ) ; 
+ return writer ; 
+ } 
+ catch ( Throwable e ) 
+ { 
+ + if ( key ! = null ) 
+ + logger . warn ( " [ Stream { } ] Error while reading partition { } from stream on ks = ' { } ' and table = ' { } ' . " , 
+ + session . planId ( ) , key , cfs . keyspace . getName ( ) , cfs . getColumnFamilyName ( ) ) ; 
+ if ( writer ! = null ) 
+ { 
+ try 
+ @ @ - 113 , 10 + 132 , 6 @ @ public class CompressedStreamReader extends StreamReader 
+ else 
+ throw Throwables . propagate ( e ) ; 
+ } 
+ - finally 
+ - { 
+ - cis . close ( ) ; 
+ - } 
+ } 
+ 
+ @ Override 
+ diff - - git a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamWriter . java b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamWriter . java 
+ index 001c927 . . 6fe08e6 100644 
+ - - - a / src / java / org / apache / cassandra / streaming / compress / CompressedStreamWriter . java 
+ + + + b / src / java / org / apache / cassandra / streaming / compress / CompressedStreamWriter . java 
+ @ @ - 24 , 6 + 24 , 9 @ @ import java . util . ArrayList ; 
+ import java . util . Collection ; 
+ import java . util . List ; 
+ 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ + 
+ import org . apache . cassandra . io . compress . CompressionMetadata ; 
+ import org . apache . cassandra . io . sstable . SSTableReader ; 
+ import org . apache . cassandra . io . util . FileUtils ; 
+ @ @ - 40 , 6 + 43 , 8 @ @ public class CompressedStreamWriter extends StreamWriter 
+ { 
+ public static final int CHUNK _ SIZE = 10 * 1024 * 1024 ; 
+ 
+ + private static final Logger logger = LoggerFactory . getLogger ( CompressedStreamWriter . class ) ; 
+ + 
+ private final CompressionInfo compressionInfo ; 
+ 
+ public CompressedStreamWriter ( SSTableReader sstable , Collection < Pair < Long , Long > > sections , CompressionInfo compressionInfo , StreamSession session ) 
+ @ @ - 52 , 12 + 57 , 15 @ @ public class CompressedStreamWriter extends StreamWriter 
+ public void write ( WritableByteChannel channel ) throws IOException 
+ { 
+ long totalSize = totalSize ( ) ; 
+ + logger . debug ( " [ Stream # { } ] Start streaming file { } to { } , repairedAt = { } , totalSize = { } " , session . planId ( ) , 
+ + sstable . getFilename ( ) , session . peer , sstable . getSSTableMetadata ( ) . repairedAt , totalSize ) ; 
+ RandomAccessReader file = sstable . openDataReader ( ) ; 
+ FileChannel fc = file . getChannel ( ) ; 
+ 
+ long progress = 0L ; 
+ / / calculate chunks to transfer . we want to send continuous chunks altogether . 
+ List < Pair < Long , Long > > sections = getTransferSections ( compressionInfo . chunks ) ; 
+ + int sectionIdx = 0 ; 
+ try 
+ { 
+ / / stream each of the required sections of the file 
+ @ @ - 65 , 6 + 73 , 8 @ @ public class CompressedStreamWriter extends StreamWriter 
+ { 
+ / / length of the section to stream 
+ long length = section . right - section . left ; 
+ + logger . trace ( " [ Stream # { } ] Writing section { } with length { } to stream . " , session . planId ( ) , sectionIdx + + , length ) ; 
+ + 
+ / / tracks write progress 
+ long bytesTransferred = 0 ; 
+ while ( bytesTransferred < length ) 
+ @ @ - 77 , 6 + 87 , 8 @ @ public class CompressedStreamWriter extends StreamWriter 
+ session . progress ( sstable . descriptor , ProgressInfo . Direction . OUT , progress , totalSize ) ; 
+ } 
+ } 
+ + logger . debug ( " [ Stream # { } ] Finished streaming file { } to { } , bytesTransferred = { } , totalSize = { } " , 
+ + session . planId ( ) , sstable . getFilename ( ) , session . peer , progress , totalSize ) ; 
+ } 
+ finally 
+ { 
+ diff - - git a / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java b / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java 
+ index 87e0003 . . c70b932 100644 
+ - - - a / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java 
+ + + + b / test / unit / org / apache / cassandra / streaming / compress / CompressedInputStreamTest . java 
+ @ @ - 58 , 52 + 58 , 6 @ @ public class CompressedInputStreamTest 
+ } 
+ 
+ / * * 
+ - * Test CompressedInputStream not hang when closed while reading 
+ - * @ throws Exception 
+ - * / 
+ - @ Test ( expected = EOFException . class ) 
+ - public void testClose ( ) throws Exception 
+ - { 
+ - CompressionParameters param = new CompressionParameters ( SnappyCompressor . instance , 32 , Collections . < String , String > emptyMap ( ) ) ; 
+ - CompressionMetadata . Chunk [ ] chunks = { new CompressionMetadata . Chunk ( 0 , 100 ) } ; 
+ - final SynchronousQueue < Integer > blocker = new SynchronousQueue < > ( ) ; 
+ - InputStream blockingInput = new InputStream ( ) 
+ - { 
+ - @ Override 
+ - public int read ( ) throws IOException 
+ - { 
+ - try 
+ - { 
+ - / / 10 second cut off not to stop other test in case 
+ - return Objects . requireNonNull ( blocker . poll ( 10 , TimeUnit . SECONDS ) ) ; 
+ - } 
+ - catch ( InterruptedException e ) 
+ - { 
+ - throw new IOException ( " Interrupted as expected " , e ) ; 
+ - } 
+ - } 
+ - } ; 
+ - CompressionInfo info = new CompressionInfo ( chunks , param ) ; 
+ - try ( CompressedInputStream cis = new CompressedInputStream ( blockingInput , info , true ) ) 
+ - { 
+ - new Thread ( new Runnable ( ) 
+ - { 
+ - @ Override 
+ - public void run ( ) 
+ - { 
+ - try 
+ - { 
+ - cis . close ( ) ; 
+ - } 
+ - catch ( Exception ignore ) { } 
+ - } 
+ - } ) . start ( ) ; 
+ - / / block here 
+ - cis . read ( ) ; 
+ - } 
+ - } 
+ - 
+ - / * * 
+ * @ param valuesToCheck array of longs of range ( 0 - 999 ) 
+ * @ throws Exception 
+ * /
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

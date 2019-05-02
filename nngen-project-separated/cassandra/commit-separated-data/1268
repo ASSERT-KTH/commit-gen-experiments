@@ -1,0 +1,161 @@
+BLEU SCORE: 0.015445276590783498
+
+TEST MSG: In mutateMV , if not yet gossiping , write all mutations to batchlog
+GENERATED MSG: Re - apply MV updates on commitlog replay
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index ba0012e . . 0bac64e 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 0 <nl> + * If node is not yet gossiping write all MV updates to batchlog only ( CASSANDRA - 10413 ) <nl> * Re - populate token metadata after commit log recovery ( CASSANDRA - 10293 ) <nl> * Provide additional metrics for materialized views ( CASSANDRA - 10323 ) <nl> * Flush system schema tables after local schema changes ( CASSANDRA - 10429 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / view / ViewUtils . java b / src / java / org / apache / cassandra / db / view / ViewUtils . java <nl> index 628142d . . ebbae65 100644 <nl> - - - a / src / java / org / apache / cassandra / db / view / ViewUtils . java <nl> + + + b / src / java / org / apache / cassandra / db / view / ViewUtils . java <nl> @ @ - 94 , 7 + 94 , 7 @ @ public final class ViewUtils <nl> <nl> if ( StorageService . instance . getTokenMetadata ( ) . pendingEndpointsFor ( viewToken , keyspaceName ) . size ( ) > 0 ) <nl> { <nl> - / / Since there are pending endpoints we are going to store hints this in the batchlog regardless . <nl> + / / Since there are pending endpoints we are going to write to the batchlog regardless . <nl> / / So we can pretend we are the views endpoint . <nl> <nl> return FBUtilities . getBroadcastAddress ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index d1142fc . . f210951 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 660 , 55 + 660 , 64 @ @ public class StorageProxy implements StorageProxyMBean <nl> final String localDataCenter = DatabaseDescriptor . getEndpointSnitch ( ) . getDatacenter ( FBUtilities . getBroadcastAddress ( ) ) ; <nl> <nl> long startTime = System . nanoTime ( ) ; <nl> - List < WriteResponseHandlerWrapper > wrappers = new ArrayList < > ( mutations . size ( ) ) ; <nl> + <nl> <nl> try <nl> { <nl> - Token baseToken = StorageService . instance . getTokenMetadata ( ) . partitioner . getToken ( dataKey ) ; <nl> - <nl> - ConsistencyLevel consistencyLevel = ConsistencyLevel . ONE ; <nl> - <nl> - / / Since the base - > view replication is 1 : 1 we only need to store the BL locally <nl> - final Collection < InetAddress > batchlogEndpoints = Collections . singleton ( FBUtilities . getBroadcastAddress ( ) ) ; <nl> + / / if we haven ' t joined the ring , write everything to batchlog because paired replicas may be stale <nl> final UUID batchUUID = UUIDGen . getTimeUUID ( ) ; <nl> - BatchlogResponseHandler . BatchlogCleanup cleanup = new BatchlogResponseHandler . BatchlogCleanup ( mutations . size ( ) , <nl> - ( ) - > asyncRemoveFromBatchlog ( batchlogEndpoints , batchUUID ) ) ; <nl> <nl> - / / add a handler for each mutation - includes checking availability , but doesn ' t initiate any writes , yet <nl> - for ( Mutation mutation : mutations ) <nl> + if ( ! Gossiper . instance . isEnabled ( ) ) <nl> + { <nl> + BatchlogManager . store ( Batch . createLocal ( batchUUID , FBUtilities . timestampMicros ( ) , <nl> + mutations ) , <nl> + writeCommitLog ) ; <nl> + } <nl> + else <nl> { <nl> - String keyspaceName = mutation . getKeyspaceName ( ) ; <nl> - Token tk = mutation . key ( ) . getToken ( ) ; <nl> - InetAddress pairedEndpoint = ViewUtils . getViewNaturalEndpoint ( keyspaceName , baseToken , tk ) ; <nl> - List < InetAddress > naturalEndpoints = Lists . newArrayList ( pairedEndpoint ) ; <nl> - <nl> - WriteResponseHandlerWrapper wrapper = wrapViewBatchResponseHandler ( mutation , <nl> - consistencyLevel , <nl> - consistencyLevel , <nl> - naturalEndpoints , <nl> - baseComplete , <nl> - WriteType . BATCH , <nl> - cleanup ) ; <nl> - <nl> - / / When local node is the endpoint and there are no pending nodes we can <nl> - / / Just apply the mutation locally . <nl> - if ( pairedEndpoint . equals ( FBUtilities . getBroadcastAddress ( ) ) & & wrapper . handler . pendingEndpoints . isEmpty ( ) ) <nl> + List < WriteResponseHandlerWrapper > wrappers = new ArrayList < > ( mutations . size ( ) ) ; <nl> + Token baseToken = StorageService . instance . getTokenMetadata ( ) . partitioner . getToken ( dataKey ) ; <nl> + <nl> + ConsistencyLevel consistencyLevel = ConsistencyLevel . ONE ; <nl> + <nl> + / / Since the base - > view replication is 1 : 1 we only need to store the BL locally <nl> + final Collection < InetAddress > batchlogEndpoints = Collections . singleton ( FBUtilities . getBroadcastAddress ( ) ) ; <nl> + BatchlogResponseHandler . BatchlogCleanup cleanup = new BatchlogResponseHandler . BatchlogCleanup ( mutations . size ( ) , <nl> + ( ) - > asyncRemoveFromBatchlog ( batchlogEndpoints , batchUUID ) ) ; <nl> + <nl> + / / add a handler for each mutation - includes checking availability , but doesn ' t initiate any writes , yet <nl> + for ( Mutation mutation : mutations ) <nl> { <nl> - mutation . apply ( writeCommitLog ) ; <nl> - viewWriteMetrics . viewReplicasSuccess . inc ( ) ; <nl> + String keyspaceName = mutation . getKeyspaceName ( ) ; <nl> + Token tk = mutation . key ( ) . getToken ( ) ; <nl> + InetAddress pairedEndpoint = ViewUtils . getViewNaturalEndpoint ( keyspaceName , baseToken , tk ) ; <nl> + List < InetAddress > naturalEndpoints = Lists . newArrayList ( pairedEndpoint ) ; <nl> + <nl> + WriteResponseHandlerWrapper wrapper = wrapViewBatchResponseHandler ( mutation , <nl> + consistencyLevel , <nl> + consistencyLevel , <nl> + naturalEndpoints , <nl> + baseComplete , <nl> + WriteType . BATCH , <nl> + cleanup ) ; <nl> + <nl> + / / When local node is the endpoint and there are no pending nodes we can <nl> + / / Just apply the mutation locally . <nl> + if ( pairedEndpoint . equals ( FBUtilities . getBroadcastAddress ( ) ) & & wrapper . handler . pendingEndpoints . isEmpty ( ) & & StorageService . instance . isJoined ( ) ) <nl> + mutation . apply ( writeCommitLog ) ; <nl> + else <nl> + wrappers . add ( wrapper ) ; <nl> } <nl> - else <nl> - wrappers . add ( wrapper ) ; <nl> - } <nl> <nl> - if ( ! wrappers . isEmpty ( ) ) <nl> - { <nl> - / / Apply to local batchlog memtable in this thread <nl> - BatchlogManager . store ( Batch . createLocal ( batchUUID , FBUtilities . timestampMicros ( ) , Lists . transform ( wrappers , w - > w . mutation ) ) , <nl> - writeCommitLog ) ; <nl> + if ( ! wrappers . isEmpty ( ) ) <nl> + { <nl> + / / Apply to local batchlog memtable in this thread <nl> + BatchlogManager . store ( Batch . createLocal ( batchUUID , FBUtilities . timestampMicros ( ) , Lists . transform ( wrappers , w - > w . mutation ) ) , <nl> + writeCommitLog ) ; <nl> <nl> - / / now actually perform the writes and wait for them to complete <nl> - asyncWriteBatchedMutations ( wrappers , localDataCenter , Stage . VIEW _ MUTATION ) ; <nl> + / / now actually perform the writes and wait for them to complete <nl> + asyncWriteBatchedMutations ( wrappers , localDataCenter , Stage . VIEW _ MUTATION ) ; <nl> + } <nl> } <nl> } <nl> finally <nl> @ @ - 1081 , 7 + 1090 , 7 @ @ public class StorageProxy implements StorageProxyMBean <nl> * | off | ANY | - - > DO NOT fire hints . And DO NOT wait for them to complete . <nl> * } <nl> * < / pre > <nl> - * <nl> + * <nl> * @ throws OverloadedException if the hints cannot be written / enqueued <nl> * / <nl> public static void sendToHintedEndpoints ( final Mutation mutation , <nl> @ @ - 2250 , 7 + 2259 , 7 @ @ public class StorageProxy implements StorageProxyMBean <nl> } <nl> <nl> Set < InetAddress > allEndpoints = Gossiper . instance . getLiveTokenOwners ( ) ; <nl> - <nl> + <nl> int blockFor = allEndpoints . size ( ) ; <nl> final TruncateResponseHandler responseHandler = new TruncateResponseHandler ( blockFor ) ; <nl>
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index ba0012e . . 0bac64e 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 0 
+ + * If node is not yet gossiping write all MV updates to batchlog only ( CASSANDRA - 10413 ) 
+ * Re - populate token metadata after commit log recovery ( CASSANDRA - 10293 ) 
+ * Provide additional metrics for materialized views ( CASSANDRA - 10323 ) 
+ * Flush system schema tables after local schema changes ( CASSANDRA - 10429 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / view / ViewUtils . java b / src / java / org / apache / cassandra / db / view / ViewUtils . java 
+ index 628142d . . ebbae65 100644 
+ - - - a / src / java / org / apache / cassandra / db / view / ViewUtils . java 
+ + + + b / src / java / org / apache / cassandra / db / view / ViewUtils . java 
+ @ @ - 94 , 7 + 94 , 7 @ @ public final class ViewUtils 
+ 
+ if ( StorageService . instance . getTokenMetadata ( ) . pendingEndpointsFor ( viewToken , keyspaceName ) . size ( ) > 0 ) 
+ { 
+ - / / Since there are pending endpoints we are going to store hints this in the batchlog regardless . 
+ + / / Since there are pending endpoints we are going to write to the batchlog regardless . 
+ / / So we can pretend we are the views endpoint . 
+ 
+ return FBUtilities . getBroadcastAddress ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index d1142fc . . f210951 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 660 , 55 + 660 , 64 @ @ public class StorageProxy implements StorageProxyMBean 
+ final String localDataCenter = DatabaseDescriptor . getEndpointSnitch ( ) . getDatacenter ( FBUtilities . getBroadcastAddress ( ) ) ; 
+ 
+ long startTime = System . nanoTime ( ) ; 
+ - List < WriteResponseHandlerWrapper > wrappers = new ArrayList < > ( mutations . size ( ) ) ; 
+ + 
+ 
+ try 
+ { 
+ - Token baseToken = StorageService . instance . getTokenMetadata ( ) . partitioner . getToken ( dataKey ) ; 
+ - 
+ - ConsistencyLevel consistencyLevel = ConsistencyLevel . ONE ; 
+ - 
+ - / / Since the base - > view replication is 1 : 1 we only need to store the BL locally 
+ - final Collection < InetAddress > batchlogEndpoints = Collections . singleton ( FBUtilities . getBroadcastAddress ( ) ) ; 
+ + / / if we haven ' t joined the ring , write everything to batchlog because paired replicas may be stale 
+ final UUID batchUUID = UUIDGen . getTimeUUID ( ) ; 
+ - BatchlogResponseHandler . BatchlogCleanup cleanup = new BatchlogResponseHandler . BatchlogCleanup ( mutations . size ( ) , 
+ - ( ) - > asyncRemoveFromBatchlog ( batchlogEndpoints , batchUUID ) ) ; 
+ 
+ - / / add a handler for each mutation - includes checking availability , but doesn ' t initiate any writes , yet 
+ - for ( Mutation mutation : mutations ) 
+ + if ( ! Gossiper . instance . isEnabled ( ) ) 
+ + { 
+ + BatchlogManager . store ( Batch . createLocal ( batchUUID , FBUtilities . timestampMicros ( ) , 
+ + mutations ) , 
+ + writeCommitLog ) ; 
+ + } 
+ + else 
+ { 
+ - String keyspaceName = mutation . getKeyspaceName ( ) ; 
+ - Token tk = mutation . key ( ) . getToken ( ) ; 
+ - InetAddress pairedEndpoint = ViewUtils . getViewNaturalEndpoint ( keyspaceName , baseToken , tk ) ; 
+ - List < InetAddress > naturalEndpoints = Lists . newArrayList ( pairedEndpoint ) ; 
+ - 
+ - WriteResponseHandlerWrapper wrapper = wrapViewBatchResponseHandler ( mutation , 
+ - consistencyLevel , 
+ - consistencyLevel , 
+ - naturalEndpoints , 
+ - baseComplete , 
+ - WriteType . BATCH , 
+ - cleanup ) ; 
+ - 
+ - / / When local node is the endpoint and there are no pending nodes we can 
+ - / / Just apply the mutation locally . 
+ - if ( pairedEndpoint . equals ( FBUtilities . getBroadcastAddress ( ) ) & & wrapper . handler . pendingEndpoints . isEmpty ( ) ) 
+ + List < WriteResponseHandlerWrapper > wrappers = new ArrayList < > ( mutations . size ( ) ) ; 
+ + Token baseToken = StorageService . instance . getTokenMetadata ( ) . partitioner . getToken ( dataKey ) ; 
+ + 
+ + ConsistencyLevel consistencyLevel = ConsistencyLevel . ONE ; 
+ + 
+ + / / Since the base - > view replication is 1 : 1 we only need to store the BL locally 
+ + final Collection < InetAddress > batchlogEndpoints = Collections . singleton ( FBUtilities . getBroadcastAddress ( ) ) ; 
+ + BatchlogResponseHandler . BatchlogCleanup cleanup = new BatchlogResponseHandler . BatchlogCleanup ( mutations . size ( ) , 
+ + ( ) - > asyncRemoveFromBatchlog ( batchlogEndpoints , batchUUID ) ) ; 
+ + 
+ + / / add a handler for each mutation - includes checking availability , but doesn ' t initiate any writes , yet 
+ + for ( Mutation mutation : mutations ) 
+ { 
+ - mutation . apply ( writeCommitLog ) ; 
+ - viewWriteMetrics . viewReplicasSuccess . inc ( ) ; 
+ + String keyspaceName = mutation . getKeyspaceName ( ) ; 
+ + Token tk = mutation . key ( ) . getToken ( ) ; 
+ + InetAddress pairedEndpoint = ViewUtils . getViewNaturalEndpoint ( keyspaceName , baseToken , tk ) ; 
+ + List < InetAddress > naturalEndpoints = Lists . newArrayList ( pairedEndpoint ) ; 
+ + 
+ + WriteResponseHandlerWrapper wrapper = wrapViewBatchResponseHandler ( mutation , 
+ + consistencyLevel , 
+ + consistencyLevel , 
+ + naturalEndpoints , 
+ + baseComplete , 
+ + WriteType . BATCH , 
+ + cleanup ) ; 
+ + 
+ + / / When local node is the endpoint and there are no pending nodes we can 
+ + / / Just apply the mutation locally . 
+ + if ( pairedEndpoint . equals ( FBUtilities . getBroadcastAddress ( ) ) & & wrapper . handler . pendingEndpoints . isEmpty ( ) & & StorageService . instance . isJoined ( ) ) 
+ + mutation . apply ( writeCommitLog ) ; 
+ + else 
+ + wrappers . add ( wrapper ) ; 
+ } 
+ - else 
+ - wrappers . add ( wrapper ) ; 
+ - } 
+ 
+ - if ( ! wrappers . isEmpty ( ) ) 
+ - { 
+ - / / Apply to local batchlog memtable in this thread 
+ - BatchlogManager . store ( Batch . createLocal ( batchUUID , FBUtilities . timestampMicros ( ) , Lists . transform ( wrappers , w - > w . mutation ) ) , 
+ - writeCommitLog ) ; 
+ + if ( ! wrappers . isEmpty ( ) ) 
+ + { 
+ + / / Apply to local batchlog memtable in this thread 
+ + BatchlogManager . store ( Batch . createLocal ( batchUUID , FBUtilities . timestampMicros ( ) , Lists . transform ( wrappers , w - > w . mutation ) ) , 
+ + writeCommitLog ) ; 
+ 
+ - / / now actually perform the writes and wait for them to complete 
+ - asyncWriteBatchedMutations ( wrappers , localDataCenter , Stage . VIEW _ MUTATION ) ; 
+ + / / now actually perform the writes and wait for them to complete 
+ + asyncWriteBatchedMutations ( wrappers , localDataCenter , Stage . VIEW _ MUTATION ) ; 
+ + } 
+ } 
+ } 
+ finally 
+ @ @ - 1081 , 7 + 1090 , 7 @ @ public class StorageProxy implements StorageProxyMBean 
+ * | off | ANY | - - > DO NOT fire hints . And DO NOT wait for them to complete . 
+ * } 
+ * < / pre > 
+ - * 
+ + * 
+ * @ throws OverloadedException if the hints cannot be written / enqueued 
+ * / 
+ public static void sendToHintedEndpoints ( final Mutation mutation , 
+ @ @ - 2250 , 7 + 2259 , 7 @ @ public class StorageProxy implements StorageProxyMBean 
+ } 
+ 
+ Set < InetAddress > allEndpoints = Gossiper . instance . getLiveTokenOwners ( ) ; 
+ - 
+ + 
+ int blockFor = allEndpoints . size ( ) ; 
+ final TruncateResponseHandler responseHandler = new TruncateResponseHandler ( blockFor ) ; 
+
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

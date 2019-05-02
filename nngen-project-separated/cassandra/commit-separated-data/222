@@ -1,0 +1,993 @@
+BLEU SCORE: 0.0367352656298894
+
+TEST MSG: Prevent continuous schema exchange between 3 . 0 to 3 . 11 nodes
+GENERATED MSG: merge from 0 . 7
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index eaf312f . . 60794f0 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 11 . 2 <nl> + * Prevent continuous schema exchange between 3 . 0 and 3 . 11 nodes ( CASSANDRA - 14109 ) <nl> * Fix imbalanced disks when replacing node with same address with JBOD ( CASSANDRA - 14084 ) <nl> * Reload compaction strategies when disk boundaries are invalidated ( CASSANDRA - 13948 ) <nl> * Remove OpenJDK log warning ( CASSANDRA - 13916 ) <nl> diff - - git a / NEWS . txt b / NEWS . txt <nl> index 0c32278 . . f4b15e7 100644 <nl> - - - a / NEWS . txt <nl> + + + b / NEWS . txt <nl> @ @ - 25 , 6 + 25 , 15 @ @ Upgrading <nl> - Cassandra is not logging anymore by default an Heap histogram on OutOfMemoryError . To enable that behavior <nl> set the ' cassandra . printHeapHistogramOnOutOfMemoryError ' System property to ' true ' . See CASSANDRA - 13006 <nl> for more details . <nl> + - Upgrades from 3 . 0 might have produced unnecessary schema migrations while <nl> + there was at least one 3 . 0 node in the cluster . It is therefore highly <nl> + recommended to upgrade from 3 . 0 to at least 3 . 11 . 2 . The root cause of <nl> + this schema mismatch was a difference in the way how schema digests were computed <nl> + in 3 . 0 and 3 . 11 . 2 . To mitigate this issue , 3 . 11 . 2 and newer announce <nl> + 3 . 0 compatible digests as long as there is at least one 3 . 0 node in the <nl> + cluster . Once all nodes have been upgraded , the " real " schema version will be <nl> + announced . Note : this fix is only necessary in 3 . 11 . 2 and therefore only applies <nl> + to 3 . 11 . ( CASSANDRA - 14109 ) <nl> <nl> Materialized Views <nl> - - - - - - - - - - - - - - - - - - - <nl> diff - - git a / src / java / org / apache / cassandra / config / Schema . java b / src / java / org / apache / cassandra / config / Schema . java <nl> index 8fc83df . . 253a66b 100644 <nl> - - - a / src / java / org / apache / cassandra / config / Schema . java <nl> + + + b / src / java / org / apache / cassandra / config / Schema . java <nl> @ @ - 22 , 6 + 22 , 7 @ @ import java . util . stream . Collectors ; <nl> <nl> import com . google . common . collect . ImmutableList ; <nl> import com . google . common . collect . Sets ; <nl> + import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 33 , 6 + 34 , 7 @ @ import org . apache . cassandra . db . commitlog . CommitLog ; <nl> import org . apache . cassandra . db . compaction . CompactionManager ; <nl> import org . apache . cassandra . db . marshal . AbstractType ; <nl> import org . apache . cassandra . db . marshal . UserType ; <nl> + import org . apache . cassandra . gms . Gossiper ; <nl> import org . apache . cassandra . index . Index ; <nl> import org . apache . cassandra . io . sstable . Descriptor ; <nl> import org . apache . cassandra . locator . LocalStrategy ; <nl> @ @ - 40 , 7 + 42 , 6 @ @ import org . apache . cassandra . schema . * ; <nl> import org . apache . cassandra . service . MigrationManager ; <nl> import org . apache . cassandra . utils . ConcurrentBiMap ; <nl> import org . apache . cassandra . utils . Pair ; <nl> - import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; <nl> <nl> public class Schema <nl> { <nl> @ @ - 58 , 6 + 59 , 7 @ @ public class Schema <nl> private final ConcurrentBiMap < Pair < String , String > , UUID > cfIdMap = new ConcurrentBiMap < > ( ) ; <nl> <nl> private volatile UUID version ; <nl> + private volatile UUID altVersion ; <nl> <nl> / * * <nl> * Initialize empty schema object and load the hardcoded system tables <nl> @ @ - 518 , 30 + 520 , 82 @ @ public class Schema <nl> / * Version control * / <nl> <nl> / * * <nl> - * @ return current schema version <nl> + * The schema version to announce . <nl> + * This will be either the " real " schema version including the { @ code cdc } column , <nl> + * if no node in the cluster is running at 3 . 0 , or a 3 . 0 compatible <nl> + * schema version , with the { @ code cdc } column excluded , if at least one node is <nl> + * running 3 . 0 . <nl> + * <nl> + * @ return " current " schema version <nl> * / <nl> public UUID getVersion ( ) <nl> { <nl> + return Gossiper . instance . isEnabled ( ) & & Gossiper . instance . isAnyNodeOn30 ( ) <nl> + ? altVersion <nl> + : version ; <nl> + } <nl> + <nl> + / * * <nl> + * The 3 . 11 schema version , always includes the { @ code cdc } column . <nl> + * / <nl> + public UUID getRealVersion ( ) <nl> + { <nl> return version ; <nl> } <nl> <nl> / * * <nl> + * The " alternative " schema version , compatible to 3 . 0 , always excludes the <nl> + * { @ code cdc } column . <nl> + * / <nl> + public UUID getAltVersion ( ) <nl> + { <nl> + return altVersion ; <nl> + } <nl> + <nl> + / * * <nl> + * Checks whether the given schema version is the same as the current local schema <nl> + * version , either the 3 . 0 compatible or " real " one . <nl> + * / <nl> + public boolean isSameVersion ( UUID schemaVersion ) <nl> + { <nl> + return schemaVersion ! = null <nl> + & & ( schemaVersion . equals ( version ) | | schemaVersion . equals ( altVersion ) ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Checks whether the current schema is empty . <nl> + * / <nl> + public boolean isEmpty ( ) <nl> + { <nl> + return SchemaConstants . emptyVersion . equals ( version ) ; <nl> + } <nl> + <nl> + / * * <nl> * Read schema from system keyspace and calculate MD5 digest of every row , resulting digest <nl> * will be converted into UUID which would act as content - based version of the schema . <nl> + * <nl> + * 3 . 11 note : we calculate the " real " schema version and the 3 . 0 compatible schema <nl> + * version here . <nl> * / <nl> public void updateVersion ( ) <nl> { <nl> - version = SchemaKeyspace . calculateSchemaDigest ( ) ; <nl> - SystemKeyspace . updateSchemaVersion ( version ) ; <nl> + Pair < UUID , UUID > mixedVersions = SchemaKeyspace . calculateSchemaDigest ( ) ; <nl> + version = mixedVersions . left ; <nl> + altVersion = mixedVersions . right ; <nl> + SystemKeyspace . updateSchemaVersion ( getVersion ( ) ) ; <nl> } <nl> <nl> - / * <nl> + / * * <nl> * Like updateVersion , but also announces via gossip <nl> + * <nl> + * 3 . 11 note : we announce the " current " schema version , which can be either the 3 . 0 <nl> + * compatible one , if at least one node is still running 3 . 0 , or the " real " schema version . <nl> * / <nl> public void updateVersionAndAnnounce ( ) <nl> { <nl> updateVersion ( ) ; <nl> - MigrationManager . passiveAnnounce ( version ) ; <nl> + UUID current = getVersion ( ) ; <nl> + MigrationManager . passiveAnnounce ( current , current = = getAltVersion ( ) ) ; <nl> } <nl> <nl> / * * <nl> @ @ - 785 , 4 + 839 , 17 @ @ public class Schema <nl> <nl> return transformed ; <nl> } <nl> + <nl> + / * * <nl> + * Converts the given schema version to a string . Returns { @ code unknown } , if { @ code version } is { @ code null } <nl> + * or { @ code " ( empty ) " } , if { @ code version } refers to an { @ link SchemaConstants # emptyVersion empty ) schema . <nl> + * / <nl> + public static String schemaVersionToString ( UUID version ) <nl> + { <nl> + return version = = null <nl> + ? " unknown " <nl> + : SchemaConstants . emptyVersion . equals ( version ) <nl> + ? " ( empty ) " <nl> + : version . toString ( ) ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / Columns . java b / src / java / org / apache / cassandra / db / Columns . java <nl> index 18729de . . 965e401 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Columns . java <nl> + + + b / src / java / org / apache / cassandra / db / Columns . java <nl> @ @ - 367 , 6 + 367 , 13 @ @ public class Columns extends AbstractCollection < ColumnDefinition > implements Col <nl> digest . update ( c . name . bytes . duplicate ( ) ) ; <nl> } <nl> <nl> + public void digest ( MessageDigest digest , Set < ByteBuffer > columnsToExclude ) <nl> + { <nl> + for ( ColumnDefinition c : this ) <nl> + if ( ! columnsToExclude . contains ( c . name . bytes ) ) <nl> + digest . update ( c . name . bytes . duplicate ( ) ) ; <nl> + } <nl> + <nl> / * * <nl> * Apply a function to each column definition in forwards or reversed order . <nl> * @ param function <nl> diff - - git a / src / java / org / apache / cassandra / db / SchemaCheckVerbHandler . java b / src / java / org / apache / cassandra / db / SchemaCheckVerbHandler . java <nl> index 4270a24 . . be501de 100644 <nl> - - - a / src / java / org / apache / cassandra / db / SchemaCheckVerbHandler . java <nl> + + + b / src / java / org / apache / cassandra / db / SchemaCheckVerbHandler . java <nl> @ @ - 36 , 7 + 36 , 14 @ @ public class SchemaCheckVerbHandler implements IVerbHandler <nl> public void doVerb ( MessageIn message , int id ) <nl> { <nl> logger . trace ( " Received schema check request . " ) ; <nl> - MessageOut < UUID > response = new MessageOut < UUID > ( MessagingService . Verb . INTERNAL _ RESPONSE , Schema . instance . getVersion ( ) , UUIDSerializer . serializer ) ; <nl> + <nl> + / * <nl> + 3 . 11 is special here : We return the 3 . 0 compatible version , if the requesting node <nl> + is running 3 . 0 . Otherwise the " real " schema version . <nl> + * / <nl> + MessageOut < UUID > response = new MessageOut < > ( MessagingService . Verb . INTERNAL _ RESPONSE , <nl> + Schema . instance . getVersion ( ) , <nl> + UUIDSerializer . serializer ) ; <nl> MessagingService . instance ( ) . sendReply ( response , id , message . from ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / db / rows / AbstractRow . java b / src / java / org / apache / cassandra / db / rows / AbstractRow . java <nl> index 847cb47 . . 13e6502 100644 <nl> - - - a / src / java / org / apache / cassandra / db / rows / AbstractRow . java <nl> + + + b / src / java / org / apache / cassandra / db / rows / AbstractRow . java <nl> @ @ - 19 , 7 + 19 , 9 @ @ package org . apache . cassandra . db . rows ; <nl> import java . nio . ByteBuffer ; <nl> import java . security . MessageDigest ; <nl> import java . util . AbstractCollection ; <nl> + import java . util . Collections ; <nl> import java . util . Objects ; <nl> + import java . util . Set ; <nl> import java . util . function . Function ; <nl> import java . util . stream . Collectors ; <nl> import java . util . stream . StreamSupport ; <nl> @ @ - 63 , 6 + 65 , 11 @ @ public abstract class AbstractRow extends AbstractCollection < ColumnData > impleme <nl> <nl> public void digest ( MessageDigest digest ) <nl> { <nl> + digest ( digest , Collections . emptySet ( ) ) ; <nl> + } <nl> + <nl> + public void digest ( MessageDigest digest , Set < ByteBuffer > columnsToExclude ) <nl> + { <nl> FBUtilities . updateWithByte ( digest , kind ( ) . ordinal ( ) ) ; <nl> clustering ( ) . digest ( digest ) ; <nl> <nl> @ @ - 70 , 7 + 77 , 8 @ @ public abstract class AbstractRow extends AbstractCollection < ColumnData > impleme <nl> primaryKeyLivenessInfo ( ) . digest ( digest ) ; <nl> <nl> for ( ColumnData cd : this ) <nl> - cd . digest ( digest ) ; <nl> + if ( ! columnsToExclude . contains ( cd . column . name . bytes ) ) <nl> + cd . digest ( digest ) ; <nl> } <nl> <nl> public void validateData ( CFMetaData metadata ) <nl> diff - - git a / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundMarker . java b / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundMarker . java <nl> index a82bb64 . . fb94da3 100644 <nl> - - - a / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundMarker . java <nl> + + + b / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundMarker . java <nl> @ @ - 20 , 6 + 20 , 7 @ @ package org . apache . cassandra . db . rows ; <nl> import java . nio . ByteBuffer ; <nl> import java . security . MessageDigest ; <nl> import java . util . Objects ; <nl> + import java . util . Set ; <nl> <nl> import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . db . * ; <nl> @ @ - 132 , 6 + 133 , 12 @ @ public class RangeTombstoneBoundMarker extends AbstractRangeTombstoneMarker < Clus <nl> deletion . digest ( digest ) ; <nl> } <nl> <nl> + @ Override <nl> + public void digest ( MessageDigest digest , Set < ByteBuffer > columnsToExclude ) <nl> + { <nl> + digest ( digest ) ; <nl> + } <nl> + <nl> public String toString ( CFMetaData metadata ) <nl> { <nl> return " Marker " + bound . toString ( metadata ) + ' @ ' + deletion . markedForDeleteAt ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundaryMarker . java b / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundaryMarker . java <nl> index 70d6a9d . . 9190ecf 100644 <nl> - - - a / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundaryMarker . java <nl> + + + b / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundaryMarker . java <nl> @ @ - 20 , 6 + 20 , 7 @ @ package org . apache . cassandra . db . rows ; <nl> import java . nio . ByteBuffer ; <nl> import java . security . MessageDigest ; <nl> import java . util . Objects ; <nl> + import java . util . Set ; <nl> <nl> import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . db . * ; <nl> @ @ - 151 , 6 + 152 , 12 @ @ public class RangeTombstoneBoundaryMarker extends AbstractRangeTombstoneMarker < C <nl> startDeletion . digest ( digest ) ; <nl> } <nl> <nl> + @ Override <nl> + public void digest ( MessageDigest digest , Set < ByteBuffer > columnsToExclude ) <nl> + { <nl> + digest ( digest ) ; <nl> + } <nl> + <nl> public String toString ( CFMetaData metadata ) <nl> { <nl> return String . format ( " Marker % s @ % d - % d " , bound . toString ( metadata ) , endDeletion . markedForDeleteAt ( ) , startDeletion . markedForDeleteAt ( ) ) ; <nl> diff - - git a / src / java / org / apache / cassandra / db / rows / RowIterators . java b / src / java / org / apache / cassandra / db / rows / RowIterators . java <nl> index bce6a7d . . 1463bf5 100644 <nl> - - - a / src / java / org / apache / cassandra / db / rows / RowIterators . java <nl> + + + b / src / java / org / apache / cassandra / db / rows / RowIterators . java <nl> @ @ - 17 , 7 + 17 , 9 @ @ <nl> * / <nl> package org . apache . cassandra . db . rows ; <nl> <nl> + import java . nio . ByteBuffer ; <nl> import java . security . MessageDigest ; <nl> + import java . util . Set ; <nl> <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 36 , 7 + 38 , 7 @ @ public abstract class RowIterators <nl> <nl> private RowIterators ( ) { } <nl> <nl> - public static void digest ( RowIterator iterator , MessageDigest digest ) <nl> + public static void digest ( RowIterator iterator , MessageDigest digest , MessageDigest altDigest , Set < ByteBuffer > columnsToExclude ) <nl> { <nl> / / TODO : we ' re not computing digest the same way that old nodes . This is <nl> / / currently ok as this is only used for schema digest and the is no exchange <nl> @ @ - 48 , 8 + 50 , 23 @ @ public abstract class RowIterators <nl> FBUtilities . updateWithBoolean ( digest , iterator . isReverseOrder ( ) ) ; <nl> iterator . staticRow ( ) . digest ( digest ) ; <nl> <nl> + if ( altDigest ! = null ) <nl> + { <nl> + / / Compute the " alternative digest " here . <nl> + altDigest . update ( iterator . partitionKey ( ) . getKey ( ) . duplicate ( ) ) ; <nl> + iterator . columns ( ) . regulars . digest ( altDigest , columnsToExclude ) ; <nl> + iterator . columns ( ) . statics . digest ( altDigest , columnsToExclude ) ; <nl> + FBUtilities . updateWithBoolean ( altDigest , iterator . isReverseOrder ( ) ) ; <nl> + iterator . staticRow ( ) . digest ( altDigest , columnsToExclude ) ; <nl> + } <nl> + <nl> while ( iterator . hasNext ( ) ) <nl> - iterator . next ( ) . digest ( digest ) ; <nl> + { <nl> + Row row = iterator . next ( ) ; <nl> + row . digest ( digest ) ; <nl> + if ( altDigest ! = null ) <nl> + row . digest ( altDigest , columnsToExclude ) ; <nl> + } <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / db / rows / Unfiltered . java b / src / java / org / apache / cassandra / db / rows / Unfiltered . java <nl> index e75c632 . . 3d8a9b1 100644 <nl> - - - a / src / java / org / apache / cassandra / db / rows / Unfiltered . java <nl> + + + b / src / java / org / apache / cassandra / db / rows / Unfiltered . java <nl> @ @ - 17 , 7 + 17 , 9 @ @ <nl> * / <nl> package org . apache . cassandra . db . rows ; <nl> <nl> + import java . nio . ByteBuffer ; <nl> import java . security . MessageDigest ; <nl> + import java . util . Set ; <nl> <nl> import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . db . Clusterable ; <nl> @ @ - 46 , 6 + 48 , 16 @ @ public interface Unfiltered extends Clusterable <nl> public void digest ( MessageDigest digest ) ; <nl> <nl> / * * <nl> + * Digest the atom using the provided { @ code MessageDigest } . <nl> + * This method only exists in 3 . 11 . <nl> + * Same like { @ link # digest ( MessageDigest ) } , but excludes the given columns from digest calculation . <nl> + * / <nl> + public default void digest ( MessageDigest digest , Set < ByteBuffer > columnsToExclude ) <nl> + { <nl> + throw new UnsupportedOperationException ( " no no no - don ' t use this one - use digest ( MessageDigest ) instead " ) ; <nl> + } <nl> + <nl> + / * * <nl> * Validate the data of this atom . <nl> * <nl> * @ param metadata the metadata for the table this atom is part of . <nl> diff - - git a / src / java / org / apache / cassandra / gms / EndpointState . java b / src / java / org / apache / cassandra / gms / EndpointState . java <nl> index 70f2a68 . . 674b597 100644 <nl> - - - a / src / java / org / apache / cassandra / gms / EndpointState . java <nl> + + + b / src / java / org / apache / cassandra / gms / EndpointState . java <nl> @ @ - 22 , 14 + 22 , 19 @ @ import java . util . Collections ; <nl> import java . util . EnumMap ; <nl> import java . util . Map ; <nl> import java . util . Set ; <nl> + import java . util . UUID ; <nl> import java . util . concurrent . atomic . AtomicReference ; <nl> <nl> + import javax . annotation . Nullable ; <nl> + <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> import org . apache . cassandra . db . TypeSizes ; <nl> import org . apache . cassandra . io . IVersionedSerializer ; <nl> import org . apache . cassandra . io . util . DataInputPlus ; <nl> import org . apache . cassandra . io . util . DataOutputPlus ; <nl> + import org . apache . cassandra . utils . CassandraVersion ; <nl> + <nl> / * * <nl> * This abstraction represents both the HeartBeatState and the ApplicationState in an EndpointState <nl> * instance . Any state for a given endpoint can be retrieved from this instance . <nl> @ @ - 154 , 6 + 159 , 24 @ @ public class EndpointState <nl> return pieces [ 0 ] ; <nl> } <nl> <nl> + @ Nullable <nl> + public UUID getSchemaVersion ( ) <nl> + { <nl> + VersionedValue applicationState = getApplicationState ( ApplicationState . SCHEMA ) ; <nl> + return applicationState ! = null <nl> + ? UUID . fromString ( applicationState . value ) <nl> + : null ; <nl> + } <nl> + <nl> + @ Nullable <nl> + public CassandraVersion getReleaseVersion ( ) <nl> + { <nl> + VersionedValue applicationState = getApplicationState ( ApplicationState . RELEASE _ VERSION ) ; <nl> + return applicationState ! = null <nl> + ? new CassandraVersion ( applicationState . value ) <nl> + : null ; <nl> + } <nl> + <nl> public String toString ( ) <nl> { <nl> return " EndpointState : HeartBeatState = " + hbState + " , AppStateMap = " + applicationState . get ( ) ; <nl> diff - - git a / src / java / org / apache / cassandra / gms / Gossiper . java b / src / java / org / apache / cassandra / gms / Gossiper . java <nl> index 14601d7 . . 2dac5c2 100644 <nl> - - - a / src / java / org / apache / cassandra / gms / Gossiper . java <nl> + + + b / src / java / org / apache / cassandra / gms / Gossiper . java <nl> @ @ - 24 , 7 + 24 , 7 @ @ import java . util . * ; <nl> import java . util . Map . Entry ; <nl> import java . util . concurrent . * ; <nl> import java . util . concurrent . locks . ReentrantLock ; <nl> - <nl> + import javax . annotation . Nullable ; <nl> import javax . management . MBeanServer ; <nl> import javax . management . ObjectName ; <nl> <nl> @ @ - 32 , 9 + 32 , 6 @ @ import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . collect . ImmutableList ; <nl> import com . google . common . collect . ImmutableMap ; <nl> import com . google . common . util . concurrent . Uninterruptibles ; <nl> - <nl> - import org . apache . cassandra . utils . CassandraVersion ; <nl> - import org . apache . cassandra . utils . Pair ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 43 , 14 + 40 , 17 @ @ import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutor ; <nl> import org . apache . cassandra . concurrent . Stage ; <nl> import org . apache . cassandra . concurrent . StageManager ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . config . Schema ; <nl> import org . apache . cassandra . dht . Token ; <nl> import org . apache . cassandra . net . IAsyncCallback ; <nl> import org . apache . cassandra . net . MessageIn ; <nl> import org . apache . cassandra . net . MessageOut ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> import org . apache . cassandra . service . StorageService ; <nl> + import org . apache . cassandra . utils . CassandraVersion ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> import org . apache . cassandra . utils . JVMStabilityInspector ; <nl> + import org . apache . cassandra . utils . Pair ; <nl> <nl> / * * <nl> * This module is responsible for Gossiping information for the local endpoint . This abstraction <nl> @ @ - 75 , 6 + 75 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean <nl> static final List < String > DEAD _ STATES = Arrays . asList ( VersionedValue . REMOVING _ TOKEN , VersionedValue . REMOVED _ TOKEN , <nl> VersionedValue . STATUS _ LEFT , VersionedValue . HIBERNATE ) ; <nl> static ArrayList < String > SILENT _ SHUTDOWN _ STATES = new ArrayList < > ( ) ; <nl> + <nl> static <nl> { <nl> SILENT _ SHUTDOWN _ STATES . addAll ( DEAD _ STATES ) ; <nl> @ @ - 130 , 6 + 131 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean <nl> <nl> private final Map < InetAddress , Long > expireTimeEndpointMap = new ConcurrentHashMap < InetAddress , Long > ( ) ; <nl> <nl> + private volatile boolean anyNodeOn30 = false ; / / we assume the regular case here - all nodes are on 3 . 11 <nl> private volatile boolean inShadowRound = false ; <nl> / / seeds gathered during shadow round that indicated to be in the shadow round phase as well <nl> private final Set < InetAddress > seedsInShadowRound = new ConcurrentSkipListSet < > ( inetcomparator ) ; <nl> @ @ - 852 , 20 + 854 , 6 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean <nl> return endpointStateMap . get ( ep ) ; <nl> } <nl> <nl> - public boolean valuesEqual ( InetAddress ep1 , InetAddress ep2 , ApplicationState as ) <nl> - { <nl> - EndpointState state1 = getEndpointStateForEndpoint ( ep1 ) ; <nl> - EndpointState state2 = getEndpointStateForEndpoint ( ep2 ) ; <nl> - <nl> - if ( state1 = = null | | state2 = = null ) <nl> - return false ; <nl> - <nl> - VersionedValue value1 = state1 . getApplicationState ( as ) ; <nl> - VersionedValue value2 = state2 . getApplicationState ( as ) ; <nl> - <nl> - return ! ( value1 = = null | | value2 = = null ) & & value1 . value . equals ( value2 . value ) ; <nl> - } <nl> - <nl> public Set < Entry < InetAddress , EndpointState > > getEndpointStates ( ) <nl> { <nl> return endpointStateMap . entrySet ( ) ; <nl> @ @ - 1198 , 6 + 1186 , 26 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean <nl> handleMajorStateChange ( ep , remoteState ) ; <nl> } <nl> } <nl> + <nl> + boolean any30 = anyEndpointOn30 ( ) ; <nl> + if ( any30 ! = anyNodeOn30 ) <nl> + { <nl> + logger . info ( any30 <nl> + ? " There is at least one 3 . 0 node in the cluster - will store and announce compatible schema version " <nl> + : " There are no 3 . 0 nodes in the cluster - will store and announce real schema version " ) ; <nl> + <nl> + anyNodeOn30 = any30 ; <nl> + executor . submit ( Schema . instance : : updateVersionAndAnnounce ) ; <nl> + } <nl> + } <nl> + <nl> + private boolean anyEndpointOn30 ( ) <nl> + { <nl> + return endpointStateMap . values ( ) <nl> + . stream ( ) <nl> + . map ( EndpointState : : getReleaseVersion ) <nl> + . filter ( Objects : : nonNull ) <nl> + . anyMatch ( CassandraVersion : : is30 ) ; <nl> } <nl> <nl> private void applyNewStates ( InetAddress addr , EndpointState localState , EndpointState remoteState ) <nl> @ @ - 1547 , 6 + 1555 , 11 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean <nl> return ( scheduledGossipTask ! = null ) & & ( ! scheduledGossipTask . isCancelled ( ) ) ; <nl> } <nl> <nl> + public boolean isAnyNodeOn30 ( ) <nl> + { <nl> + return anyNodeOn30 ; <nl> + } <nl> + <nl> protected void maybeFinishShadowRound ( InetAddress respondent , boolean isInShadowRound , Map < InetAddress , EndpointState > epStateMap ) <nl> { <nl> if ( inShadowRound ) <nl> @ @ - 1629 , 16 + 1642 , 18 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean <nl> return System . currentTimeMillis ( ) + Gossiper . aVeryLongTime ; <nl> } <nl> <nl> + @ Nullable <nl> public CassandraVersion getReleaseVersion ( InetAddress ep ) <nl> { <nl> EndpointState state = getEndpointStateForEndpoint ( ep ) ; <nl> - if ( state ! = null ) <nl> - { <nl> - VersionedValue applicationState = state . getApplicationState ( ApplicationState . RELEASE _ VERSION ) ; <nl> - if ( applicationState ! = null ) <nl> - return new CassandraVersion ( applicationState . value ) ; <nl> - } <nl> - return null ; <nl> + return state ! = null ? state . getReleaseVersion ( ) : null ; <nl> + } <nl> + <nl> + @ Nullable <nl> + public UUID getSchemaVersion ( InetAddress ep ) <nl> + { <nl> + EndpointState state = getEndpointStateForEndpoint ( ep ) ; <nl> + return state ! = null ? state . getSchemaVersion ( ) : null ; <nl> } <nl> <nl> public static void waitToSettle ( ) <nl> diff - - git a / src / java / org / apache / cassandra / hints / HintsDispatchTrigger . java b / src / java / org / apache / cassandra / hints / HintsDispatchTrigger . java <nl> index 47d986f . . cc1c221 100644 <nl> - - - a / src / java / org / apache / cassandra / hints / HintsDispatchTrigger . java <nl> + + + b / src / java / org / apache / cassandra / hints / HintsDispatchTrigger . java <nl> @ @ - 19 , 6 + 19 , 7 @ @ package org . apache . cassandra . hints ; <nl> <nl> import java . util . concurrent . atomic . AtomicBoolean ; <nl> <nl> + import org . apache . cassandra . config . Schema ; <nl> import org . apache . cassandra . gms . ApplicationState ; <nl> import org . apache . cassandra . gms . Gossiper ; <nl> <nl> @ @ - 64 , 7 + 65 , 7 @ @ final class HintsDispatchTrigger implements Runnable <nl> . filter ( store - > ! isScheduled ( store ) ) <nl> . filter ( HintsStore : : isLive ) <nl> . filter ( store - > store . isWriting ( ) | | store . hasFiles ( ) ) <nl> - . filter ( store - > Gossiper . instance . valuesEqual ( getBroadcastAddress ( ) , store . address ( ) , ApplicationState . SCHEMA ) ) <nl> + . filter ( store - > Schema . instance . isSameVersion ( Gossiper . instance . getSchemaVersion ( store . address ( ) ) ) ) <nl> . forEach ( this : : schedule ) ; <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / schema / SchemaKeyspace . java b / src / java / org / apache / cassandra / schema / SchemaKeyspace . java <nl> index 7834b12 . . b6add96 100644 <nl> - - - a / src / java / org / apache / cassandra / schema / SchemaKeyspace . java <nl> + + + b / src / java / org / apache / cassandra / schema / SchemaKeyspace . java <nl> @ @ - 311 , 18 + 311 , 24 @ @ public final class SchemaKeyspace <nl> / * * <nl> * Read schema from system keyspace and calculate MD5 digest of every row , resulting digest <nl> * will be converted into UUID which would act as content - based version of the schema . <nl> + * <nl> + * This implementation is special cased for 3 . 11 as it returns the schema digests for 3 . 11 <nl> + * < em > and < / em > 3 . 0 - i . e . with and without the beloved { @ code cdc } column . <nl> * / <nl> - public static UUID calculateSchemaDigest ( ) <nl> + public static Pair < UUID , UUID > calculateSchemaDigest ( ) <nl> { <nl> MessageDigest digest ; <nl> + MessageDigest digest30 ; <nl> try <nl> { <nl> digest = MessageDigest . getInstance ( " MD5 " ) ; <nl> + digest30 = MessageDigest . getInstance ( " MD5 " ) ; <nl> } <nl> catch ( NoSuchAlgorithmException e ) <nl> { <nl> throw new RuntimeException ( e ) ; <nl> } <nl> + Set < ByteBuffer > cdc = Collections . singleton ( ByteBufferUtil . bytes ( " cdc " ) ) ; <nl> <nl> for ( String table : ALL _ FOR _ DIGEST ) <nl> { <nl> @ @ - 340 , 12 + 346 , 15 @ @ public final class SchemaKeyspace <nl> try ( RowIterator partition = schema . next ( ) ) <nl> { <nl> if ( ! isSystemKeyspaceSchemaPartition ( partition . partitionKey ( ) ) ) <nl> - RowIterators . digest ( partition , digest ) ; <nl> + { <nl> + RowIterators . digest ( partition , digest , digest30 , cdc ) ; <nl> + } <nl> } <nl> } <nl> } <nl> } <nl> - return UUID . nameUUIDFromBytes ( digest . digest ( ) ) ; <nl> + <nl> + return Pair . create ( UUID . nameUUIDFromBytes ( digest . digest ( ) ) , UUID . nameUUIDFromBytes ( digest30 . digest ( ) ) ) ; <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / service / MigrationManager . java b / src / java / org / apache / cassandra / service / MigrationManager . java <nl> index 3332d2c . . a1b3597 100644 <nl> - - - a / src / java / org / apache / cassandra / service / MigrationManager . java <nl> + + + b / src / java / org / apache / cassandra / service / MigrationManager . java <nl> @ @ - 31 , 7 + 31 , 6 @ @ import org . apache . cassandra . concurrent . Stage ; <nl> import org . apache . cassandra . concurrent . StageManager ; <nl> import org . apache . cassandra . config . CFMetaData ; <nl> import org . apache . cassandra . config . Schema ; <nl> - import org . apache . cassandra . config . SchemaConstants ; <nl> import org . apache . cassandra . config . ViewDefinition ; <nl> import org . apache . cassandra . cql3 . functions . UDAggregate ; <nl> import org . apache . cassandra . cql3 . functions . UDFunction ; <nl> @ @ - 78 , 10 + 77 , 9 @ @ public class MigrationManager <nl> <nl> public static void scheduleSchemaPull ( InetAddress endpoint , EndpointState state ) <nl> { <nl> - VersionedValue value = state . getApplicationState ( ApplicationState . SCHEMA ) ; <nl> - <nl> - if ( ! endpoint . equals ( FBUtilities . getBroadcastAddress ( ) ) & & value ! = null ) <nl> - maybeScheduleSchemaPull ( UUID . fromString ( value . value ) , endpoint ) ; <nl> + UUID schemaVersion = state . getSchemaVersion ( ) ; <nl> + if ( ! endpoint . equals ( FBUtilities . getBroadcastAddress ( ) ) & & schemaVersion ! = null ) <nl> + maybeScheduleSchemaPull ( schemaVersion , endpoint ) ; <nl> } <nl> <nl> / * * <nl> @ @ - 90 , 16 + 88 , 37 @ @ public class MigrationManager <nl> * / <nl> private static void maybeScheduleSchemaPull ( final UUID theirVersion , final InetAddress endpoint ) <nl> { <nl> - if ( ( Schema . instance . getVersion ( ) ! = null & & Schema . instance . getVersion ( ) . equals ( theirVersion ) ) | | ! shouldPullSchemaFrom ( endpoint ) ) <nl> + if ( Schema . instance . getVersion ( ) = = null ) <nl> + { <nl> + logger . debug ( " Not pulling schema from { } , because local schama version is not known yet " , <nl> + endpoint ) ; <nl> + return ; <nl> + } <nl> + if ( Schema . instance . isSameVersion ( theirVersion ) ) <nl> + { <nl> + logger . debug ( " Not pulling schema from { } , because schema versions match : " + <nl> + " local / real = { } , local / compatible = { } , remote = { } " , <nl> + endpoint , <nl> + Schema . schemaVersionToString ( Schema . instance . getRealVersion ( ) ) , <nl> + Schema . schemaVersionToString ( Schema . instance . getAltVersion ( ) ) , <nl> + Schema . schemaVersionToString ( theirVersion ) ) ; <nl> + return ; <nl> + } <nl> + if ( ! shouldPullSchemaFrom ( endpoint ) ) <nl> { <nl> logger . debug ( " Not pulling schema because versions match or shouldPullSchemaFrom returned false " ) ; <nl> return ; <nl> } <nl> <nl> - if ( SchemaConstants . emptyVersion . equals ( Schema . instance . getVersion ( ) ) | | runtimeMXBean . getUptime ( ) < MIGRATION _ DELAY _ IN _ MS ) <nl> + if ( Schema . instance . isEmpty ( ) | | runtimeMXBean . getUptime ( ) < MIGRATION _ DELAY _ IN _ MS ) <nl> { <nl> / / If we think we may be bootstrapping or have recently started , submit MigrationTask immediately <nl> - logger . debug ( " Submitting migration task for { } " , endpoint ) ; <nl> + logger . debug ( " Immediately submitting migration task for { } , " + <nl> + " schema versions : local / real = { } , local / compatible = { } , remote = { } " , <nl> + endpoint , <nl> + Schema . schemaVersionToString ( Schema . instance . getRealVersion ( ) ) , <nl> + Schema . schemaVersionToString ( Schema . instance . getAltVersion ( ) ) , <nl> + Schema . schemaVersionToString ( theirVersion ) ) ; <nl> submitMigrationTask ( endpoint ) ; <nl> } <nl> else <nl> @ @ - 109 , 20 + 128 , 22 @ @ public class MigrationManager <nl> Runnable runnable = ( ) - > <nl> { <nl> / / grab the latest version of the schema since it may have changed again since the initial scheduling <nl> - EndpointState epState = Gossiper . instance . getEndpointStateForEndpoint ( endpoint ) ; <nl> - if ( epState = = null ) <nl> + UUID epSchemaVersion = Gossiper . instance . getSchemaVersion ( endpoint ) ; <nl> + if ( epSchemaVersion = = null ) <nl> { <nl> logger . debug ( " epState vanished for { } , not submitting migration task " , endpoint ) ; <nl> return ; <nl> } <nl> - VersionedValue value = epState . getApplicationState ( ApplicationState . SCHEMA ) ; <nl> - UUID currentVersion = UUID . fromString ( value . value ) ; <nl> - if ( Schema . instance . getVersion ( ) . equals ( currentVersion ) ) <nl> + if ( Schema . instance . isSameVersion ( epSchemaVersion ) ) <nl> { <nl> - logger . debug ( " not submitting migration task for { } because our versions match " , endpoint ) ; <nl> + logger . debug ( " Not submitting migration task for { } because our versions match ( { } ) " , endpoint , epSchemaVersion ) ; <nl> return ; <nl> } <nl> - logger . debug ( " submitting migration task for { } " , endpoint ) ; <nl> + logger . debug ( " submitting migration task for { } , schema version mismatch : local / real = { } , local / compatible = { } , remote = { } " , <nl> + endpoint , <nl> + Schema . schemaVersionToString ( Schema . instance . getRealVersion ( ) ) , <nl> + Schema . schemaVersionToString ( Schema . instance . getAltVersion ( ) ) , <nl> + Schema . schemaVersionToString ( epSchemaVersion ) ) ; <nl> submitMigrationTask ( endpoint ) ; <nl> } ; <nl> ScheduledExecutors . nonPeriodicTasks . schedule ( runnable , MIGRATION _ DELAY _ IN _ MS , TimeUnit . MILLISECONDS ) ; <nl> @ @ - 585 , 11 + 606 , 14 @ @ public class MigrationManager <nl> * Used to notify nodes as they arrive in the cluster . <nl> * <nl> * @ param version The schema version to announce <nl> + * @ param compatible flag whether { @ code version } is a 3 . 0 compatible version <nl> * / <nl> - public static void passiveAnnounce ( UUID version ) <nl> + public static void passiveAnnounce ( UUID version , boolean compatible ) <nl> { <nl> Gossiper . instance . addLocalApplicationState ( ApplicationState . SCHEMA , StorageService . instance . valueFactory . schema ( version ) ) ; <nl> - logger . debug ( " Gossiping my schema version { } " , version ) ; <nl> + logger . debug ( " Gossiping my { } schema version { } " , <nl> + compatible ? " 3 . 0 compatible " : " 3 . 11 " , <nl> + Schema . schemaVersionToString ( version ) ) ; <nl> } <nl> <nl> / * * <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java <nl> index 15027b2 . . c5e2912 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageService . java <nl> @ @ - 831 , 6 + 831 , 31 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE <nl> } <nl> } <nl> <nl> + public void waitForSchema ( int delay ) <nl> + { <nl> + logger . debug ( " Waiting for schema ( max { } seconds ) " , delay ) ; <nl> + / / first sleep the delay to make sure we see all our peers <nl> + for ( int i = 0 ; i < delay ; i + = 1000 ) <nl> + { <nl> + / / if we see schema , we can proceed to the next check directly <nl> + if ( ! Schema . instance . isEmpty ( ) ) <nl> + { <nl> + logger . debug ( " current schema version : { } ( 3 . 0 compatible : { } ) " , Schema . instance . getRealVersion ( ) , Schema . instance . getAltVersion ( ) ) ; <nl> + break ; <nl> + } <nl> + Uninterruptibles . sleepUninterruptibly ( 1 , TimeUnit . SECONDS ) ; <nl> + } <nl> + / / if our schema hasn ' t matched yet , wait until it has <nl> + / / we do this by waiting for all in - flight migration requests and responses to complete <nl> + / / ( post CASSANDRA - 1391 we don ' t expect this to be necessary very often , but it doesn ' t hurt to be careful ) <nl> + if ( ! MigrationManager . isReadyForBootstrap ( ) ) <nl> + { <nl> + setMode ( Mode . JOINING , " waiting for schema information to complete " , true ) ; <nl> + MigrationManager . waitUntilReadyForBootstrap ( ) ; <nl> + } <nl> + logger . info ( " Has schema with version { } " , Schema . instance . getVersion ( ) ) ; <nl> + } <nl> + <nl> private void joinTokenRing ( int delay ) throws ConfigurationException <nl> { <nl> joined = true ; <nl> diff - - git a / src / java / org / apache / cassandra / utils / CassandraVersion . java b / src / java / org / apache / cassandra / utils / CassandraVersion . java <nl> index aed0fe7 . . bf9fe6a 100644 <nl> - - - a / src / java / org / apache / cassandra / utils / CassandraVersion . java <nl> + + + b / src / java / org / apache / cassandra / utils / CassandraVersion . java <nl> @ @ - 118 , 6 + 118 , 11 @ @ public class CassandraVersion implements Comparable < CassandraVersion > <nl> return compareIdentifiers ( build , other . build , - 1 ) ; <nl> } <nl> <nl> + public boolean is30 ( ) <nl> + { <nl> + return major = = 3 & & minor = = 0 ; <nl> + } <nl> + <nl> / * * <nl> * Returns a version that is backward compatible with this version amongst a list <nl> * of provided version , or null if none can be found .
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index eec904a . . 982454c 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 59 , 6 + 59 , 8 @ @ <nl> the old ones ( CASSANDRA - 1644 ) <nl> * upgrade to Thrift 0 . 5 ( CASSANDRA - 1367 ) <nl> * renamed CL . DCQUORUM to LOCAL _ QUORUM and DCQUORUMSYNC to EACH _ QUORUM <nl> + * cli truncate support ( CASSANDRA - 1653 ) <nl> + * update GC settings in cassandra . bat ( CASSANDRA - 1636 ) <nl> <nl> <nl> 0 . 7 - beta2 <nl> diff - - git a / src / java / org / apache / cassandra / cli / Cli . g b / src / java / org / apache / cassandra / cli / Cli . g <nl> index e59c608 . . a9229ee 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / Cli . g <nl> + + + b / src / java / org / apache / cassandra / cli / Cli . g <nl> @ @ - 55 , 6 + 55 , 7 @ @ tokens { <nl> NODE _ UPDATE _ KEYSPACE ; <nl> NODE _ UPDATE _ COLUMN _ FAMILY ; <nl> NODE _ LIST ; <nl> + NODE _ TRUNCATE ; <nl> <nl> / / Internal Nodes . <nl> NODE _ COLUMN _ ACCESS ; <nl> @ @ - 123 , 6 + 124 , 7 @ @ statement <nl> | setStatement <nl> | showStatement <nl> | listStatement <nl> + | truncateStatement <nl> | - > ^ ( NODE _ NO _ OP ) <nl> ; <nl> <nl> @ @ - 174 , 6 + 176 , 8 @ @ helpStatement <nl> - > ^ ( NODE _ HELP NODE _ THRIFT _ COUNT ) <nl> | K _ HELP K _ LIST <nl> - > ^ ( NODE _ HELP NODE _ LIST ) <nl> + | K _ HELP K _ TRUNCATE <nl> + - > ^ ( NODE _ HELP NODE _ TRUNCATE ) <nl> | K _ HELP <nl> - > ^ ( NODE _ HELP ) <nl> | ' ? ' <nl> @ @ - 231 , 6 + 235 , 11 @ @ listStatement <nl> - > ^ ( NODE _ LIST columnFamily keyRangeExpr ? ^ ( NODE _ LIMIT $ limit ) ? ) <nl> ; <nl> <nl> + truncateStatement <nl> + : K _ TRUNCATE columnFamily <nl> + - > ^ ( NODE _ TRUNCATE columnFamily ) <nl> + ; <nl> + <nl> showClusterName <nl> : K _ SHOW K _ CLUSTER K _ NAME <nl> - > ^ ( NODE _ SHOW _ CLUSTER _ NAME ) <nl> @ @ - 430 , 6 + 439 , 7 @ @ K _ AND : ' AND ' ; <nl> K _ UPDATE : ' UPDATE ' ; <nl> K _ LIST : ' LIST ' ; <nl> K _ LIMIT : ' LIMIT ' ; <nl> + K _ TRUNCATE : ' TRUNCATE ' ; <nl> <nl> / / private syntactic rules <nl> fragment <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliClient . java b / src / java / org / apache / cassandra / cli / CliClient . java <nl> index b6ace98 . . b63105a 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliClient . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliClient . java <nl> @ @ - 171 , 6 + 171 , 9 @ @ public class CliClient extends CliUserHelp <nl> case CliParser . NODE _ LIST : <nl> executeList ( tree ) ; <nl> break ; <nl> + case CliParser . NODE _ TRUNCATE : <nl> + executeTruncate ( tree . getChild ( 0 ) . getText ( ) ) ; <nl> + break ; <nl> case CliParser . NODE _ NO _ OP : <nl> / / comment lines come here ; they are treated as no ops . <nl> break ; <nl> @ @ - 943 , 6 + 946 , 30 @ @ public class CliClient extends CliUserHelp <nl> printSliceList ( columnFamilyDef , keySlices ) ; <nl> } <nl> <nl> + / / TRUNCATE < columnFamily > <nl> + private void executeTruncate ( String columnFamily ) <nl> + { <nl> + if ( ! CliMain . isConnected ( ) | | ! hasKeySpace ( ) ) <nl> + return ; <nl> + <nl> + / / getting CfDef , it will fail if there is no such column family in current keySpace . <nl> + CfDef cfDef = getCfDef ( columnFamily ) ; <nl> + <nl> + try <nl> + { <nl> + thriftClient . truncate ( cfDef . getName ( ) ) ; <nl> + sessionState . out . println ( columnFamily + " truncated . " ) ; <nl> + } <nl> + catch ( InvalidRequestException e ) <nl> + { <nl> + throw new RuntimeException ( e . getWhy ( ) ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new RuntimeException ( e . getMessage ( ) ) ; <nl> + } <nl> + } <nl> + <nl> / / SHOW API VERSION <nl> private void executeShowVersion ( ) throws TException <nl> { <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliCompleter . java b / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> index f541fe5 . . b033d8f 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliCompleter . java <nl> @ @ - 55 , 12 + 55 , 16 @ @ public class CliCompleter extends SimpleCompletor <nl> " help set " , <nl> " help del " , <nl> " help count " , <nl> + " help list " , <nl> + " help truncate " <nl> } ; <nl> private static String [ ] keyspaceCommands = { <nl> " get " , <nl> " set " , <nl> " count " , <nl> - " del " <nl> + " del " , <nl> + " list " , <nl> + " truncate " <nl> } ; <nl> <nl> public CliCompleter ( ) <nl> diff - - git a / src / java / org / apache / cassandra / cli / CliUserHelp . java b / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> index 7c512e2 . . db6a779 100644 <nl> - - - a / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> + + + b / src / java / org / apache / cassandra / cli / CliUserHelp . java <nl> @ @ - 281 , 6 + 281 , 13 @ @ public class CliUserHelp { <nl> state . out . println ( " list Users [ j : ] limit 40 " ) ; <nl> break ; <nl> <nl> + case CliParser . NODE _ TRUNCATE : <nl> + state . out . println ( " truncate < column _ family > " ) ; <nl> + state . out . println ( " Truncate specified column family . \ n " ) ; <nl> + state . out . println ( " example : " ) ; <nl> + state . out . println ( " truncate Category " ) ; <nl> + break ; <nl> + <nl> default : <nl> state . out . println ( " ? " ) ; <nl> break ; <nl> @ @ - 324 , 7 + 331 , 8 @ @ public class CliUserHelp { <nl> state . out . println ( " del < cf > [ ' < key > ' ] [ ' < super > ' ] [ ' < col > ' ] Delete sub column . " ) ; <nl> state . out . println ( " count < cf > [ ' < key > ' ] Count columns in record . " ) ; <nl> state . out . println ( " count < cf > [ ' < key > ' ] [ ' < super > ' ] Count columns in a super column . " ) ; <nl> - state . out . println ( " list < cf > List all rows in the column family . " ) ; <nl> + state . out . println ( " truncate < column _ family > Truncate specified column family . " ) ; <nl> + state . out . println ( " list < cf > List all rows in the column family . " ) ; <nl> state . out . println ( " list < cf > [ < startKey > : ] " ) ; <nl> state . out . println ( " List rows in the column family beginning with < startKey > . " ) ; <nl> state . out . println ( " list < cf > [ < startKey > : < endKey > ] " ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / cli / CliTest . java b / test / unit / org / apache / cassandra / cli / CliTest . java <nl> index 24a3de0 . . eddcafd 100644 <nl> - - - a / test / unit / org / apache / cassandra / cli / CliTest . java <nl> + + + b / test / unit / org / apache / cassandra / cli / CliTest . java <nl> @ @ - 52 , 6 + 52 , 7 @ @ public class CliTest extends TestCase <nl> " list CF3 [ h : ] " , <nl> " list CF3 limit 10 " , <nl> " list CF3 [ h : g ] limit 10 " , <nl> + " truncate CF1 " , <nl> " update keyspace TestKeySpace with placement _ strategy = ' org . apache . cassandra . locator . LocalStrategy ' " , <nl> " update keyspace TestKeySpace with replication _ factor = 1 and strategy _ options = [ { DC1 : 3 , DC2 : 4 , DC5 : 1 } ] " <nl> } ; <nl> @ @ - 101 , 6 + 102 , 10 @ @ public class CliTest extends TestCase <nl> assertTrue ( result . startsWith ( " = > ( column = " ) ) ; <nl> } <nl> } <nl> + else if ( statement . startsWith ( " truncate " ) ) <nl> + { <nl> + assertTrue ( result . contains ( " truncated . " ) ) ; <nl> + } <nl> <nl> outStream . reset ( ) ; / / reset stream so we have only output from next statement all the time <nl> errStream . reset ( ) ; / / no errors to the end user .
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index eaf312f . . 60794f0 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 11 . 2 
+ + * Prevent continuous schema exchange between 3 . 0 and 3 . 11 nodes ( CASSANDRA - 14109 ) 
+ * Fix imbalanced disks when replacing node with same address with JBOD ( CASSANDRA - 14084 ) 
+ * Reload compaction strategies when disk boundaries are invalidated ( CASSANDRA - 13948 ) 
+ * Remove OpenJDK log warning ( CASSANDRA - 13916 ) 
+ diff - - git a / NEWS . txt b / NEWS . txt 
+ index 0c32278 . . f4b15e7 100644 
+ - - - a / NEWS . txt 
+ + + + b / NEWS . txt 
+ @ @ - 25 , 6 + 25 , 15 @ @ Upgrading 
+ - Cassandra is not logging anymore by default an Heap histogram on OutOfMemoryError . To enable that behavior 
+ set the ' cassandra . printHeapHistogramOnOutOfMemoryError ' System property to ' true ' . See CASSANDRA - 13006 
+ for more details . 
+ + - Upgrades from 3 . 0 might have produced unnecessary schema migrations while 
+ + there was at least one 3 . 0 node in the cluster . It is therefore highly 
+ + recommended to upgrade from 3 . 0 to at least 3 . 11 . 2 . The root cause of 
+ + this schema mismatch was a difference in the way how schema digests were computed 
+ + in 3 . 0 and 3 . 11 . 2 . To mitigate this issue , 3 . 11 . 2 and newer announce 
+ + 3 . 0 compatible digests as long as there is at least one 3 . 0 node in the 
+ + cluster . Once all nodes have been upgraded , the " real " schema version will be 
+ + announced . Note : this fix is only necessary in 3 . 11 . 2 and therefore only applies 
+ + to 3 . 11 . ( CASSANDRA - 14109 ) 
+ 
+ Materialized Views 
+ - - - - - - - - - - - - - - - - - - - 
+ diff - - git a / src / java / org / apache / cassandra / config / Schema . java b / src / java / org / apache / cassandra / config / Schema . java 
+ index 8fc83df . . 253a66b 100644 
+ - - - a / src / java / org / apache / cassandra / config / Schema . java 
+ + + + b / src / java / org / apache / cassandra / config / Schema . java 
+ @ @ - 22 , 6 + 22 , 7 @ @ import java . util . stream . Collectors ; 
+ 
+ import com . google . common . collect . ImmutableList ; 
+ import com . google . common . collect . Sets ; 
+ + import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 33 , 6 + 34 , 7 @ @ import org . apache . cassandra . db . commitlog . CommitLog ; 
+ import org . apache . cassandra . db . compaction . CompactionManager ; 
+ import org . apache . cassandra . db . marshal . AbstractType ; 
+ import org . apache . cassandra . db . marshal . UserType ; 
+ + import org . apache . cassandra . gms . Gossiper ; 
+ import org . apache . cassandra . index . Index ; 
+ import org . apache . cassandra . io . sstable . Descriptor ; 
+ import org . apache . cassandra . locator . LocalStrategy ; 
+ @ @ - 40 , 7 + 42 , 6 @ @ import org . apache . cassandra . schema . * ; 
+ import org . apache . cassandra . service . MigrationManager ; 
+ import org . apache . cassandra . utils . ConcurrentBiMap ; 
+ import org . apache . cassandra . utils . Pair ; 
+ - import org . cliffc . high _ scale _ lib . NonBlockingHashMap ; 
+ 
+ public class Schema 
+ { 
+ @ @ - 58 , 6 + 59 , 7 @ @ public class Schema 
+ private final ConcurrentBiMap < Pair < String , String > , UUID > cfIdMap = new ConcurrentBiMap < > ( ) ; 
+ 
+ private volatile UUID version ; 
+ + private volatile UUID altVersion ; 
+ 
+ / * * 
+ * Initialize empty schema object and load the hardcoded system tables 
+ @ @ - 518 , 30 + 520 , 82 @ @ public class Schema 
+ / * Version control * / 
+ 
+ / * * 
+ - * @ return current schema version 
+ + * The schema version to announce . 
+ + * This will be either the " real " schema version including the { @ code cdc } column , 
+ + * if no node in the cluster is running at 3 . 0 , or a 3 . 0 compatible 
+ + * schema version , with the { @ code cdc } column excluded , if at least one node is 
+ + * running 3 . 0 . 
+ + * 
+ + * @ return " current " schema version 
+ * / 
+ public UUID getVersion ( ) 
+ { 
+ + return Gossiper . instance . isEnabled ( ) & & Gossiper . instance . isAnyNodeOn30 ( ) 
+ + ? altVersion 
+ + : version ; 
+ + } 
+ + 
+ + / * * 
+ + * The 3 . 11 schema version , always includes the { @ code cdc } column . 
+ + * / 
+ + public UUID getRealVersion ( ) 
+ + { 
+ return version ; 
+ } 
+ 
+ / * * 
+ + * The " alternative " schema version , compatible to 3 . 0 , always excludes the 
+ + * { @ code cdc } column . 
+ + * / 
+ + public UUID getAltVersion ( ) 
+ + { 
+ + return altVersion ; 
+ + } 
+ + 
+ + / * * 
+ + * Checks whether the given schema version is the same as the current local schema 
+ + * version , either the 3 . 0 compatible or " real " one . 
+ + * / 
+ + public boolean isSameVersion ( UUID schemaVersion ) 
+ + { 
+ + return schemaVersion ! = null 
+ + & & ( schemaVersion . equals ( version ) | | schemaVersion . equals ( altVersion ) ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Checks whether the current schema is empty . 
+ + * / 
+ + public boolean isEmpty ( ) 
+ + { 
+ + return SchemaConstants . emptyVersion . equals ( version ) ; 
+ + } 
+ + 
+ + / * * 
+ * Read schema from system keyspace and calculate MD5 digest of every row , resulting digest 
+ * will be converted into UUID which would act as content - based version of the schema . 
+ + * 
+ + * 3 . 11 note : we calculate the " real " schema version and the 3 . 0 compatible schema 
+ + * version here . 
+ * / 
+ public void updateVersion ( ) 
+ { 
+ - version = SchemaKeyspace . calculateSchemaDigest ( ) ; 
+ - SystemKeyspace . updateSchemaVersion ( version ) ; 
+ + Pair < UUID , UUID > mixedVersions = SchemaKeyspace . calculateSchemaDigest ( ) ; 
+ + version = mixedVersions . left ; 
+ + altVersion = mixedVersions . right ; 
+ + SystemKeyspace . updateSchemaVersion ( getVersion ( ) ) ; 
+ } 
+ 
+ - / * 
+ + / * * 
+ * Like updateVersion , but also announces via gossip 
+ + * 
+ + * 3 . 11 note : we announce the " current " schema version , which can be either the 3 . 0 
+ + * compatible one , if at least one node is still running 3 . 0 , or the " real " schema version . 
+ * / 
+ public void updateVersionAndAnnounce ( ) 
+ { 
+ updateVersion ( ) ; 
+ - MigrationManager . passiveAnnounce ( version ) ; 
+ + UUID current = getVersion ( ) ; 
+ + MigrationManager . passiveAnnounce ( current , current = = getAltVersion ( ) ) ; 
+ } 
+ 
+ / * * 
+ @ @ - 785 , 4 + 839 , 17 @ @ public class Schema 
+ 
+ return transformed ; 
+ } 
+ + 
+ + / * * 
+ + * Converts the given schema version to a string . Returns { @ code unknown } , if { @ code version } is { @ code null } 
+ + * or { @ code " ( empty ) " } , if { @ code version } refers to an { @ link SchemaConstants # emptyVersion empty ) schema . 
+ + * / 
+ + public static String schemaVersionToString ( UUID version ) 
+ + { 
+ + return version = = null 
+ + ? " unknown " 
+ + : SchemaConstants . emptyVersion . equals ( version ) 
+ + ? " ( empty ) " 
+ + : version . toString ( ) ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / Columns . java b / src / java / org / apache / cassandra / db / Columns . java 
+ index 18729de . . 965e401 100644 
+ - - - a / src / java / org / apache / cassandra / db / Columns . java 
+ + + + b / src / java / org / apache / cassandra / db / Columns . java 
+ @ @ - 367 , 6 + 367 , 13 @ @ public class Columns extends AbstractCollection < ColumnDefinition > implements Col 
+ digest . update ( c . name . bytes . duplicate ( ) ) ; 
+ } 
+ 
+ + public void digest ( MessageDigest digest , Set < ByteBuffer > columnsToExclude ) 
+ + { 
+ + for ( ColumnDefinition c : this ) 
+ + if ( ! columnsToExclude . contains ( c . name . bytes ) ) 
+ + digest . update ( c . name . bytes . duplicate ( ) ) ; 
+ + } 
+ + 
+ / * * 
+ * Apply a function to each column definition in forwards or reversed order . 
+ * @ param function 
+ diff - - git a / src / java / org / apache / cassandra / db / SchemaCheckVerbHandler . java b / src / java / org / apache / cassandra / db / SchemaCheckVerbHandler . java 
+ index 4270a24 . . be501de 100644 
+ - - - a / src / java / org / apache / cassandra / db / SchemaCheckVerbHandler . java 
+ + + + b / src / java / org / apache / cassandra / db / SchemaCheckVerbHandler . java 
+ @ @ - 36 , 7 + 36 , 14 @ @ public class SchemaCheckVerbHandler implements IVerbHandler 
+ public void doVerb ( MessageIn message , int id ) 
+ { 
+ logger . trace ( " Received schema check request . " ) ; 
+ - MessageOut < UUID > response = new MessageOut < UUID > ( MessagingService . Verb . INTERNAL _ RESPONSE , Schema . instance . getVersion ( ) , UUIDSerializer . serializer ) ; 
+ + 
+ + / * 
+ + 3 . 11 is special here : We return the 3 . 0 compatible version , if the requesting node 
+ + is running 3 . 0 . Otherwise the " real " schema version . 
+ + * / 
+ + MessageOut < UUID > response = new MessageOut < > ( MessagingService . Verb . INTERNAL _ RESPONSE , 
+ + Schema . instance . getVersion ( ) , 
+ + UUIDSerializer . serializer ) ; 
+ MessagingService . instance ( ) . sendReply ( response , id , message . from ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / db / rows / AbstractRow . java b / src / java / org / apache / cassandra / db / rows / AbstractRow . java 
+ index 847cb47 . . 13e6502 100644 
+ - - - a / src / java / org / apache / cassandra / db / rows / AbstractRow . java 
+ + + + b / src / java / org / apache / cassandra / db / rows / AbstractRow . java 
+ @ @ - 19 , 7 + 19 , 9 @ @ package org . apache . cassandra . db . rows ; 
+ import java . nio . ByteBuffer ; 
+ import java . security . MessageDigest ; 
+ import java . util . AbstractCollection ; 
+ + import java . util . Collections ; 
+ import java . util . Objects ; 
+ + import java . util . Set ; 
+ import java . util . function . Function ; 
+ import java . util . stream . Collectors ; 
+ import java . util . stream . StreamSupport ; 
+ @ @ - 63 , 6 + 65 , 11 @ @ public abstract class AbstractRow extends AbstractCollection < ColumnData > impleme 
+ 
+ public void digest ( MessageDigest digest ) 
+ { 
+ + digest ( digest , Collections . emptySet ( ) ) ; 
+ + } 
+ + 
+ + public void digest ( MessageDigest digest , Set < ByteBuffer > columnsToExclude ) 
+ + { 
+ FBUtilities . updateWithByte ( digest , kind ( ) . ordinal ( ) ) ; 
+ clustering ( ) . digest ( digest ) ; 
+ 
+ @ @ - 70 , 7 + 77 , 8 @ @ public abstract class AbstractRow extends AbstractCollection < ColumnData > impleme 
+ primaryKeyLivenessInfo ( ) . digest ( digest ) ; 
+ 
+ for ( ColumnData cd : this ) 
+ - cd . digest ( digest ) ; 
+ + if ( ! columnsToExclude . contains ( cd . column . name . bytes ) ) 
+ + cd . digest ( digest ) ; 
+ } 
+ 
+ public void validateData ( CFMetaData metadata ) 
+ diff - - git a / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundMarker . java b / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundMarker . java 
+ index a82bb64 . . fb94da3 100644 
+ - - - a / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundMarker . java 
+ + + + b / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundMarker . java 
+ @ @ - 20 , 6 + 20 , 7 @ @ package org . apache . cassandra . db . rows ; 
+ import java . nio . ByteBuffer ; 
+ import java . security . MessageDigest ; 
+ import java . util . Objects ; 
+ + import java . util . Set ; 
+ 
+ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . db . * ; 
+ @ @ - 132 , 6 + 133 , 12 @ @ public class RangeTombstoneBoundMarker extends AbstractRangeTombstoneMarker < Clus 
+ deletion . digest ( digest ) ; 
+ } 
+ 
+ + @ Override 
+ + public void digest ( MessageDigest digest , Set < ByteBuffer > columnsToExclude ) 
+ + { 
+ + digest ( digest ) ; 
+ + } 
+ + 
+ public String toString ( CFMetaData metadata ) 
+ { 
+ return " Marker " + bound . toString ( metadata ) + ' @ ' + deletion . markedForDeleteAt ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundaryMarker . java b / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundaryMarker . java 
+ index 70d6a9d . . 9190ecf 100644 
+ - - - a / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundaryMarker . java 
+ + + + b / src / java / org / apache / cassandra / db / rows / RangeTombstoneBoundaryMarker . java 
+ @ @ - 20 , 6 + 20 , 7 @ @ package org . apache . cassandra . db . rows ; 
+ import java . nio . ByteBuffer ; 
+ import java . security . MessageDigest ; 
+ import java . util . Objects ; 
+ + import java . util . Set ; 
+ 
+ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . db . * ; 
+ @ @ - 151 , 6 + 152 , 12 @ @ public class RangeTombstoneBoundaryMarker extends AbstractRangeTombstoneMarker < C 
+ startDeletion . digest ( digest ) ; 
+ } 
+ 
+ + @ Override 
+ + public void digest ( MessageDigest digest , Set < ByteBuffer > columnsToExclude ) 
+ + { 
+ + digest ( digest ) ; 
+ + } 
+ + 
+ public String toString ( CFMetaData metadata ) 
+ { 
+ return String . format ( " Marker % s @ % d - % d " , bound . toString ( metadata ) , endDeletion . markedForDeleteAt ( ) , startDeletion . markedForDeleteAt ( ) ) ; 
+ diff - - git a / src / java / org / apache / cassandra / db / rows / RowIterators . java b / src / java / org / apache / cassandra / db / rows / RowIterators . java 
+ index bce6a7d . . 1463bf5 100644 
+ - - - a / src / java / org / apache / cassandra / db / rows / RowIterators . java 
+ + + + b / src / java / org / apache / cassandra / db / rows / RowIterators . java 
+ @ @ - 17 , 7 + 17 , 9 @ @ 
+ * / 
+ package org . apache . cassandra . db . rows ; 
+ 
+ + import java . nio . ByteBuffer ; 
+ import java . security . MessageDigest ; 
+ + import java . util . Set ; 
+ 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 36 , 7 + 38 , 7 @ @ public abstract class RowIterators 
+ 
+ private RowIterators ( ) { } 
+ 
+ - public static void digest ( RowIterator iterator , MessageDigest digest ) 
+ + public static void digest ( RowIterator iterator , MessageDigest digest , MessageDigest altDigest , Set < ByteBuffer > columnsToExclude ) 
+ { 
+ / / TODO : we ' re not computing digest the same way that old nodes . This is 
+ / / currently ok as this is only used for schema digest and the is no exchange 
+ @ @ - 48 , 8 + 50 , 23 @ @ public abstract class RowIterators 
+ FBUtilities . updateWithBoolean ( digest , iterator . isReverseOrder ( ) ) ; 
+ iterator . staticRow ( ) . digest ( digest ) ; 
+ 
+ + if ( altDigest ! = null ) 
+ + { 
+ + / / Compute the " alternative digest " here . 
+ + altDigest . update ( iterator . partitionKey ( ) . getKey ( ) . duplicate ( ) ) ; 
+ + iterator . columns ( ) . regulars . digest ( altDigest , columnsToExclude ) ; 
+ + iterator . columns ( ) . statics . digest ( altDigest , columnsToExclude ) ; 
+ + FBUtilities . updateWithBoolean ( altDigest , iterator . isReverseOrder ( ) ) ; 
+ + iterator . staticRow ( ) . digest ( altDigest , columnsToExclude ) ; 
+ + } 
+ + 
+ while ( iterator . hasNext ( ) ) 
+ - iterator . next ( ) . digest ( digest ) ; 
+ + { 
+ + Row row = iterator . next ( ) ; 
+ + row . digest ( digest ) ; 
+ + if ( altDigest ! = null ) 
+ + row . digest ( altDigest , columnsToExclude ) ; 
+ + } 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / db / rows / Unfiltered . java b / src / java / org / apache / cassandra / db / rows / Unfiltered . java 
+ index e75c632 . . 3d8a9b1 100644 
+ - - - a / src / java / org / apache / cassandra / db / rows / Unfiltered . java 
+ + + + b / src / java / org / apache / cassandra / db / rows / Unfiltered . java 
+ @ @ - 17 , 7 + 17 , 9 @ @ 
+ * / 
+ package org . apache . cassandra . db . rows ; 
+ 
+ + import java . nio . ByteBuffer ; 
+ import java . security . MessageDigest ; 
+ + import java . util . Set ; 
+ 
+ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . db . Clusterable ; 
+ @ @ - 46 , 6 + 48 , 16 @ @ public interface Unfiltered extends Clusterable 
+ public void digest ( MessageDigest digest ) ; 
+ 
+ / * * 
+ + * Digest the atom using the provided { @ code MessageDigest } . 
+ + * This method only exists in 3 . 11 . 
+ + * Same like { @ link # digest ( MessageDigest ) } , but excludes the given columns from digest calculation . 
+ + * / 
+ + public default void digest ( MessageDigest digest , Set < ByteBuffer > columnsToExclude ) 
+ + { 
+ + throw new UnsupportedOperationException ( " no no no - don ' t use this one - use digest ( MessageDigest ) instead " ) ; 
+ + } 
+ + 
+ + / * * 
+ * Validate the data of this atom . 
+ * 
+ * @ param metadata the metadata for the table this atom is part of . 
+ diff - - git a / src / java / org / apache / cassandra / gms / EndpointState . java b / src / java / org / apache / cassandra / gms / EndpointState . java 
+ index 70f2a68 . . 674b597 100644 
+ - - - a / src / java / org / apache / cassandra / gms / EndpointState . java 
+ + + + b / src / java / org / apache / cassandra / gms / EndpointState . java 
+ @ @ - 22 , 14 + 22 , 19 @ @ import java . util . Collections ; 
+ import java . util . EnumMap ; 
+ import java . util . Map ; 
+ import java . util . Set ; 
+ + import java . util . UUID ; 
+ import java . util . concurrent . atomic . AtomicReference ; 
+ 
+ + import javax . annotation . Nullable ; 
+ + 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ import org . apache . cassandra . db . TypeSizes ; 
+ import org . apache . cassandra . io . IVersionedSerializer ; 
+ import org . apache . cassandra . io . util . DataInputPlus ; 
+ import org . apache . cassandra . io . util . DataOutputPlus ; 
+ + import org . apache . cassandra . utils . CassandraVersion ; 
+ + 
+ / * * 
+ * This abstraction represents both the HeartBeatState and the ApplicationState in an EndpointState 
+ * instance . Any state for a given endpoint can be retrieved from this instance . 
+ @ @ - 154 , 6 + 159 , 24 @ @ public class EndpointState 
+ return pieces [ 0 ] ; 
+ } 
+ 
+ + @ Nullable 
+ + public UUID getSchemaVersion ( ) 
+ + { 
+ + VersionedValue applicationState = getApplicationState ( ApplicationState . SCHEMA ) ; 
+ + return applicationState ! = null 
+ + ? UUID . fromString ( applicationState . value ) 
+ + : null ; 
+ + } 
+ + 
+ + @ Nullable 
+ + public CassandraVersion getReleaseVersion ( ) 
+ + { 
+ + VersionedValue applicationState = getApplicationState ( ApplicationState . RELEASE _ VERSION ) ; 
+ + return applicationState ! = null 
+ + ? new CassandraVersion ( applicationState . value ) 
+ + : null ; 
+ + } 
+ + 
+ public String toString ( ) 
+ { 
+ return " EndpointState : HeartBeatState = " + hbState + " , AppStateMap = " + applicationState . get ( ) ; 
+ diff - - git a / src / java / org / apache / cassandra / gms / Gossiper . java b / src / java / org / apache / cassandra / gms / Gossiper . java 
+ index 14601d7 . . 2dac5c2 100644 
+ - - - a / src / java / org / apache / cassandra / gms / Gossiper . java 
+ + + + b / src / java / org / apache / cassandra / gms / Gossiper . java 
+ @ @ - 24 , 7 + 24 , 7 @ @ import java . util . * ; 
+ import java . util . Map . Entry ; 
+ import java . util . concurrent . * ; 
+ import java . util . concurrent . locks . ReentrantLock ; 
+ - 
+ + import javax . annotation . Nullable ; 
+ import javax . management . MBeanServer ; 
+ import javax . management . ObjectName ; 
+ 
+ @ @ - 32 , 9 + 32 , 6 @ @ import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . collect . ImmutableList ; 
+ import com . google . common . collect . ImmutableMap ; 
+ import com . google . common . util . concurrent . Uninterruptibles ; 
+ - 
+ - import org . apache . cassandra . utils . CassandraVersion ; 
+ - import org . apache . cassandra . utils . Pair ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 43 , 14 + 40 , 17 @ @ import org . apache . cassandra . concurrent . JMXEnabledThreadPoolExecutor ; 
+ import org . apache . cassandra . concurrent . Stage ; 
+ import org . apache . cassandra . concurrent . StageManager ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . config . Schema ; 
+ import org . apache . cassandra . dht . Token ; 
+ import org . apache . cassandra . net . IAsyncCallback ; 
+ import org . apache . cassandra . net . MessageIn ; 
+ import org . apache . cassandra . net . MessageOut ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ import org . apache . cassandra . service . StorageService ; 
+ + import org . apache . cassandra . utils . CassandraVersion ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ import org . apache . cassandra . utils . JVMStabilityInspector ; 
+ + import org . apache . cassandra . utils . Pair ; 
+ 
+ / * * 
+ * This module is responsible for Gossiping information for the local endpoint . This abstraction 
+ @ @ - 75 , 6 + 75 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean 
+ static final List < String > DEAD _ STATES = Arrays . asList ( VersionedValue . REMOVING _ TOKEN , VersionedValue . REMOVED _ TOKEN , 
+ VersionedValue . STATUS _ LEFT , VersionedValue . HIBERNATE ) ; 
+ static ArrayList < String > SILENT _ SHUTDOWN _ STATES = new ArrayList < > ( ) ; 
+ + 
+ static 
+ { 
+ SILENT _ SHUTDOWN _ STATES . addAll ( DEAD _ STATES ) ; 
+ @ @ - 130 , 6 + 131 , 7 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean 
+ 
+ private final Map < InetAddress , Long > expireTimeEndpointMap = new ConcurrentHashMap < InetAddress , Long > ( ) ; 
+ 
+ + private volatile boolean anyNodeOn30 = false ; / / we assume the regular case here - all nodes are on 3 . 11 
+ private volatile boolean inShadowRound = false ; 
+ / / seeds gathered during shadow round that indicated to be in the shadow round phase as well 
+ private final Set < InetAddress > seedsInShadowRound = new ConcurrentSkipListSet < > ( inetcomparator ) ; 
+ @ @ - 852 , 20 + 854 , 6 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean 
+ return endpointStateMap . get ( ep ) ; 
+ } 
+ 
+ - public boolean valuesEqual ( InetAddress ep1 , InetAddress ep2 , ApplicationState as ) 
+ - { 
+ - EndpointState state1 = getEndpointStateForEndpoint ( ep1 ) ; 
+ - EndpointState state2 = getEndpointStateForEndpoint ( ep2 ) ; 
+ - 
+ - if ( state1 = = null | | state2 = = null ) 
+ - return false ; 
+ - 
+ - VersionedValue value1 = state1 . getApplicationState ( as ) ; 
+ - VersionedValue value2 = state2 . getApplicationState ( as ) ; 
+ - 
+ - return ! ( value1 = = null | | value2 = = null ) & & value1 . value . equals ( value2 . value ) ; 
+ - } 
+ - 
+ public Set < Entry < InetAddress , EndpointState > > getEndpointStates ( ) 
+ { 
+ return endpointStateMap . entrySet ( ) ; 
+ @ @ - 1198 , 6 + 1186 , 26 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean 
+ handleMajorStateChange ( ep , remoteState ) ; 
+ } 
+ } 
+ + 
+ + boolean any30 = anyEndpointOn30 ( ) ; 
+ + if ( any30 ! = anyNodeOn30 ) 
+ + { 
+ + logger . info ( any30 
+ + ? " There is at least one 3 . 0 node in the cluster - will store and announce compatible schema version " 
+ + : " There are no 3 . 0 nodes in the cluster - will store and announce real schema version " ) ; 
+ + 
+ + anyNodeOn30 = any30 ; 
+ + executor . submit ( Schema . instance : : updateVersionAndAnnounce ) ; 
+ + } 
+ + } 
+ + 
+ + private boolean anyEndpointOn30 ( ) 
+ + { 
+ + return endpointStateMap . values ( ) 
+ + . stream ( ) 
+ + . map ( EndpointState : : getReleaseVersion ) 
+ + . filter ( Objects : : nonNull ) 
+ + . anyMatch ( CassandraVersion : : is30 ) ; 
+ } 
+ 
+ private void applyNewStates ( InetAddress addr , EndpointState localState , EndpointState remoteState ) 
+ @ @ - 1547 , 6 + 1555 , 11 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean 
+ return ( scheduledGossipTask ! = null ) & & ( ! scheduledGossipTask . isCancelled ( ) ) ; 
+ } 
+ 
+ + public boolean isAnyNodeOn30 ( ) 
+ + { 
+ + return anyNodeOn30 ; 
+ + } 
+ + 
+ protected void maybeFinishShadowRound ( InetAddress respondent , boolean isInShadowRound , Map < InetAddress , EndpointState > epStateMap ) 
+ { 
+ if ( inShadowRound ) 
+ @ @ - 1629 , 16 + 1642 , 18 @ @ public class Gossiper implements IFailureDetectionEventListener , GossiperMBean 
+ return System . currentTimeMillis ( ) + Gossiper . aVeryLongTime ; 
+ } 
+ 
+ + @ Nullable 
+ public CassandraVersion getReleaseVersion ( InetAddress ep ) 
+ { 
+ EndpointState state = getEndpointStateForEndpoint ( ep ) ; 
+ - if ( state ! = null ) 
+ - { 
+ - VersionedValue applicationState = state . getApplicationState ( ApplicationState . RELEASE _ VERSION ) ; 
+ - if ( applicationState ! = null ) 
+ - return new CassandraVersion ( applicationState . value ) ; 
+ - } 
+ - return null ; 
+ + return state ! = null ? state . getReleaseVersion ( ) : null ; 
+ + } 
+ + 
+ + @ Nullable 
+ + public UUID getSchemaVersion ( InetAddress ep ) 
+ + { 
+ + EndpointState state = getEndpointStateForEndpoint ( ep ) ; 
+ + return state ! = null ? state . getSchemaVersion ( ) : null ; 
+ } 
+ 
+ public static void waitToSettle ( ) 
+ diff - - git a / src / java / org / apache / cassandra / hints / HintsDispatchTrigger . java b / src / java / org / apache / cassandra / hints / HintsDispatchTrigger . java 
+ index 47d986f . . cc1c221 100644 
+ - - - a / src / java / org / apache / cassandra / hints / HintsDispatchTrigger . java 
+ + + + b / src / java / org / apache / cassandra / hints / HintsDispatchTrigger . java 
+ @ @ - 19 , 6 + 19 , 7 @ @ package org . apache . cassandra . hints ; 
+ 
+ import java . util . concurrent . atomic . AtomicBoolean ; 
+ 
+ + import org . apache . cassandra . config . Schema ; 
+ import org . apache . cassandra . gms . ApplicationState ; 
+ import org . apache . cassandra . gms . Gossiper ; 
+ 
+ @ @ - 64 , 7 + 65 , 7 @ @ final class HintsDispatchTrigger implements Runnable 
+ . filter ( store - > ! isScheduled ( store ) ) 
+ . filter ( HintsStore : : isLive ) 
+ . filter ( store - > store . isWriting ( ) | | store . hasFiles ( ) ) 
+ - . filter ( store - > Gossiper . instance . valuesEqual ( getBroadcastAddress ( ) , store . address ( ) , ApplicationState . SCHEMA ) ) 
+ + . filter ( store - > Schema . instance . isSameVersion ( Gossiper . instance . getSchemaVersion ( store . address ( ) ) ) ) 
+ . forEach ( this : : schedule ) ; 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / schema / SchemaKeyspace . java b / src / java / org / apache / cassandra / schema / SchemaKeyspace . java 
+ index 7834b12 . . b6add96 100644 
+ - - - a / src / java / org / apache / cassandra / schema / SchemaKeyspace . java 
+ + + + b / src / java / org / apache / cassandra / schema / SchemaKeyspace . java 
+ @ @ - 311 , 18 + 311 , 24 @ @ public final class SchemaKeyspace 
+ / * * 
+ * Read schema from system keyspace and calculate MD5 digest of every row , resulting digest 
+ * will be converted into UUID which would act as content - based version of the schema . 
+ + * 
+ + * This implementation is special cased for 3 . 11 as it returns the schema digests for 3 . 11 
+ + * < em > and < / em > 3 . 0 - i . e . with and without the beloved { @ code cdc } column . 
+ * / 
+ - public static UUID calculateSchemaDigest ( ) 
+ + public static Pair < UUID , UUID > calculateSchemaDigest ( ) 
+ { 
+ MessageDigest digest ; 
+ + MessageDigest digest30 ; 
+ try 
+ { 
+ digest = MessageDigest . getInstance ( " MD5 " ) ; 
+ + digest30 = MessageDigest . getInstance ( " MD5 " ) ; 
+ } 
+ catch ( NoSuchAlgorithmException e ) 
+ { 
+ throw new RuntimeException ( e ) ; 
+ } 
+ + Set < ByteBuffer > cdc = Collections . singleton ( ByteBufferUtil . bytes ( " cdc " ) ) ; 
+ 
+ for ( String table : ALL _ FOR _ DIGEST ) 
+ { 
+ @ @ - 340 , 12 + 346 , 15 @ @ public final class SchemaKeyspace 
+ try ( RowIterator partition = schema . next ( ) ) 
+ { 
+ if ( ! isSystemKeyspaceSchemaPartition ( partition . partitionKey ( ) ) ) 
+ - RowIterators . digest ( partition , digest ) ; 
+ + { 
+ + RowIterators . digest ( partition , digest , digest30 , cdc ) ; 
+ + } 
+ } 
+ } 
+ } 
+ } 
+ - return UUID . nameUUIDFromBytes ( digest . digest ( ) ) ; 
+ + 
+ + return Pair . create ( UUID . nameUUIDFromBytes ( digest . digest ( ) ) , UUID . nameUUIDFromBytes ( digest30 . digest ( ) ) ) ; 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / service / MigrationManager . java b / src / java / org / apache / cassandra / service / MigrationManager . java 
+ index 3332d2c . . a1b3597 100644 
+ - - - a / src / java / org / apache / cassandra / service / MigrationManager . java 
+ + + + b / src / java / org / apache / cassandra / service / MigrationManager . java 
+ @ @ - 31 , 7 + 31 , 6 @ @ import org . apache . cassandra . concurrent . Stage ; 
+ import org . apache . cassandra . concurrent . StageManager ; 
+ import org . apache . cassandra . config . CFMetaData ; 
+ import org . apache . cassandra . config . Schema ; 
+ - import org . apache . cassandra . config . SchemaConstants ; 
+ import org . apache . cassandra . config . ViewDefinition ; 
+ import org . apache . cassandra . cql3 . functions . UDAggregate ; 
+ import org . apache . cassandra . cql3 . functions . UDFunction ; 
+ @ @ - 78 , 10 + 77 , 9 @ @ public class MigrationManager 
+ 
+ public static void scheduleSchemaPull ( InetAddress endpoint , EndpointState state ) 
+ { 
+ - VersionedValue value = state . getApplicationState ( ApplicationState . SCHEMA ) ; 
+ - 
+ - if ( ! endpoint . equals ( FBUtilities . getBroadcastAddress ( ) ) & & value ! = null ) 
+ - maybeScheduleSchemaPull ( UUID . fromString ( value . value ) , endpoint ) ; 
+ + UUID schemaVersion = state . getSchemaVersion ( ) ; 
+ + if ( ! endpoint . equals ( FBUtilities . getBroadcastAddress ( ) ) & & schemaVersion ! = null ) 
+ + maybeScheduleSchemaPull ( schemaVersion , endpoint ) ; 
+ } 
+ 
+ / * * 
+ @ @ - 90 , 16 + 88 , 37 @ @ public class MigrationManager 
+ * / 
+ private static void maybeScheduleSchemaPull ( final UUID theirVersion , final InetAddress endpoint ) 
+ { 
+ - if ( ( Schema . instance . getVersion ( ) ! = null & & Schema . instance . getVersion ( ) . equals ( theirVersion ) ) | | ! shouldPullSchemaFrom ( endpoint ) ) 
+ + if ( Schema . instance . getVersion ( ) = = null ) 
+ + { 
+ + logger . debug ( " Not pulling schema from { } , because local schama version is not known yet " , 
+ + endpoint ) ; 
+ + return ; 
+ + } 
+ + if ( Schema . instance . isSameVersion ( theirVersion ) ) 
+ + { 
+ + logger . debug ( " Not pulling schema from { } , because schema versions match : " + 
+ + " local / real = { } , local / compatible = { } , remote = { } " , 
+ + endpoint , 
+ + Schema . schemaVersionToString ( Schema . instance . getRealVersion ( ) ) , 
+ + Schema . schemaVersionToString ( Schema . instance . getAltVersion ( ) ) , 
+ + Schema . schemaVersionToString ( theirVersion ) ) ; 
+ + return ; 
+ + } 
+ + if ( ! shouldPullSchemaFrom ( endpoint ) ) 
+ { 
+ logger . debug ( " Not pulling schema because versions match or shouldPullSchemaFrom returned false " ) ; 
+ return ; 
+ } 
+ 
+ - if ( SchemaConstants . emptyVersion . equals ( Schema . instance . getVersion ( ) ) | | runtimeMXBean . getUptime ( ) < MIGRATION _ DELAY _ IN _ MS ) 
+ + if ( Schema . instance . isEmpty ( ) | | runtimeMXBean . getUptime ( ) < MIGRATION _ DELAY _ IN _ MS ) 
+ { 
+ / / If we think we may be bootstrapping or have recently started , submit MigrationTask immediately 
+ - logger . debug ( " Submitting migration task for { } " , endpoint ) ; 
+ + logger . debug ( " Immediately submitting migration task for { } , " + 
+ + " schema versions : local / real = { } , local / compatible = { } , remote = { } " , 
+ + endpoint , 
+ + Schema . schemaVersionToString ( Schema . instance . getRealVersion ( ) ) , 
+ + Schema . schemaVersionToString ( Schema . instance . getAltVersion ( ) ) , 
+ + Schema . schemaVersionToString ( theirVersion ) ) ; 
+ submitMigrationTask ( endpoint ) ; 
+ } 
+ else 
+ @ @ - 109 , 20 + 128 , 22 @ @ public class MigrationManager 
+ Runnable runnable = ( ) - > 
+ { 
+ / / grab the latest version of the schema since it may have changed again since the initial scheduling 
+ - EndpointState epState = Gossiper . instance . getEndpointStateForEndpoint ( endpoint ) ; 
+ - if ( epState = = null ) 
+ + UUID epSchemaVersion = Gossiper . instance . getSchemaVersion ( endpoint ) ; 
+ + if ( epSchemaVersion = = null ) 
+ { 
+ logger . debug ( " epState vanished for { } , not submitting migration task " , endpoint ) ; 
+ return ; 
+ } 
+ - VersionedValue value = epState . getApplicationState ( ApplicationState . SCHEMA ) ; 
+ - UUID currentVersion = UUID . fromString ( value . value ) ; 
+ - if ( Schema . instance . getVersion ( ) . equals ( currentVersion ) ) 
+ + if ( Schema . instance . isSameVersion ( epSchemaVersion ) ) 
+ { 
+ - logger . debug ( " not submitting migration task for { } because our versions match " , endpoint ) ; 
+ + logger . debug ( " Not submitting migration task for { } because our versions match ( { } ) " , endpoint , epSchemaVersion ) ; 
+ return ; 
+ } 
+ - logger . debug ( " submitting migration task for { } " , endpoint ) ; 
+ + logger . debug ( " submitting migration task for { } , schema version mismatch : local / real = { } , local / compatible = { } , remote = { } " , 
+ + endpoint , 
+ + Schema . schemaVersionToString ( Schema . instance . getRealVersion ( ) ) , 
+ + Schema . schemaVersionToString ( Schema . instance . getAltVersion ( ) ) , 
+ + Schema . schemaVersionToString ( epSchemaVersion ) ) ; 
+ submitMigrationTask ( endpoint ) ; 
+ } ; 
+ ScheduledExecutors . nonPeriodicTasks . schedule ( runnable , MIGRATION _ DELAY _ IN _ MS , TimeUnit . MILLISECONDS ) ; 
+ @ @ - 585 , 11 + 606 , 14 @ @ public class MigrationManager 
+ * Used to notify nodes as they arrive in the cluster . 
+ * 
+ * @ param version The schema version to announce 
+ + * @ param compatible flag whether { @ code version } is a 3 . 0 compatible version 
+ * / 
+ - public static void passiveAnnounce ( UUID version ) 
+ + public static void passiveAnnounce ( UUID version , boolean compatible ) 
+ { 
+ Gossiper . instance . addLocalApplicationState ( ApplicationState . SCHEMA , StorageService . instance . valueFactory . schema ( version ) ) ; 
+ - logger . debug ( " Gossiping my schema version { } " , version ) ; 
+ + logger . debug ( " Gossiping my { } schema version { } " , 
+ + compatible ? " 3 . 0 compatible " : " 3 . 11 " , 
+ + Schema . schemaVersionToString ( version ) ) ; 
+ } 
+ 
+ / * * 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageService . java b / src / java / org / apache / cassandra / service / StorageService . java 
+ index 15027b2 . . c5e2912 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageService . java 
+ @ @ - 831 , 6 + 831 , 31 @ @ public class StorageService extends NotificationBroadcasterSupport implements IE 
+ } 
+ } 
+ 
+ + public void waitForSchema ( int delay ) 
+ + { 
+ + logger . debug ( " Waiting for schema ( max { } seconds ) " , delay ) ; 
+ + / / first sleep the delay to make sure we see all our peers 
+ + for ( int i = 0 ; i < delay ; i + = 1000 ) 
+ + { 
+ + / / if we see schema , we can proceed to the next check directly 
+ + if ( ! Schema . instance . isEmpty ( ) ) 
+ + { 
+ + logger . debug ( " current schema version : { } ( 3 . 0 compatible : { } ) " , Schema . instance . getRealVersion ( ) , Schema . instance . getAltVersion ( ) ) ; 
+ + break ; 
+ + } 
+ + Uninterruptibles . sleepUninterruptibly ( 1 , TimeUnit . SECONDS ) ; 
+ + } 
+ + / / if our schema hasn ' t matched yet , wait until it has 
+ + / / we do this by waiting for all in - flight migration requests and responses to complete 
+ + / / ( post CASSANDRA - 1391 we don ' t expect this to be necessary very often , but it doesn ' t hurt to be careful ) 
+ + if ( ! MigrationManager . isReadyForBootstrap ( ) ) 
+ + { 
+ + setMode ( Mode . JOINING , " waiting for schema information to complete " , true ) ; 
+ + MigrationManager . waitUntilReadyForBootstrap ( ) ; 
+ + } 
+ + logger . info ( " Has schema with version { } " , Schema . instance . getVersion ( ) ) ; 
+ + } 
+ + 
+ private void joinTokenRing ( int delay ) throws ConfigurationException 
+ { 
+ joined = true ; 
+ diff - - git a / src / java / org / apache / cassandra / utils / CassandraVersion . java b / src / java / org / apache / cassandra / utils / CassandraVersion . java 
+ index aed0fe7 . . bf9fe6a 100644 
+ - - - a / src / java / org / apache / cassandra / utils / CassandraVersion . java 
+ + + + b / src / java / org / apache / cassandra / utils / CassandraVersion . java 
+ @ @ - 118 , 6 + 118 , 11 @ @ public class CassandraVersion implements Comparable < CassandraVersion > 
+ return compareIdentifiers ( build , other . build , - 1 ) ; 
+ } 
+ 
+ + public boolean is30 ( ) 
+ + { 
+ + return major = = 3 & & minor = = 0 ; 
+ + } 
+ + 
+ / * * 
+ * Returns a version that is backward compatible with this version amongst a list 
+ * of provided version , or null if none can be found .
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index eec904a . . 982454c 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 59 , 6 + 59 , 8 @ @ 
+ the old ones ( CASSANDRA - 1644 ) 
+ * upgrade to Thrift 0 . 5 ( CASSANDRA - 1367 ) 
+ * renamed CL . DCQUORUM to LOCAL _ QUORUM and DCQUORUMSYNC to EACH _ QUORUM 
+ + * cli truncate support ( CASSANDRA - 1653 ) 
+ + * update GC settings in cassandra . bat ( CASSANDRA - 1636 ) 
+ 
+ 
+ 0 . 7 - beta2 
+ diff - - git a / src / java / org / apache / cassandra / cli / Cli . g b / src / java / org / apache / cassandra / cli / Cli . g 
+ index e59c608 . . a9229ee 100644 
+ - - - a / src / java / org / apache / cassandra / cli / Cli . g 
+ + + + b / src / java / org / apache / cassandra / cli / Cli . g 
+ @ @ - 55 , 6 + 55 , 7 @ @ tokens { 
+ NODE _ UPDATE _ KEYSPACE ; 
+ NODE _ UPDATE _ COLUMN _ FAMILY ; 
+ NODE _ LIST ; 
+ + NODE _ TRUNCATE ; 
+ 
+ / / Internal Nodes . 
+ NODE _ COLUMN _ ACCESS ; 
+ @ @ - 123 , 6 + 124 , 7 @ @ statement 
+ | setStatement 
+ | showStatement 
+ | listStatement 
+ + | truncateStatement 
+ | - > ^ ( NODE _ NO _ OP ) 
+ ; 
+ 
+ @ @ - 174 , 6 + 176 , 8 @ @ helpStatement 
+ - > ^ ( NODE _ HELP NODE _ THRIFT _ COUNT ) 
+ | K _ HELP K _ LIST 
+ - > ^ ( NODE _ HELP NODE _ LIST ) 
+ + | K _ HELP K _ TRUNCATE 
+ + - > ^ ( NODE _ HELP NODE _ TRUNCATE ) 
+ | K _ HELP 
+ - > ^ ( NODE _ HELP ) 
+ | ' ? ' 
+ @ @ - 231 , 6 + 235 , 11 @ @ listStatement 
+ - > ^ ( NODE _ LIST columnFamily keyRangeExpr ? ^ ( NODE _ LIMIT $ limit ) ? ) 
+ ; 
+ 
+ + truncateStatement 
+ + : K _ TRUNCATE columnFamily 
+ + - > ^ ( NODE _ TRUNCATE columnFamily ) 
+ + ; 
+ + 
+ showClusterName 
+ : K _ SHOW K _ CLUSTER K _ NAME 
+ - > ^ ( NODE _ SHOW _ CLUSTER _ NAME ) 
+ @ @ - 430 , 6 + 439 , 7 @ @ K _ AND : ' AND ' ; 
+ K _ UPDATE : ' UPDATE ' ; 
+ K _ LIST : ' LIST ' ; 
+ K _ LIMIT : ' LIMIT ' ; 
+ + K _ TRUNCATE : ' TRUNCATE ' ; 
+ 
+ / / private syntactic rules 
+ fragment 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliClient . java b / src / java / org / apache / cassandra / cli / CliClient . java 
+ index b6ace98 . . b63105a 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliClient . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliClient . java 
+ @ @ - 171 , 6 + 171 , 9 @ @ public class CliClient extends CliUserHelp 
+ case CliParser . NODE _ LIST : 
+ executeList ( tree ) ; 
+ break ; 
+ + case CliParser . NODE _ TRUNCATE : 
+ + executeTruncate ( tree . getChild ( 0 ) . getText ( ) ) ; 
+ + break ; 
+ case CliParser . NODE _ NO _ OP : 
+ / / comment lines come here ; they are treated as no ops . 
+ break ; 
+ @ @ - 943 , 6 + 946 , 30 @ @ public class CliClient extends CliUserHelp 
+ printSliceList ( columnFamilyDef , keySlices ) ; 
+ } 
+ 
+ + / / TRUNCATE < columnFamily > 
+ + private void executeTruncate ( String columnFamily ) 
+ + { 
+ + if ( ! CliMain . isConnected ( ) | | ! hasKeySpace ( ) ) 
+ + return ; 
+ + 
+ + / / getting CfDef , it will fail if there is no such column family in current keySpace . 
+ + CfDef cfDef = getCfDef ( columnFamily ) ; 
+ + 
+ + try 
+ + { 
+ + thriftClient . truncate ( cfDef . getName ( ) ) ; 
+ + sessionState . out . println ( columnFamily + " truncated . " ) ; 
+ + } 
+ + catch ( InvalidRequestException e ) 
+ + { 
+ + throw new RuntimeException ( e . getWhy ( ) ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new RuntimeException ( e . getMessage ( ) ) ; 
+ + } 
+ + } 
+ + 
+ / / SHOW API VERSION 
+ private void executeShowVersion ( ) throws TException 
+ { 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliCompleter . java b / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ index f541fe5 . . b033d8f 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliCompleter . java 
+ @ @ - 55 , 12 + 55 , 16 @ @ public class CliCompleter extends SimpleCompletor 
+ " help set " , 
+ " help del " , 
+ " help count " , 
+ + " help list " , 
+ + " help truncate " 
+ } ; 
+ private static String [ ] keyspaceCommands = { 
+ " get " , 
+ " set " , 
+ " count " , 
+ - " del " 
+ + " del " , 
+ + " list " , 
+ + " truncate " 
+ } ; 
+ 
+ public CliCompleter ( ) 
+ diff - - git a / src / java / org / apache / cassandra / cli / CliUserHelp . java b / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ index 7c512e2 . . db6a779 100644 
+ - - - a / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ + + + b / src / java / org / apache / cassandra / cli / CliUserHelp . java 
+ @ @ - 281 , 6 + 281 , 13 @ @ public class CliUserHelp { 
+ state . out . println ( " list Users [ j : ] limit 40 " ) ; 
+ break ; 
+ 
+ + case CliParser . NODE _ TRUNCATE : 
+ + state . out . println ( " truncate < column _ family > " ) ; 
+ + state . out . println ( " Truncate specified column family . \ n " ) ; 
+ + state . out . println ( " example : " ) ; 
+ + state . out . println ( " truncate Category " ) ; 
+ + break ; 
+ + 
+ default : 
+ state . out . println ( " ? " ) ; 
+ break ; 
+ @ @ - 324 , 7 + 331 , 8 @ @ public class CliUserHelp { 
+ state . out . println ( " del < cf > [ ' < key > ' ] [ ' < super > ' ] [ ' < col > ' ] Delete sub column . " ) ; 
+ state . out . println ( " count < cf > [ ' < key > ' ] Count columns in record . " ) ; 
+ state . out . println ( " count < cf > [ ' < key > ' ] [ ' < super > ' ] Count columns in a super column . " ) ; 
+ - state . out . println ( " list < cf > List all rows in the column family . " ) ; 
+ + state . out . println ( " truncate < column _ family > Truncate specified column family . " ) ; 
+ + state . out . println ( " list < cf > List all rows in the column family . " ) ; 
+ state . out . println ( " list < cf > [ < startKey > : ] " ) ; 
+ state . out . println ( " List rows in the column family beginning with < startKey > . " ) ; 
+ state . out . println ( " list < cf > [ < startKey > : < endKey > ] " ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / cli / CliTest . java b / test / unit / org / apache / cassandra / cli / CliTest . java 
+ index 24a3de0 . . eddcafd 100644 
+ - - - a / test / unit / org / apache / cassandra / cli / CliTest . java 
+ + + + b / test / unit / org / apache / cassandra / cli / CliTest . java 
+ @ @ - 52 , 6 + 52 , 7 @ @ public class CliTest extends TestCase 
+ " list CF3 [ h : ] " , 
+ " list CF3 limit 10 " , 
+ " list CF3 [ h : g ] limit 10 " , 
+ + " truncate CF1 " , 
+ " update keyspace TestKeySpace with placement _ strategy = ' org . apache . cassandra . locator . LocalStrategy ' " , 
+ " update keyspace TestKeySpace with replication _ factor = 1 and strategy _ options = [ { DC1 : 3 , DC2 : 4 , DC5 : 1 } ] " 
+ } ; 
+ @ @ - 101 , 6 + 102 , 10 @ @ public class CliTest extends TestCase 
+ assertTrue ( result . startsWith ( " = > ( column = " ) ) ; 
+ } 
+ } 
+ + else if ( statement . startsWith ( " truncate " ) ) 
+ + { 
+ + assertTrue ( result . contains ( " truncated . " ) ) ; 
+ + } 
+ 
+ outStream . reset ( ) ; / / reset stream so we have only output from next statement all the time 
+ errStream . reset ( ) ; / / no errors to the end user .

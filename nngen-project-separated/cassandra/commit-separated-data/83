@@ -1,0 +1,366 @@
+BLEU SCORE: 0.018738883683389617
+
+TEST MSG: Fail query on transient replica if coordinator only expects full data
+GENERATED MSG: Fix CQLSSTableWriter throwing exception and spawning threads
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 264c80f . . a30bec7 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 4 . 0 <nl> + * Fail query on transient replica if coordinator only expects full data ( CASSANDRA - 14704 ) <nl> * Remove mentions of transient replication from repair path ( CASSANDRA - 14698 ) <nl> * Fix handleRepairStatusChangedNotification to remove first then add ( CASSANDRA - 14720 ) <nl> * Allow transient node to serve as a repair coordinator ( CASSANDRA - 14693 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / ReadCommandVerbHandler . java b / src / java / org / apache / cassandra / db / ReadCommandVerbHandler . java <nl> index 1b28c2c . . 0e97dd8 100644 <nl> - - - a / src / java / org / apache / cassandra / db / ReadCommandVerbHandler . java <nl> + + + b / src / java / org / apache / cassandra / db / ReadCommandVerbHandler . java <nl> @ @ - 17 , 8 + 17 , 14 @ @ <nl> * / <nl> package org . apache . cassandra . db ; <nl> <nl> + import org . slf4j . Logger ; <nl> + import org . slf4j . LoggerFactory ; <nl> + <nl> import org . apache . cassandra . db . partitions . UnfilteredPartitionIterator ; <nl> + import org . apache . cassandra . dht . Token ; <nl> + import org . apache . cassandra . exceptions . InvalidRequestException ; <nl> import org . apache . cassandra . io . IVersionedSerializer ; <nl> + import org . apache . cassandra . locator . Replica ; <nl> import org . apache . cassandra . net . IVerbHandler ; <nl> import org . apache . cassandra . net . MessageIn ; <nl> import org . apache . cassandra . net . MessageOut ; <nl> @ @ - 29 , 6 + 35 , 8 @ @ import org . apache . cassandra . tracing . Tracing ; <nl> <nl> public class ReadCommandVerbHandler implements IVerbHandler < ReadCommand > <nl> { <nl> + private static final Logger logger = LoggerFactory . getLogger ( ReadCommandVerbHandler . class ) ; <nl> + <nl> protected IVersionedSerializer < ReadResponse > serializer ( ) <nl> { <nl> return ReadResponse . serializer ; <nl> @ @ - 42 , 6 + 50 , 8 @ @ public class ReadCommandVerbHandler implements IVerbHandler < ReadCommand > <nl> } <nl> <nl> ReadCommand command = message . payload ; <nl> + validateTransientStatus ( message ) ; <nl> + <nl> command . setMonitoringTime ( message . constructionTime , message . isCrossNode ( ) , message . getTimeout ( ) , message . getSlowQueryTimeout ( ) ) ; <nl> <nl> if ( message . parameters . containsKey ( ParameterType . TRACK _ REPAIRED _ DATA ) ) <nl> @ @ - 65 , 4 + 75 , 36 @ @ public class ReadCommandVerbHandler implements IVerbHandler < ReadCommand > <nl> MessageOut < ReadResponse > reply = new MessageOut < > ( MessagingService . Verb . REQUEST _ RESPONSE , response , serializer ( ) ) ; <nl> MessagingService . instance ( ) . sendReply ( reply , id , message . from ) ; <nl> } <nl> + <nl> + private void validateTransientStatus ( MessageIn < ReadCommand > message ) <nl> + { <nl> + ReadCommand command = message . payload ; <nl> + Token token ; <nl> + <nl> + if ( command . isLimitedToOnePartition ( ) ) <nl> + token = ( ( SinglePartitionReadCommand ) command ) . partitionKey ( ) . getToken ( ) ; <nl> + else <nl> + token = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) . keyRange ( ) . right . getToken ( ) ; <nl> + <nl> + Replica replica = Keyspace . open ( command . metadata ( ) . keyspace ) <nl> + . getReplicationStrategy ( ) <nl> + . getLocalReplicaFor ( token ) ; <nl> + <nl> + if ( replica = = null ) <nl> + { <nl> + logger . warn ( " Received a read request from { } for a range that is not owned by the current replica { } . " , <nl> + message . from , <nl> + command ) ; <nl> + return ; <nl> + } <nl> + <nl> + if ( ! command . acceptsTransient ( ) & & replica . isTransient ( ) ) <nl> + { <nl> + MessagingService . instance ( ) . incrementDroppedMessages ( message , message . getLifetimeInMS ( ) ) ; <nl> + throw new InvalidRequestException ( String . format ( " Attempted to serve % s data request from % s node in % s " , <nl> + replica . isTransient ( ) ? " transient " : " full " , <nl> + command . acceptsTransient ( ) ? " transient " : " full " , <nl> + this ) ) ; <nl> + } <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / locator / AbstractReplicationStrategy . java b / src / java / org / apache / cassandra / locator / AbstractReplicationStrategy . java <nl> index 0ddc0a4 . . d168052 100644 <nl> - - - a / src / java / org / apache / cassandra / locator / AbstractReplicationStrategy . java <nl> + + + b / src / java / org / apache / cassandra / locator / AbstractReplicationStrategy . java <nl> @ @ - 124 , 6 + 124 , 13 @ @ public abstract class AbstractReplicationStrategy <nl> return endpoints ; <nl> } <nl> <nl> + public Replica getLocalReplicaFor ( RingPosition searchPosition ) <nl> + { <nl> + return getNaturalReplicas ( searchPosition ) <nl> + . byEndpoint ( ) <nl> + . get ( FBUtilities . getBroadcastAddressAndPort ( ) ) ; <nl> + } <nl> + <nl> / * * <nl> * calculate the natural endpoints for the given token <nl> * <nl> diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> index 9d9c628 . . 5eb43cf 100644 <nl> - - - a / src / java / org / apache / cassandra / service / StorageProxy . java <nl> + + + b / src / java / org / apache / cassandra / service / StorageProxy . java <nl> @ @ - 1919 , 7 + 1919 , 7 @ @ public class StorageProxy implements StorageProxyMBean <nl> EndpointsForRange targetReplicas = consistency . filterForQuery ( keyspace , liveReplicas ) ; <nl> int minResponses = Math . min ( targetReplicas . size ( ) , blockFor ) ; <nl> <nl> - / / Endpoitns for range here as well <nl> + / / Endpoints for range here as well <nl> return ReplicaLayout . forRangeRead ( keyspace , consistency , range , <nl> liveReplicas , targetReplicas . subList ( 0 , minResponses ) ) ; <nl> } <nl> @ @ - 2146 , 9 + 2146 , 10 @ @ public class StorageProxy implements StorageProxyMBean <nl> for ( Replica replica : replicaLayout . selected ( ) ) <nl> { <nl> Tracing . trace ( " Enqueuing request to { } " , replica ) ; <nl> - MessageOut < ReadCommand > message = rangeCommand . createMessage ( ) ; <nl> + PartitionRangeReadCommand command = replica . isFull ( ) ? rangeCommand : rangeCommand . copyAsTransientQuery ( ) ; <nl> + MessageOut < ReadCommand > message = command . createMessage ( ) ; <nl> if ( command . isTrackingRepairedStatus ( ) & & replica . isFull ( ) ) <nl> - message = message . withParameter ( ParameterType . TRACK _ REPAIRED _ DATA , MessagingService . ONE _ BYTE ) ; <nl> + message = message . withParameter ( ParameterType . TRACK _ REPAIRED _ DATA , MessagingService . ONE _ BYTE ) ; <nl> MessagingService . instance ( ) . sendRRWithFailure ( message , replica . endpoint ( ) , handler ) ; <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / SchemaLoader . java b / test / unit / org / apache / cassandra / SchemaLoader . java <nl> index 62b9670 . . 41f8095 100644 <nl> - - - a / test / unit / org / apache / cassandra / SchemaLoader . java <nl> + + + b / test / unit / org / apache / cassandra / SchemaLoader . java <nl> @ @ - 102 , 6 + 102 , 8 @ @ public class SchemaLoader <nl> String ks _ nocommit = testName + " NoCommitlogSpace " ; <nl> String ks _ prsi = testName + " PerRowSecondaryIndex " ; <nl> String ks _ cql = testName + " cql _ keyspace " ; <nl> + String ks _ cql _ replicated = testName + " cql _ keyspace _ replicated " ; <nl> + String ks _ with _ transient = testName + " ks _ with _ transient " ; <nl> <nl> AbstractType bytes = BytesType . instance ; <nl> <nl> @ @ - 218 , 16 + 220 , 16 @ @ public class SchemaLoader <nl> schema . add ( KeyspaceMetadata . create ( ks _ nocommit , KeyspaceParams . simpleTransient ( 1 ) , Tables . of ( <nl> standardCFMD ( ks _ nocommit , " Standard1 " ) . build ( ) ) ) ) ; <nl> <nl> + String simpleTable = " CREATE TABLE table1 ( " <nl> + + " k int PRIMARY KEY , " <nl> + + " v1 text , " <nl> + + " v2 int " <nl> + + " ) " ; <nl> / / CQLKeyspace <nl> schema . add ( KeyspaceMetadata . create ( ks _ cql , KeyspaceParams . simple ( 1 ) , Tables . of ( <nl> <nl> / / Column Families <nl> - CreateTableStatement . parse ( " CREATE TABLE table1 ( " <nl> - + " k int PRIMARY KEY , " <nl> - + " v1 text , " <nl> - + " v2 int " <nl> - + " ) " , ks _ cql ) <nl> - . build ( ) , <nl> + CreateTableStatement . parse ( simpleTable , ks _ cql ) . build ( ) , <nl> <nl> CreateTableStatement . parse ( " CREATE TABLE table2 ( " <nl> + " k text , " <nl> @ @ - 237 , 6 + 239 , 12 @ @ public class SchemaLoader <nl> . build ( ) <nl> ) ) ) ; <nl> <nl> + schema . add ( KeyspaceMetadata . create ( ks _ cql _ replicated , KeyspaceParams . simple ( 3 ) , <nl> + Tables . of ( CreateTableStatement . parse ( simpleTable , ks _ cql _ replicated ) . build ( ) ) ) ) ; <nl> + <nl> + schema . add ( KeyspaceMetadata . create ( ks _ with _ transient , KeyspaceParams . simple ( " 3 / 1 " ) , <nl> + Tables . of ( CreateTableStatement . parse ( simpleTable , ks _ with _ transient ) . build ( ) ) ) ) ; <nl> + <nl> if ( DatabaseDescriptor . getPartitioner ( ) instanceof Murmur3Partitioner ) <nl> { <nl> schema . add ( KeyspaceMetadata . create ( " sasi " , <nl> diff - - git a / test / unit / org / apache / cassandra / cql3 / CQLTester . java b / test / unit / org / apache / cassandra / cql3 / CQLTester . java <nl> index adadb9c . . e6b0e29 100644 <nl> - - - a / test / unit / org / apache / cassandra / cql3 / CQLTester . java <nl> + + + b / test / unit / org / apache / cassandra / cql3 / CQLTester . java <nl> @ @ - 190 , 6 + 190 , 7 @ @ public abstract class CQLTester <nl> return ; <nl> <nl> DatabaseDescriptor . daemonInitialization ( ) ; <nl> + DatabaseDescriptor . setTransientReplicationEnabledUnsafe ( true ) ; <nl> <nl> / / Cleanup first <nl> try <nl> diff - - git a / test / unit / org / apache / cassandra / db / ReadCommandVerbHandlerTest . java b / test / unit / org / apache / cassandra / db / ReadCommandVerbHandlerTest . java <nl> index 0c43661 . . b7e053b 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / ReadCommandVerbHandlerTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / ReadCommandVerbHandlerTest . java <nl> @ @ - 29 , 11 + 29 , 14 @ @ import org . junit . BeforeClass ; <nl> import org . junit . Test ; <nl> <nl> import org . apache . cassandra . SchemaLoader ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . db . filter . ClusteringIndexSliceFilter ; <nl> import org . apache . cassandra . db . filter . ColumnFilter ; <nl> import org . apache . cassandra . db . filter . DataLimits ; <nl> import org . apache . cassandra . db . filter . RowFilter ; <nl> + import org . apache . cassandra . exceptions . InvalidRequestException ; <nl> import org . apache . cassandra . locator . InetAddressAndPort ; <nl> + import org . apache . cassandra . locator . TokenMetadata ; <nl> import org . apache . cassandra . net . IMessageSink ; <nl> import org . apache . cassandra . net . MessageIn ; <nl> import org . apache . cassandra . net . MessageOut ; <nl> @ @ - 41 , 27 + 44 , 41 @ @ import org . apache . cassandra . net . MessagingService ; <nl> import org . apache . cassandra . net . ParameterType ; <nl> import org . apache . cassandra . schema . Schema ; <nl> import org . apache . cassandra . schema . TableMetadata ; <nl> + import org . apache . cassandra . service . StorageService ; <nl> import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . FBUtilities ; <nl> <nl> + import static org . apache . cassandra . Util . token ; <nl> import static org . junit . Assert . assertFalse ; <nl> import static org . junit . Assert . assertTrue ; <nl> <nl> public class ReadCommandVerbHandlerTest <nl> { <nl> + private final static Random random = new Random ( ) ; <nl> + <nl> + private static ReadCommandVerbHandler handler ; <nl> + private static TableMetadata metadata ; <nl> + private static TableMetadata metadata _ with _ transient ; <nl> + private static DecoratedKey KEY ; <nl> + <nl> private static final String TEST _ NAME = " read _ command _ vh _ test _ " ; <nl> - private static final String KEYSPACE = TEST _ NAME + " cql _ keyspace " ; <nl> + private static final String KEYSPACE = TEST _ NAME + " cql _ keyspace _ replicated " ; <nl> + private static final String KEYSPACE _ WITH _ TRANSIENT = TEST _ NAME + " ks _ with _ transient " ; <nl> private static final String TABLE = " table1 " ; <nl> <nl> - private final Random random = new Random ( ) ; <nl> - private ReadCommandVerbHandler handler ; <nl> - private TableMetadata metadata ; <nl> - <nl> @ BeforeClass <nl> - public static void init ( ) <nl> + public static void init ( ) throws Throwable <nl> { <nl> SchemaLoader . loadSchema ( ) ; <nl> SchemaLoader . schemaDefinition ( TEST _ NAME ) ; <nl> + metadata = Schema . instance . getTableMetadata ( KEYSPACE , TABLE ) ; <nl> + metadata _ with _ transient = Schema . instance . getTableMetadata ( KEYSPACE _ WITH _ TRANSIENT , TABLE ) ; <nl> + KEY = key ( metadata , 1 ) ; <nl> + <nl> + TokenMetadata tmd = StorageService . instance . getTokenMetadata ( ) ; <nl> + tmd . updateNormalToken ( KEY . getToken ( ) , InetAddressAndPort . getByName ( " 127 . 0 . 0 . 2 " ) ) ; <nl> + tmd . updateNormalToken ( key ( metadata , 2 ) . getToken ( ) , InetAddressAndPort . getByName ( " 127 . 0 . 0 . 3 " ) ) ; <nl> + tmd . updateNormalToken ( key ( metadata , 3 ) . getToken ( ) , FBUtilities . getBroadcastAddressAndPort ( ) ) ; <nl> } <nl> <nl> @ Before <nl> @ @ - 81 , 14 + 98 , 13 @ @ public class ReadCommandVerbHandlerTest <nl> } <nl> } ) ; <nl> <nl> - metadata = Schema . instance . getTableMetadata ( KEYSPACE , TABLE ) ; <nl> handler = new ReadCommandVerbHandler ( ) ; <nl> } <nl> <nl> @ Test <nl> public void setRepairedDataTrackingFlagIfHeaderPresent ( ) <nl> { <nl> - ReadCommand command = command ( key ( ) ) ; <nl> + SinglePartitionReadCommand command = command ( metadata ) ; <nl> assertFalse ( command . isTrackingRepairedStatus ( ) ) ; <nl> Map < ParameterType , Object > params = ImmutableMap . of ( ParameterType . TRACK _ REPAIRED _ DATA , <nl> MessagingService . ONE _ BYTE ) ; <nl> @ @ - 104 , 7 + 120 , 7 @ @ public class ReadCommandVerbHandlerTest <nl> @ Test <nl> public void dontSetRepairedDataTrackingFlagUnlessHeaderPresent ( ) <nl> { <nl> - ReadCommand command = command ( key ( ) ) ; <nl> + SinglePartitionReadCommand command = command ( metadata ) ; <nl> assertFalse ( command . isTrackingRepairedStatus ( ) ) ; <nl> Map < ParameterType , Object > params = ImmutableMap . of ( ParameterType . TRACE _ SESSION , <nl> UUID . randomUUID ( ) ) ; <nl> @ @ - 120 , 7 + 136 , 7 @ @ public class ReadCommandVerbHandlerTest <nl> @ Test <nl> public void dontSetRepairedDataTrackingFlagIfHeadersEmpty ( ) <nl> { <nl> - ReadCommand command = command ( key ( ) ) ; <nl> + SinglePartitionReadCommand command = command ( metadata ) ; <nl> assertFalse ( command . isTrackingRepairedStatus ( ) ) ; <nl> handler . doVerb ( MessageIn . create ( peer ( ) , <nl> command , <nl> @ @ - 131 , 17 + 147 , 24 @ @ public class ReadCommandVerbHandlerTest <nl> assertFalse ( command . isTrackingRepairedStatus ( ) ) ; <nl> } <nl> <nl> - private int key ( ) <nl> + @ Test ( expected = InvalidRequestException . class ) <nl> + public void rejectsRequestWithNonMatchingTransientness ( ) <nl> { <nl> - return random . nextInt ( ) ; <nl> + SinglePartitionReadCommand command = command ( metadata _ with _ transient ) ; <nl> + handler . doVerb ( MessageIn . create ( peer ( ) , <nl> + command , <nl> + ImmutableMap . of ( ) , <nl> + MessagingService . Verb . READ , <nl> + MessagingService . current _ version ) , <nl> + messageId ( ) ) ; <nl> } <nl> <nl> - private int messageId ( ) <nl> + private static int messageId ( ) <nl> { <nl> return random . nextInt ( ) ; <nl> } <nl> <nl> - private InetAddressAndPort peer ( ) <nl> + private static InetAddressAndPort peer ( ) <nl> { <nl> try <nl> { <nl> @ @ - 153 , 19 + 176 , 23 @ @ public class ReadCommandVerbHandlerTest <nl> } <nl> } <nl> <nl> - private ReadCommand command ( int key ) <nl> + private static SinglePartitionReadCommand command ( TableMetadata metadata ) <nl> { <nl> return new SinglePartitionReadCommand ( false , <nl> - 0 , <nl> - false , <nl> - metadata , <nl> - FBUtilities . nowInSeconds ( ) , <nl> - ColumnFilter . all ( metadata ) , <nl> - RowFilter . NONE , <nl> - DataLimits . NONE , <nl> - metadata . partitioner . decorateKey ( ByteBufferUtil . bytes ( key ) ) , <nl> - new ClusteringIndexSliceFilter ( Slices . ALL , false ) , <nl> - null ) ; <nl> + 0 , <nl> + false , <nl> + metadata , <nl> + FBUtilities . nowInSeconds ( ) , <nl> + ColumnFilter . all ( metadata ) , <nl> + RowFilter . NONE , <nl> + DataLimits . NONE , <nl> + KEY , <nl> + new ClusteringIndexSliceFilter ( Slices . ALL , false ) , <nl> + null ) ; <nl> } <nl> <nl> + private static DecoratedKey key ( TableMetadata metadata , int key ) <nl> + { <nl> + return metadata . partitioner . decorateKey ( ByteBufferUtil . bytes ( key ) ) ; <nl> + } <nl> }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 264c80f . . a30bec7 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 4 . 0 
+ + * Fail query on transient replica if coordinator only expects full data ( CASSANDRA - 14704 ) 
+ * Remove mentions of transient replication from repair path ( CASSANDRA - 14698 ) 
+ * Fix handleRepairStatusChangedNotification to remove first then add ( CASSANDRA - 14720 ) 
+ * Allow transient node to serve as a repair coordinator ( CASSANDRA - 14693 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / ReadCommandVerbHandler . java b / src / java / org / apache / cassandra / db / ReadCommandVerbHandler . java 
+ index 1b28c2c . . 0e97dd8 100644 
+ - - - a / src / java / org / apache / cassandra / db / ReadCommandVerbHandler . java 
+ + + + b / src / java / org / apache / cassandra / db / ReadCommandVerbHandler . java 
+ @ @ - 17 , 8 + 17 , 14 @ @ 
+ * / 
+ package org . apache . cassandra . db ; 
+ 
+ + import org . slf4j . Logger ; 
+ + import org . slf4j . LoggerFactory ; 
+ + 
+ import org . apache . cassandra . db . partitions . UnfilteredPartitionIterator ; 
+ + import org . apache . cassandra . dht . Token ; 
+ + import org . apache . cassandra . exceptions . InvalidRequestException ; 
+ import org . apache . cassandra . io . IVersionedSerializer ; 
+ + import org . apache . cassandra . locator . Replica ; 
+ import org . apache . cassandra . net . IVerbHandler ; 
+ import org . apache . cassandra . net . MessageIn ; 
+ import org . apache . cassandra . net . MessageOut ; 
+ @ @ - 29 , 6 + 35 , 8 @ @ import org . apache . cassandra . tracing . Tracing ; 
+ 
+ public class ReadCommandVerbHandler implements IVerbHandler < ReadCommand > 
+ { 
+ + private static final Logger logger = LoggerFactory . getLogger ( ReadCommandVerbHandler . class ) ; 
+ + 
+ protected IVersionedSerializer < ReadResponse > serializer ( ) 
+ { 
+ return ReadResponse . serializer ; 
+ @ @ - 42 , 6 + 50 , 8 @ @ public class ReadCommandVerbHandler implements IVerbHandler < ReadCommand > 
+ } 
+ 
+ ReadCommand command = message . payload ; 
+ + validateTransientStatus ( message ) ; 
+ + 
+ command . setMonitoringTime ( message . constructionTime , message . isCrossNode ( ) , message . getTimeout ( ) , message . getSlowQueryTimeout ( ) ) ; 
+ 
+ if ( message . parameters . containsKey ( ParameterType . TRACK _ REPAIRED _ DATA ) ) 
+ @ @ - 65 , 4 + 75 , 36 @ @ public class ReadCommandVerbHandler implements IVerbHandler < ReadCommand > 
+ MessageOut < ReadResponse > reply = new MessageOut < > ( MessagingService . Verb . REQUEST _ RESPONSE , response , serializer ( ) ) ; 
+ MessagingService . instance ( ) . sendReply ( reply , id , message . from ) ; 
+ } 
+ + 
+ + private void validateTransientStatus ( MessageIn < ReadCommand > message ) 
+ + { 
+ + ReadCommand command = message . payload ; 
+ + Token token ; 
+ + 
+ + if ( command . isLimitedToOnePartition ( ) ) 
+ + token = ( ( SinglePartitionReadCommand ) command ) . partitionKey ( ) . getToken ( ) ; 
+ + else 
+ + token = ( ( PartitionRangeReadCommand ) command ) . dataRange ( ) . keyRange ( ) . right . getToken ( ) ; 
+ + 
+ + Replica replica = Keyspace . open ( command . metadata ( ) . keyspace ) 
+ + . getReplicationStrategy ( ) 
+ + . getLocalReplicaFor ( token ) ; 
+ + 
+ + if ( replica = = null ) 
+ + { 
+ + logger . warn ( " Received a read request from { } for a range that is not owned by the current replica { } . " , 
+ + message . from , 
+ + command ) ; 
+ + return ; 
+ + } 
+ + 
+ + if ( ! command . acceptsTransient ( ) & & replica . isTransient ( ) ) 
+ + { 
+ + MessagingService . instance ( ) . incrementDroppedMessages ( message , message . getLifetimeInMS ( ) ) ; 
+ + throw new InvalidRequestException ( String . format ( " Attempted to serve % s data request from % s node in % s " , 
+ + replica . isTransient ( ) ? " transient " : " full " , 
+ + command . acceptsTransient ( ) ? " transient " : " full " , 
+ + this ) ) ; 
+ + } 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / locator / AbstractReplicationStrategy . java b / src / java / org / apache / cassandra / locator / AbstractReplicationStrategy . java 
+ index 0ddc0a4 . . d168052 100644 
+ - - - a / src / java / org / apache / cassandra / locator / AbstractReplicationStrategy . java 
+ + + + b / src / java / org / apache / cassandra / locator / AbstractReplicationStrategy . java 
+ @ @ - 124 , 6 + 124 , 13 @ @ public abstract class AbstractReplicationStrategy 
+ return endpoints ; 
+ } 
+ 
+ + public Replica getLocalReplicaFor ( RingPosition searchPosition ) 
+ + { 
+ + return getNaturalReplicas ( searchPosition ) 
+ + . byEndpoint ( ) 
+ + . get ( FBUtilities . getBroadcastAddressAndPort ( ) ) ; 
+ + } 
+ + 
+ / * * 
+ * calculate the natural endpoints for the given token 
+ * 
+ diff - - git a / src / java / org / apache / cassandra / service / StorageProxy . java b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ index 9d9c628 . . 5eb43cf 100644 
+ - - - a / src / java / org / apache / cassandra / service / StorageProxy . java 
+ + + + b / src / java / org / apache / cassandra / service / StorageProxy . java 
+ @ @ - 1919 , 7 + 1919 , 7 @ @ public class StorageProxy implements StorageProxyMBean 
+ EndpointsForRange targetReplicas = consistency . filterForQuery ( keyspace , liveReplicas ) ; 
+ int minResponses = Math . min ( targetReplicas . size ( ) , blockFor ) ; 
+ 
+ - / / Endpoitns for range here as well 
+ + / / Endpoints for range here as well 
+ return ReplicaLayout . forRangeRead ( keyspace , consistency , range , 
+ liveReplicas , targetReplicas . subList ( 0 , minResponses ) ) ; 
+ } 
+ @ @ - 2146 , 9 + 2146 , 10 @ @ public class StorageProxy implements StorageProxyMBean 
+ for ( Replica replica : replicaLayout . selected ( ) ) 
+ { 
+ Tracing . trace ( " Enqueuing request to { } " , replica ) ; 
+ - MessageOut < ReadCommand > message = rangeCommand . createMessage ( ) ; 
+ + PartitionRangeReadCommand command = replica . isFull ( ) ? rangeCommand : rangeCommand . copyAsTransientQuery ( ) ; 
+ + MessageOut < ReadCommand > message = command . createMessage ( ) ; 
+ if ( command . isTrackingRepairedStatus ( ) & & replica . isFull ( ) ) 
+ - message = message . withParameter ( ParameterType . TRACK _ REPAIRED _ DATA , MessagingService . ONE _ BYTE ) ; 
+ + message = message . withParameter ( ParameterType . TRACK _ REPAIRED _ DATA , MessagingService . ONE _ BYTE ) ; 
+ MessagingService . instance ( ) . sendRRWithFailure ( message , replica . endpoint ( ) , handler ) ; 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / SchemaLoader . java b / test / unit / org / apache / cassandra / SchemaLoader . java 
+ index 62b9670 . . 41f8095 100644 
+ - - - a / test / unit / org / apache / cassandra / SchemaLoader . java 
+ + + + b / test / unit / org / apache / cassandra / SchemaLoader . java 
+ @ @ - 102 , 6 + 102 , 8 @ @ public class SchemaLoader 
+ String ks _ nocommit = testName + " NoCommitlogSpace " ; 
+ String ks _ prsi = testName + " PerRowSecondaryIndex " ; 
+ String ks _ cql = testName + " cql _ keyspace " ; 
+ + String ks _ cql _ replicated = testName + " cql _ keyspace _ replicated " ; 
+ + String ks _ with _ transient = testName + " ks _ with _ transient " ; 
+ 
+ AbstractType bytes = BytesType . instance ; 
+ 
+ @ @ - 218 , 16 + 220 , 16 @ @ public class SchemaLoader 
+ schema . add ( KeyspaceMetadata . create ( ks _ nocommit , KeyspaceParams . simpleTransient ( 1 ) , Tables . of ( 
+ standardCFMD ( ks _ nocommit , " Standard1 " ) . build ( ) ) ) ) ; 
+ 
+ + String simpleTable = " CREATE TABLE table1 ( " 
+ + + " k int PRIMARY KEY , " 
+ + + " v1 text , " 
+ + + " v2 int " 
+ + + " ) " ; 
+ / / CQLKeyspace 
+ schema . add ( KeyspaceMetadata . create ( ks _ cql , KeyspaceParams . simple ( 1 ) , Tables . of ( 
+ 
+ / / Column Families 
+ - CreateTableStatement . parse ( " CREATE TABLE table1 ( " 
+ - + " k int PRIMARY KEY , " 
+ - + " v1 text , " 
+ - + " v2 int " 
+ - + " ) " , ks _ cql ) 
+ - . build ( ) , 
+ + CreateTableStatement . parse ( simpleTable , ks _ cql ) . build ( ) , 
+ 
+ CreateTableStatement . parse ( " CREATE TABLE table2 ( " 
+ + " k text , " 
+ @ @ - 237 , 6 + 239 , 12 @ @ public class SchemaLoader 
+ . build ( ) 
+ ) ) ) ; 
+ 
+ + schema . add ( KeyspaceMetadata . create ( ks _ cql _ replicated , KeyspaceParams . simple ( 3 ) , 
+ + Tables . of ( CreateTableStatement . parse ( simpleTable , ks _ cql _ replicated ) . build ( ) ) ) ) ; 
+ + 
+ + schema . add ( KeyspaceMetadata . create ( ks _ with _ transient , KeyspaceParams . simple ( " 3 / 1 " ) , 
+ + Tables . of ( CreateTableStatement . parse ( simpleTable , ks _ with _ transient ) . build ( ) ) ) ) ; 
+ + 
+ if ( DatabaseDescriptor . getPartitioner ( ) instanceof Murmur3Partitioner ) 
+ { 
+ schema . add ( KeyspaceMetadata . create ( " sasi " , 
+ diff - - git a / test / unit / org / apache / cassandra / cql3 / CQLTester . java b / test / unit / org / apache / cassandra / cql3 / CQLTester . java 
+ index adadb9c . . e6b0e29 100644 
+ - - - a / test / unit / org / apache / cassandra / cql3 / CQLTester . java 
+ + + + b / test / unit / org / apache / cassandra / cql3 / CQLTester . java 
+ @ @ - 190 , 6 + 190 , 7 @ @ public abstract class CQLTester 
+ return ; 
+ 
+ DatabaseDescriptor . daemonInitialization ( ) ; 
+ + DatabaseDescriptor . setTransientReplicationEnabledUnsafe ( true ) ; 
+ 
+ / / Cleanup first 
+ try 
+ diff - - git a / test / unit / org / apache / cassandra / db / ReadCommandVerbHandlerTest . java b / test / unit / org / apache / cassandra / db / ReadCommandVerbHandlerTest . java 
+ index 0c43661 . . b7e053b 100644 
+ - - - a / test / unit / org / apache / cassandra / db / ReadCommandVerbHandlerTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / ReadCommandVerbHandlerTest . java 
+ @ @ - 29 , 11 + 29 , 14 @ @ import org . junit . BeforeClass ; 
+ import org . junit . Test ; 
+ 
+ import org . apache . cassandra . SchemaLoader ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . db . filter . ClusteringIndexSliceFilter ; 
+ import org . apache . cassandra . db . filter . ColumnFilter ; 
+ import org . apache . cassandra . db . filter . DataLimits ; 
+ import org . apache . cassandra . db . filter . RowFilter ; 
+ + import org . apache . cassandra . exceptions . InvalidRequestException ; 
+ import org . apache . cassandra . locator . InetAddressAndPort ; 
+ + import org . apache . cassandra . locator . TokenMetadata ; 
+ import org . apache . cassandra . net . IMessageSink ; 
+ import org . apache . cassandra . net . MessageIn ; 
+ import org . apache . cassandra . net . MessageOut ; 
+ @ @ - 41 , 27 + 44 , 41 @ @ import org . apache . cassandra . net . MessagingService ; 
+ import org . apache . cassandra . net . ParameterType ; 
+ import org . apache . cassandra . schema . Schema ; 
+ import org . apache . cassandra . schema . TableMetadata ; 
+ + import org . apache . cassandra . service . StorageService ; 
+ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . FBUtilities ; 
+ 
+ + import static org . apache . cassandra . Util . token ; 
+ import static org . junit . Assert . assertFalse ; 
+ import static org . junit . Assert . assertTrue ; 
+ 
+ public class ReadCommandVerbHandlerTest 
+ { 
+ + private final static Random random = new Random ( ) ; 
+ + 
+ + private static ReadCommandVerbHandler handler ; 
+ + private static TableMetadata metadata ; 
+ + private static TableMetadata metadata _ with _ transient ; 
+ + private static DecoratedKey KEY ; 
+ + 
+ private static final String TEST _ NAME = " read _ command _ vh _ test _ " ; 
+ - private static final String KEYSPACE = TEST _ NAME + " cql _ keyspace " ; 
+ + private static final String KEYSPACE = TEST _ NAME + " cql _ keyspace _ replicated " ; 
+ + private static final String KEYSPACE _ WITH _ TRANSIENT = TEST _ NAME + " ks _ with _ transient " ; 
+ private static final String TABLE = " table1 " ; 
+ 
+ - private final Random random = new Random ( ) ; 
+ - private ReadCommandVerbHandler handler ; 
+ - private TableMetadata metadata ; 
+ - 
+ @ BeforeClass 
+ - public static void init ( ) 
+ + public static void init ( ) throws Throwable 
+ { 
+ SchemaLoader . loadSchema ( ) ; 
+ SchemaLoader . schemaDefinition ( TEST _ NAME ) ; 
+ + metadata = Schema . instance . getTableMetadata ( KEYSPACE , TABLE ) ; 
+ + metadata _ with _ transient = Schema . instance . getTableMetadata ( KEYSPACE _ WITH _ TRANSIENT , TABLE ) ; 
+ + KEY = key ( metadata , 1 ) ; 
+ + 
+ + TokenMetadata tmd = StorageService . instance . getTokenMetadata ( ) ; 
+ + tmd . updateNormalToken ( KEY . getToken ( ) , InetAddressAndPort . getByName ( " 127 . 0 . 0 . 2 " ) ) ; 
+ + tmd . updateNormalToken ( key ( metadata , 2 ) . getToken ( ) , InetAddressAndPort . getByName ( " 127 . 0 . 0 . 3 " ) ) ; 
+ + tmd . updateNormalToken ( key ( metadata , 3 ) . getToken ( ) , FBUtilities . getBroadcastAddressAndPort ( ) ) ; 
+ } 
+ 
+ @ Before 
+ @ @ - 81 , 14 + 98 , 13 @ @ public class ReadCommandVerbHandlerTest 
+ } 
+ } ) ; 
+ 
+ - metadata = Schema . instance . getTableMetadata ( KEYSPACE , TABLE ) ; 
+ handler = new ReadCommandVerbHandler ( ) ; 
+ } 
+ 
+ @ Test 
+ public void setRepairedDataTrackingFlagIfHeaderPresent ( ) 
+ { 
+ - ReadCommand command = command ( key ( ) ) ; 
+ + SinglePartitionReadCommand command = command ( metadata ) ; 
+ assertFalse ( command . isTrackingRepairedStatus ( ) ) ; 
+ Map < ParameterType , Object > params = ImmutableMap . of ( ParameterType . TRACK _ REPAIRED _ DATA , 
+ MessagingService . ONE _ BYTE ) ; 
+ @ @ - 104 , 7 + 120 , 7 @ @ public class ReadCommandVerbHandlerTest 
+ @ Test 
+ public void dontSetRepairedDataTrackingFlagUnlessHeaderPresent ( ) 
+ { 
+ - ReadCommand command = command ( key ( ) ) ; 
+ + SinglePartitionReadCommand command = command ( metadata ) ; 
+ assertFalse ( command . isTrackingRepairedStatus ( ) ) ; 
+ Map < ParameterType , Object > params = ImmutableMap . of ( ParameterType . TRACE _ SESSION , 
+ UUID . randomUUID ( ) ) ; 
+ @ @ - 120 , 7 + 136 , 7 @ @ public class ReadCommandVerbHandlerTest 
+ @ Test 
+ public void dontSetRepairedDataTrackingFlagIfHeadersEmpty ( ) 
+ { 
+ - ReadCommand command = command ( key ( ) ) ; 
+ + SinglePartitionReadCommand command = command ( metadata ) ; 
+ assertFalse ( command . isTrackingRepairedStatus ( ) ) ; 
+ handler . doVerb ( MessageIn . create ( peer ( ) , 
+ command , 
+ @ @ - 131 , 17 + 147 , 24 @ @ public class ReadCommandVerbHandlerTest 
+ assertFalse ( command . isTrackingRepairedStatus ( ) ) ; 
+ } 
+ 
+ - private int key ( ) 
+ + @ Test ( expected = InvalidRequestException . class ) 
+ + public void rejectsRequestWithNonMatchingTransientness ( ) 
+ { 
+ - return random . nextInt ( ) ; 
+ + SinglePartitionReadCommand command = command ( metadata _ with _ transient ) ; 
+ + handler . doVerb ( MessageIn . create ( peer ( ) , 
+ + command , 
+ + ImmutableMap . of ( ) , 
+ + MessagingService . Verb . READ , 
+ + MessagingService . current _ version ) , 
+ + messageId ( ) ) ; 
+ } 
+ 
+ - private int messageId ( ) 
+ + private static int messageId ( ) 
+ { 
+ return random . nextInt ( ) ; 
+ } 
+ 
+ - private InetAddressAndPort peer ( ) 
+ + private static InetAddressAndPort peer ( ) 
+ { 
+ try 
+ { 
+ @ @ - 153 , 19 + 176 , 23 @ @ public class ReadCommandVerbHandlerTest 
+ } 
+ } 
+ 
+ - private ReadCommand command ( int key ) 
+ + private static SinglePartitionReadCommand command ( TableMetadata metadata ) 
+ { 
+ return new SinglePartitionReadCommand ( false , 
+ - 0 , 
+ - false , 
+ - metadata , 
+ - FBUtilities . nowInSeconds ( ) , 
+ - ColumnFilter . all ( metadata ) , 
+ - RowFilter . NONE , 
+ - DataLimits . NONE , 
+ - metadata . partitioner . decorateKey ( ByteBufferUtil . bytes ( key ) ) , 
+ - new ClusteringIndexSliceFilter ( Slices . ALL , false ) , 
+ - null ) ; 
+ + 0 , 
+ + false , 
+ + metadata , 
+ + FBUtilities . nowInSeconds ( ) , 
+ + ColumnFilter . all ( metadata ) , 
+ + RowFilter . NONE , 
+ + DataLimits . NONE , 
+ + KEY , 
+ + new ClusteringIndexSliceFilter ( Slices . ALL , false ) , 
+ + null ) ; 
+ } 
+ 
+ + private static DecoratedKey key ( TableMetadata metadata , int key ) 
+ + { 
+ + return metadata . partitioner . decorateKey ( ByteBufferUtil . bytes ( key ) ) ; 
+ + } 
+ }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

@@ -1,0 +1,235 @@
+BLEU SCORE: 0.08745825313180632
+
+TEST MSG: GCInspector logs very different times
+GENERATED MSG: switch to notification - based GCInspector
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index ac68df9 . . 39bcc7c 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 2 . 1 . 6 <nl> + * GCInspector logs very different times ( CASSANDRA - 9124 ) <nl> * Fix deleting from an empty list ( CASSANDRA - 9198 ) <nl> * Update tuple and collection types that use a user - defined type when that UDT <nl> is modified ( CASSANDRA - 9148 , CASSANDRA - 9192 ) <nl> diff - - git a / src / java / org / apache / cassandra / service / GCInspector . java b / src / java / org / apache / cassandra / service / GCInspector . java <nl> index c4bffac . . df0527f 100644 <nl> - - - a / src / java / org / apache / cassandra / service / GCInspector . java <nl> + + + b / src / java / org / apache / cassandra / service / GCInspector . java <nl> @ @ - 17 , 11 + 17 , 12 @ @ <nl> * / <nl> package org . apache . cassandra . service ; <nl> <nl> + import java . lang . management . GarbageCollectorMXBean ; <nl> import java . lang . management . ManagementFactory ; <nl> import java . lang . management . MemoryUsage ; <nl> - import java . util . ArrayList ; <nl> - import java . util . Collections ; <nl> - import java . util . List ; <nl> + import java . util . Arrays ; <nl> + import java . util . HashMap ; <nl> + import java . util . Map ; <nl> import java . util . concurrent . TimeUnit ; <nl> import java . util . concurrent . atomic . AtomicReference ; <nl> import javax . management . MBeanServer ; <nl> @ @ - 34 , 6 + 35 , 7 @ @ import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> import com . sun . management . GarbageCollectionNotificationInfo ; <nl> + import com . sun . management . GcInfo ; <nl> import org . apache . cassandra . io . sstable . SSTableDeletingTask ; <nl> import org . apache . cassandra . utils . StatusLogger ; <nl> <nl> @ @ - 70 , 21 + 72 , 57 @ @ public class GCInspector implements NotificationListener , GCInspectorMXBean <nl> } <nl> } <nl> <nl> + static final class GCState <nl> + { <nl> + final GarbageCollectorMXBean gcBean ; <nl> + final boolean assumeGCIsPartiallyConcurrent ; <nl> + final boolean assumeGCIsOldGen ; <nl> + private String [ ] keys ; <nl> + long lastGcTotalDuration = 0 ; <nl> + <nl> + <nl> + GCState ( GarbageCollectorMXBean gcBean , boolean assumeGCIsPartiallyConcurrent , boolean assumeGCIsOldGen ) <nl> + { <nl> + this . gcBean = gcBean ; <nl> + this . assumeGCIsPartiallyConcurrent = assumeGCIsPartiallyConcurrent ; <nl> + this . assumeGCIsOldGen = assumeGCIsOldGen ; <nl> + } <nl> + <nl> + String [ ] keys ( GarbageCollectionNotificationInfo info ) <nl> + { <nl> + if ( keys ! = null ) <nl> + return keys ; <nl> + <nl> + keys = info . getGcInfo ( ) . getMemoryUsageBeforeGc ( ) . keySet ( ) . toArray ( new String [ 0 ] ) ; <nl> + Arrays . sort ( keys ) ; <nl> + <nl> + return keys ; <nl> + } <nl> + } <nl> + <nl> final AtomicReference < State > state = new AtomicReference < > ( new State ( ) ) ; <nl> <nl> + final Map < String , GCState > gcStates = new HashMap < > ( ) ; <nl> + <nl> public GCInspector ( ) <nl> { <nl> MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; <nl> <nl> try <nl> { <nl> + ObjectName gcName = new ObjectName ( ManagementFactory . GARBAGE _ COLLECTOR _ MXBEAN _ DOMAIN _ TYPE + " , * " ) ; <nl> + for ( ObjectName name : mbs . queryNames ( gcName , null ) ) <nl> + { <nl> + GarbageCollectorMXBean gc = ManagementFactory . newPlatformMXBeanProxy ( mbs , name . getCanonicalName ( ) , GarbageCollectorMXBean . class ) ; <nl> + gcStates . put ( gc . getName ( ) , new GCState ( gc , assumeGCIsPartiallyConcurrent ( gc ) , assumeGCIsOldGen ( gc ) ) ) ; <nl> + } <nl> + <nl> mbs . registerMBean ( this , new ObjectName ( MBEAN _ NAME ) ) ; <nl> } <nl> catch ( Exception e ) <nl> { <nl> throw new RuntimeException ( e ) ; <nl> } <nl> - <nl> } <nl> <nl> public static void register ( ) throws Exception <nl> @ @ - 98 , 7 + 136 , 64 @ @ public class GCInspector implements NotificationListener , GCInspectorMXBean <nl> } <nl> } <nl> <nl> - public void handleNotification ( Notification notification , Object handback ) <nl> + / * <nl> + * Assume that a GC type is at least partially concurrent and so a side channel method <nl> + * should be used to calculate application stopped time due to the GC . <nl> + * <nl> + * If the GC isn ' t recognized then assume that is concurrent and we need to do our own calculation <nl> + * via the the side channel . <nl> + * / <nl> + private static boolean assumeGCIsPartiallyConcurrent ( GarbageCollectorMXBean gc ) <nl> + { <nl> + switch ( gc . getName ( ) ) <nl> + { <nl> + / / First two are from the serial collector <nl> + case " Copy " : <nl> + case " MarkSweepCompact " : <nl> + / / Parallel collector <nl> + case " PS MarkSweep " : <nl> + case " PS Scavenge " : <nl> + case " G1 Young Generation " : <nl> + / / CMS young generation collector <nl> + case " ParNew " : <nl> + return false ; <nl> + case " ConcurrentMarkSweep " : <nl> + case " G1 Old Generation " : <nl> + return true ; <nl> + default : <nl> + / / Assume possibly concurrent if unsure <nl> + return true ; <nl> + } <nl> + } <nl> + <nl> + / * <nl> + * Assume that a GC type is an old generation collection so SSTableDeletingTask . rescheduleFailedTasks ( ) <nl> + * should be invoked . <nl> + * <nl> + * Defaults to not invoking SSTableDeletingTask . rescheduleFailedTasks ( ) on unrecognized GC names <nl> + * / <nl> + private static boolean assumeGCIsOldGen ( GarbageCollectorMXBean gc ) <nl> + { <nl> + switch ( gc . getName ( ) ) <nl> + { <nl> + case " Copy " : <nl> + case " PS Scavenge " : <nl> + case " G1 Young Generation " : <nl> + case " ParNew " : <nl> + return false ; <nl> + case " MarkSweepCompact " : <nl> + case " PS MarkSweep " : <nl> + case " ConcurrentMarkSweep " : <nl> + case " G1 Old Generation " : <nl> + return true ; <nl> + default : <nl> + / / Assume not old gen otherwise , don ' t call <nl> + / / SSTableDeletingTask . rescheduleFailedTasks ( ) <nl> + return false ; <nl> + } <nl> + } <nl> + <nl> + public void handleNotification ( final Notification notification , final Object handback ) <nl> { <nl> String type = notification . getType ( ) ; <nl> if ( type . equals ( GarbageCollectionNotificationInfo . GARBAGE _ COLLECTION _ NOTIFICATION ) ) <nl> @ @ - 106 , 25 + 201 , 40 @ @ public class GCInspector implements NotificationListener , GCInspectorMXBean <nl> / / retrieve the garbage collection notification information <nl> CompositeData cd = ( CompositeData ) notification . getUserData ( ) ; <nl> GarbageCollectionNotificationInfo info = GarbageCollectionNotificationInfo . from ( cd ) ; <nl> + String gcName = info . getGcName ( ) ; <nl> + GcInfo gcInfo = info . getGcInfo ( ) ; <nl> <nl> - long duration = info . getGcInfo ( ) . getDuration ( ) ; <nl> + long duration = gcInfo . getDuration ( ) ; <nl> + <nl> + / * <nl> + * The duration supplied in the notification info includes more than just <nl> + * application stopped time for concurrent GCs . Try and do a better job coming up with a good stopped time <nl> + * value by asking for and tracking cumulative time spent blocked in GC . <nl> + * / <nl> + GCState gcState = gcStates . get ( gcName ) ; <nl> + if ( gcState . assumeGCIsPartiallyConcurrent ) <nl> + { <nl> + long previousTotal = gcState . lastGcTotalDuration ; <nl> + long total = gcState . gcBean . getCollectionTime ( ) ; <nl> + gcState . lastGcTotalDuration = total ; <nl> + duration = total - previousTotal ; / / may be zero for a really fast collection <nl> + } <nl> <nl> StringBuilder sb = new StringBuilder ( ) ; <nl> sb . append ( info . getGcName ( ) ) . append ( " GC in " ) . append ( duration ) . append ( " ms . " ) ; <nl> - <nl> long bytes = 0 ; <nl> - List < String > keys = new ArrayList < > ( info . getGcInfo ( ) . getMemoryUsageBeforeGc ( ) . keySet ( ) ) ; <nl> - Collections . sort ( keys ) ; <nl> - for ( String key : keys ) <nl> + Map < String , MemoryUsage > beforeMemoryUsage = gcInfo . getMemoryUsageBeforeGc ( ) ; <nl> + Map < String , MemoryUsage > afterMemoryUsage = gcInfo . getMemoryUsageAfterGc ( ) ; <nl> + for ( String key : gcState . keys ( info ) ) <nl> { <nl> - MemoryUsage before = info . getGcInfo ( ) . getMemoryUsageBeforeGc ( ) . get ( key ) ; <nl> - MemoryUsage after = info . getGcInfo ( ) . getMemoryUsageAfterGc ( ) . get ( key ) ; <nl> + MemoryUsage before = beforeMemoryUsage . get ( key ) ; <nl> + MemoryUsage after = afterMemoryUsage . get ( key ) ; <nl> if ( after ! = null & & after . getUsed ( ) ! = before . getUsed ( ) ) <nl> { <nl> sb . append ( key ) . append ( " : " ) . append ( before . getUsed ( ) ) ; <nl> sb . append ( " - > " ) ; <nl> sb . append ( after . getUsed ( ) ) ; <nl> - if ( ! key . equals ( keys . get ( keys . size ( ) - 1 ) ) ) <nl> + if ( ! key . equals ( gcState . keys [ gcState . keys . length - 1 ] ) ) <nl> sb . append ( " ; " ) ; <nl> bytes + = before . getUsed ( ) - after . getUsed ( ) ; <nl> } <nl> @ @ - 146 , 8 + 256 , 8 @ @ public class GCInspector implements NotificationListener , GCInspectorMXBean <nl> if ( duration > MIN _ LOG _ DURATION _ TPSTATS ) <nl> StatusLogger . log ( ) ; <nl> <nl> - / / if we just finished a full collection and we ' re still using a lot of memory , try to reduce the pressure <nl> - if ( info . getGcName ( ) . equals ( " ConcurrentMarkSweep " ) ) <nl> + / / if we just finished an old gen collection and we ' re still using a lot of memory , try to reduce the pressure <nl> + if ( gcState . assumeGCIsOldGen ) <nl> SSTableDeletingTask . rescheduleFailedTasks ( ) ; <nl> } <nl> }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index ac68df9 . . 39bcc7c 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 2 . 1 . 6 
+ + * GCInspector logs very different times ( CASSANDRA - 9124 ) 
+ * Fix deleting from an empty list ( CASSANDRA - 9198 ) 
+ * Update tuple and collection types that use a user - defined type when that UDT 
+ is modified ( CASSANDRA - 9148 , CASSANDRA - 9192 ) 
+ diff - - git a / src / java / org / apache / cassandra / service / GCInspector . java b / src / java / org / apache / cassandra / service / GCInspector . java 
+ index c4bffac . . df0527f 100644 
+ - - - a / src / java / org / apache / cassandra / service / GCInspector . java 
+ + + + b / src / java / org / apache / cassandra / service / GCInspector . java 
+ @ @ - 17 , 11 + 17 , 12 @ @ 
+ * / 
+ package org . apache . cassandra . service ; 
+ 
+ + import java . lang . management . GarbageCollectorMXBean ; 
+ import java . lang . management . ManagementFactory ; 
+ import java . lang . management . MemoryUsage ; 
+ - import java . util . ArrayList ; 
+ - import java . util . Collections ; 
+ - import java . util . List ; 
+ + import java . util . Arrays ; 
+ + import java . util . HashMap ; 
+ + import java . util . Map ; 
+ import java . util . concurrent . TimeUnit ; 
+ import java . util . concurrent . atomic . AtomicReference ; 
+ import javax . management . MBeanServer ; 
+ @ @ - 34 , 6 + 35 , 7 @ @ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ import com . sun . management . GarbageCollectionNotificationInfo ; 
+ + import com . sun . management . GcInfo ; 
+ import org . apache . cassandra . io . sstable . SSTableDeletingTask ; 
+ import org . apache . cassandra . utils . StatusLogger ; 
+ 
+ @ @ - 70 , 21 + 72 , 57 @ @ public class GCInspector implements NotificationListener , GCInspectorMXBean 
+ } 
+ } 
+ 
+ + static final class GCState 
+ + { 
+ + final GarbageCollectorMXBean gcBean ; 
+ + final boolean assumeGCIsPartiallyConcurrent ; 
+ + final boolean assumeGCIsOldGen ; 
+ + private String [ ] keys ; 
+ + long lastGcTotalDuration = 0 ; 
+ + 
+ + 
+ + GCState ( GarbageCollectorMXBean gcBean , boolean assumeGCIsPartiallyConcurrent , boolean assumeGCIsOldGen ) 
+ + { 
+ + this . gcBean = gcBean ; 
+ + this . assumeGCIsPartiallyConcurrent = assumeGCIsPartiallyConcurrent ; 
+ + this . assumeGCIsOldGen = assumeGCIsOldGen ; 
+ + } 
+ + 
+ + String [ ] keys ( GarbageCollectionNotificationInfo info ) 
+ + { 
+ + if ( keys ! = null ) 
+ + return keys ; 
+ + 
+ + keys = info . getGcInfo ( ) . getMemoryUsageBeforeGc ( ) . keySet ( ) . toArray ( new String [ 0 ] ) ; 
+ + Arrays . sort ( keys ) ; 
+ + 
+ + return keys ; 
+ + } 
+ + } 
+ + 
+ final AtomicReference < State > state = new AtomicReference < > ( new State ( ) ) ; 
+ 
+ + final Map < String , GCState > gcStates = new HashMap < > ( ) ; 
+ + 
+ public GCInspector ( ) 
+ { 
+ MBeanServer mbs = ManagementFactory . getPlatformMBeanServer ( ) ; 
+ 
+ try 
+ { 
+ + ObjectName gcName = new ObjectName ( ManagementFactory . GARBAGE _ COLLECTOR _ MXBEAN _ DOMAIN _ TYPE + " , * " ) ; 
+ + for ( ObjectName name : mbs . queryNames ( gcName , null ) ) 
+ + { 
+ + GarbageCollectorMXBean gc = ManagementFactory . newPlatformMXBeanProxy ( mbs , name . getCanonicalName ( ) , GarbageCollectorMXBean . class ) ; 
+ + gcStates . put ( gc . getName ( ) , new GCState ( gc , assumeGCIsPartiallyConcurrent ( gc ) , assumeGCIsOldGen ( gc ) ) ) ; 
+ + } 
+ + 
+ mbs . registerMBean ( this , new ObjectName ( MBEAN _ NAME ) ) ; 
+ } 
+ catch ( Exception e ) 
+ { 
+ throw new RuntimeException ( e ) ; 
+ } 
+ - 
+ } 
+ 
+ public static void register ( ) throws Exception 
+ @ @ - 98 , 7 + 136 , 64 @ @ public class GCInspector implements NotificationListener , GCInspectorMXBean 
+ } 
+ } 
+ 
+ - public void handleNotification ( Notification notification , Object handback ) 
+ + / * 
+ + * Assume that a GC type is at least partially concurrent and so a side channel method 
+ + * should be used to calculate application stopped time due to the GC . 
+ + * 
+ + * If the GC isn ' t recognized then assume that is concurrent and we need to do our own calculation 
+ + * via the the side channel . 
+ + * / 
+ + private static boolean assumeGCIsPartiallyConcurrent ( GarbageCollectorMXBean gc ) 
+ + { 
+ + switch ( gc . getName ( ) ) 
+ + { 
+ + / / First two are from the serial collector 
+ + case " Copy " : 
+ + case " MarkSweepCompact " : 
+ + / / Parallel collector 
+ + case " PS MarkSweep " : 
+ + case " PS Scavenge " : 
+ + case " G1 Young Generation " : 
+ + / / CMS young generation collector 
+ + case " ParNew " : 
+ + return false ; 
+ + case " ConcurrentMarkSweep " : 
+ + case " G1 Old Generation " : 
+ + return true ; 
+ + default : 
+ + / / Assume possibly concurrent if unsure 
+ + return true ; 
+ + } 
+ + } 
+ + 
+ + / * 
+ + * Assume that a GC type is an old generation collection so SSTableDeletingTask . rescheduleFailedTasks ( ) 
+ + * should be invoked . 
+ + * 
+ + * Defaults to not invoking SSTableDeletingTask . rescheduleFailedTasks ( ) on unrecognized GC names 
+ + * / 
+ + private static boolean assumeGCIsOldGen ( GarbageCollectorMXBean gc ) 
+ + { 
+ + switch ( gc . getName ( ) ) 
+ + { 
+ + case " Copy " : 
+ + case " PS Scavenge " : 
+ + case " G1 Young Generation " : 
+ + case " ParNew " : 
+ + return false ; 
+ + case " MarkSweepCompact " : 
+ + case " PS MarkSweep " : 
+ + case " ConcurrentMarkSweep " : 
+ + case " G1 Old Generation " : 
+ + return true ; 
+ + default : 
+ + / / Assume not old gen otherwise , don ' t call 
+ + / / SSTableDeletingTask . rescheduleFailedTasks ( ) 
+ + return false ; 
+ + } 
+ + } 
+ + 
+ + public void handleNotification ( final Notification notification , final Object handback ) 
+ { 
+ String type = notification . getType ( ) ; 
+ if ( type . equals ( GarbageCollectionNotificationInfo . GARBAGE _ COLLECTION _ NOTIFICATION ) ) 
+ @ @ - 106 , 25 + 201 , 40 @ @ public class GCInspector implements NotificationListener , GCInspectorMXBean 
+ / / retrieve the garbage collection notification information 
+ CompositeData cd = ( CompositeData ) notification . getUserData ( ) ; 
+ GarbageCollectionNotificationInfo info = GarbageCollectionNotificationInfo . from ( cd ) ; 
+ + String gcName = info . getGcName ( ) ; 
+ + GcInfo gcInfo = info . getGcInfo ( ) ; 
+ 
+ - long duration = info . getGcInfo ( ) . getDuration ( ) ; 
+ + long duration = gcInfo . getDuration ( ) ; 
+ + 
+ + / * 
+ + * The duration supplied in the notification info includes more than just 
+ + * application stopped time for concurrent GCs . Try and do a better job coming up with a good stopped time 
+ + * value by asking for and tracking cumulative time spent blocked in GC . 
+ + * / 
+ + GCState gcState = gcStates . get ( gcName ) ; 
+ + if ( gcState . assumeGCIsPartiallyConcurrent ) 
+ + { 
+ + long previousTotal = gcState . lastGcTotalDuration ; 
+ + long total = gcState . gcBean . getCollectionTime ( ) ; 
+ + gcState . lastGcTotalDuration = total ; 
+ + duration = total - previousTotal ; / / may be zero for a really fast collection 
+ + } 
+ 
+ StringBuilder sb = new StringBuilder ( ) ; 
+ sb . append ( info . getGcName ( ) ) . append ( " GC in " ) . append ( duration ) . append ( " ms . " ) ; 
+ - 
+ long bytes = 0 ; 
+ - List < String > keys = new ArrayList < > ( info . getGcInfo ( ) . getMemoryUsageBeforeGc ( ) . keySet ( ) ) ; 
+ - Collections . sort ( keys ) ; 
+ - for ( String key : keys ) 
+ + Map < String , MemoryUsage > beforeMemoryUsage = gcInfo . getMemoryUsageBeforeGc ( ) ; 
+ + Map < String , MemoryUsage > afterMemoryUsage = gcInfo . getMemoryUsageAfterGc ( ) ; 
+ + for ( String key : gcState . keys ( info ) ) 
+ { 
+ - MemoryUsage before = info . getGcInfo ( ) . getMemoryUsageBeforeGc ( ) . get ( key ) ; 
+ - MemoryUsage after = info . getGcInfo ( ) . getMemoryUsageAfterGc ( ) . get ( key ) ; 
+ + MemoryUsage before = beforeMemoryUsage . get ( key ) ; 
+ + MemoryUsage after = afterMemoryUsage . get ( key ) ; 
+ if ( after ! = null & & after . getUsed ( ) ! = before . getUsed ( ) ) 
+ { 
+ sb . append ( key ) . append ( " : " ) . append ( before . getUsed ( ) ) ; 
+ sb . append ( " - > " ) ; 
+ sb . append ( after . getUsed ( ) ) ; 
+ - if ( ! key . equals ( keys . get ( keys . size ( ) - 1 ) ) ) 
+ + if ( ! key . equals ( gcState . keys [ gcState . keys . length - 1 ] ) ) 
+ sb . append ( " ; " ) ; 
+ bytes + = before . getUsed ( ) - after . getUsed ( ) ; 
+ } 
+ @ @ - 146 , 8 + 256 , 8 @ @ public class GCInspector implements NotificationListener , GCInspectorMXBean 
+ if ( duration > MIN _ LOG _ DURATION _ TPSTATS ) 
+ StatusLogger . log ( ) ; 
+ 
+ - / / if we just finished a full collection and we ' re still using a lot of memory , try to reduce the pressure 
+ - if ( info . getGcName ( ) . equals ( " ConcurrentMarkSweep " ) ) 
+ + / / if we just finished an old gen collection and we ' re still using a lot of memory , try to reduce the pressure 
+ + if ( gcState . assumeGCIsOldGen ) 
+ SSTableDeletingTask . rescheduleFailedTasks ( ) ; 
+ } 
+ }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

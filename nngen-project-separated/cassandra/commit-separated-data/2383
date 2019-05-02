@@ -1,0 +1,900 @@
+BLEU SCORE: 0.02383853510228548
+
+TEST MSG: Fix memtable copy bug causing rangetombstones to be missed
+GENERATED MSG: range query support
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 35c02f9 . . fd7c62b 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 25 , 7 + 25 , 7 @ @ Merged from 1 . 2 : <nl> * Check internal addresses for seeds ( CASSANDRA - 6523 ) <nl> * Fix potential / by 0 in HHOM page size calculation ( CASSANDRA - 7354 ) <nl> * Use LOCAL _ ONE for non - superuser auth queries ( CASSANDRA - 7328 ) <nl> - <nl> + * Fix RangeTombstone copy bug ( CASSANDRA - 7371 ) <nl> <nl> 2 . 1 . 0 - rc1 <nl> * Revert flush directory ( CASSANDRA - 6357 ) <nl> diff - - git a / src / java / org / apache / cassandra / cql3 / statements / BatchStatement . java b / src / java / org / apache / cassandra / cql3 / statements / BatchStatement . java <nl> index e513aef . . 3cec81b 100644 <nl> - - - a / src / java / org / apache / cassandra / cql3 / statements / BatchStatement . java <nl> + + + b / src / java / org / apache / cassandra / cql3 / statements / BatchStatement . java <nl> @ @ - 23 , 6 + 23 , 7 @ @ import java . util . * ; <nl> import com . google . common . base . Function ; <nl> import com . google . common . collect . * ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . transport . Frame ; <nl> import org . github . jamm . MemoryMeter ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> @ @ - 122 , 7 + 123 , 7 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache <nl> return statements ; <nl> } <nl> <nl> - private Collection < ? extends IMutation > getMutations ( BatchQueryOptions options , boolean local , long now ) <nl> + private Collection < ? extends IMutation > getMutations ( BatchQueryOptions options , boolean local , long now , Frame sourceFrame ) <nl> throws RequestExecutionException , RequestValidationException <nl> { <nl> Map < String , Map < ByteBuffer , IMutation > > mutations = new HashMap < > ( ) ; <nl> @ @ - 131 , 7 + 132 , 7 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache <nl> ModificationStatement statement = statements . get ( i ) ; <nl> QueryOptions statementOptions = options . forStatement ( i ) ; <nl> long timestamp = attrs . getTimestamp ( now , statementOptions ) ; <nl> - addStatementMutations ( statement , statementOptions , local , timestamp , mutations ) ; <nl> + addStatementMutations ( statement , statementOptions , local , timestamp , mutations , sourceFrame ) ; <nl> } <nl> return unzipMutations ( mutations ) ; <nl> } <nl> @ @ - 152 , 7 + 153 , 8 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache <nl> QueryOptions options , <nl> boolean local , <nl> long now , <nl> - Map < String , Map < ByteBuffer , IMutation > > mutations ) <nl> + Map < String , Map < ByteBuffer , IMutation > > mutations , <nl> + Frame sourceFrame ) <nl> throws RequestExecutionException , RequestValidationException <nl> { <nl> String ksName = statement . keyspace ( ) ; <nl> @ @ - 177 , 6 + 179 , 7 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache <nl> if ( mutation = = null ) <nl> { <nl> mut = new Mutation ( ksName , key ) ; <nl> + mut . setSourceFrame ( sourceFrame ) ; <nl> mutation = type = = Type . COUNTER ? new CounterMutation ( mut , options . getConsistency ( ) ) : mut ; <nl> ksMap . put ( key , mutation ) ; <nl> } <nl> @ @ - 219 , 10 + 222 , 10 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache <nl> <nl> public ResultMessage execute ( QueryState queryState , BatchQueryOptions options ) throws RequestExecutionException , RequestValidationException <nl> { <nl> - return execute ( options , false , options . getTimestamp ( queryState ) ) ; <nl> + return execute ( queryState , options , false , options . getTimestamp ( queryState ) ) ; <nl> } <nl> <nl> - public ResultMessage execute ( BatchQueryOptions options , boolean local , long now ) <nl> + private ResultMessage execute ( QueryState queryState , BatchQueryOptions options , boolean local , long now ) <nl> throws RequestExecutionException , RequestValidationException <nl> { <nl> if ( options . getConsistency ( ) = = null ) <nl> @ @ - 233 , 7 + 236 , 7 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache <nl> if ( hasConditions ) <nl> return executeWithConditions ( options , now ) ; <nl> <nl> - executeWithoutConditions ( getMutations ( options , local , now ) , options . getConsistency ( ) ) ; <nl> + executeWithoutConditions ( getMutations ( options , local , now , queryState . getSourceFrame ( ) ) , options . getConsistency ( ) ) ; <nl> return new ResultMessage . Void ( ) ; <nl> } <nl> <nl> @ @ - 309 , 7 + 312 , 7 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache <nl> public ResultMessage executeInternal ( QueryState queryState , QueryOptions options ) throws RequestValidationException , RequestExecutionException <nl> { <nl> assert ! hasConditions ; <nl> - for ( IMutation mutation : getMutations ( BatchQueryOptions . withoutPerStatementVariables ( options ) , true , queryState . getTimestamp ( ) ) ) <nl> + for ( IMutation mutation : getMutations ( BatchQueryOptions . withoutPerStatementVariables ( options ) , true , queryState . getTimestamp ( ) , queryState . getSourceFrame ( ) ) ) <nl> { <nl> / / We don ' t use counters internally . <nl> assert mutation instanceof Mutation ; <nl> diff - - git a / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java b / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java <nl> index 27eb46d . . 0e38784 100644 <nl> - - - a / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java <nl> + + + b / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java <nl> @ @ - 38 , 6 + 38 , 7 @ @ import org . apache . cassandra . utils . ObjectSizes ; <nl> import org . apache . cassandra . utils . btree . BTree ; <nl> import org . apache . cassandra . utils . btree . UpdateFunction ; <nl> import org . apache . cassandra . utils . concurrent . OpOrder ; <nl> + import org . apache . cassandra . utils . memory . HeapAllocator ; <nl> import org . apache . cassandra . utils . memory . MemtableAllocator ; <nl> <nl> import static org . apache . cassandra . db . index . SecondaryIndexManager . Updater ; <nl> @ @ - 163 , 6 + 164 , 8 @ @ public class AtomicBTreeColumns extends ColumnFamily <nl> public long addAllWithSizeDelta ( final ColumnFamily cm , MemtableAllocator allocator , OpOrder . Group writeOp , Updater indexer ) <nl> { <nl> ColumnUpdater updater = new ColumnUpdater ( this , cm . metadata , allocator , writeOp , indexer ) ; <nl> + DeletionInfo inputDeletionInfoCopy = null ; <nl> + <nl> while ( true ) <nl> { <nl> Holder current = ref ; <nl> @ @ - 172 , 7 + 175 , 10 @ @ public class AtomicBTreeColumns extends ColumnFamily <nl> DeletionInfo deletionInfo ; <nl> if ( cm . deletionInfo ( ) . mayModify ( current . deletionInfo ) ) <nl> { <nl> - deletionInfo = current . deletionInfo . copy ( ) . add ( cm . deletionInfo ( ) ) ; <nl> + if ( inputDeletionInfoCopy = = null ) <nl> + inputDeletionInfoCopy = cm . deletionInfo ( ) . copy ( HeapAllocator . instance ) ; <nl> + <nl> + deletionInfo = current . deletionInfo . copy ( ) . add ( inputDeletionInfoCopy ) ; <nl> updater . allocated ( deletionInfo . unsharedHeapSize ( ) - current . deletionInfo . unsharedHeapSize ( ) ) ; <nl> } <nl> else <nl> diff - - git a / src / java / org / apache / cassandra / db / DeletionInfo . java b / src / java / org / apache / cassandra / db / DeletionInfo . java <nl> index a167b85 . . b8988ec 100644 <nl> - - - a / src / java / org / apache / cassandra / db / DeletionInfo . java <nl> + + + b / src / java / org / apache / cassandra / db / DeletionInfo . java <nl> @ @ - 33 , 6 + 33 , 8 @ @ import org . apache . cassandra . io . IVersionedSerializer ; <nl> import org . apache . cassandra . io . util . DataOutputPlus ; <nl> import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . ObjectSizes ; <nl> + import org . apache . cassandra . utils . memory . AbstractAllocator ; <nl> + import org . apache . cassandra . utils . memory . MemtableAllocator ; <nl> <nl> / * * <nl> * A combination of a top - level ( or row ) tombstone and range tombstones describing the deletions <nl> @ @ - 102 , 6 + 104 , 16 @ @ public class DeletionInfo implements IMeasurableMemory <nl> return new DeletionInfo ( topLevel , ranges = = null ? null : ranges . copy ( ) ) ; <nl> } <nl> <nl> + public DeletionInfo copy ( AbstractAllocator allocator ) <nl> + { <nl> + <nl> + RangeTombstoneList rangesCopy = null ; <nl> + if ( ranges ! = null ) <nl> + rangesCopy = ranges . copy ( allocator ) ; <nl> + <nl> + return new DeletionInfo ( topLevel , rangesCopy ) ; <nl> + } <nl> + <nl> / * * <nl> * Returns whether this DeletionInfo is live , that is deletes no columns . <nl> * / <nl> diff - - git a / src / java / org / apache / cassandra / db / RangeTombstoneList . java b / src / java / org / apache / cassandra / db / RangeTombstoneList . java <nl> index b06c520 . . 757a1d0 100644 <nl> - - - a / src / java / org / apache / cassandra / db / RangeTombstoneList . java <nl> + + + b / src / java / org / apache / cassandra / db / RangeTombstoneList . java <nl> @ @ - 37 , 6 + 37 , 8 @ @ import org . apache . cassandra . io . IVersionedSerializer ; <nl> import org . apache . cassandra . io . util . DataOutputPlus ; <nl> import org . apache . cassandra . net . MessagingService ; <nl> import org . apache . cassandra . utils . ObjectSizes ; <nl> + import org . apache . cassandra . utils . memory . AbstractAllocator ; <nl> + import org . apache . cassandra . utils . memory . HeapPool ; <nl> <nl> / * * <nl> * Data structure holding the range tombstones of a ColumnFamily . <nl> @ @ - 114 , 6 + 116 , 25 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable <nl> boundaryHeapSize , size ) ; <nl> } <nl> <nl> + public RangeTombstoneList copy ( AbstractAllocator allocator ) <nl> + { <nl> + RangeTombstoneList copy = new RangeTombstoneList ( comparator , <nl> + new Composite [ size ] , <nl> + new Composite [ size ] , <nl> + Arrays . copyOf ( markedAts , size ) , <nl> + Arrays . copyOf ( delTimes , size ) , <nl> + boundaryHeapSize , size ) ; <nl> + <nl> + <nl> + for ( int i = 0 ; i < size ; i + + ) <nl> + { <nl> + copy . starts [ i ] = starts [ i ] . copy ( null , allocator ) ; <nl> + copy . ends [ i ] = ends [ i ] . copy ( null , allocator ) ; <nl> + } <nl> + <nl> + return copy ; <nl> + } <nl> + <nl> public void add ( RangeTombstone tombstone ) <nl> { <nl> add ( tombstone . min , tombstone . max , tombstone . data . markedForDeleteAt , tombstone . data . localDeletionTime ) ; <nl> diff - - git a / test / conf / cassandra . yaml b / test / conf / cassandra . yaml <nl> index b766a64 . . 72a357d 100644 <nl> - - - a / test / conf / cassandra . yaml <nl> + + + b / test / conf / cassandra . yaml <nl> @ @ - 11 , 6 + 11 , 8 @ @ partitioner : org . apache . cassandra . dht . ByteOrderedPartitioner <nl> listen _ address : 127 . 0 . 0 . 1 <nl> storage _ port : 7010 <nl> rpc _ port : 9170 <nl> + start _ native _ transport : true <nl> + native _ transport _ port : 9042 <nl> column _ index _ size _ in _ kb : 4 <nl> commitlog _ directory : build / test / cassandra / commitlog <nl> saved _ caches _ directory : build / test / cassandra / saved _ caches <nl> diff - - git a / test / unit / org / apache / cassandra / cql3 / DeleteTest . java b / test / unit / org / apache / cassandra / cql3 / DeleteTest . java <nl> new file mode 100644 <nl> index 0000000 . . 3395dcc <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / cql3 / DeleteTest . java <nl> @ @ - 0 , 0 + 1 , 148 @ @ <nl> + package org . apache . cassandra . cql3 ; <nl> + <nl> + <nl> + import com . datastax . driver . core . Cluster ; <nl> + import com . datastax . driver . core . PreparedStatement ; <nl> + import com . datastax . driver . core . ResultSetFuture ; <nl> + import com . datastax . driver . core . Session ; <nl> + import org . apache . cassandra . SchemaLoader ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + import org . apache . cassandra . config . Schema ; <nl> + import org . apache . cassandra . exceptions . ConfigurationException ; <nl> + import org . apache . cassandra . service . EmbeddedCassandraService ; <nl> + import org . junit . Assert ; <nl> + import org . junit . BeforeClass ; <nl> + import org . junit . Test ; <nl> + <nl> + import java . io . IOException ; <nl> + <nl> + public class DeleteTest extends SchemaLoader <nl> + { <nl> + <nl> + private static EmbeddedCassandraService cassandra ; <nl> + <nl> + private static Cluster cluster ; <nl> + private static Session session ; <nl> + private static PreparedStatement pstmtI ; <nl> + private static PreparedStatement pstmtU ; <nl> + private static PreparedStatement pstmtD ; <nl> + private static PreparedStatement pstmt1 ; <nl> + private static PreparedStatement pstmt2 ; <nl> + private static PreparedStatement pstmt3 ; <nl> + private static PreparedStatement pstmt4 ; <nl> + private static PreparedStatement pstmt5 ; <nl> + <nl> + @ BeforeClass ( ) <nl> + public static void setup ( ) throws ConfigurationException , IOException <nl> + { <nl> + <nl> + Schema . instance . clear ( ) ; / / Schema are now written on disk and will be reloaded <nl> + cassandra = new EmbeddedCassandraService ( ) ; <nl> + cassandra . start ( ) ; <nl> + <nl> + cluster = Cluster . builder ( ) . addContactPoint ( " 127 . 0 . 0 . 1 " ) . withPort ( DatabaseDescriptor . getNativeTransportPort ( ) ) . build ( ) ; <nl> + session = cluster . connect ( ) ; <nl> + <nl> + session . execute ( " drop keyspace if exists junit ; " ) ; <nl> + session . execute ( " create keyspace junit WITH REPLICATION = { ' class ' : ' SimpleStrategy ' , ' replication _ factor ' : 2 } ; " ) ; <nl> + session . execute ( " CREATE TABLE junit . tpc _ base ( \ n " + <nl> + " id int , \ n " + <nl> + " cid int , \ n " + <nl> + " val text , \ n " + <nl> + " PRIMARY KEY ( ( id ) , cid ) \ n " + <nl> + " ) ; " ) ; <nl> + session . execute ( " CREATE TABLE junit . tpc _ inherit _ a ( \ n " + <nl> + " id int , \ n " + <nl> + " cid int , \ n " + <nl> + " inh _ a text , \ n " + <nl> + " val text , \ n " + <nl> + " PRIMARY KEY ( ( id ) , cid ) \ n " + <nl> + " ) ; " ) ; <nl> + session . execute ( " CREATE TABLE junit . tpc _ inherit _ b ( \ n " + <nl> + " id int , \ n " + <nl> + " cid int , \ n " + <nl> + " inh _ b text , \ n " + <nl> + " val text , \ n " + <nl> + " PRIMARY KEY ( ( id ) , cid ) \ n " + <nl> + " ) ; " ) ; <nl> + session . execute ( " CREATE TABLE junit . tpc _ inherit _ b2 ( \ n " + <nl> + " id int , \ n " + <nl> + " cid int , \ n " + <nl> + " inh _ b text , \ n " + <nl> + " inh _ b2 text , \ n " + <nl> + " val text , \ n " + <nl> + " PRIMARY KEY ( ( id ) , cid ) \ n " + <nl> + " ) ; " ) ; <nl> + session . execute ( " CREATE TABLE junit . tpc _ inherit _ c ( \ n " + <nl> + " id int , \ n " + <nl> + " cid int , \ n " + <nl> + " inh _ c text , \ n " + <nl> + " val text , \ n " + <nl> + " PRIMARY KEY ( ( id ) , cid ) \ n " + <nl> + " ) ; " ) ; <nl> + try { <nl> + Thread . sleep ( 2000L ) ; <nl> + } catch ( InterruptedException e ) { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + <nl> + pstmtI = session . prepare ( " insert into junit . tpc _ inherit _ b ( id , cid , inh _ b , val ) values ( ? , ? , ? , ? ) " ) ; <nl> + pstmtU = session . prepare ( " update junit . tpc _ inherit _ b set inh _ b = ? , val = ? where id = ? and cid = ? " ) ; <nl> + pstmtD = session . prepare ( " delete from junit . tpc _ inherit _ b where id = ? and cid = ? " ) ; <nl> + pstmt1 = session . prepare ( " select id , cid , val from junit . tpc _ base where id = ? and cid = ? " ) ; <nl> + pstmt2 = session . prepare ( " select id , cid , inh _ a , val from junit . tpc _ inherit _ a where id = ? and cid = ? " ) ; <nl> + pstmt3 = session . prepare ( " select id , cid , inh _ b , val from junit . tpc _ inherit _ b where id = ? and cid = ? " ) ; <nl> + pstmt4 = session . prepare ( " select id , cid , inh _ b , inh _ b2 , val from junit . tpc _ inherit _ b2 where id = ? and cid = ? " ) ; <nl> + pstmt5 = session . prepare ( " select id , cid , inh _ c , val from junit . tpc _ inherit _ c where id = ? and cid = ? " ) ; <nl> + } <nl> + <nl> + <nl> + <nl> + @ Test <nl> + public void lostDeletesTest ( ) <nl> + { <nl> + <nl> + for ( int i = 0 ; i < 500 ; i + + ) <nl> + { <nl> + session . execute ( pstmtI . bind ( 1 , 1 , " inhB " , " valB " ) ) ; <nl> + <nl> + ResultSetFuture [ ] futures = load ( ) ; <nl> + <nl> + Assert . assertTrue ( futures [ 0 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + Assert . assertTrue ( futures [ 1 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + Assert . assertNotNull ( futures [ 2 ] . getUninterruptibly ( ) . one ( ) ) ; <nl> + Assert . assertTrue ( futures [ 3 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + Assert . assertTrue ( futures [ 4 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + <nl> + session . execute ( pstmtU . bind ( " inhBu " , " valBu " , 1 , 1 ) ) ; <nl> + <nl> + futures = load ( ) ; <nl> + <nl> + Assert . assertTrue ( futures [ 0 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + Assert . assertTrue ( futures [ 1 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + Assert . assertNotNull ( futures [ 2 ] . getUninterruptibly ( ) . one ( ) ) ; <nl> + Assert . assertTrue ( futures [ 3 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + Assert . assertTrue ( futures [ 4 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + <nl> + session . execute ( pstmtD . bind ( 1 , 1 ) ) ; <nl> + <nl> + futures = load ( ) ; <nl> + <nl> + Assert . assertTrue ( futures [ 0 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + Assert . assertTrue ( futures [ 1 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + Assert . assertTrue ( futures [ 2 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + Assert . assertTrue ( futures [ 3 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + Assert . assertTrue ( futures [ 4 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; <nl> + } <nl> + } <nl> + <nl> + private ResultSetFuture [ ] load ( ) { <nl> + return new ResultSetFuture [ ] { <nl> + session . executeAsync ( pstmt1 . bind ( 1 , 1 ) ) , <nl> + session . executeAsync ( pstmt2 . bind ( 1 , 1 ) ) , <nl> + session . executeAsync ( pstmt3 . bind ( 1 , 1 ) ) , <nl> + session . executeAsync ( pstmt4 . bind ( 1 , 1 ) ) , <nl> + session . executeAsync ( pstmt5 . bind ( 1 , 1 ) ) <nl> + } ; <nl> + } <nl> + }
+NEAREST DIFF (one line): diff - - git a / src / org / apache / cassandra / config / DatabaseDescriptor . java b / src / org / apache / cassandra / config / DatabaseDescriptor . java <nl> index 683009c . . 73cf3a6 100644 <nl> - - - a / src / org / apache / cassandra / config / DatabaseDescriptor . java <nl> + + + b / src / org / apache / cassandra / config / DatabaseDescriptor . java <nl> @ @ - 18 , 21 + 18 , 24 @ @ <nl> <nl> package org . apache . cassandra . config ; <nl> <nl> - import java . util . * ; <nl> + import java . io . File ; <nl> + import java . io . IOException ; <nl> + import java . util . ArrayList ; <nl> + import java . util . HashMap ; <nl> + import java . util . HashSet ; <nl> + import java . util . List ; <nl> + import java . util . Map ; <nl> + import java . util . Set ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> - import java . io . * ; <nl> <nl> import org . apache . cassandra . db . ColumnFamily ; <nl> + import org . apache . cassandra . db . SystemTable ; <nl> import org . apache . cassandra . db . Table ; <nl> import org . apache . cassandra . db . TypeInfo ; <nl> - import org . apache . cassandra . db . DBManager ; <nl> - import org . apache . cassandra . db . SystemTable ; <nl> - import org . apache . cassandra . db . Table . TableMetadata ; <nl> import org . apache . cassandra . utils . FileUtils ; <nl> import org . apache . cassandra . utils . XMLUtils ; <nl> import org . w3c . dom . Node ; <nl> import org . w3c . dom . NodeList ; <nl> - import org . apache . cassandra . io . * ; <nl> <nl> <nl> / * * <nl> @ @ - 306 , 6 + 309 , 9 @ @ public class DatabaseDescriptor <nl> / * Read the table related stuff from config * / <nl> NodeList tables = xmlUtils . getRequestedNodeList ( " / Storage / Tables / Table " ) ; <nl> int size = tables . getLength ( ) ; <nl> + if ( size = = 0 ) { <nl> + throw new UnsupportedOperationException ( " A Table must be configured " ) ; <nl> + } <nl> for ( int i = 0 ; i < size ; + + i ) <nl> { <nl> Node table = tables . item ( i ) ; <nl> @ @ - 785 , 4 + 791 , 9 @ @ public class DatabaseDescriptor <nl> { <nl> return tableToCFMetaDataMap _ ; <nl> } <nl> + <nl> + public static String getTableName ( ) <nl> + { <nl> + return tables _ . get ( 0 ) ; <nl> + } <nl> } <nl> diff - - git a / src / org / apache / cassandra / db / ColumnFamily . java b / src / org / apache / cassandra / db / ColumnFamily . java <nl> index 51ac744 . . a2ac3a2 100644 <nl> - - - a / src / org / apache / cassandra / db / ColumnFamily . java <nl> + + + b / src / org / apache / cassandra / db / ColumnFamily . java <nl> @ @ - 288 , 7 + 288 , 7 @ @ public final class ColumnFamily <nl> return columns _ . getSortedColumns ( ) ; <nl> } <nl> <nl> - Map < String , IColumn > getColumns ( ) <nl> + public Map < String , IColumn > getColumns ( ) <nl> { <nl> return columns _ . getColumns ( ) ; <nl> } <nl> diff - - git a / src / org / apache / cassandra / db / ColumnFamilyStore . java b / src / org / apache / cassandra / db / ColumnFamilyStore . java <nl> index be7c245 . . 28bb3f7 100644 <nl> - - - a / src / org / apache / cassandra / db / ColumnFamilyStore . java <nl> + + + b / src / org / apache / cassandra / db / ColumnFamilyStore . java <nl> @ @ - 1384 , 4 + 1384 , 14 @ @ public class ColumnFamilyStore <nl> { <nl> memtable _ . get ( ) . flushOnRecovery ( ) ; <nl> } <nl> + <nl> + public Object getMemtable ( ) <nl> + { <nl> + return memtable _ . get ( ) ; <nl> + } <nl> + <nl> + public Set < String > getSSTableFilenames ( ) <nl> + { <nl> + return Collections . unmodifiableSet ( ssTables _ ) ; <nl> + } <nl> } <nl> diff - - git a / src / org / apache / cassandra / db / Memtable . java b / src / org / apache / cassandra / db / Memtable . java <nl> index 2bdad37 . . 567b829 100644 <nl> - - - a / src / org / apache / cassandra / db / Memtable . java <nl> + + + b / src / org / apache / cassandra / db / Memtable . java <nl> @ @ - 26 , 6 + 26 , 8 @ @ import java . util . HashMap ; <nl> import java . util . List ; <nl> import java . util . Map ; <nl> import java . util . Set ; <nl> + import java . util . Iterator ; <nl> + import java . util . PriorityQueue ; <nl> import java . util . concurrent . Callable ; <nl> import java . util . concurrent . ExecutionException ; <nl> import java . util . concurrent . ExecutorService ; <nl> @ @ - 45 , 6 + 47 , 7 @ @ import org . apache . cassandra . io . DataOutputBuffer ; <nl> import org . apache . cassandra . io . SSTable ; <nl> import org . apache . cassandra . utils . BloomFilter ; <nl> import org . apache . cassandra . utils . LogUtil ; <nl> + import org . apache . cassandra . utils . DestructivePQIterator ; <nl> <nl> / * * <nl> * Author : Avinash Lakshman ( alakshman @ facebook . com ) & Prashant Malik ( pmalik @ facebook . com ) <nl> @ @ - 419 , 4 + 422 , 9 @ @ public class Memtable implements MemtableMBean , Comparable < Memtable > <nl> columnFamilies _ . clear ( ) ; <nl> } <nl> <nl> + public Iterator < String > sortedKeyIterator ( ) <nl> + { <nl> + return new DestructivePQIterator < String > ( new PriorityQueue < String > ( columnFamilies _ . keySet ( ) ) ) ; <nl> + } <nl> + <nl> } <nl> diff - - git a / src / org / apache / cassandra / db / MemtableManager . java b / src / org / apache / cassandra / db / MemtableManager . java <nl> index 997bbd3 . . 54242d1 100644 <nl> - - - a / src / org / apache / cassandra / db / MemtableManager . java <nl> + + + b / src / org / apache / cassandra / db / MemtableManager . java <nl> @ @ - 40 , 7 + 40 , 7 @ @ public class MemtableManager <nl> private static Lock lock _ = new ReentrantLock ( ) ; <nl> private static Logger logger _ = Logger . getLogger ( MemtableManager . class ) ; <nl> private ReentrantReadWriteLock rwLock _ = new ReentrantReadWriteLock ( true ) ; <nl> - static MemtableManager instance ( ) <nl> + public static MemtableManager instance ( ) <nl> { <nl> if ( instance _ = = null ) <nl> { <nl> @ @ - 157 , 7 + 157 , 22 @ @ public class MemtableManager <nl> 	 } <nl> } <nl> <nl> - <nl> - <nl> + public List < Memtable > getUnflushedMemtables ( String cfName ) <nl> + { <nl> + rwLock _ . readLock ( ) . lock ( ) ; <nl> + try <nl> + { <nl> + List < Memtable > memtables = history _ . get ( cfName ) ; <nl> + if ( memtables ! = null ) <nl> + { <nl> + return new ArrayList < Memtable > ( memtables ) ; <nl> + } <nl> + return Arrays . asList ( new Memtable [ 0 ] ) ; <nl> + } <nl> + finally <nl> + { <nl> + rwLock _ . readLock ( ) . unlock ( ) ; <nl> + } <nl> + } <nl> <nl> } <nl> diff - - git a / src / org / apache / cassandra / db / Table . java b / src / org / apache / cassandra / db / Table . java <nl> index 9c84b42 . . f1b260a 100644 <nl> - - - a / src / org / apache / cassandra / db / Table . java <nl> + + + b / src / org / apache / cassandra / db / Table . java <nl> @ @ - 60 , 7 + 60 , 7 @ @ public class Table <nl> * is basically the column family name and the ID associated with <nl> * this column family . We use this ID in the Commit Log header to <nl> * determine when a log file that has been rolled can be deleted . <nl> - * / <nl> + * / <nl> public static class TableMetadata <nl> { <nl> / * Name of the column family * / <nl> @ @ - 454 , 7 + 454 , 7 @ @ public class Table <nl> return columnFamilyStores _ ; <nl> } <nl> <nl> - ColumnFamilyStore getColumnFamilyStore ( String cfName ) <nl> + public ColumnFamilyStore getColumnFamilyStore ( String cfName ) <nl> { <nl> return columnFamilyStores _ . get ( cfName ) ; <nl> } <nl> @ @ - 875 , 4 + 875 , 17 @ @ public class Table <nl> long timeTaken = System . currentTimeMillis ( ) - start ; <nl> dbAnalyticsSource _ . updateWriteStatistics ( timeTaken ) ; <nl> } <nl> + <nl> + public Set < String > getApplicationColumnFamilies ( ) <nl> + { <nl> + Set < String > set = new HashSet < String > ( ) ; <nl> + for ( String cfName : getColumnFamilies ( ) ) <nl> + { <nl> + if ( DatabaseDescriptor . isApplicationColumnFamily ( cfName ) ) <nl> + { <nl> + set . add ( cfName ) ; <nl> + } <nl> + } <nl> + return set ; <nl> + } <nl> } <nl> diff - - git a / src / org / apache / cassandra / service / CassandraServer . java b / src / org / apache / cassandra / service / CassandraServer . java <nl> index 93b62e7 . . c2d5f66 100644 <nl> - - - a / src / org / apache / cassandra / service / CassandraServer . java <nl> + + + b / src / org / apache / cassandra / service / CassandraServer . java <nl> @ @ - 817 , 6 + 817 , 71 @ @ public class CassandraServer extends FacebookBase implements <nl> return result ; <nl> } <nl> <nl> + public List < String > get _ range ( String tablename , final String startkey ) throws CassandraException <nl> + { <nl> + logger _ . debug ( " get _ range " ) ; <nl> + <nl> + / / send request <nl> + Message message ; <nl> + DataOutputBuffer dob = new DataOutputBuffer ( ) ; <nl> + try <nl> + { <nl> + dob . writeUTF ( startkey ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + logger _ . error ( " unable to write startkey " , e ) ; <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + byte [ ] messageBody = Arrays . copyOf ( dob . getData ( ) , dob . getLength ( ) ) ; <nl> + message = new Message ( StorageService . getLocalStorageEndPoint ( ) , <nl> + StorageService . readStage _ , <nl> + StorageService . rangeVerbHandler _ , <nl> + messageBody ) ; <nl> + EndPoint endPoint ; <nl> + try <nl> + { <nl> + endPoint = StorageService . instance ( ) . findSuitableEndPoint ( startkey ) ; <nl> + } <nl> + catch ( Exception e ) <nl> + { <nl> + throw new CassandraException ( " Unable to find endpoint for " + startkey ) ; <nl> + } <nl> + IAsyncResult iar = MessagingService . getMessagingInstance ( ) . sendRR ( message , endPoint ) ; <nl> + <nl> + / / read response <nl> + / / TODO send more requests if we need to span multiple nodes ( or can we just let client worry about that , <nl> + / / since they have to handle multiple requests anyway ? ) <nl> + byte [ ] responseBody ; <nl> + try <nl> + { <nl> + responseBody = ( byte [ ] ) iar . get ( 2 * DatabaseDescriptor . getRpcTimeout ( ) , TimeUnit . MILLISECONDS ) [ 0 ] ; <nl> + } <nl> + catch ( TimeoutException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + DataInputBuffer bufIn = new DataInputBuffer ( ) ; <nl> + bufIn . reset ( responseBody , responseBody . length ) ; <nl> + <nl> + / / turn into List <nl> + List < String > keys = new ArrayList < String > ( ) ; <nl> + while ( bufIn . getPosition ( ) < responseBody . length ) <nl> + { <nl> + try <nl> + { <nl> + keys . add ( bufIn . readUTF ( ) ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + logger _ . error ( " bad utf " , e ) ; <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + return keys ; <nl> + } <nl> + <nl> / * <nl> * This method is used to ensure that all keys <nl> * prior to the specified key , as dtermined by <nl> diff - - git a / src / org / apache / cassandra / service / RangeVerbHandler . java b / src / org / apache / cassandra / service / RangeVerbHandler . java <nl> new file mode 100644 <nl> index 0000000 . . 3587907 <nl> - - - / dev / null <nl> + + + b / src / org / apache / cassandra / service / RangeVerbHandler . java <nl> @ @ - 0 , 0 + 1 , 152 @ @ <nl> + package org . apache . cassandra . service ; <nl> + <nl> + import java . util . ArrayList ; <nl> + import java . util . List ; <nl> + import java . util . Iterator ; <nl> + import java . util . Comparator ; <nl> + import java . util . Arrays ; <nl> + import java . io . FileNotFoundException ; <nl> + import java . io . IOException ; <nl> + <nl> + import org . apache . commons . collections . IteratorUtils ; <nl> + import org . apache . commons . collections . Predicate ; <nl> + <nl> + import org . apache . cassandra . net . MessagingService ; <nl> + import org . apache . cassandra . net . IVerbHandler ; <nl> + import org . apache . cassandra . net . Message ; <nl> + import org . apache . cassandra . db . IdentityFilter ; <nl> + import org . apache . cassandra . db . ColumnFamily ; <nl> + import org . apache . cassandra . db . ColumnFamilyStore ; <nl> + import org . apache . cassandra . db . FileStruct ; <nl> + import org . apache . cassandra . db . Table ; <nl> + import org . apache . cassandra . db . Memtable ; <nl> + import org . apache . cassandra . db . MemtableManager ; <nl> + import org . apache . cassandra . io . SequenceFile ; <nl> + import org . apache . cassandra . io . DataInputBuffer ; <nl> + import org . apache . cassandra . io . DataOutputBuffer ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + <nl> + public class RangeVerbHandler implements IVerbHandler <nl> + { <nl> + public static final Comparator < String > STRING _ COMPARATOR = new Comparator < String > ( ) <nl> + { <nl> + public int compare ( String o1 , String o2 ) <nl> + { <nl> + return o1 . compareTo ( o2 ) ; <nl> + } <nl> + } ; <nl> + <nl> + public void doVerb ( Message message ) <nl> + { <nl> + byte [ ] bytes = ( byte [ ] ) message . getMessageBody ( ) [ 0 ] ; <nl> + final String startkey ; <nl> + if ( bytes . length = = 0 ) <nl> + { <nl> + startkey = " " ; <nl> + } <nl> + else <nl> + { <nl> + DataInputBuffer dib = new DataInputBuffer ( ) ; <nl> + dib . reset ( bytes , bytes . length ) ; <nl> + try <nl> + { <nl> + startkey = dib . readUTF ( ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + <nl> + List < Iterator < String > > iterators = new ArrayList < Iterator < String > > ( ) ; <nl> + Table table = Table . open ( DatabaseDescriptor . getTableName ( ) ) ; <nl> + for ( String cfName : table . getApplicationColumnFamilies ( ) ) <nl> + { <nl> + ColumnFamilyStore cfs = table . getColumnFamilyStore ( cfName ) ; <nl> + <nl> + / / memtable keys : current and historical <nl> + Iterator < Memtable > it = ( Iterator < Memtable > ) IteratorUtils . chainedIterator ( <nl> + IteratorUtils . singletonIterator ( cfs . getMemtable ( ) ) , <nl> + MemtableManager . instance ( ) . getUnflushedMemtables ( cfName ) . iterator ( ) ) ; <nl> + while ( it . hasNext ( ) ) <nl> + { <nl> + iterators . add ( IteratorUtils . filteredIterator ( it . next ( ) . sortedKeyIterator ( ) , new Predicate ( ) <nl> + { <nl> + public boolean evaluate ( Object key ) <nl> + { <nl> + return ( ( String ) key ) . compareTo ( startkey ) > = 0 ; <nl> + } <nl> + } ) ) ; <nl> + } <nl> + <nl> + / / sstables <nl> + for ( String filename : cfs . getSSTableFilenames ( ) ) <nl> + { <nl> + try <nl> + { <nl> + FileStruct fs = new FileStruct ( SequenceFile . reader ( filename ) ) ; <nl> + fs . seekTo ( startkey ) ; <nl> + iterators . add ( fs . iterator ( ) ) ; <nl> + } <nl> + catch ( FileNotFoundException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + } <nl> + <nl> + Iterator < String > iter = IteratorUtils . collatedIterator ( STRING _ COMPARATOR , iterators ) ; <nl> + List < String > keys = new ArrayList < String > ( ) ; <nl> + String last = null , current = null ; <nl> + <nl> + while ( keys . size ( ) < 1000 ) <nl> + { <nl> + if ( ! iter . hasNext ( ) ) <nl> + { <nl> + break ; <nl> + } <nl> + current = iter . next ( ) ; <nl> + if ( ! current . equals ( last ) ) <nl> + { <nl> + last = current ; <nl> + for ( String cfName : table . getApplicationColumnFamilies ( ) ) <nl> + { <nl> + ColumnFamilyStore cfs = table . getColumnFamilyStore ( cfName ) ; <nl> + try <nl> + { <nl> + ColumnFamily cf = cfs . getColumnFamily ( current , cfName , new IdentityFilter ( ) ) ; <nl> + if ( cf ! = null & & cf . getColumns ( ) . size ( ) > 0 ) <nl> + { <nl> + keys . add ( current ) ; <nl> + break ; <nl> + } <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( ) ; <nl> + } <nl> + } <nl> + } <nl> + } <nl> + <nl> + DataOutputBuffer dob = new DataOutputBuffer ( ) ; <nl> + for ( String key : keys ) <nl> + { <nl> + try <nl> + { <nl> + dob . writeUTF ( key ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + throw new RuntimeException ( e ) ; <nl> + } <nl> + } <nl> + byte [ ] data = Arrays . copyOf ( dob . getData ( ) , dob . getLength ( ) ) ; <nl> + Message response = message . getReply ( StorageService . getLocalStorageEndPoint ( ) , data ) ; <nl> + MessagingService . getMessagingInstance ( ) . sendOneWay ( response , message . getFrom ( ) ) ; <nl> + } <nl> + } <nl> diff - - git a / src / org / apache / cassandra / service / StorageService . java b / src / org / apache / cassandra / service / StorageService . java <nl> index 409cd5f . . 95de5c6 100644 <nl> - - - a / src / org / apache / cassandra / service / StorageService . java <nl> + + + b / src / org / apache / cassandra / service / StorageService . java <nl> @ @ - 138 , 6 + 138 , 7 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto <nl> public final static String bsMetadataVerbHandler _ = " BS - METADATA - VERB - HANDLER " ; <nl> public final static String calloutDeployVerbHandler _ = " CALLOUT - DEPLOY - VERB - HANDLER " ; <nl> public final static String touchVerbHandler _ = " TOUCH - VERB - HANDLER " ; <nl> + public static String rangeVerbHandler _ = " RANGE - VERB - HANDLER " ; <nl> <nl> public static enum ConsistencyLevel <nl> { <nl> diff - - git a / src / org / apache / cassandra / utils / DestructivePQIterator . java b / src / org / apache / cassandra / utils / DestructivePQIterator . java <nl> new file mode 100644 <nl> index 0000000 . . 0ed96f8 <nl> - - - / dev / null <nl> + + + b / src / org / apache / cassandra / utils / DestructivePQIterator . java <nl> @ @ - 0 , 0 + 1 , 25 @ @ <nl> + package org . apache . cassandra . utils ; <nl> + <nl> + import java . util . Iterator ; <nl> + import java . util . PriorityQueue ; <nl> + <nl> + public class DestructivePQIterator < T > implements Iterator < T > { <nl> + private PriorityQueue < T > pq ; <nl> + <nl> + public DestructivePQIterator ( PriorityQueue < T > pq ) { <nl> + this . pq = pq ; <nl> + } <nl> + <nl> + public boolean hasNext ( ) { <nl> + return pq . size ( ) > 0 ; <nl> + } <nl> + <nl> + public T next ( ) { <nl> + return pq . poll ( ) ; <nl> + } <nl> + <nl> + public void remove ( ) { <nl> + throw new UnsupportedOperationException ( ) ; <nl> + } <nl> + } <nl> + <nl> diff - - git a / test / org / apache / cassandra / service / CassandraServerTest . java b / test / org / apache / cassandra / service / CassandraServerTest . java <nl> index 07c7dfe . . 762bbb5 100644 <nl> - - - a / test / org / apache / cassandra / service / CassandraServerTest . java <nl> + + + b / test / org / apache / cassandra / service / CassandraServerTest . java <nl> @ @ - 9 , 8 + 9 , 50 @ @ import org . testng . annotations . Test ; <nl> import java . io . IOException ; <nl> import java . util . * ; <nl> <nl> + import com . facebook . thrift . TException ; <nl> + <nl> public class CassandraServerTest extends ServerTest { <nl> / * <nl> + TODO fix resetting server so this works <nl> + @ Test <nl> + public void test _ get _ range _ empty ( ) throws IOException , TException { <nl> + CassandraServer server = new CassandraServer ( ) ; <nl> + server . start ( ) ; <nl> + <nl> + assert CollectionUtils . EMPTY _ COLLECTION . equals ( server . get _ range ( DatabaseDescriptor . getTableName ( ) , " " ) ) ; <nl> + } <nl> + * / <nl> + <nl> + / * <nl> + @ Test <nl> + public void test _ get _ range ( ) throws IOException , TException , CassandraException <nl> + { <nl> + CassandraServer server = new CassandraServer ( ) ; <nl> + try <nl> + { <nl> + server . start ( ) ; <nl> + } <nl> + catch ( Throwable throwable ) <nl> + { <nl> + throw new RuntimeException ( throwable ) ; <nl> + } <nl> + <nl> + / / TODO insert some data <nl> + try { <nl> + String last = null ; <nl> + for ( String key : server . get _ range ( DatabaseDescriptor . getTableName ( ) , " key1 " ) ) { <nl> + if ( last ! = null ) { <nl> + assert last . compareTo ( key ) < 0 ; <nl> + } <nl> + last = key ; <nl> + } <nl> + } finally { <nl> + server . shutdown ( ) ; <nl> + } <nl> + } <nl> + * / <nl> + <nl> + / * <nl> @ Test <nl> public void test _ get _ column ( ) throws Throwable { <nl> CassandraServer server = new CassandraServer ( ) ;
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 35c02f9 . . fd7c62b 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 25 , 7 + 25 , 7 @ @ Merged from 1 . 2 : 
+ * Check internal addresses for seeds ( CASSANDRA - 6523 ) 
+ * Fix potential / by 0 in HHOM page size calculation ( CASSANDRA - 7354 ) 
+ * Use LOCAL _ ONE for non - superuser auth queries ( CASSANDRA - 7328 ) 
+ - 
+ + * Fix RangeTombstone copy bug ( CASSANDRA - 7371 ) 
+ 
+ 2 . 1 . 0 - rc1 
+ * Revert flush directory ( CASSANDRA - 6357 ) 
+ diff - - git a / src / java / org / apache / cassandra / cql3 / statements / BatchStatement . java b / src / java / org / apache / cassandra / cql3 / statements / BatchStatement . java 
+ index e513aef . . 3cec81b 100644 
+ - - - a / src / java / org / apache / cassandra / cql3 / statements / BatchStatement . java 
+ + + + b / src / java / org / apache / cassandra / cql3 / statements / BatchStatement . java 
+ @ @ - 23 , 6 + 23 , 7 @ @ import java . util . * ; 
+ import com . google . common . base . Function ; 
+ import com . google . common . collect . * ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . transport . Frame ; 
+ import org . github . jamm . MemoryMeter ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ @ @ - 122 , 7 + 123 , 7 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache 
+ return statements ; 
+ } 
+ 
+ - private Collection < ? extends IMutation > getMutations ( BatchQueryOptions options , boolean local , long now ) 
+ + private Collection < ? extends IMutation > getMutations ( BatchQueryOptions options , boolean local , long now , Frame sourceFrame ) 
+ throws RequestExecutionException , RequestValidationException 
+ { 
+ Map < String , Map < ByteBuffer , IMutation > > mutations = new HashMap < > ( ) ; 
+ @ @ - 131 , 7 + 132 , 7 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache 
+ ModificationStatement statement = statements . get ( i ) ; 
+ QueryOptions statementOptions = options . forStatement ( i ) ; 
+ long timestamp = attrs . getTimestamp ( now , statementOptions ) ; 
+ - addStatementMutations ( statement , statementOptions , local , timestamp , mutations ) ; 
+ + addStatementMutations ( statement , statementOptions , local , timestamp , mutations , sourceFrame ) ; 
+ } 
+ return unzipMutations ( mutations ) ; 
+ } 
+ @ @ - 152 , 7 + 153 , 8 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache 
+ QueryOptions options , 
+ boolean local , 
+ long now , 
+ - Map < String , Map < ByteBuffer , IMutation > > mutations ) 
+ + Map < String , Map < ByteBuffer , IMutation > > mutations , 
+ + Frame sourceFrame ) 
+ throws RequestExecutionException , RequestValidationException 
+ { 
+ String ksName = statement . keyspace ( ) ; 
+ @ @ - 177 , 6 + 179 , 7 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache 
+ if ( mutation = = null ) 
+ { 
+ mut = new Mutation ( ksName , key ) ; 
+ + mut . setSourceFrame ( sourceFrame ) ; 
+ mutation = type = = Type . COUNTER ? new CounterMutation ( mut , options . getConsistency ( ) ) : mut ; 
+ ksMap . put ( key , mutation ) ; 
+ } 
+ @ @ - 219 , 10 + 222 , 10 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache 
+ 
+ public ResultMessage execute ( QueryState queryState , BatchQueryOptions options ) throws RequestExecutionException , RequestValidationException 
+ { 
+ - return execute ( options , false , options . getTimestamp ( queryState ) ) ; 
+ + return execute ( queryState , options , false , options . getTimestamp ( queryState ) ) ; 
+ } 
+ 
+ - public ResultMessage execute ( BatchQueryOptions options , boolean local , long now ) 
+ + private ResultMessage execute ( QueryState queryState , BatchQueryOptions options , boolean local , long now ) 
+ throws RequestExecutionException , RequestValidationException 
+ { 
+ if ( options . getConsistency ( ) = = null ) 
+ @ @ - 233 , 7 + 236 , 7 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache 
+ if ( hasConditions ) 
+ return executeWithConditions ( options , now ) ; 
+ 
+ - executeWithoutConditions ( getMutations ( options , local , now ) , options . getConsistency ( ) ) ; 
+ + executeWithoutConditions ( getMutations ( options , local , now , queryState . getSourceFrame ( ) ) , options . getConsistency ( ) ) ; 
+ return new ResultMessage . Void ( ) ; 
+ } 
+ 
+ @ @ - 309 , 7 + 312 , 7 @ @ public class BatchStatement implements CQLStatement , MeasurableForPreparedCache 
+ public ResultMessage executeInternal ( QueryState queryState , QueryOptions options ) throws RequestValidationException , RequestExecutionException 
+ { 
+ assert ! hasConditions ; 
+ - for ( IMutation mutation : getMutations ( BatchQueryOptions . withoutPerStatementVariables ( options ) , true , queryState . getTimestamp ( ) ) ) 
+ + for ( IMutation mutation : getMutations ( BatchQueryOptions . withoutPerStatementVariables ( options ) , true , queryState . getTimestamp ( ) , queryState . getSourceFrame ( ) ) ) 
+ { 
+ / / We don ' t use counters internally . 
+ assert mutation instanceof Mutation ; 
+ diff - - git a / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java b / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java 
+ index 27eb46d . . 0e38784 100644 
+ - - - a / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java 
+ + + + b / src / java / org / apache / cassandra / db / AtomicBTreeColumns . java 
+ @ @ - 38 , 6 + 38 , 7 @ @ import org . apache . cassandra . utils . ObjectSizes ; 
+ import org . apache . cassandra . utils . btree . BTree ; 
+ import org . apache . cassandra . utils . btree . UpdateFunction ; 
+ import org . apache . cassandra . utils . concurrent . OpOrder ; 
+ + import org . apache . cassandra . utils . memory . HeapAllocator ; 
+ import org . apache . cassandra . utils . memory . MemtableAllocator ; 
+ 
+ import static org . apache . cassandra . db . index . SecondaryIndexManager . Updater ; 
+ @ @ - 163 , 6 + 164 , 8 @ @ public class AtomicBTreeColumns extends ColumnFamily 
+ public long addAllWithSizeDelta ( final ColumnFamily cm , MemtableAllocator allocator , OpOrder . Group writeOp , Updater indexer ) 
+ { 
+ ColumnUpdater updater = new ColumnUpdater ( this , cm . metadata , allocator , writeOp , indexer ) ; 
+ + DeletionInfo inputDeletionInfoCopy = null ; 
+ + 
+ while ( true ) 
+ { 
+ Holder current = ref ; 
+ @ @ - 172 , 7 + 175 , 10 @ @ public class AtomicBTreeColumns extends ColumnFamily 
+ DeletionInfo deletionInfo ; 
+ if ( cm . deletionInfo ( ) . mayModify ( current . deletionInfo ) ) 
+ { 
+ - deletionInfo = current . deletionInfo . copy ( ) . add ( cm . deletionInfo ( ) ) ; 
+ + if ( inputDeletionInfoCopy = = null ) 
+ + inputDeletionInfoCopy = cm . deletionInfo ( ) . copy ( HeapAllocator . instance ) ; 
+ + 
+ + deletionInfo = current . deletionInfo . copy ( ) . add ( inputDeletionInfoCopy ) ; 
+ updater . allocated ( deletionInfo . unsharedHeapSize ( ) - current . deletionInfo . unsharedHeapSize ( ) ) ; 
+ } 
+ else 
+ diff - - git a / src / java / org / apache / cassandra / db / DeletionInfo . java b / src / java / org / apache / cassandra / db / DeletionInfo . java 
+ index a167b85 . . b8988ec 100644 
+ - - - a / src / java / org / apache / cassandra / db / DeletionInfo . java 
+ + + + b / src / java / org / apache / cassandra / db / DeletionInfo . java 
+ @ @ - 33 , 6 + 33 , 8 @ @ import org . apache . cassandra . io . IVersionedSerializer ; 
+ import org . apache . cassandra . io . util . DataOutputPlus ; 
+ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . ObjectSizes ; 
+ + import org . apache . cassandra . utils . memory . AbstractAllocator ; 
+ + import org . apache . cassandra . utils . memory . MemtableAllocator ; 
+ 
+ / * * 
+ * A combination of a top - level ( or row ) tombstone and range tombstones describing the deletions 
+ @ @ - 102 , 6 + 104 , 16 @ @ public class DeletionInfo implements IMeasurableMemory 
+ return new DeletionInfo ( topLevel , ranges = = null ? null : ranges . copy ( ) ) ; 
+ } 
+ 
+ + public DeletionInfo copy ( AbstractAllocator allocator ) 
+ + { 
+ + 
+ + RangeTombstoneList rangesCopy = null ; 
+ + if ( ranges ! = null ) 
+ + rangesCopy = ranges . copy ( allocator ) ; 
+ + 
+ + return new DeletionInfo ( topLevel , rangesCopy ) ; 
+ + } 
+ + 
+ / * * 
+ * Returns whether this DeletionInfo is live , that is deletes no columns . 
+ * / 
+ diff - - git a / src / java / org / apache / cassandra / db / RangeTombstoneList . java b / src / java / org / apache / cassandra / db / RangeTombstoneList . java 
+ index b06c520 . . 757a1d0 100644 
+ - - - a / src / java / org / apache / cassandra / db / RangeTombstoneList . java 
+ + + + b / src / java / org / apache / cassandra / db / RangeTombstoneList . java 
+ @ @ - 37 , 6 + 37 , 8 @ @ import org . apache . cassandra . io . IVersionedSerializer ; 
+ import org . apache . cassandra . io . util . DataOutputPlus ; 
+ import org . apache . cassandra . net . MessagingService ; 
+ import org . apache . cassandra . utils . ObjectSizes ; 
+ + import org . apache . cassandra . utils . memory . AbstractAllocator ; 
+ + import org . apache . cassandra . utils . memory . HeapPool ; 
+ 
+ / * * 
+ * Data structure holding the range tombstones of a ColumnFamily . 
+ @ @ - 114 , 6 + 116 , 25 @ @ public class RangeTombstoneList implements Iterable < RangeTombstone > , IMeasurable 
+ boundaryHeapSize , size ) ; 
+ } 
+ 
+ + public RangeTombstoneList copy ( AbstractAllocator allocator ) 
+ + { 
+ + RangeTombstoneList copy = new RangeTombstoneList ( comparator , 
+ + new Composite [ size ] , 
+ + new Composite [ size ] , 
+ + Arrays . copyOf ( markedAts , size ) , 
+ + Arrays . copyOf ( delTimes , size ) , 
+ + boundaryHeapSize , size ) ; 
+ + 
+ + 
+ + for ( int i = 0 ; i < size ; i + + ) 
+ + { 
+ + copy . starts [ i ] = starts [ i ] . copy ( null , allocator ) ; 
+ + copy . ends [ i ] = ends [ i ] . copy ( null , allocator ) ; 
+ + } 
+ + 
+ + return copy ; 
+ + } 
+ + 
+ public void add ( RangeTombstone tombstone ) 
+ { 
+ add ( tombstone . min , tombstone . max , tombstone . data . markedForDeleteAt , tombstone . data . localDeletionTime ) ; 
+ diff - - git a / test / conf / cassandra . yaml b / test / conf / cassandra . yaml 
+ index b766a64 . . 72a357d 100644 
+ - - - a / test / conf / cassandra . yaml 
+ + + + b / test / conf / cassandra . yaml 
+ @ @ - 11 , 6 + 11 , 8 @ @ partitioner : org . apache . cassandra . dht . ByteOrderedPartitioner 
+ listen _ address : 127 . 0 . 0 . 1 
+ storage _ port : 7010 
+ rpc _ port : 9170 
+ + start _ native _ transport : true 
+ + native _ transport _ port : 9042 
+ column _ index _ size _ in _ kb : 4 
+ commitlog _ directory : build / test / cassandra / commitlog 
+ saved _ caches _ directory : build / test / cassandra / saved _ caches 
+ diff - - git a / test / unit / org / apache / cassandra / cql3 / DeleteTest . java b / test / unit / org / apache / cassandra / cql3 / DeleteTest . java 
+ new file mode 100644 
+ index 0000000 . . 3395dcc 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / cql3 / DeleteTest . java 
+ @ @ - 0 , 0 + 1 , 148 @ @ 
+ + package org . apache . cassandra . cql3 ; 
+ + 
+ + 
+ + import com . datastax . driver . core . Cluster ; 
+ + import com . datastax . driver . core . PreparedStatement ; 
+ + import com . datastax . driver . core . ResultSetFuture ; 
+ + import com . datastax . driver . core . Session ; 
+ + import org . apache . cassandra . SchemaLoader ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + import org . apache . cassandra . config . Schema ; 
+ + import org . apache . cassandra . exceptions . ConfigurationException ; 
+ + import org . apache . cassandra . service . EmbeddedCassandraService ; 
+ + import org . junit . Assert ; 
+ + import org . junit . BeforeClass ; 
+ + import org . junit . Test ; 
+ + 
+ + import java . io . IOException ; 
+ + 
+ + public class DeleteTest extends SchemaLoader 
+ + { 
+ + 
+ + private static EmbeddedCassandraService cassandra ; 
+ + 
+ + private static Cluster cluster ; 
+ + private static Session session ; 
+ + private static PreparedStatement pstmtI ; 
+ + private static PreparedStatement pstmtU ; 
+ + private static PreparedStatement pstmtD ; 
+ + private static PreparedStatement pstmt1 ; 
+ + private static PreparedStatement pstmt2 ; 
+ + private static PreparedStatement pstmt3 ; 
+ + private static PreparedStatement pstmt4 ; 
+ + private static PreparedStatement pstmt5 ; 
+ + 
+ + @ BeforeClass ( ) 
+ + public static void setup ( ) throws ConfigurationException , IOException 
+ + { 
+ + 
+ + Schema . instance . clear ( ) ; / / Schema are now written on disk and will be reloaded 
+ + cassandra = new EmbeddedCassandraService ( ) ; 
+ + cassandra . start ( ) ; 
+ + 
+ + cluster = Cluster . builder ( ) . addContactPoint ( " 127 . 0 . 0 . 1 " ) . withPort ( DatabaseDescriptor . getNativeTransportPort ( ) ) . build ( ) ; 
+ + session = cluster . connect ( ) ; 
+ + 
+ + session . execute ( " drop keyspace if exists junit ; " ) ; 
+ + session . execute ( " create keyspace junit WITH REPLICATION = { ' class ' : ' SimpleStrategy ' , ' replication _ factor ' : 2 } ; " ) ; 
+ + session . execute ( " CREATE TABLE junit . tpc _ base ( \ n " + 
+ + " id int , \ n " + 
+ + " cid int , \ n " + 
+ + " val text , \ n " + 
+ + " PRIMARY KEY ( ( id ) , cid ) \ n " + 
+ + " ) ; " ) ; 
+ + session . execute ( " CREATE TABLE junit . tpc _ inherit _ a ( \ n " + 
+ + " id int , \ n " + 
+ + " cid int , \ n " + 
+ + " inh _ a text , \ n " + 
+ + " val text , \ n " + 
+ + " PRIMARY KEY ( ( id ) , cid ) \ n " + 
+ + " ) ; " ) ; 
+ + session . execute ( " CREATE TABLE junit . tpc _ inherit _ b ( \ n " + 
+ + " id int , \ n " + 
+ + " cid int , \ n " + 
+ + " inh _ b text , \ n " + 
+ + " val text , \ n " + 
+ + " PRIMARY KEY ( ( id ) , cid ) \ n " + 
+ + " ) ; " ) ; 
+ + session . execute ( " CREATE TABLE junit . tpc _ inherit _ b2 ( \ n " + 
+ + " id int , \ n " + 
+ + " cid int , \ n " + 
+ + " inh _ b text , \ n " + 
+ + " inh _ b2 text , \ n " + 
+ + " val text , \ n " + 
+ + " PRIMARY KEY ( ( id ) , cid ) \ n " + 
+ + " ) ; " ) ; 
+ + session . execute ( " CREATE TABLE junit . tpc _ inherit _ c ( \ n " + 
+ + " id int , \ n " + 
+ + " cid int , \ n " + 
+ + " inh _ c text , \ n " + 
+ + " val text , \ n " + 
+ + " PRIMARY KEY ( ( id ) , cid ) \ n " + 
+ + " ) ; " ) ; 
+ + try { 
+ + Thread . sleep ( 2000L ) ; 
+ + } catch ( InterruptedException e ) { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + 
+ + pstmtI = session . prepare ( " insert into junit . tpc _ inherit _ b ( id , cid , inh _ b , val ) values ( ? , ? , ? , ? ) " ) ; 
+ + pstmtU = session . prepare ( " update junit . tpc _ inherit _ b set inh _ b = ? , val = ? where id = ? and cid = ? " ) ; 
+ + pstmtD = session . prepare ( " delete from junit . tpc _ inherit _ b where id = ? and cid = ? " ) ; 
+ + pstmt1 = session . prepare ( " select id , cid , val from junit . tpc _ base where id = ? and cid = ? " ) ; 
+ + pstmt2 = session . prepare ( " select id , cid , inh _ a , val from junit . tpc _ inherit _ a where id = ? and cid = ? " ) ; 
+ + pstmt3 = session . prepare ( " select id , cid , inh _ b , val from junit . tpc _ inherit _ b where id = ? and cid = ? " ) ; 
+ + pstmt4 = session . prepare ( " select id , cid , inh _ b , inh _ b2 , val from junit . tpc _ inherit _ b2 where id = ? and cid = ? " ) ; 
+ + pstmt5 = session . prepare ( " select id , cid , inh _ c , val from junit . tpc _ inherit _ c where id = ? and cid = ? " ) ; 
+ + } 
+ + 
+ + 
+ + 
+ + @ Test 
+ + public void lostDeletesTest ( ) 
+ + { 
+ + 
+ + for ( int i = 0 ; i < 500 ; i + + ) 
+ + { 
+ + session . execute ( pstmtI . bind ( 1 , 1 , " inhB " , " valB " ) ) ; 
+ + 
+ + ResultSetFuture [ ] futures = load ( ) ; 
+ + 
+ + Assert . assertTrue ( futures [ 0 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + Assert . assertTrue ( futures [ 1 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + Assert . assertNotNull ( futures [ 2 ] . getUninterruptibly ( ) . one ( ) ) ; 
+ + Assert . assertTrue ( futures [ 3 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + Assert . assertTrue ( futures [ 4 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + 
+ + session . execute ( pstmtU . bind ( " inhBu " , " valBu " , 1 , 1 ) ) ; 
+ + 
+ + futures = load ( ) ; 
+ + 
+ + Assert . assertTrue ( futures [ 0 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + Assert . assertTrue ( futures [ 1 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + Assert . assertNotNull ( futures [ 2 ] . getUninterruptibly ( ) . one ( ) ) ; 
+ + Assert . assertTrue ( futures [ 3 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + Assert . assertTrue ( futures [ 4 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + 
+ + session . execute ( pstmtD . bind ( 1 , 1 ) ) ; 
+ + 
+ + futures = load ( ) ; 
+ + 
+ + Assert . assertTrue ( futures [ 0 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + Assert . assertTrue ( futures [ 1 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + Assert . assertTrue ( futures [ 2 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + Assert . assertTrue ( futures [ 3 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + Assert . assertTrue ( futures [ 4 ] . getUninterruptibly ( ) . isExhausted ( ) ) ; 
+ + } 
+ + } 
+ + 
+ + private ResultSetFuture [ ] load ( ) { 
+ + return new ResultSetFuture [ ] { 
+ + session . executeAsync ( pstmt1 . bind ( 1 , 1 ) ) , 
+ + session . executeAsync ( pstmt2 . bind ( 1 , 1 ) ) , 
+ + session . executeAsync ( pstmt3 . bind ( 1 , 1 ) ) , 
+ + session . executeAsync ( pstmt4 . bind ( 1 , 1 ) ) , 
+ + session . executeAsync ( pstmt5 . bind ( 1 , 1 ) ) 
+ + } ; 
+ + } 
+ + }
+
+NEAREST DIFF:
+diff - - git a / src / org / apache / cassandra / config / DatabaseDescriptor . java b / src / org / apache / cassandra / config / DatabaseDescriptor . java 
+ index 683009c . . 73cf3a6 100644 
+ - - - a / src / org / apache / cassandra / config / DatabaseDescriptor . java 
+ + + + b / src / org / apache / cassandra / config / DatabaseDescriptor . java 
+ @ @ - 18 , 21 + 18 , 24 @ @ 
+ 
+ package org . apache . cassandra . config ; 
+ 
+ - import java . util . * ; 
+ + import java . io . File ; 
+ + import java . io . IOException ; 
+ + import java . util . ArrayList ; 
+ + import java . util . HashMap ; 
+ + import java . util . HashSet ; 
+ + import java . util . List ; 
+ + import java . util . Map ; 
+ + import java . util . Set ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ - import java . io . * ; 
+ 
+ import org . apache . cassandra . db . ColumnFamily ; 
+ + import org . apache . cassandra . db . SystemTable ; 
+ import org . apache . cassandra . db . Table ; 
+ import org . apache . cassandra . db . TypeInfo ; 
+ - import org . apache . cassandra . db . DBManager ; 
+ - import org . apache . cassandra . db . SystemTable ; 
+ - import org . apache . cassandra . db . Table . TableMetadata ; 
+ import org . apache . cassandra . utils . FileUtils ; 
+ import org . apache . cassandra . utils . XMLUtils ; 
+ import org . w3c . dom . Node ; 
+ import org . w3c . dom . NodeList ; 
+ - import org . apache . cassandra . io . * ; 
+ 
+ 
+ / * * 
+ @ @ - 306 , 6 + 309 , 9 @ @ public class DatabaseDescriptor 
+ / * Read the table related stuff from config * / 
+ NodeList tables = xmlUtils . getRequestedNodeList ( " / Storage / Tables / Table " ) ; 
+ int size = tables . getLength ( ) ; 
+ + if ( size = = 0 ) { 
+ + throw new UnsupportedOperationException ( " A Table must be configured " ) ; 
+ + } 
+ for ( int i = 0 ; i < size ; + + i ) 
+ { 
+ Node table = tables . item ( i ) ; 
+ @ @ - 785 , 4 + 791 , 9 @ @ public class DatabaseDescriptor 
+ { 
+ return tableToCFMetaDataMap _ ; 
+ } 
+ + 
+ + public static String getTableName ( ) 
+ + { 
+ + return tables _ . get ( 0 ) ; 
+ + } 
+ } 
+ diff - - git a / src / org / apache / cassandra / db / ColumnFamily . java b / src / org / apache / cassandra / db / ColumnFamily . java 
+ index 51ac744 . . a2ac3a2 100644 
+ - - - a / src / org / apache / cassandra / db / ColumnFamily . java 
+ + + + b / src / org / apache / cassandra / db / ColumnFamily . java 
+ @ @ - 288 , 7 + 288 , 7 @ @ public final class ColumnFamily 
+ return columns _ . getSortedColumns ( ) ; 
+ } 
+ 
+ - Map < String , IColumn > getColumns ( ) 
+ + public Map < String , IColumn > getColumns ( ) 
+ { 
+ return columns _ . getColumns ( ) ; 
+ } 
+ diff - - git a / src / org / apache / cassandra / db / ColumnFamilyStore . java b / src / org / apache / cassandra / db / ColumnFamilyStore . java 
+ index be7c245 . . 28bb3f7 100644 
+ - - - a / src / org / apache / cassandra / db / ColumnFamilyStore . java 
+ + + + b / src / org / apache / cassandra / db / ColumnFamilyStore . java 
+ @ @ - 1384 , 4 + 1384 , 14 @ @ public class ColumnFamilyStore 
+ { 
+ memtable _ . get ( ) . flushOnRecovery ( ) ; 
+ } 
+ + 
+ + public Object getMemtable ( ) 
+ + { 
+ + return memtable _ . get ( ) ; 
+ + } 
+ + 
+ + public Set < String > getSSTableFilenames ( ) 
+ + { 
+ + return Collections . unmodifiableSet ( ssTables _ ) ; 
+ + } 
+ } 
+ diff - - git a / src / org / apache / cassandra / db / Memtable . java b / src / org / apache / cassandra / db / Memtable . java 
+ index 2bdad37 . . 567b829 100644 
+ - - - a / src / org / apache / cassandra / db / Memtable . java 
+ + + + b / src / org / apache / cassandra / db / Memtable . java 
+ @ @ - 26 , 6 + 26 , 8 @ @ import java . util . HashMap ; 
+ import java . util . List ; 
+ import java . util . Map ; 
+ import java . util . Set ; 
+ + import java . util . Iterator ; 
+ + import java . util . PriorityQueue ; 
+ import java . util . concurrent . Callable ; 
+ import java . util . concurrent . ExecutionException ; 
+ import java . util . concurrent . ExecutorService ; 
+ @ @ - 45 , 6 + 47 , 7 @ @ import org . apache . cassandra . io . DataOutputBuffer ; 
+ import org . apache . cassandra . io . SSTable ; 
+ import org . apache . cassandra . utils . BloomFilter ; 
+ import org . apache . cassandra . utils . LogUtil ; 
+ + import org . apache . cassandra . utils . DestructivePQIterator ; 
+ 
+ / * * 
+ * Author : Avinash Lakshman ( alakshman @ facebook . com ) & Prashant Malik ( pmalik @ facebook . com ) 
+ @ @ - 419 , 4 + 422 , 9 @ @ public class Memtable implements MemtableMBean , Comparable < Memtable > 
+ columnFamilies _ . clear ( ) ; 
+ } 
+ 
+ + public Iterator < String > sortedKeyIterator ( ) 
+ + { 
+ + return new DestructivePQIterator < String > ( new PriorityQueue < String > ( columnFamilies _ . keySet ( ) ) ) ; 
+ + } 
+ + 
+ } 
+ diff - - git a / src / org / apache / cassandra / db / MemtableManager . java b / src / org / apache / cassandra / db / MemtableManager . java 
+ index 997bbd3 . . 54242d1 100644 
+ - - - a / src / org / apache / cassandra / db / MemtableManager . java 
+ + + + b / src / org / apache / cassandra / db / MemtableManager . java 
+ @ @ - 40 , 7 + 40 , 7 @ @ public class MemtableManager 
+ private static Lock lock _ = new ReentrantLock ( ) ; 
+ private static Logger logger _ = Logger . getLogger ( MemtableManager . class ) ; 
+ private ReentrantReadWriteLock rwLock _ = new ReentrantReadWriteLock ( true ) ; 
+ - static MemtableManager instance ( ) 
+ + public static MemtableManager instance ( ) 
+ { 
+ if ( instance _ = = null ) 
+ { 
+ @ @ - 157 , 7 + 157 , 22 @ @ public class MemtableManager 
+ 	 } 
+ } 
+ 
+ - 
+ - 
+ + public List < Memtable > getUnflushedMemtables ( String cfName ) 
+ + { 
+ + rwLock _ . readLock ( ) . lock ( ) ; 
+ + try 
+ + { 
+ + List < Memtable > memtables = history _ . get ( cfName ) ; 
+ + if ( memtables ! = null ) 
+ + { 
+ + return new ArrayList < Memtable > ( memtables ) ; 
+ + } 
+ + return Arrays . asList ( new Memtable [ 0 ] ) ; 
+ + } 
+ + finally 
+ + { 
+ + rwLock _ . readLock ( ) . unlock ( ) ; 
+ + } 
+ + } 
+ 
+ } 
+ diff - - git a / src / org / apache / cassandra / db / Table . java b / src / org / apache / cassandra / db / Table . java 
+ index 9c84b42 . . f1b260a 100644 
+ - - - a / src / org / apache / cassandra / db / Table . java 
+ + + + b / src / org / apache / cassandra / db / Table . java 
+ @ @ - 60 , 7 + 60 , 7 @ @ public class Table 
+ * is basically the column family name and the ID associated with 
+ * this column family . We use this ID in the Commit Log header to 
+ * determine when a log file that has been rolled can be deleted . 
+ - * / 
+ + * / 
+ public static class TableMetadata 
+ { 
+ / * Name of the column family * / 
+ @ @ - 454 , 7 + 454 , 7 @ @ public class Table 
+ return columnFamilyStores _ ; 
+ } 
+ 
+ - ColumnFamilyStore getColumnFamilyStore ( String cfName ) 
+ + public ColumnFamilyStore getColumnFamilyStore ( String cfName ) 
+ { 
+ return columnFamilyStores _ . get ( cfName ) ; 
+ } 
+ @ @ - 875 , 4 + 875 , 17 @ @ public class Table 
+ long timeTaken = System . currentTimeMillis ( ) - start ; 
+ dbAnalyticsSource _ . updateWriteStatistics ( timeTaken ) ; 
+ } 
+ + 
+ + public Set < String > getApplicationColumnFamilies ( ) 
+ + { 
+ + Set < String > set = new HashSet < String > ( ) ; 
+ + for ( String cfName : getColumnFamilies ( ) ) 
+ + { 
+ + if ( DatabaseDescriptor . isApplicationColumnFamily ( cfName ) ) 
+ + { 
+ + set . add ( cfName ) ; 
+ + } 
+ + } 
+ + return set ; 
+ + } 
+ } 
+ diff - - git a / src / org / apache / cassandra / service / CassandraServer . java b / src / org / apache / cassandra / service / CassandraServer . java 
+ index 93b62e7 . . c2d5f66 100644 
+ - - - a / src / org / apache / cassandra / service / CassandraServer . java 
+ + + + b / src / org / apache / cassandra / service / CassandraServer . java 
+ @ @ - 817 , 6 + 817 , 71 @ @ public class CassandraServer extends FacebookBase implements 
+ return result ; 
+ } 
+ 
+ + public List < String > get _ range ( String tablename , final String startkey ) throws CassandraException 
+ + { 
+ + logger _ . debug ( " get _ range " ) ; 
+ + 
+ + / / send request 
+ + Message message ; 
+ + DataOutputBuffer dob = new DataOutputBuffer ( ) ; 
+ + try 
+ + { 
+ + dob . writeUTF ( startkey ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + logger _ . error ( " unable to write startkey " , e ) ; 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + byte [ ] messageBody = Arrays . copyOf ( dob . getData ( ) , dob . getLength ( ) ) ; 
+ + message = new Message ( StorageService . getLocalStorageEndPoint ( ) , 
+ + StorageService . readStage _ , 
+ + StorageService . rangeVerbHandler _ , 
+ + messageBody ) ; 
+ + EndPoint endPoint ; 
+ + try 
+ + { 
+ + endPoint = StorageService . instance ( ) . findSuitableEndPoint ( startkey ) ; 
+ + } 
+ + catch ( Exception e ) 
+ + { 
+ + throw new CassandraException ( " Unable to find endpoint for " + startkey ) ; 
+ + } 
+ + IAsyncResult iar = MessagingService . getMessagingInstance ( ) . sendRR ( message , endPoint ) ; 
+ + 
+ + / / read response 
+ + / / TODO send more requests if we need to span multiple nodes ( or can we just let client worry about that , 
+ + / / since they have to handle multiple requests anyway ? ) 
+ + byte [ ] responseBody ; 
+ + try 
+ + { 
+ + responseBody = ( byte [ ] ) iar . get ( 2 * DatabaseDescriptor . getRpcTimeout ( ) , TimeUnit . MILLISECONDS ) [ 0 ] ; 
+ + } 
+ + catch ( TimeoutException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + DataInputBuffer bufIn = new DataInputBuffer ( ) ; 
+ + bufIn . reset ( responseBody , responseBody . length ) ; 
+ + 
+ + / / turn into List 
+ + List < String > keys = new ArrayList < String > ( ) ; 
+ + while ( bufIn . getPosition ( ) < responseBody . length ) 
+ + { 
+ + try 
+ + { 
+ + keys . add ( bufIn . readUTF ( ) ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + logger _ . error ( " bad utf " , e ) ; 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + return keys ; 
+ + } 
+ + 
+ / * 
+ * This method is used to ensure that all keys 
+ * prior to the specified key , as dtermined by 
+ diff - - git a / src / org / apache / cassandra / service / RangeVerbHandler . java b / src / org / apache / cassandra / service / RangeVerbHandler . java 
+ new file mode 100644 
+ index 0000000 . . 3587907 
+ - - - / dev / null 
+ + + + b / src / org / apache / cassandra / service / RangeVerbHandler . java 
+ @ @ - 0 , 0 + 1 , 152 @ @ 
+ + package org . apache . cassandra . service ; 
+ + 
+ + import java . util . ArrayList ; 
+ + import java . util . List ; 
+ + import java . util . Iterator ; 
+ + import java . util . Comparator ; 
+ + import java . util . Arrays ; 
+ + import java . io . FileNotFoundException ; 
+ + import java . io . IOException ; 
+ + 
+ + import org . apache . commons . collections . IteratorUtils ; 
+ + import org . apache . commons . collections . Predicate ; 
+ + 
+ + import org . apache . cassandra . net . MessagingService ; 
+ + import org . apache . cassandra . net . IVerbHandler ; 
+ + import org . apache . cassandra . net . Message ; 
+ + import org . apache . cassandra . db . IdentityFilter ; 
+ + import org . apache . cassandra . db . ColumnFamily ; 
+ + import org . apache . cassandra . db . ColumnFamilyStore ; 
+ + import org . apache . cassandra . db . FileStruct ; 
+ + import org . apache . cassandra . db . Table ; 
+ + import org . apache . cassandra . db . Memtable ; 
+ + import org . apache . cassandra . db . MemtableManager ; 
+ + import org . apache . cassandra . io . SequenceFile ; 
+ + import org . apache . cassandra . io . DataInputBuffer ; 
+ + import org . apache . cassandra . io . DataOutputBuffer ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + 
+ + public class RangeVerbHandler implements IVerbHandler 
+ + { 
+ + public static final Comparator < String > STRING _ COMPARATOR = new Comparator < String > ( ) 
+ + { 
+ + public int compare ( String o1 , String o2 ) 
+ + { 
+ + return o1 . compareTo ( o2 ) ; 
+ + } 
+ + } ; 
+ + 
+ + public void doVerb ( Message message ) 
+ + { 
+ + byte [ ] bytes = ( byte [ ] ) message . getMessageBody ( ) [ 0 ] ; 
+ + final String startkey ; 
+ + if ( bytes . length = = 0 ) 
+ + { 
+ + startkey = " " ; 
+ + } 
+ + else 
+ + { 
+ + DataInputBuffer dib = new DataInputBuffer ( ) ; 
+ + dib . reset ( bytes , bytes . length ) ; 
+ + try 
+ + { 
+ + startkey = dib . readUTF ( ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + 
+ + List < Iterator < String > > iterators = new ArrayList < Iterator < String > > ( ) ; 
+ + Table table = Table . open ( DatabaseDescriptor . getTableName ( ) ) ; 
+ + for ( String cfName : table . getApplicationColumnFamilies ( ) ) 
+ + { 
+ + ColumnFamilyStore cfs = table . getColumnFamilyStore ( cfName ) ; 
+ + 
+ + / / memtable keys : current and historical 
+ + Iterator < Memtable > it = ( Iterator < Memtable > ) IteratorUtils . chainedIterator ( 
+ + IteratorUtils . singletonIterator ( cfs . getMemtable ( ) ) , 
+ + MemtableManager . instance ( ) . getUnflushedMemtables ( cfName ) . iterator ( ) ) ; 
+ + while ( it . hasNext ( ) ) 
+ + { 
+ + iterators . add ( IteratorUtils . filteredIterator ( it . next ( ) . sortedKeyIterator ( ) , new Predicate ( ) 
+ + { 
+ + public boolean evaluate ( Object key ) 
+ + { 
+ + return ( ( String ) key ) . compareTo ( startkey ) > = 0 ; 
+ + } 
+ + } ) ) ; 
+ + } 
+ + 
+ + / / sstables 
+ + for ( String filename : cfs . getSSTableFilenames ( ) ) 
+ + { 
+ + try 
+ + { 
+ + FileStruct fs = new FileStruct ( SequenceFile . reader ( filename ) ) ; 
+ + fs . seekTo ( startkey ) ; 
+ + iterators . add ( fs . iterator ( ) ) ; 
+ + } 
+ + catch ( FileNotFoundException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + } 
+ + 
+ + Iterator < String > iter = IteratorUtils . collatedIterator ( STRING _ COMPARATOR , iterators ) ; 
+ + List < String > keys = new ArrayList < String > ( ) ; 
+ + String last = null , current = null ; 
+ + 
+ + while ( keys . size ( ) < 1000 ) 
+ + { 
+ + if ( ! iter . hasNext ( ) ) 
+ + { 
+ + break ; 
+ + } 
+ + current = iter . next ( ) ; 
+ + if ( ! current . equals ( last ) ) 
+ + { 
+ + last = current ; 
+ + for ( String cfName : table . getApplicationColumnFamilies ( ) ) 
+ + { 
+ + ColumnFamilyStore cfs = table . getColumnFamilyStore ( cfName ) ; 
+ + try 
+ + { 
+ + ColumnFamily cf = cfs . getColumnFamily ( current , cfName , new IdentityFilter ( ) ) ; 
+ + if ( cf ! = null & & cf . getColumns ( ) . size ( ) > 0 ) 
+ + { 
+ + keys . add ( current ) ; 
+ + break ; 
+ + } 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( ) ; 
+ + } 
+ + } 
+ + } 
+ + } 
+ + 
+ + DataOutputBuffer dob = new DataOutputBuffer ( ) ; 
+ + for ( String key : keys ) 
+ + { 
+ + try 
+ + { 
+ + dob . writeUTF ( key ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + throw new RuntimeException ( e ) ; 
+ + } 
+ + } 
+ + byte [ ] data = Arrays . copyOf ( dob . getData ( ) , dob . getLength ( ) ) ; 
+ + Message response = message . getReply ( StorageService . getLocalStorageEndPoint ( ) , data ) ; 
+ + MessagingService . getMessagingInstance ( ) . sendOneWay ( response , message . getFrom ( ) ) ; 
+ + } 
+ + } 
+ diff - - git a / src / org / apache / cassandra / service / StorageService . java b / src / org / apache / cassandra / service / StorageService . java 
+ index 409cd5f . . 95de5c6 100644 
+ - - - a / src / org / apache / cassandra / service / StorageService . java 
+ + + + b / src / org / apache / cassandra / service / StorageService . java 
+ @ @ - 138 , 6 + 138 , 7 @ @ public final class StorageService implements IEndPointStateChangeSubscriber , Sto 
+ public final static String bsMetadataVerbHandler _ = " BS - METADATA - VERB - HANDLER " ; 
+ public final static String calloutDeployVerbHandler _ = " CALLOUT - DEPLOY - VERB - HANDLER " ; 
+ public final static String touchVerbHandler _ = " TOUCH - VERB - HANDLER " ; 
+ + public static String rangeVerbHandler _ = " RANGE - VERB - HANDLER " ; 
+ 
+ public static enum ConsistencyLevel 
+ { 
+ diff - - git a / src / org / apache / cassandra / utils / DestructivePQIterator . java b / src / org / apache / cassandra / utils / DestructivePQIterator . java 
+ new file mode 100644 
+ index 0000000 . . 0ed96f8 
+ - - - / dev / null 
+ + + + b / src / org / apache / cassandra / utils / DestructivePQIterator . java 
+ @ @ - 0 , 0 + 1 , 25 @ @ 
+ + package org . apache . cassandra . utils ; 
+ + 
+ + import java . util . Iterator ; 
+ + import java . util . PriorityQueue ; 
+ + 
+ + public class DestructivePQIterator < T > implements Iterator < T > { 
+ + private PriorityQueue < T > pq ; 
+ + 
+ + public DestructivePQIterator ( PriorityQueue < T > pq ) { 
+ + this . pq = pq ; 
+ + } 
+ + 
+ + public boolean hasNext ( ) { 
+ + return pq . size ( ) > 0 ; 
+ + } 
+ + 
+ + public T next ( ) { 
+ + return pq . poll ( ) ; 
+ + } 
+ + 
+ + public void remove ( ) { 
+ + throw new UnsupportedOperationException ( ) ; 
+ + } 
+ + } 
+ + 
+ diff - - git a / test / org / apache / cassandra / service / CassandraServerTest . java b / test / org / apache / cassandra / service / CassandraServerTest . java 
+ index 07c7dfe . . 762bbb5 100644 
+ - - - a / test / org / apache / cassandra / service / CassandraServerTest . java 
+ + + + b / test / org / apache / cassandra / service / CassandraServerTest . java 
+ @ @ - 9 , 8 + 9 , 50 @ @ import org . testng . annotations . Test ; 
+ import java . io . IOException ; 
+ import java . util . * ; 
+ 
+ + import com . facebook . thrift . TException ; 
+ + 
+ public class CassandraServerTest extends ServerTest { 
+ / * 
+ + TODO fix resetting server so this works 
+ + @ Test 
+ + public void test _ get _ range _ empty ( ) throws IOException , TException { 
+ + CassandraServer server = new CassandraServer ( ) ; 
+ + server . start ( ) ; 
+ + 
+ + assert CollectionUtils . EMPTY _ COLLECTION . equals ( server . get _ range ( DatabaseDescriptor . getTableName ( ) , " " ) ) ; 
+ + } 
+ + * / 
+ + 
+ + / * 
+ + @ Test 
+ + public void test _ get _ range ( ) throws IOException , TException , CassandraException 
+ + { 
+ + CassandraServer server = new CassandraServer ( ) ; 
+ + try 
+ + { 
+ + server . start ( ) ; 
+ + } 
+ + catch ( Throwable throwable ) 
+ + { 
+ + throw new RuntimeException ( throwable ) ; 
+ + } 
+ + 
+ + / / TODO insert some data 
+ + try { 
+ + String last = null ; 
+ + for ( String key : server . get _ range ( DatabaseDescriptor . getTableName ( ) , " key1 " ) ) { 
+ + if ( last ! = null ) { 
+ + assert last . compareTo ( key ) < 0 ; 
+ + } 
+ + last = key ; 
+ + } 
+ + } finally { 
+ + server . shutdown ( ) ; 
+ + } 
+ + } 
+ + * / 
+ + 
+ + / * 
+ @ Test 
+ public void test _ get _ column ( ) throws Throwable { 
+ CassandraServer server = new CassandraServer ( ) ;

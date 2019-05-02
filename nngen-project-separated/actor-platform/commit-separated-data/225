@@ -1,0 +1,1556 @@
+BLEU SCORE: 0.13485111859503685
+
+TEST MSG: fix ( server ) : multi - sequence fixes
+GENERATED MSG: feat ( server : bots ) : bots api
+
+TEST DIFF (one line): diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / migrations / v2 / MigrationTsActions . scala b / actor - server / actor - core / src / main / scala / im / actor / server / migrations / v2 / MigrationTsActions . scala < nl > new file mode 100644 < nl > index 0000000 . . 94a022c < nl > - - - / dev / null < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / migrations / v2 / MigrationTsActions . scala < nl > @ @ - 0 , 0 + 1 , 51 @ @ < nl > + package im . actor . server . migrations . v2 < nl > + < nl > + import java . time . Instant < nl > + < nl > + import com . google . protobuf . wrappers . Int64Value < nl > + import im . actor . storage . { Connector , SimpleStorage } < nl > + import org . slf4j . LoggerFactory < nl > + < nl > + import scala . concurrent . duration . _ < nl > + import scala . language . postfixOps < nl > + < nl > + object MigrationNameList { < nl > + val MultiSequence = " multi - sequence - 2016 - 07 - 01 " < nl > + } < nl > + < nl > + / * * < nl > + * Stores mapping " Migration name " - > " Migration timestamp " < nl > + * name : String < nl > + * timestamp : Long < nl > + * / < nl > + private object MigrationTsStorage extends SimpleStorage ( " migration _ ts " ) < nl > + < nl > + / / TODO : find better name < nl > + object MigrationTsActions { < nl > + < nl > + private val log = LoggerFactory . getLogger ( this . getClass ) < nl > + < nl > + implicit val OperationTimeout = 10 seconds < nl > + < nl > + def getTimestamp ( migrationName : String ) ( implicit conn : Connector ) : Option [ Long ] = { < nl > + conn . runSync ( MigrationTsStorage . get ( migrationName ) ) map { bytes ⇒ < nl > + Int64Value . parseFrom ( bytes ) . value < nl > + } < nl > + } < nl > + < nl > + / / insert timestamp in ` MigrationTsStorage ` . Make sure it happens only once . < nl > + def insertTimestamp ( migrationName : String , ts : Long ) ( implicit conn : Connector ) : Unit = { < nl > + val alreadyRun = conn . runSync ( MigrationTsStorage . get ( migrationName ) ) . isDefined < nl > + if ( alreadyRun ) { < nl > + log . info ( " Migration { } already run at { } , skipping " , migrationName , Instant . ofEpochMilli ( ts ) ) < nl > + } else { < nl > + conn . runSync ( < nl > + MigrationTsStorage . upsert ( < nl > + migrationName , < nl > + Int64Value ( ts ) . toByteArray < nl > + ) < nl > + ) < nl > + log . info ( " Wrote migration timestamp for : { } , date : { } " , migrationName , Instant . ofEpochMilli ( ts ) ) < nl > + } < nl > + } < nl > + } < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > index 90385c9 . . 9f0b5ed 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > @ @ - 8 , 24 + 8 , 36 @ @ import akka . stream . ActorMaterializer < nl > import akka . util . Timeout < nl > import com . google . protobuf . wrappers . Int32Value < nl > import im . actor . server . db . DbExtension < nl > + import im . actor . server . migrations . v2 . { MigrationNameList , MigrationTsActions } < nl > import im . actor . server . model . _ < nl > import im . actor . server . sequence . operations . { DeliveryOperations , DifferenceOperations , PushOperations } < nl > import im . actor . storage . SimpleStorage < nl > - import im . actor . storage . api . { GetAction , PutAction } < nl > + import im . actor . storage . api . { GetAction , UpsertAction } < nl > < nl > import scala . concurrent . duration . _ < nl > import scala . concurrent . { ExecutionContext , Future , Promise } < nl > < nl > - case class Difference ( updates : IndexedSeq [ SerializedUpdate ] , seq : Int , commonState : Array [ Byte ] , needMore : Boolean ) < nl > + final case class Difference ( < nl > + updates : IndexedSeq [ SerializedUpdate ] , < nl > + clientSeq : Int , < nl > + commonState : Array [ Byte ] , < nl > + needMore : Boolean < nl > + ) < nl > < nl > - object SeqStorage extends SimpleStorage ( " seqs " ) { < nl > + / * * < nl > + * Stores mapping ` authId ` - > ` seq ` for < nl > + * authId : Long < nl > + * seq : Int < nl > + * / < nl > + object SequenceStorage extends SimpleStorage ( " sequence " ) { < nl > def getSeq ( authId : Long ) : GetAction = { < nl > get ( authId . toString ) < nl > } < nl > - def putSeq ( authId : Long , seq : Int ) : PutAction = { < nl > - put ( authId . toString , Int32Value ( seq ) . toByteArray ) < nl > + def upsertSeq ( authId : Long , seq : Int ) : UpsertAction = { < nl > + upsert ( authId . toString , Int32Value ( seq ) . toByteArray ) < nl > } < nl > } < nl > + < nl > final class SeqUpdatesExtension ( _ system : ActorSystem ) < nl > extends Extension < nl > with DeliveryOperations < nl > @ @ - 38 , 11 + 50 , 19 @ @ final class SeqUpdatesExtension ( _ system : ActorSystem ) < nl > protected implicit val OperationTimeout : Timeout = Timeout ( 20 . seconds ) < nl > private implicit val system : ActorSystem = _ system < nl > protected implicit val ec : ExecutionContext = system . dispatcher < nl > - protected implicit lazy val db = DbExtension ( system ) . db < nl > + protected lazy val ( db , conn ) = { < nl > + val ext = DbExtension ( system ) < nl > + ( ext . db , ext . connector ) < nl > + } < nl > lazy val region : SeqUpdatesManagerRegion = SeqUpdatesManagerRegion . start ( ) ( system ) < nl > private val writer = system . actorOf ( BatchUpdatesWriter . props , " batch - updates - writer " ) < nl > private val mediator = DistributedPubSub ( system ) . mediator < nl > < nl > + val MultiSequenceMigrationTs : Long = { < nl > + val optTs = MigrationTsActions . getTimestamp ( MigrationNameList . MultiSequence ) ( conn ) < nl > + optTs . getOrElse ( throw new RuntimeException ( s " No Migration timestamp found for $ { MigrationNameList . MultiSequence } " ) ) < nl > + } < nl > + < nl > def getSeqState ( userId : Int , authId : Long ) : Future [ SeqState ] = < nl > ( region . ref ? Envelope ( userId ) . withGetSeqState ( GetSeqState ( authId ) ) ) . mapTo [ SeqState ] < nl > < nl > @ @ - 58 , 7 + 78 , 7 @ @ final class SeqUpdatesExtension ( _ system : ActorSystem ) < nl > def subscribe ( authId : Long , ref : ActorRef ) : Future [ Unit ] = < nl > ( mediator ? DistributedPubSubMediator . Subscribe ( UserSequence . topic ( authId ) , ref ) ) map ( _ ⇒ ( ) ) < nl > < nl > - def commonState ( commonSeq : Int ) : CommonState = CommonState ( CommonStateVersion . V1 , commonSeq ) < nl > + def buildCommonState ( commonSeq : Int ) : CommonState = CommonState ( CommonStateVersion . V1 , commonSeq ) < nl > < nl > def persistUpdate ( update : SeqUpdate ) : Future [ Unit ] = { < nl > val promise = Promise [ Unit ] ( ) < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala < nl > index c39d7da . . 014f921 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala < nl > @ @ - 8 , 26 + 8 , 19 @ @ import com . google . protobuf . ByteString < nl > import com . google . protobuf . wrappers . { Int32Value , StringValue } < nl > import im . actor . api . rpc . sequence . UpdateEmptyUpdate < nl > import im . actor . server . db . DbExtension < nl > - import im . actor . server . model . { AuthId , SeqUpdate , UpdateMapping } < nl > - import im . actor . server . persist . AuthIdRepo < nl > + import im . actor . server . model . { SeqUpdate , UpdateMapping } < nl > + import im . actor . server . persist . { AuthIdRepo , AuthSessionRepo } < nl > import im . actor . server . persist . sequence . UserSequenceRepo < nl > import im . actor . server . pubsub . PubSubExtension < nl > < nl > + import scala . collection . immutable < nl > import scala . concurrent . Future < nl > import scala . language . postfixOps < nl > import scala . util . { Failure , Success } < nl > < nl > - object UserSequence { < nl > - def topic ( authId : Long ) : String = s " sequence . $ authId " < nl > - < nl > - private final case class Initialized ( commonSeq : Int , seqs : Map [ Long , Int ] ) < nl > - < nl > - private [ sequence ] def props = < nl > - Props ( new UserSequence ) < nl > - } < nl > - < nl > private trait SeqControl { < nl > - private var _ commonSeq : Int = 0 < nl > + import UserSequence . _ < nl > + private var _ commonSeq : Int = Const . UserSeqStart < nl > < nl > protected def commonSeq = this . _ commonSeq < nl > protected def commonSeq _ = ( seq : Int ) = this . _ commonSeq = seq < nl > @ @ - 38 , 20 + 31 , 36 @ @ private trait SeqControl { < nl > nseq < nl > } < nl > < nl > - private var _ seqMap : Map [ Long , Int ] = Map . empty < nl > + private var _ seqMap : immutable . Map [ Long , Int ] = Map . empty < nl > < nl > protected def seqMap = this . _ seqMap < nl > protected def seqMap _ = ( map : Map [ Long , Int ] ) = this . _ seqMap = map < nl > < nl > - protected def getSeq ( authId : Long ) = seqMap getOrElse ( authId , 0 ) < nl > + protected def getSeq ( authId : Long ) = this . _ seqMap getOrElse ( authId , Const . SeqStart ) < nl > < nl > protected def nextSeq ( authId : Long ) = { < nl > - val nextSeq = _ seqMap . getOrElse ( authId , 0 ) + 1 < nl > + val nextSeq = _ seqMap . getOrElse ( authId , Const . SeqStart ) + 1 < nl > this . _ seqMap + = ( authId → nextSeq ) < nl > nextSeq < nl > } < nl > } < nl > < nl > + object UserSequence { < nl > + object Const { < nl > + val UserSeqStart : Int = 0 < nl > + val SeqStart : Int = 1 < nl > + val SeqIncrement : Int = 1000 < nl > + val FlushInterval : Int = 500 / / TODO : make it 250 < nl > + } < nl > + < nl > + def topic ( authId : Long ) : String = s " sequence . $ authId " < nl > + < nl > + private final case class Initialized ( userSeq : Int , seqs : Map [ Long , Int ] ) < nl > + < nl > + private [ sequence ] def props = < nl > + Props ( new UserSequence ) < nl > + } < nl > + < nl > private [ sequence ] final class UserSequence < nl > extends Actor < nl > with ActorLogging < nl > @ @ - 63 , 8 + 72 , 10 @ @ private [ sequence ] final class UserSequence < nl > import akka . cluster . pubsub . DistributedPubSubMediator . _ < nl > import context . dispatcher < nl > < nl > - private val db = DbExtension ( context . system ) . db < nl > - private val connector = DbExtension ( context . system ) . connector < nl > + private val ( db , conn ) = { < nl > + val ext = DbExtension ( context . system ) < nl > + ( ext . db , ext . connector ) < nl > + } < nl > private val seqUpdExt = SeqUpdatesExtension ( context . system ) < nl > private val pubSubExt = PubSubExtension ( context . system ) < nl > < nl > @ @ - 84 , 8 + 95 , 8 @ @ private [ sequence ] final class UserSequence < nl > init ( ) < nl > < nl > def receive = { < nl > - case Initialized ( commonSeq , seqs ) ⇒ < nl > - this . commonSeq = commonSeq < nl > + case Initialized ( userSeq , seqs ) ⇒ < nl > + this . commonSeq = userSeq < nl > this . seqMap = seqs < nl > unstashAll ( ) < nl > context become initialized < nl > @ @ - 102 , 16 + 113 , 22 @ @ private [ sequence ] final class UserSequence < nl > * / < nl > override def preRestart ( reason : Throwable , message : Option [ Any ] ) : Unit = { < nl > log . error ( reason , " Failure while processing { } " , message ) < nl > - authIdsOptFu . keys foreach { authId ⇒ < nl > - val seq = getSeq ( authId ) < nl > - if ( seq ! = 0 ) { < nl > - log . warning ( " Persisting current seq : { } for authId : { } " , seq , authId ) < nl > - connector . run ( SeqStorage . putSeq ( authId , seq ) ) < nl > - } < nl > - } < nl > + persistNonEmptySeqs ( ) < nl > super . preRestart ( reason , message ) < nl > } < nl > < nl > + / / TODO : figure out is it okay to access actor ' s state in postStop . < nl > + / / / * * < nl > + / / * On actor stop we are trying to persist < nl > + / / * all non - empty ` seq ` s for every authId . < nl > + / / * This method may never been called . < nl > + / / * / < nl > + / / override def postStop ( ) : Unit = { < nl > + / / log . warning ( " Stopping user sequence , trying to persist seqs " ) < nl > + / / persistNonEmptySeqs ( ) < nl > + / / super . postStop ( ) < nl > + / / } < nl > + < nl > private def initialized : Receive = { < nl > case cmd : VendorPushCommand ⇒ vendorPush forward cmd < nl > case DeliverUpdate ( authId , mappingOpt , pushRules , reduceKey , deliveryId ) ⇒ < nl > @ @ - 120 , 7 + 137 , 7 @ @ private [ sequence ] final class UserSequence < nl > case None ⇒ log . error ( " Empty mapping " ) < nl > } < nl > case GetSeqState ( authId ) ⇒ < nl > - sender ( ) ! SeqState ( getSeq ( authId ) , commonState ( ) ) < nl > + sender ( ) ! SeqState ( getSeq ( authId ) , buildCommonState ( ) ) < nl > case RegisterAuthId ( authId ) ⇒ < nl > addAuthId ( authId ) < nl > case UnregisterAuthId ( authId ) ⇒ < nl > @ @ - 133 , 23 + 150 , 18 @ @ private [ sequence ] final class UserSequence < nl > } < nl > < nl > / * * < nl > - * Initialize user sequence . < nl > - * ` commonSeq ` is primary key for UserSequenceRepo , or 0 if UserSequence is empty . < nl > - * ` seq ` - s for every authId retrieved and associated with empty optimization function . < nl > - * If ` authId ` sequence is empty - return 0 , otherwise return ` seq ` + 1000 . < nl > + * • Fetch ` userSeq ` , or get ` Const . UserSeqStart ` if sequence isn ' t initialized yet . < nl > + * • Associate every ` authId ` with empty optimization function and put in ` authIdsOptFu ` map < nl > + * • Initialize sequence for every authId < nl > * / < nl > private def init ( ) : Unit = < nl > ( for { < nl > - authIds ← db . run ( AuthIdRepo . findByUserId ( userId ) ) < nl > - _ = this . authIdsOptFu = authIds . map ( _ . id → Optimization . EmptyFunc ) . toMap < nl > - authIdsSeqs ← Future . traverse ( authIds ) { < nl > - case AuthId ( authId , _ , _ ) ⇒ < nl > - connector . run ( SeqStorage . getSeq ( authId ) ) map { seqBytes ⇒ < nl > - authId → ( seqBytes map ( Int32Value . parseFrom ( _ ) . value + 1000 ) getOrElse 0 ) < nl > - } < nl > - } < nl > - commonSeq ← db . run ( UserSequenceRepo . fetchSeq ( userId ) ) map ( _ getOrElse 0 ) < nl > - } yield Initialized ( commonSeq , authIdsSeqs . toMap ) ) pipeTo self < nl > + userSeq ← db . run ( UserSequenceRepo . fetchSeq ( userId ) ) map ( _ getOrElse Const . UserSeqStart ) < nl > + authIdsModels ← db . run ( AuthIdRepo . findByUserId ( userId ) ) < nl > + authIds = authIdsModels map ( _ . id ) < nl > + _ = this . authIdsOptFu = authIds . map ( _ → Optimization . EmptyFunc ) . toMap < nl > + authIdsSeqs ← initializeSeqs ( userSeq , authIds ) < nl > + } yield Initialized ( userSeq , authIdsSeqs . toMap ) ) pipeTo self < nl > < nl > private def deliver ( < nl > authId : Long , < nl > @ @ - 172 , 7 + 184 , 7 @ @ private [ sequence ] final class UserSequence < nl > ) < nl > < nl > writeToDb ( seqUpdate ) map { _ ⇒ < nl > - val state = commonState ( ) < nl > + val state = buildCommonState ( ) < nl > < nl > authIdsOptFu . keys foreach { authId ⇒ < nl > val update = optimizedMapping . custom . getOrElse ( authId , optimizedMapping . getDefault ) < nl > @ @ - 180 , 9 + 192 , 7 @ @ private [ sequence ] final class UserSequence < nl > / / This update won ' t affect sequence , and will not appear in difference . < nl > if ( update . header ! = UpdateEmptyUpdate . header ) { < nl > val seq = nextSeq ( authId ) < nl > - if ( seq % 500 = = 0 ) { < nl > - connector . run ( SeqStorage . putSeq ( authId , seq ) ) < nl > - } < nl > + flushSeq ( authId , seq ) < nl > pubSubExt . publish ( < nl > Publish ( < nl > topic ( authId ) , < nl > @ @ - 197 , 6 + 207 , 71 @ @ private [ sequence ] final class UserSequence < nl > } < nl > } < nl > < nl > + / * * < nl > + * Initialize ` seq ` for every ` authId ` . < nl > + * We keep compatibility with old clients ( pre - multi - sequence ) in following way : < nl > + * 1 . If ` seq ` for given ` authId ` exists in ` SequenceStorage ` - it is initialized already , sequence is : ` seq ` + ` Const . SeqIncrement ` < nl > + * 2 . If no ` seq ` found for given ` authId ` , we find ` AuthSession ` associated with given ` authId ` , and : < nl > + * 2 . 1 If ` AuthSession ` found and ` authTime ` is after migration date - this is new client , sequence is : ` Const . SeqStart ` < nl > + * 2 . 2 If ` AuthSession ` found , but ` authTime ` is before migration date - this is old client , sequence is : ` commonSeq ` + Const . SeqIncrement < nl > + * 2 . 3 If ` AuthSession ` not found ( what could be an error ) , we ASSUME this is old client , sequence is : ` commonSeq ` + Const . SeqIncrement < nl > + * < nl > + * NOTE : After we get ` seq ` from storage , or create new one - we should persist it , < nl > + * to avoid cases , when client ' s seq won ' t be persisted until next interval point . < nl > + * / < nl > + private def initializeSeqs ( userSeq : Int , authIds : Seq [ Long ] ) : Future [ Seq [ ( Long , Int ) ] ] = < nl > + Future . traverse ( authIds ) { authId ⇒ < nl > + val seqFu = conn . run ( SequenceStorage . getSeq ( authId ) ) flatMap { < nl > + case Some ( seqBytes ) ⇒ < nl > + FastFuture . successful ( Int32Value . parseFrom ( seqBytes ) . value + Const . SeqIncrement ) / / 1 . < nl > + case None ⇒ < nl > + for { < nl > + optSession ← db . run ( AuthSessionRepo . findByAuthId ( authId ) ) < nl > + seq = optSession match { < nl > + case Some ( session ) ⇒ < nl > + if ( session . authTime . getMillis > seqUpdExt . MultiSequenceMigrationTs ) < nl > + Const . SeqStart / / 2 . 1 < nl > + else < nl > + userSeq + Const . SeqIncrement / / 2 . 2 < nl > + case None ⇒ < nl > + log . warning ( " Didn ' t find auth session for authId : { } , assuming it an old client ! " , authId ) < nl > + userSeq + Const . SeqIncrement / / 2 . 3 < nl > + } < nl > + } yield seq < nl > + } < nl > + < nl > + for { < nl > + seq ← seqFu < nl > + _ ← conn . run ( SequenceStorage . upsertSeq ( authId , seq ) ) < nl > + } yield authId → seq < nl > + } < nl > + < nl > + / / TODO : move to SequenceStorageActions < nl > + private def persistSeq ( authId : Long , seq : Int ) : Future [ Int ] = < nl > + conn . run ( SequenceStorage . upsertSeq ( authId , seq ) ) < nl > + < nl > + / * * < nl > + * Flush ` seq ` for given ` authId ` with ` Const . FlushInterval ` interval . < nl > + * / < nl > + private def flushSeq ( authId : Long , seq : Int ) : Unit = { < nl > + if ( seq % Const . FlushInterval = = 0 ) { < nl > + persistSeq ( authId , seq ) < nl > + } < nl > + } < nl > + < nl > + / * * < nl > + * Persist non - empty seqs for every user ' s ` authId ` . < nl > + * / < nl > + private def persistNonEmptySeqs ( ) : Unit = { < nl > + authIdsOptFu . keys foreach { authId ⇒ < nl > + val seq = getSeq ( authId ) < nl > + if ( seq > Const . SeqStart ) { < nl > + log . warning ( " Persisting current seq : { } for authId : { } " , seq , authId ) < nl > + persistSeq ( authId , seq ) < nl > + } < nl > + } < nl > + } < nl > + < nl > private def applyOptimizations ( mapping : UpdateMapping ) : UpdateMapping = { < nl > val default = mapping . getDefault < nl > val customOptimized = authIdsOptFu flatMap { < nl > @ @ - 213 , 9 + 288 , 10 @ @ private [ sequence ] final class UserSequence < nl > } < nl > if ( ! this . seqMap . contains ( authId ) ) { < nl > for { < nl > - optSeq ← connector . run ( SeqStorage . getSeq ( authId ) ) < nl > - seq = optSeq map ( v ⇒ Int32Value . parseFrom ( v ) . value ) getOrElse 0 < nl > + optSeq ← conn . run ( SequenceStorage . getSeq ( authId ) ) < nl > + seq = optSeq map ( v ⇒ Int32Value . parseFrom ( v ) . value ) getOrElse Const . SeqStart < nl > _ = this . seqMap + = authId → seq < nl > + _ ← persistSeq ( authId , seq ) < nl > } yield ( ) < nl > } < nl > } < nl > @ @ - 225 , 8 + 301 , 8 @ @ private [ sequence ] final class UserSequence < nl > this . seqMap - = authId < nl > } < nl > < nl > - private def commonState ( ) : ByteString = < nl > - ByteString . copyFrom ( seqUpdExt . commonState ( commonSeq ) . toByteArray ) < nl > + private def buildCommonState ( ) : ByteString = < nl > + ByteString . copyFrom ( seqUpdExt . buildCommonState ( commonSeq ) . toByteArray ) < nl > < nl > private def cached ( authId : Long , deliveryId : String ) ( f : ⇒ Future [ SeqState ] ) : Unit = { < nl > val deliveryKey = s " $ { authId } _ $ { deliveryId } " < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / operations / DifferenceOperations . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / operations / DifferenceOperations . scala < nl > index ab5ecc9 . . 1e08e3f 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / operations / DifferenceOperations . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / operations / DifferenceOperations . scala < nl > @ @ - 1 , 5 + 1 , 6 @ @ < nl > package im . actor . server . sequence . operations < nl > < nl > + import akka . http . scaladsl . util . FastFuture < nl > import im . actor . api . rpc . sequence . UpdateEmptyUpdate < nl > import im . actor . server . model . { SeqUpdate , SerializedUpdate , UpdateMapping } < nl > import im . actor . server . persist . sequence . UserSequenceRepo < nl > @ @ - 47 , 7 + 48 , 7 @ @ trait DifferenceOperations { this : SeqUpdatesExtension ⇒ < nl > def getDifference ( < nl > userId : Int , < nl > clientSeq : Int , < nl > - state : Array [ Byte ] , < nl > + commonState : Array [ Byte ] , < nl > authId : Long , < nl > authSid : Int , < nl > maxSizeInBytes : Long < nl > @ @ - 66 , 7 + 67 , 7 @ @ trait DifferenceOperations { this : SeqUpdatesExtension ⇒ < nl > } < nl > } < nl > < nl > - val commonSeq = CommonState . validate ( state ) match { < nl > + val commonSeq = CommonState . validate ( commonState ) match { < nl > case Success ( CommonState ( _ , 0 ) ) ⇒ < nl > log . debug ( " Got old client with seq : { } " , clientSeq ) < nl > clientSeq < nl > @ @ - 78 , 10 + 79 , 15 @ @ trait DifferenceOperations { this : SeqUpdatesExtension ⇒ < nl > < nl > for { < nl > ( acc , needMore ) ← db . run ( run ( commonSeq , DiffAcc . empty ( commonSeq ) , 0L ) ) < nl > + newClientSeq ← if ( ! needMore ) { < nl > + getSeqState ( userId , authId ) map ( _ . seq ) < nl > + } else { < nl > + FastFuture . successful ( clientSeq + acc . seqDelta ) < nl > + } < nl > } yield Difference ( < nl > updates = acc . toVector , < nl > - seq = clientSeq + acc . seqDelta , < nl > - commonState = commonState ( acc . commonSeq ) . toByteArray , < nl > + clientSeq = newClientSeq , < nl > + commonState = buildCommonState ( acc . commonSeq ) . toByteArray , < nl > needMore = needMore < nl > ) < nl > } < nl > diff - - git a / actor - server / actor - models / src / main / scala / im / actor / server / model / AuthSession . scala b / actor - server / actor - models / src / main / scala / im / actor / server / model / AuthSession . scala < nl > index a2fb571 . . 571db78 100644 < nl > - - - a / actor - server / actor - models / src / main / scala / im / actor / server / model / AuthSession . scala < nl > + + + b / actor - server / actor - models / src / main / scala / im / actor / server / model / AuthSession . scala < nl > @ @ - 23 , 8 + 23 , 17 @ @ object AppId { < nl > < nl > @ SerialVersionUID ( 1L ) < nl > final case class AuthSession ( < nl > - userId : Int , id : Int , authId : Long , appId : Int , appTitle : String , deviceTitle : String , deviceHash : Array [ Byte ] , < nl > - authTime : DateTime , authLocation : String , latitude : Option [ Double ] , longitude : Option [ Double ] < nl > + userId : Int , < nl > + id : Int , < nl > + authId : Long , < nl > + appId : Int , < nl > + appTitle : String , < nl > + deviceTitle : String , < nl > + deviceHash : Array [ Byte ] , < nl > + authTime : DateTime , < nl > + authLocation : String , < nl > + latitude : Option [ Double ] , < nl > + longitude : Option [ Double ] < nl > ) < nl > < nl > object AuthSession { < nl > diff - - git a / actor - server / actor - persist / src / main / resources / sql / migration / V20160623061400 _ _ AddTimestampIndexToSequence . sql b / actor - server / actor - persist / src / main / resources / sql / migration / V20160623061400 _ _ AddTimestampIndexToSequence . sql < nl > index a305ead . . 179a3c1 100644 < nl > - - - a / actor - server / actor - persist / src / main / resources / sql / migration / V20160623061400 _ _ AddTimestampIndexToSequence . sql < nl > + + + b / actor - server / actor - persist / src / main / resources / sql / migration / V20160623061400 _ _ AddTimestampIndexToSequence . sql < nl > @ @ - 1 + 1 , 2 @ @ < nl > CREATE INDEX ON user _ sequence ( user _ id , timestamp ) ; < nl > + create index ON auth _ sessions ( auth _ id ) ; < nl > diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / sequence / SequenceServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / sequence / SequenceServiceImpl . scala < nl > index 2d1db00 . . 37817bb 100644 < nl > - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / sequence / SequenceServiceImpl . scala < nl > + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / sequence / SequenceServiceImpl . scala < nl > @ @ - 16 , 7 + 16 , 7 @ @ import im . actor . api . rpc . misc . { ResponseSeq , ResponseVoid } < nl > import im . actor . api . rpc . peers . { ApiGroupOutPeer , ApiUserOutPeer } < nl > import im . actor . server . db . DbExtension < nl > import im . actor . server . group . { GroupExtension , GroupUtils } < nl > - import im . actor . server . sequence . { Difference , SeqUpdatesExtension } < nl > + import im . actor . server . sequence . { Difference , SeqState , SeqUpdatesExtension } < nl > import im . actor . server . session . _ < nl > import im . actor . server . user . UserUtils < nl > import im . actor . server . db . ActorPostgresDriver . api . _ < nl > @ @ - 46 , 14 + 46 , 13 @ @ final class SequenceServiceImpl ( config : SequenceServiceConfig ) ( < nl > override def doHandleGetState ( optimizations : IndexedSeq [ ApiUpdateOptimization . ApiUpdateOptimization ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseSeq ] ] = < nl > authorized ( clientData ) { implicit client ⇒ < nl > subscribeToSeq ( optimizations ) < nl > - val action = for { < nl > - seqState ← DBIO . from ( seqUpdExt . getSeqState ( client . userId , clientData . authId ) ) < nl > - } yield Ok ( ResponseSeq ( seqState . seq , seqState . state . toByteArray ) ) < nl > - db . run ( action ) < nl > + for { < nl > + SeqState ( seq , state ) ← seqUpdExt . getSeqState ( client . userId , clientData . authId ) < nl > + } yield Ok ( ResponseSeq ( seq , state . toByteArray ) ) < nl > } < nl > < nl > override def doHandleGetDifference ( < nl > - seq : Int , < nl > + clientSeq : Int , < nl > commonState : Array [ Byte ] , < nl > optimizations : IndexedSeq [ ApiUpdateOptimization . ApiUpdateOptimization ] , < nl > clientData : ClientData < nl > @ @ - 63 , 10 + 62 , 10 @ @ final class SequenceServiceImpl ( config : SequenceServiceConfig ) ( < nl > < nl > for { < nl > / / FIXME : would new updates between getSeqState and getDifference break client state ? < nl > - Difference ( updates , clientSeq , newCommonState , needMore ) ← seqUpdExt . getDifference ( < nl > + Difference ( updates , newClientSeq , newCommonState , needMore ) ← seqUpdExt . getDifference ( < nl > userId = client . userId , < nl > - clientSeq = seq , < nl > - state = commonState , < nl > + clientSeq = clientSeq , < nl > + commonState = commonState , < nl > authId = client . authId , < nl > authSid = client . authSid , < nl > maxSizeInBytes = maxDifferenceSize < nl > @ @ - 77 , 7 + 76 , 7 @ @ final class SequenceServiceImpl ( config : SequenceServiceConfig ) ( < nl > ( userRefs , groupRefs ) ← getRefs ( userIds , groupIds , optimizations , client ) < nl > } yield { < nl > Ok ( ResponseGetDifference ( < nl > - seq = clientSeq , < nl > + seq = newClientSeq , < nl > state = newCommonState , < nl > updates = diffUpdates , < nl > needMore = needMore , < nl > diff - - git a / actor - server / actor - testkit / src / main / scala / im / actor / server / BaseAppSuite . scala b / actor - server / actor - testkit / src / main / scala / im / actor / server / BaseAppSuite . scala < nl > index c520008 . . 8b488f8 100644 < nl > - - - a / actor - server / actor - testkit / src / main / scala / im / actor / server / BaseAppSuite . scala < nl > + + + b / actor - server / actor - testkit / src / main / scala / im / actor / server / BaseAppSuite . scala < nl > @ @ - 1 , 15 + 1 , 16 @ @ < nl > package im . actor . server < nl > < nl > + import java . time . Instant < nl > + < nl > import akka . actor . ActorSystem < nl > import akka . stream . ActorMaterializer < nl > import org . scalatest . concurrent . ScalaFutures < nl > import org . scalatest . time . { Seconds , Span } < nl > - import org . scalatest . { Inside , FlatSpecLike , Matchers } < nl > - import slick . driver . PostgresDriver < nl > + import org . scalatest . { FlatSpecLike , Inside , Matchers } < nl > < nl > import scala . concurrent . ExecutionContext < nl > - < nl > import im . actor . server . db . DbExtension < nl > + import im . actor . server . migrations . v2 . { MigrationNameList , MigrationTsActions } < nl > < nl > abstract class BaseAppSuite ( _ system : ActorSystem = { < nl > ActorSpecification . createSystem ( ) < nl > @ @ - 27 , 12 + 28 , 19 @ @ abstract class BaseAppSuite ( _ system : ActorSystem = { < nl > protected implicit val materializer : ActorMaterializer = ActorMaterializer ( ) < nl > implicit lazy val ec : ExecutionContext = _ system . dispatcher < nl > < nl > - protected implicit lazy val db : PostgresDriver . api . Database = { < nl > + protected implicit lazy val ( db , conn ) = { < nl > DbExtension ( _ system ) . clean ( ) < nl > DbExtension ( _ system ) . migrate ( ) < nl > - DbExtension ( _ system ) . db < nl > + val ext = DbExtension ( _ system ) < nl > + ( ext . db , ext . connector ) < nl > } < nl > < nl > + system . log . debug ( " Writing migration timestamps " ) < nl > + MigrationTsActions . insertTimestamp ( < nl > + MigrationNameList . MultiSequence , < nl > + Instant . now . toEpochMilli < nl > + ) ( conn ) < nl > + < nl > override implicit def patienceConfig : PatienceConfig = < nl > new PatienceConfig ( timeout = Span ( 15 , Seconds ) ) < nl > < nl > diff - - git a / actor - server / actor - testkit / src / main / scala / im / actor / server / SeqUpdateMatchers . scala b / actor - server / actor - testkit / src / main / scala / im / actor / server / SeqUpdateMatchers . scala < nl > index 20855ae . . abce5d8 100644 < nl > - - - a / actor - server / actor - testkit / src / main / scala / im / actor / server / SeqUpdateMatchers . scala < nl > + + + b / actor - server / actor - testkit / src / main / scala / im / actor / server / SeqUpdateMatchers . scala < nl > @ @ - 182 , 9 + 182 , 10 @ @ trait SeqUpdateMatchers extends Matchers with ScalaFutures with AnyRefLogSource < nl > Long . MaxValue < nl > ) < nl > . map { diff ⇒ < nl > - diff . updates → mkSeqState ( diff . seq , diff . commonState ) < nl > + diff . updates → mkSeqState ( diff . clientSeq , diff . commonState ) < nl > } ( system . dispatcher ) < nl > < nl > + / / TODO : move it to separate . decouple from updates . < nl > @ tailrec < nl > final def repeatAfterSleep [ T ] ( times : Int ) ( f : ⇒ T ) : T = { < nl > Try ( f ) match { < nl > diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ContactsServiceSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ContactsServiceSpec . scala < nl > index 2afeb65 . . 5e2aa3f 100644 < nl > - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ContactsServiceSpec . scala < nl > + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ContactsServiceSpec . scala < nl > @ @ - 110 , 7 + 110 , 7 @ @ final class ContactsServiceSpec < nl > < nl > implicit val clientData = api . ClientData ( authId , sessionId , Some ( AuthData ( user . id , authSid , 42 ) ) ) < nl > < nl > - def add ( firstRun : Boolean = true , expectedUpdSeq : Int = 1 ) = { < nl > + def add ( firstRun : Boolean = true , expectedUpdSeq : Int = 2 ) = { < nl > whenReady ( service . handleAddContact ( user2 . id , user2AccessHash ) ) { resp ⇒ < nl > resp should matchPattern { < nl > case Ok ( ResponseSeq ( seq , state ) ) if seq = = expectedUpdSeq ⇒ < nl > @ @ - 158 , 7 + 158 , 7 @ @ final class ContactsServiceSpec < nl > def remove ( ) = { < nl > whenReady ( service . handleRemoveContact ( user2 . id , user2AccessHash ) ) { resp ⇒ < nl > resp should matchPattern { < nl > - case Ok ( ResponseSeq ( 3 , state ) ) ⇒ < nl > + case Ok ( ResponseSeq ( 4 , state ) ) ⇒ < nl > } < nl > } < nl > < nl > @ @ - 169 , 7 + 169 , 7 @ @ final class ContactsServiceSpec < nl > } < nl > } < nl > < nl > - def addAfterRemove ( ) = add ( firstRun = false , expectedUpdSeq = 4 ) < nl > + def addAfterRemove ( ) = add ( firstRun = false , expectedUpdSeq = 5 ) < nl > } < nl > < nl > object imprt { < nl > diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / GroupsServiceSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / GroupsServiceSpec . scala < nl > index 552d2cf . . bd83d3b 100644 < nl > - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / GroupsServiceSpec . scala < nl > + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / GroupsServiceSpec . scala < nl > @ @ - 128 , 7 + 128 , 7 @ @ final class GroupsServiceSpec < nl > < nl > whenReady ( service . handleInviteUser ( groupOutPeer , Random . nextLong ( ) , user2OutPeer , Vector . empty ) ) { resp ⇒ < nl > resp should matchPattern { < nl > - case Ok ( ResponseSeqDate ( 3 , _ , _ ) ) ⇒ < nl > + case Ok ( ResponseSeqDate ( 4 , _ , _ ) ) ⇒ < nl > } < nl > } < nl > expectUpdate ( classOf [ UpdateGroupUserInvitedObsolete ] ) ( identity ) < nl > @ @ - 159 , 7 + 159 , 7 @ @ final class GroupsServiceSpec < nl > < nl > whenReady ( service . handleEditGroupTitle ( groupOutPeer , Random . nextLong ( ) , " Very fun group " , Vector . empty ) ) { resp ⇒ < nl > resp should matchPattern { < nl > - case Ok ( ResponseSeqDate ( 4 , _ , _ ) ) ⇒ < nl > + case Ok ( ResponseSeqDate ( 5 , _ , _ ) ) ⇒ < nl > } < nl > } < nl > expectUpdate ( classOf [ UpdateChatGroupsChanged ] ) ( identity ) < nl > diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / SequenceServiceSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / SequenceServiceSpec . scala < nl > index 54ea27f . . 70166d1 100644 < nl > - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / SequenceServiceSpec . scala < nl > + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / SequenceServiceSpec . scala < nl > @ @ - 1 , 6 + 1 , 5 @ @ < nl > package im . actor . server . api . rpc . service < nl > < nl > - import com . google . protobuf . CodedInputStream < nl > import com . typesafe . config . ConfigFactory < nl > import im . actor . api . rpc . _ < nl > import im . actor . api . rpc . contacts . UpdateContactsAdded < nl > @ @ - 11 , 7 + 10 , 7 @ @ import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType } < nl > import im . actor . api . rpc . sequence . { ApiUpdateContainer , ApiUpdateOptimization , ResponseGetDifference , UpdateEmptyUpdate } < nl > import im . actor . server . _ < nl > import im . actor . server . api . rpc . service . sequence . SequenceServiceConfig < nl > - import im . actor . server . sequence . { CommonState , CommonStateVersion } < nl > + import im . actor . server . sequence . { CommonState , CommonStateVersion , UserSequence } < nl > < nl > import scala . concurrent . Future < nl > < nl > @ @ - 47 , 7 + 46 , 7 @ @ final class SequenceServiceSpec extends BaseAppSuite ( { < nl > implicit val clientData = ClientData ( authId , sessionId , Some ( AuthData ( user . id , authSid , 42 ) ) ) < nl > < nl > whenReady ( service . handleGetState ( Vector . empty ) ) { res ⇒ < nl > - res should matchPattern { case Ok ( ResponseSeq ( 0 , _ ) ) ⇒ } < nl > + res should matchPattern { case Ok ( ResponseSeq ( 1 , _ ) ) ⇒ } < nl > } < nl > } < nl > < nl > @ @ - 119 , 11 + 118 , 11 @ @ final class SequenceServiceSpec extends BaseAppSuite ( { < nl > ( updates . map ( _ . toByteArray . length ) . sum < = withError ( config . maxDifferenceSize ) ) shouldEqual true < nl > needMore shouldEqual false < nl > totalUpdates + + = updates < nl > - diff . seq shouldEqual seq2 + updates . length < nl > + diff . seq shouldEqual seq2 + updates . length + UserSequence . Const . SeqStart / / this is real user ' s seq < nl > } < nl > val commonState = CommonState . parseFrom ( diff . state ) < nl > commonState . version shouldEqual CommonStateVersion . V1 < nl > - commonState . seq shouldEqual diff . seq < nl > + commonState . seq shouldEqual diff . seq - UserSequence . Const . SeqStart / / user ' s seq starts from ` UserSequence . Const . SeqStart ` - take away difference < nl > ( diff . seq , diff . state ) < nl > } < nl > } < nl > @ @ - 137 , 8 + 136 , 9 @ @ final class SequenceServiceSpec extends BaseAppSuite ( { < nl > } < nl > < nl > totalUpdates . length shouldEqual 3841 < nl > - finalSeq shouldEqual 3841 < nl > - CommonState . parseFrom ( finalState ) . seq shouldEqual 3841 < nl > + val current = getCurrentState < nl > + finalSeq shouldEqual current . seq < nl > + CommonState . parseFrom ( finalState ) . seq shouldEqual CommonState . parseFrom ( current . state . toByteArray ) . seq < nl > } < nl > < nl > def bigUpdate ( ) = { < nl > diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / migrations / MigrationTsSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / migrations / MigrationTsSpec . scala < nl > new file mode 100644 < nl > index 0000000 . . ef0819f < nl > - - - / dev / null < nl > + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / migrations / MigrationTsSpec . scala < nl > @ @ - 0 , 0 + 1 , 24 @ @ < nl > + package im . actor . server . migrations < nl > + < nl > + import im . actor . server . BaseAppSuite < nl > + import im . actor . server . db . DbExtension < nl > + import im . actor . server . migrations . v2 . MigrationTsActions < nl > + < nl > + class MigrationTsSpec extends BaseAppSuite { < nl > + < nl > + " Migration timestamp " should " be written only once , and never changed " in writeOnce ( ) < nl > + < nl > + def writeOnce ( ) : Unit = { < nl > + val conn = DbExtension ( system ) . connector < nl > + < nl > + val initialTs = System . currentTimeMillis - 1000 < nl > + MigrationTsActions . insertTimestamp ( " test - migration - 2016 - 07 - 03 " , initialTs ) ( conn ) < nl > + < nl > + val secondTs = System . currentTimeMillis + 2000 < nl > + MigrationTsActions . insertTimestamp ( " test - migration - 2016 - 07 - 03 " , secondTs ) ( conn ) < nl > + < nl > + val optTs = MigrationTsActions . getTimestamp ( " test - migration - 2016 - 07 - 03 " ) ( conn ) < nl > + optTs should not be empty < nl > + optTs . get shouldEqual initialTs < nl > + } < nl > + } < nl > diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / sequence / UserSequenceSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / sequence / UserSequenceSpec . scala < nl > index ba36ff5 . . dc213d8 100644 < nl > - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / sequence / UserSequenceSpec . scala < nl > + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / sequence / UserSequenceSpec . scala < nl > @ @ - 52 , 13 + 52 , 13 @ @ final class UserSequenceSpec extends BaseAppSuite ( < nl > { < nl > probe . send ( region . ref , deliverEnv ) < nl > val msg = probe . receiveOne ( 5 . seconds ) . asInstanceOf [ SeqState ] < nl > - msg . seq should = = = ( 1 ) < nl > + msg . seq shouldEqual 2 < nl > } < nl > < nl > { < nl > probe . send ( region . ref , deliverEnv ) < nl > val msg = probe . receiveOne ( 1 . second ) . asInstanceOf [ SeqState ] < nl > - msg . seq should = = = ( 2 ) < nl > + msg . seq shouldEqual 3 < nl > } < nl > < nl > probe . expectNoMsg ( 3 . seconds ) < nl > @ @ - 66 , 19 + 66 , 19 @ @ final class UserSequenceSpec extends BaseAppSuite ( < nl > { < nl > probe . send ( region . ref , deliverEnv ) < nl > val msg = probe . receiveOne ( 1 . second ) . asInstanceOf [ SeqState ] < nl > - msg . seq should = = = ( 3 ) < nl > + msg . seq shouldEqual 4 < nl > } < nl > < nl > for ( a ← 1 to 600 ) < nl > probe . send ( region . ref , deliverEnv ) < nl > < nl > - probe . receiveN ( 600 , 5 . seconds ) / / seq = 603 < nl > + probe . receiveN ( 600 , 5 . seconds ) / / seq = 604 < nl > probe . expectNoMsg ( 4 . seconds ) < nl > < nl > { < nl > probe . send ( region . ref , deliverEnv ) < nl > val msg = probe . receiveOne ( 5 . seconds ) . asInstanceOf [ SeqState ] < nl > - msg . seq should = = = ( 604 ) < nl > + msg . seq shouldEqual 605 < nl > } < nl > } < nl > < nl > @ @ - 97 , 7 + 97 , 7 @ @ final class UserSequenceSpec extends BaseAppSuite ( < nl > ) < nl > ) < nl > < nl > - val futures = for ( i ← 1 to 500 ) yield { < nl > + val futures = for ( i ← 2 to 501 ) yield { < nl > val f = ( region . ref ? deliverEnv ) < nl > . mapTo [ SeqState ] < nl > < nl > diff - - git a / actor - server / project / Dependencies . scala b / actor - server / project / Dependencies . scala < nl > index e4e0a56 . . cfeaa24 100644 < nl > - - - a / actor - server / project / Dependencies . scala < nl > + + + b / actor - server / project / Dependencies . scala < nl > @ @ - 4 , 7 + 4 , 7 @ @ import sbt . _ < nl > < nl > object Dependencies { < nl > object V { < nl > - val actorCommons = " 0 . 0 . 17 " < nl > + val actorCommons = " 0 . 0 . 18 " < nl > val actorBotkit = " 1 . 0 . 109 " < nl > val akka = " 2 . 4 . 7 " < nl > val akkaHttpJson = " 1 . 5 . 0 "
+NEAREST DIFF (one line): diff - - git a / actor - server / actor - bot - messages / src / main / scala / im / actor / bot / BotMessages . scala b / actor - server / actor - bot - messages / src / main / scala / im / actor / bot / BotMessages . scala < nl > new file mode 100644 < nl > index 0000000 . . 9b8e44a < nl > - - - / dev / null < nl > + + + b / actor - server / actor - bot - messages / src / main / scala / im / actor / bot / BotMessages . scala < nl > @ @ - 0 , 0 + 1 , 33 @ @ < nl > + package im . actor . bot < nl > + < nl > + import derive . key < nl > + < nl > + sealed trait BotMessage < nl > + < nl > + final object BotMessages { < nl > + final object OutPeer { < nl > + def privat ( id : Int , accessHash : Long ) = OutPeer ( 1 , id , accessHash ) < nl > + def group ( id : Int , accessHash : Long ) = OutPeer ( 2 , id , accessHash ) < nl > + } < nl > + final case class OutPeer ( ` type ` : Int , id : Int , accessHash : Long ) < nl > + final case class Peer ( ` type ` : Int , id : Int ) < nl > + < nl > + sealed trait RequestBody < nl > + < nl > + final case class BotRequest ( id : Long , body : RequestBody ) extends BotMessage < nl > + < nl > + @ key ( " SendMessage " ) < nl > + final case class SendTextMessage ( peer : OutPeer , randomId : Long , message : String ) extends RequestBody < nl > + < nl > + sealed trait ResponseBody < nl > + < nl > + final case class BotResponse ( id : Long , body : ResponseBody ) extends BotMessage < nl > + < nl > + @ key ( " MessageSent " ) < nl > + final case class MessageSent ( date : Long ) extends ResponseBody < nl > + < nl > + sealed trait BotUpdate extends BotMessage < nl > + < nl > + @ key ( " TextMessage " ) < nl > + final case class TextMessage ( peer : Peer , senderUserId : Int , date : Long , randomId : Long , message : String ) extends BotUpdate < nl > + } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - bot / src / main / scala / im / actor / server / bot / BotExtension . scala b / actor - server / actor - bot / src / main / scala / im / actor / server / bot / BotExtension . scala < nl > new file mode 100644 < nl > index 0000000 . . f2d446e < nl > - - - / dev / null < nl > + + + b / actor - server / actor - bot / src / main / scala / im / actor / server / bot / BotExtension . scala < nl > @ @ - 0 , 0 + 1 , 98 @ @ < nl > + package im . actor . server . bot < nl > + < nl > + import akka . actor . { ExtendedActorSystem , ExtensionId , ActorSystem , Extension } < nl > + import akka . util . Timeout < nl > + import im . actor . api . rpc . users . ApiSex < nl > + import im . actor . config . ActorConfig < nl > + import im . actor . server . acl . ACLUtils < nl > + import im . actor . server . db . DbExtension < nl > + import im . actor . server . user . UserExtension < nl > + import im . actor . server . persist < nl > + import im . actor . util . misc . IdUtils < nl > + import shardakka . ShardakkaExtension < nl > + < nl > + import scala . concurrent . Future < nl > + < nl > + object BotExtension extends ExtensionId [ BotExtension ] { < nl > + private [ bot ] val tokensKV = " BotsTokens " < nl > + < nl > + override def createExtension ( system : ExtendedActorSystem ) : BotExtension = new BotExtensionImpl ( system ) < nl > + } < nl > + < nl > + trait BotExtension extends Extension { < nl > + type Token = String < nl > + type UserId = Int < nl > + type AuthId = Long < nl > + < nl > + / * * < nl > + * Creates a bot user < nl > + * < nl > + * @ return token future < nl > + * / < nl > + def create ( name : String ) : Future [ Token ] < nl > + < nl > + / * * < nl > + * Gets userId associated with token < nl > + * < nl > + * @ param token < nl > + * @ return user id < nl > + * / < nl > + def getUserId ( token : String ) : Future [ Option [ UserId ] ] < nl > + < nl > + / * * < nl > + * Gets or creates bot auth id < nl > + * @ param token < nl > + * @ return auth id < nl > + * / < nl > + def getAuthId ( token : String ) : Future [ Option [ AuthId ] ] < nl > + } < nl > + < nl > + private [ bot ] final class BotExtensionImpl ( _ system : ActorSystem ) extends BotExtension { < nl > + import _ system . _ < nl > + < nl > + private implicit val system = _ system < nl > + private implicit val timeout = Timeout ( ActorConfig . defaultTimeout ) < nl > + < nl > + private lazy val userExt = UserExtension ( system ) < nl > + private lazy val tokensKV = ShardakkaExtension ( system ) . simpleKeyValue ( BotExtension . tokensKV ) < nl > + private lazy val db = DbExtension ( system ) . db < nl > + < nl > + override def create ( name : String ) : Future [ Token ] = { < nl > + val userId = IdUtils . nextIntId ( ) < nl > + val token = ACLUtils . randomHash ( ) < nl > + < nl > + for { < nl > + user ← userExt . create ( < nl > + userId = userId , < nl > + accessSalt = ACLUtils . nextAccessSalt ( ) , < nl > + name = name , < nl > + countryCode = " US " , < nl > + sex = ApiSex . Unknown , < nl > + isBot = true < nl > + ) < nl > + _ ← tokensKV . upsert ( token , s " $ userId " ) < nl > + } yield token < nl > + } < nl > + < nl > + override def getUserId ( token : String ) : Future [ Option [ UserId ] ] = { < nl > + for { < nl > + tokOpt ← tokensKV . get ( token ) < nl > + } yield tokOpt map ( _ . toInt ) < nl > + } < nl > + < nl > + override def getAuthId ( token : String ) : Future [ Option [ AuthId ] ] = { < nl > + getUserId ( token ) flatMap { < nl > + case Some ( userId ) ⇒ getOrCreateAuthId ( userId ) map ( Some ( _ ) ) < nl > + case None ⇒ Future . successful ( None ) < nl > + } < nl > + } < nl > + < nl > + private def getOrCreateAuthId ( userId : Int ) : Future [ AuthId ] = { < nl > + db . run ( persist . AuthId . findFirstIdByUserId ( userId ) ) flatMap { < nl > + case Some ( authId ) ⇒ Future . successful ( authId ) < nl > + case None ⇒ < nl > + val authId = ACLUtils . randomLong ( ) < nl > + db . run ( persist . AuthId . create ( authId , Some ( userId ) , None ) ) map ( _ ⇒ authId ) < nl > + } < nl > + } < nl > + } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / acl / ACLUtils . scala b / actor - server / actor - core / src / main / scala / im / actor / server / acl / ACLUtils . scala < nl > index ba37e90 . . 734f1f9 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / acl / ACLUtils . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / acl / ACLUtils . scala < nl > @ @ - 46 , 7 + 46 , 18 @ @ object ACLUtils { < nl > def authTransactionHash ( accessSalt : String ) ( implicit s : ActorSystem ) : String = < nl > DigestUtils . sha1Hex ( s " $ accessSalt : $ { secretKey ( ) } " ) < nl > < nl > - def nextAccessSalt ( rng : ThreadLocalRandom ) : String = rng . nextLong ( ) . toString < nl > + def randomHash ( ) ( implicit s : ActorSystem ) : String = < nl > + DigestUtils . sha1Hex ( s " $ { randomString ( ) } : $ { secretKey ( ) } " ) < nl > + < nl > + def randomLong ( ) : Long = randomLong ( ThreadLocalRandom . current ( ) ) < nl > + < nl > + def randomLong ( rng : ThreadLocalRandom ) : Long = rng . nextLong ( ) < nl > + < nl > + def randomString ( ) : String = randomString ( ThreadLocalRandom . current ( ) ) < nl > + < nl > + def randomString ( rng : ThreadLocalRandom ) : String = rng . nextLong ( ) . toString < nl > + < nl > + def nextAccessSalt ( rng : ThreadLocalRandom ) : String = randomString ( rng ) < nl > < nl > def nextAccessSalt ( ) : String = { < nl > nextAccessSalt ( ThreadLocalRandom . current ( ) ) < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala < nl > index bd3b59c . . 79e425b 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala < nl > @ @ - 5 , 6 + 5 , 7 @ @ import akka . pattern . ask < nl > import akka . util . Timeout < nl > import im . actor . api . rpc . messaging . ApiMessage < nl > import im . actor . api . rpc . misc . ApiExtension < nl > + import im . actor . api . rpc . peers . ApiPeer < nl > import im . actor . api . rpc . peers . ApiPeerType . _ < nl > import im . actor . api . rpc . peers . ApiPeerType . ApiPeerType < nl > import im . actor . extension . InternalExtensions < nl > @ @ - 28 , 7 + 29 , 17 @ @ final class DialogExtensionImpl ( system : ActorSystem ) extends DialogExtension { < nl > < nl > implicit val s : ActorSystem = system < nl > implicit val ec : ExecutionContext = system . dispatcher < nl > - implicit val timeout : Timeout = Timeout ( 20 . seconds ) / / TODO : configurable < nl > + implicit val timeout : Timeout = Timeout ( 20 . seconds ) / / TODO : configurable < nl > + < nl > + def sendMessage ( < nl > + peer : ApiPeer , < nl > + senderUserId : Int , < nl > + senderAuthId : Long , < nl > + randomId : Long , < nl > + message : ApiMessage , < nl > + isFat : Boolean < nl > + ) : Future [ SeqStateDate ] = < nl > + sendMessage ( peer . ` type ` , peer . id , senderUserId , senderAuthId , randomId , message , isFat ) < nl > < nl > def sendMessage ( peerType : ApiPeerType , peerId : Int , senderUserId : Int , senderAuthId : Long , randomId : Long , message : ApiMessage , isFat : Boolean = false ) : Future [ SeqStateDate ] = { < nl > ( peerType match { < nl > @ @ - 83 , 4 + 94 , 4 @ @ object DialogExtension extends ExtensionId [ DialogExtensionImpl ] with ExtensionId < nl > override def lookup = DialogExtension < nl > < nl > override def createExtension ( system : ExtendedActorSystem ) = new DialogExtensionImpl ( system ) < nl > - } < nl > \ No newline at end of file < nl > + } < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > index 9552f85 . . 56fd62a 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > @ @ - 8 , 7 + 8 , 7 @ @ import slick . driver . PostgresDriver . api . _ < nl > < nl > import scala . concurrent . duration . _ < nl > import scala . concurrent . { Future , Promise } < nl > - import scala . util . { Failure , Success , Try } < nl > + import scala . util . Try < nl > < nl > sealed trait SeqUpdatesExtension extends Extension { < nl > val region : SeqUpdatesManagerRegion < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UpdatesConsumer . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UpdatesConsumer . scala < nl > index cd328be . . 2a6c005 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UpdatesConsumer . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UpdatesConsumer . scala < nl > @ @ - 10 , 11 + 10 , 11 @ @ import im . actor . api . rpc . users . ApiUser < nl > import im . actor . api . rpc . weak . { UpdateGroupOnline , UpdateUserLastSeen , UpdateUserOffline , UpdateUserOnline } < nl > import im . actor . api . rpc . { Update , UpdateBox ⇒ ProtoUpdateBox } < nl > import im . actor . server . db . DbExtension < nl > - import im . actor . server . group . { GroupExtension , GroupOffice , GroupViewRegion } < nl > + import im . actor . server . group . GroupExtension < nl > import im . actor . server . mtproto . protocol . UpdateBox < nl > import im . actor . server . persist < nl > import im . actor . server . presences . _ < nl > - import im . actor . server . user . { UserExtension , UserOffice , UserViewRegion } < nl > + import im . actor . server . user . UserExtension < nl > import org . joda . time . DateTime < nl > < nl > import scala . concurrent . _ < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala < nl > index b06a574 . . 533795b 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala < nl > @ @ - 33 , 9 + 33 , 17 @ @ private [ user ] sealed trait Commands extends AuthCommands { < nl > < nl > implicit val timeout : Timeout < nl > < nl > - def create ( userId : Int , accessSalt : String , name : String , countryCode : String , sex : ApiSex . ApiSex , isBot : Boolean , extensions : Seq [ ApiExtension ] , external : Option [ String ] ) : Future [ CreateAck ] = { < nl > + def create ( < nl > + userId : Int , < nl > + accessSalt : String , < nl > + name : String , < nl > + countryCode : String , < nl > + sex : ApiSex . ApiSex , < nl > + isBot : Boolean , < nl > + extensions : Seq [ ApiExtension ] = Seq . empty , < nl > + external : Option [ String ] = None < nl > + ) : Future [ CreateAck ] = < nl > ( processorRegion . ref ? Create ( userId , accessSalt , name , countryCode , sex , isBot , extensions , external ) ) . mapTo [ CreateAck ] < nl > - } < nl > < nl > def addPhone ( userId : Int , phone : Long ) : Future [ Unit ] = { < nl > ( processorRegion . ref ? AddPhone ( userId , phone ) ) . mapTo [ AddPhoneAck ] map ( _ ⇒ ( ) ) < nl > diff - - git a / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotBlueprint . scala b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotBlueprint . scala < nl > new file mode 100644 < nl > index 0000000 . . 940b6dd < nl > - - - / dev / null < nl > + + + b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotBlueprint . scala < nl > @ @ - 0 , 0 + 1 , 68 @ @ < nl > + package im . actor . server . api . http . bots < nl > + < nl > + import akka . actor . ActorSystem < nl > + import akka . stream . scaladsl . { Flow , Merge , Source } < nl > + import im . actor . api . rpc . messaging . ApiTextMessage < nl > + import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType } < nl > + import im . actor . bot . BotMessages < nl > + import im . actor . server . dialog . DialogExtension < nl > + import im . actor . server . sequence . SeqStateDate < nl > + import upickle . default . _ < nl > + < nl > + import scala . concurrent . Future < nl > + < nl > + final class BotBlueprint ( botUserId : Int , botAuthId : Long , system : ActorSystem ) { < nl > + < nl > + import BotMessages . _ < nl > + import akka . stream . scaladsl . FlowGraph . Implicits . _ < nl > + import system . _ < nl > + < nl > + private lazy val dialogExt = DialogExtension ( system ) < nl > + < nl > + val flow : Flow [ String , String , Unit ] = { < nl > + val updSource = < nl > + Source . actorPublisher [ BotUpdate ] ( UpdatesSource . props ( botAuthId ) ) < nl > + . map ( write [ BotUpdate ] ) < nl > + < nl > + val rqrspFlow = Flow [ String ] < nl > + . map ( parseMessage ) < nl > + . mapAsync ( 1 ) ( r ⇒ handleRequest ( r . id , r . body ) ) < nl > + . map ( write [ BotResponse ] ) < nl > + < nl > + Flow ( ) { implicit b ⇒ < nl > + val upd = b . add ( updSource ) < nl > + val rqrsp = b . add ( rqrspFlow ) < nl > + val merge = b . add ( Merge [ String ] ( 2 ) ) < nl > + < nl > + upd ~ > merge < nl > + rqrsp ~ > merge < nl > + < nl > + ( rqrsp . inlet , merge . out ) < nl > + } < nl > + } < nl > + < nl > + private def parseMessage ( source : String ) : BotRequest = read [ BotRequest ] ( source ) < nl > + < nl > + private def handleRequest ( id : Long , body : RequestBody ) : Future [ BotResponse ] = < nl > + for { < nl > + response ← handleRequestBody ( body ) < nl > + } yield BotResponse ( id , response ) < nl > + < nl > + private def handleRequestBody ( body : RequestBody ) : Future [ ResponseBody ] = body match { < nl > + case SendTextMessage ( peer , randomId , message ) ⇒ sendTextMessage ( peer , randomId , message ) < nl > + } < nl > + < nl > + private def sendTextMessage ( peer : OutPeer , randomId : Long , message : String ) : Future [ ResponseBody ] = { < nl > + / / FIXME : check access hash < nl > + for { < nl > + SeqStateDate ( _ , _ , date ) ← dialogExt . sendMessage ( < nl > + peer = ApiPeer ( ApiPeerType ( peer . ` type ` ) , peer . id ) , < nl > + senderUserId = botUserId , < nl > + senderAuthId = 0L , < nl > + randomId = randomId , < nl > + message = ApiTextMessage ( message , Vector . empty , None ) , < nl > + isFat = false < nl > + ) < nl > + } yield MessageSent ( date ) < nl > + } < nl > + } < nl > diff - - git a / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotsHandler . scala b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotsHandler . scala < nl > new file mode 100644 < nl > index 0000000 . . efa0994 < nl > - - - / dev / null < nl > + + + b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotsHandler . scala < nl > @ @ - 0 , 0 + 1 , 46 @ @ < nl > + package im . actor . server . api . http . bots < nl > + < nl > + import akka . actor . ActorSystem < nl > + import akka . http . scaladsl . model . ws . { Message , TextMessage } < nl > + import akka . http . scaladsl . server . Directives . _ < nl > + import akka . http . scaladsl . server . Route < nl > + import akka . stream . scaladsl . Flow < nl > + import cats . data . OptionT < nl > + import cats . std . future . _ < nl > + import im . actor . server . api . http . RoutesHandler < nl > + import im . actor . server . bot . BotExtension < nl > + < nl > + import scala . util . control . NoStackTrace < nl > + < nl > + private [ http ] final class BotsHandler ( system : ActorSystem ) extends RoutesHandler { < nl > + < nl > + import system . _ < nl > + < nl > + private val botExt = BotExtension ( system ) < nl > + < nl > + override def routes : Route = path ( " bots " / Segment ) { token ⇒ < nl > + val flowFuture = ( for { < nl > + userId ← OptionT ( botExt . getUserId ( token ) ) < nl > + authId ← OptionT ( botExt . getAuthId ( token ) ) < nl > + } yield flow ( userId , authId ) ) . value map { < nl > + case Some ( r ) ⇒ r < nl > + case None ⇒ throw new RuntimeException ( " Wrong token " ) with NoStackTrace < nl > + } < nl > + < nl > + onSuccess ( flowFuture ) { < nl > + case flow ⇒ handleWebsocketMessages ( flow ) < nl > + } < nl > + } < nl > + < nl > + private def flow ( botUserId : Int , botAuthId : Long ) = { < nl > + val bp = new BotBlueprint ( botUserId , botAuthId , system ) < nl > + < nl > + Flow [ Message ] < nl > + . collect { < nl > + case TextMessage . Strict ( text ) ⇒ text < nl > + case tm : TextMessage ⇒ throw new RuntimeException ( " Streamed text message is not supported " ) with NoStackTrace < nl > + } < nl > + . via ( bp . flow ) < nl > + . map ( TextMessage . Strict ( _ ) . asInstanceOf [ Message ] ) < nl > + } < nl > + } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / UpdatesSource . scala b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / UpdatesSource . scala < nl > new file mode 100644 < nl > index 0000000 . . 40f3804 < nl > - - - / dev / null < nl > + + + b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / UpdatesSource . scala < nl > @ @ - 0 , 0 + 1 , 95 @ @ < nl > + package im . actor . server . api . http . bots < nl > + < nl > + import akka . actor . { ActorLogging , Props } < nl > + import akka . stream . actor . ActorPublisher < nl > + import im . actor . api . rpc . codecs . _ < nl > + import im . actor . api . rpc . messaging . { ApiTextMessage , UpdateMessage } < nl > + import im . actor . api . rpc . sequence . SeqUpdate < nl > + import im . actor . bot . BotMessages < nl > + import im . actor . server . mtproto . protocol . UpdateBox < nl > + import im . actor . server . presences . { GroupPresenceManager , PresenceManager } < nl > + import im . actor . server . sequence . { UpdatesConsumer , WeakUpdatesManager } < nl > + < nl > + import scala . annotation . tailrec < nl > + < nl > + private [ bots ] object UpdatesSource { < nl > + def props ( authId : Long ) = Props ( classOf [ UpdatesSource ] , authId ) < nl > + } < nl > + < nl > + private class UpdatesSource ( authId : Long ) extends ActorPublisher [ BotMessages . BotUpdate ] with ActorLogging { < nl > + < nl > + import BotMessages . { Peer , TextMessage } < nl > + import akka . stream . actor . ActorPublisherMessage . _ < nl > + import context . _ < nl > + import im . actor . server . sequence . NewUpdate < nl > + < nl > + private implicit val weakUpdatesManagerRegion = WeakUpdatesManager . startRegionProxy ( ) < nl > + private implicit val presenceManagerRegion = PresenceManager . startRegionProxy ( ) < nl > + private implicit val groupPresenceManagerRegion = GroupPresenceManager . startRegionProxy ( ) < nl > + < nl > + context . actorOf ( UpdatesConsumer . props ( authId , self ) , " updatesConsumer " ) < nl > + < nl > + private var buf = Vector . empty [ BotMessages . BotUpdate ] < nl > + < nl > + def receive = { < nl > + case NewUpdate ( UpdateBox ( bodyBytes ) , _ ) ⇒ < nl > + UpdateBoxCodec . decode ( bodyBytes ) . require . value match { < nl > + case SeqUpdate ( _ , _ , header , body ) ⇒ < nl > + < nl > + header match { < nl > + case UpdateMessage . header ⇒ < nl > + UpdateMessage . parseFrom ( body ) match { < nl > + case Right ( upd ) ⇒ < nl > + upd . message match { < nl > + case ApiTextMessage ( message , _ , _ ) ⇒ < nl > + log . debug ( " Received ApiTextMessage " ) < nl > + enqueue ( TextMessage ( < nl > + peer = Peer ( upd . peer . ` type ` . id , upd . peer . id ) , < nl > + senderUserId = upd . senderUserId , < nl > + date = upd . date , < nl > + randomId = upd . randomId , < nl > + message = message < nl > + ) ) < nl > + case _ ⇒ < nl > + log . debug ( " Received non - text message , ignoring " ) < nl > + } < nl > + < nl > + case Left ( e ) ⇒ < nl > + log . error ( e , " Failed to parse UpdateMessage " ) < nl > + } < nl > + case _ ⇒ < nl > + log . debug ( " Received SeqUpdate with header : { } , ignoring " , header ) < nl > + } < nl > + case _ ⇒ < nl > + } < nl > + case Request ( _ ) ⇒ < nl > + deliverBuf ( ) < nl > + case Cancel ⇒ < nl > + context . stop ( self ) < nl > + } < nl > + < nl > + private def enqueue ( upd : BotMessages . BotUpdate ) : Unit = { < nl > + log . debug ( " Enqueuing { } " , upd ) < nl > + < nl > + if ( buf . isEmpty & & totalDemand > 0 ) { < nl > + onNext ( upd ) < nl > + } else { < nl > + buf : + = upd < nl > + deliverBuf ( ) < nl > + } < nl > + } < nl > + < nl > + @ tailrec final def deliverBuf ( ) : Unit = < nl > + if ( totalDemand > 0 ) { < nl > + if ( totalDemand < = Int . MaxValue ) { < nl > + val ( use , keep ) = buf . splitAt ( totalDemand . toInt ) < nl > + buf = keep < nl > + use foreach onNext < nl > + } else { < nl > + val ( use , keep ) = buf . splitAt ( Int . MaxValue ) < nl > + buf = keep < nl > + use foreach onNext < nl > + deliverBuf ( ) < nl > + } < nl > + } < nl > + } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / AuthId . scala b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / AuthId . scala < nl > index 8e12f6e . . aa01de9 100644 < nl > - - - a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / AuthId . scala < nl > + + + b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / AuthId . scala < nl > @ @ - 43 , 6 + 43 , 7 @ @ object AuthId { < nl > < nl > val activeByUserIdCompiled = Compiled ( ( userId : Rep [ Int ] ) ⇒ activeByUserId ( userId ) ) < nl > val activeIdByUserIdCompiled = Compiled ( ( userId : Rep [ Int ] ) ⇒ activeByUserId ( userId ) map ( _ . id ) ) < nl > + val firstActiveIdByUserIdCompiled = Compiled ( ( userId : Rep [ Int ] ) ⇒ activeByUserId ( userId ) map ( _ . id ) take ( 1 ) ) < nl > < nl > def activeIdByUserIds ( userIds : Set [ Int ] ) = activeAuthIds . filter ( _ . userId inSetBind userIds ) . map ( _ . id ) < nl > < nl > @ @ - 61 , 6 + 62 , 9 @ @ object AuthId { < nl > def findIdByUserId ( userId : Int ) = < nl > activeIdByUserIdCompiled ( userId ) . result < nl > < nl > + def findFirstIdByUserId ( userId : Int ) = < nl > + firstActiveIdByUserIdCompiled ( userId ) . result . headOption < nl > + < nl > def findIdByUserIds ( userIds : Set [ Int ] ) = < nl > activeIdByUserIds ( userIds ) . result < nl > < nl > diff - - git a / actor - server / actor - runner / src / main / scala / im / actor / server / Main . scala b / actor - server / actor - runner / src / main / scala / im / actor / server / Main . scala < nl > index c55ec26 . . 5ce2887 100644 < nl > - - - a / actor - server / actor - runner / src / main / scala / im / actor / server / Main . scala < nl > + + + b / actor - server / actor - runner / src / main / scala / im / actor / server / Main . scala < nl > @ @ - 113 , 7 + 113 , 7 @ @ object Main extends App { < nl > new EmailSender ( emailConfig ) < nl > ) < nl > case " actor - activation " ⇒ new GateCodeActivation ( gateConfig ) < nl > - case _ ⇒ throw new Exception ( " " " Invalid activation . default - service value provided : valid options : " internal " , actor - activation " " " ) < nl > + case _ ⇒ throw new Exception ( " " " Invalid activation . default - service value provided : valid options : " internal " , actor - activation " " " ) < nl > } < nl > < nl > implicit val sessionRegion = Session . startRegion ( < nl > @ @ - 146 , 10 + 146 , 10 @ @ object Main extends App { < nl > Frontend . start ( serverConfig ) < nl > HttpApiFrontend . start ( serverConfig ) < nl > } catch { < nl > - case e : ConfigException = > < nl > + case e : ConfigException ⇒ < nl > system . log . error ( e , " Failed to load server configuration " ) < nl > throw e < nl > - case e : Throwable = > < nl > + case e : Throwable ⇒ < nl > system . log . error ( e , " Server failed to start up " ) < nl > throw e < nl > } < nl > diff - - git a / actor - server / actor - runtime / src / main / resources / reference . conf b / actor - server / actor - runtime / src / main / resources / reference . conf < nl > index 281b729 . . 1402287 100644 < nl > - - - a / actor - server / actor - runtime / src / main / resources / reference . conf < nl > + + + b / actor - server / actor - runtime / src / main / resources / reference . conf < nl > @ @ - 19 , 6 + 19 , 10 @ @ tls { < nl > } < nl > } < nl > < nl > + common { < nl > + default - timeout : 20 seconds < nl > + } < nl > + < nl > akka { < nl > extensions = $ { akka . extensions } [ < nl > " akka . contrib . pattern . DistributedPubSubExtension " , < nl > diff - - git a / actor - server / actor - runtime / src / main / scala / im / actor / config / ActorConfig . scala b / actor - server / actor - runtime / src / main / scala / im / actor / config / ActorConfig . scala < nl > index badb833 . . 0cef7d5 100644 < nl > - - - a / actor - server / actor - runtime / src / main / scala / im / actor / config / ActorConfig . scala < nl > + + + b / actor - server / actor - runtime / src / main / scala / im / actor / config / ActorConfig . scala < nl > @ @ - 1 , 5 + 1 , 8 @ @ < nl > package im . actor . config < nl > < nl > + import scala . concurrent . duration . _ < nl > + import java . util . concurrent . TimeUnit < nl > + < nl > import com . typesafe . config . { Config , ConfigFactory } < nl > < nl > object ActorConfig { < nl > @ @ - 31 , 4 + 34 , 6 @ @ object ActorConfig { < nl > ) ) < nl > . resolve ( ) < nl > } < nl > + < nl > + val defaultTimeout : FiniteDuration = ActorConfig . load ( ) . getDuration ( " common . default - timeout " , TimeUnit . MILLISECONDS ) . millis < nl > } < nl > diff - - git a / actor - server / actor - session / src / main / scala / im / actor / server / session / SessionStream . scala b / actor - server / actor - session / src / main / scala / im / actor / server / session / SessionStream . scala < nl > index 2d4d434 . . 980b06d 100644 < nl > - - - a / actor - server / actor - session / src / main / scala / im / actor / server / session / SessionStream . scala < nl > + + + b / actor - server / actor - session / src / main / scala / im / actor / server / session / SessionStream . scala < nl > @ @ - 24 , 8 + 24 , 6 @ @ object SessionStreamMessage { < nl > < nl > @ SerialVersionUID ( 1L ) < nl > case class SendProtoMessage ( message : ProtoMessage with OutgoingProtoMessage ) extends SessionStreamMessage < nl > - < nl > - case class EnqueuedProtoMessage ( message : ProtoMessage , reduceKey : Option [ String ] ) extends SessionStreamMessage < nl > } < nl > < nl > private [ session ] object SessionStream { < nl > diff - - git a / actor - server / actor - session / src / main / scala / im / actor / server / session / UpdatesHandler . scala b / actor - server / actor - session / src / main / scala / im / actor / server / session / UpdatesHandler . scala < nl > index 5656c80 . . fa15f5e 100644 < nl > - - - a / actor - server / actor - session / src / main / scala / im / actor / server / session / UpdatesHandler . scala < nl > + + + b / actor - server / actor - session / src / main / scala / im / actor / server / session / UpdatesHandler . scala < nl > @ @ - 2 , 10 + 2 , 9 @ @ package im . actor . server . session < nl > < nl > import akka . actor . { ActorLogging , Props } < nl > import akka . stream . actor . _ < nl > - import im . actor . server . mtproto . protocol . ProtoMessage < nl > + import im . actor . server . mtproto . protocol . UpdateBox < nl > import im . actor . server . presences . { GroupPresenceManagerRegion , PresenceManagerRegion } < nl > import im . actor . server . sequence . _ < nl > - import im . actor . server . session . SessionStreamMessage . EnqueuedProtoMessage < nl > < nl > import scala . annotation . tailrec < nl > import scala . collection . immutable < nl > @ @ - 26 , 7 + 25 , 7 @ @ private [ session ] class UpdatesHandler ( authId : Long ) ( < nl > weakUpdManagerRegion : WeakUpdatesManagerRegion , < nl > presenceManagerRegion : PresenceManagerRegion , < nl > groupPresenceManagerRegion : GroupPresenceManagerRegion < nl > - ) extends ActorSubscriber with ActorPublisher [ ( ProtoMessage , Option [ String ] ) ] with ActorLogging { < nl > + ) extends ActorSubscriber with ActorPublisher [ ( UpdateBox , Option [ String ] ) ] with ActorLogging { < nl > < nl > import ActorPublisherMessage . _ < nl > import ActorSubscriberMessage . _ < nl > @ @ - 62 , 7 + 61 , 7 @ @ private [ session ] class UpdatesHandler ( authId : Long ) ( < nl > override val requestStrategy = WatermarkRequestStrategy ( 10 ) / / TODO : configurable < nl > < nl > / / Publisher - related < nl > - private [ this ] var messageQueue = immutable . Queue . empty [ ( ProtoMessage , Option [ String ] ) ] < nl > + private [ this ] var messageQueue = immutable . Queue . empty [ ( UpdateBox , Option [ String ] ) ] < nl > < nl > def publisher : Receive = { < nl > case NewUpdate ( ub , reduceKey ) ⇒ enqueueProtoMessage ( ub , reduceKey ) < nl > @ @ - 70 , 7 + 69 , 7 @ @ private [ session ] class UpdatesHandler ( authId : Long ) ( < nl > case Cancel ⇒ context . stop ( self ) < nl > } < nl > < nl > - private def enqueueProtoMessage ( message : ProtoMessage , reduceKey : Option [ String ] ) : Unit = { < nl > + private def enqueueProtoMessage ( message : UpdateBox , reduceKey : Option [ String ] ) : Unit = { < nl > if ( messageQueue . isEmpty & & totalDemand > 0 ) { < nl > onNext ( message → reduceKey ) < nl > } else { < nl > diff - - git a / actor - server / project / Build . scala b / actor - server / project / Build . scala < nl > index 5fb9a44 . . b96b492 100644 < nl > - - - a / actor - server / project / Build . scala < nl > + + + b / actor - server / project / Build . scala < nl > @ @ - 114 , 6 + 114 , 7 @ @ object Build extends sbt . Build with Versioning with Releasing { < nl > settings = defaultSettings < nl > ) . dependsOn ( < nl > actorActivation , < nl > + actorBot , < nl > actorEnrich , < nl > actorEmail , < nl > actorFrontend , < nl > @ @ - 133 , 6 + 134 , 24 @ @ object Build extends sbt . Build with Versioning with Releasing { < nl > ) < nl > ) . dependsOn ( actorEmail , actorSms , actorPersist ) < nl > < nl > + lazy val actorBot = Project ( < nl > + id = " actor - bot " , < nl > + base = file ( " actor - bot " ) , < nl > + settings = defaultSettings + + < nl > + Seq ( < nl > + libraryDependencies + + = Dependencies . bot < nl > + ) < nl > + ) . dependsOn ( actorBotMessages , shardakka , actorCore ) < nl > + < nl > + lazy val actorBotMessages = Project ( < nl > + id = " actor - bot - messages " , < nl > + base = file ( " actor - bot - messages " ) , < nl > + settings = defaultSettings + + < nl > + Seq ( < nl > + libraryDependencies + + = Dependencies . botMessages < nl > + ) < nl > + ) < nl > + < nl > lazy val actorCore = Project ( < nl > id = " actor - core " , < nl > base = file ( " actor - core " ) , < nl > @ @ - 164 , 7 + 183 , 7 @ @ object Build extends sbt . Build with Versioning with Releasing { < nl > settings = defaultSettings + + Seq ( < nl > libraryDependencies + + = Dependencies . httpApi < nl > ) < nl > - ) . dependsOn ( actorCore , actorPersist , actorRuntime ) < nl > + ) . dependsOn ( actorBot , actorCore , actorPersist , actorRuntime ) < nl > < nl > lazy val actorOAuth = Project ( < nl > id = " actor - oauth " , < nl > diff - - git a / actor - server / project / Dependencies . scala b / actor - server / project / Dependencies . scala < nl > index ce84317 . . 428af06 100644 < nl > - - - a / actor - server / project / Dependencies . scala < nl > + + + b / actor - server / project / Dependencies . scala < nl > @ @ - 9 , 7 + 9 , 7 @ @ object Dependencies { < nl > val scalaz = " 7 . 1 . 1 " < nl > val slick = " 3 . 0 . 3 " < nl > val scalatest = " 2 . 2 . 4 " < nl > - val catsVersion = " 0 . 1 . 2 " < nl > + val catsVersion = " 0 . 2 . 0 " < nl > < nl > } < nl > < nl > @ @ - 30 , 8 + 30 , 7 @ @ object Dependencies { < nl > val caffeine = " com . github . ben - manes . caffeine " % " caffeine " % " 1 . 2 . 0 " < nl > val eaioUuid = " com . eaio . uuid " % " uuid " % " 3 . 4 " < nl > < nl > - val cats = " org . spire - math " % % " cats - core " % V . catsVersion < nl > - val catsStd = " org . spire - math " % % " cats - std " % V . catsVersion < nl > + val cats = " org . spire - math " % % " cats " % V . catsVersion < nl > < nl > val configs = " com . github . kxbmap " % % " configs " % " 0 . 2 . 4 " < nl > < nl > @ @ - 39 , 6 + 38 , 7 @ @ object Dependencies { < nl > val javaCompat = " org . scala - lang . modules " % % " scala - java8 - compat " % " 0 . 5 . 0 " < nl > < nl > val playJson = " com . typesafe . play " % % " play - json " % " 2 . 4 . 2 " < nl > + val upickle = " com . lihaoyi " % % " upickle " % " 0 . 3 . 6 " < nl > < nl > val postgresJdbc = " org . postgresql " % " postgresql " % " 9 . 4 - 1201 - jdbc41 " exclude ( " org . slf4j " , " slf4j - simple " ) < nl > val slick = " com . typesafe . slick " % % " slick " % V . slick < nl > @ @ - 102 , 6 + 102 , 10 @ @ object Dependencies { < nl > < nl > val activation = shared + + Seq ( akkaActor , akkaHttp , playJson ) < nl > < nl > + val bot = shared + + Seq ( upickle ) < nl > + < nl > + val botMessages = Seq ( upickle ) < nl > + < nl > val core = shared + + Seq ( akkaActor , akkaContrib , amazonaws , awsWrap , caffeine , gcmServer , pushy , jodaTime , postgresJdbc , slick , scrImageCore ) < nl > < nl > val enrich = shared + + Seq ( akkaActor , akkaHttp ) < nl > @ @ - 146 , 7 + 150 , 7 @ @ object Dependencies { < nl > < nl > val notifications = shared + + Seq ( akkaContrib , slick ) < nl > < nl > - val runtime = shared + + Seq ( akkaActor , akkaHttp , akkaStream , akkaPersistenceJdbc , caffeine , cats , catsStd , concmap , jodaConvert , jodaTime , libPhoneNumber , scalazCore , akkaTestkit % " test " , scalatest % " test " ) < nl > + val runtime = shared + + Seq ( akkaActor , akkaHttp , akkaStream , akkaPersistenceJdbc , caffeine , cats , concmap , jodaConvert , jodaTime , libPhoneNumber , scalazCore , akkaTestkit % " test " , scalatest % " test " ) < nl > < nl > val voximplant = shared + + Seq ( akkaActor , dispatch , playJson )
+
+TEST DIFF:
+diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / migrations / v2 / MigrationTsActions . scala b / actor - server / actor - core / src / main / scala / im / actor / server / migrations / v2 / MigrationTsActions . scala 
+ new file mode 100644 
+ index 0000000 . . 94a022c 
+ - - - / dev / null 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / migrations / v2 / MigrationTsActions . scala 
+ @ @ - 0 , 0 + 1 , 51 @ @ 
+ + package im . actor . server . migrations . v2 
+ + 
+ + import java . time . Instant 
+ + 
+ + import com . google . protobuf . wrappers . Int64Value 
+ + import im . actor . storage . { Connector , SimpleStorage } 
+ + import org . slf4j . LoggerFactory 
+ + 
+ + import scala . concurrent . duration . _ 
+ + import scala . language . postfixOps 
+ + 
+ + object MigrationNameList { 
+ + val MultiSequence = " multi - sequence - 2016 - 07 - 01 " 
+ + } 
+ + 
+ + / * * 
+ + * Stores mapping " Migration name " - > " Migration timestamp " 
+ + * name : String 
+ + * timestamp : Long 
+ + * / 
+ + private object MigrationTsStorage extends SimpleStorage ( " migration _ ts " ) 
+ + 
+ + / / TODO : find better name 
+ + object MigrationTsActions { 
+ + 
+ + private val log = LoggerFactory . getLogger ( this . getClass ) 
+ + 
+ + implicit val OperationTimeout = 10 seconds 
+ + 
+ + def getTimestamp ( migrationName : String ) ( implicit conn : Connector ) : Option [ Long ] = { 
+ + conn . runSync ( MigrationTsStorage . get ( migrationName ) ) map { bytes ⇒ 
+ + Int64Value . parseFrom ( bytes ) . value 
+ + } 
+ + } 
+ + 
+ + / / insert timestamp in ` MigrationTsStorage ` . Make sure it happens only once . 
+ + def insertTimestamp ( migrationName : String , ts : Long ) ( implicit conn : Connector ) : Unit = { 
+ + val alreadyRun = conn . runSync ( MigrationTsStorage . get ( migrationName ) ) . isDefined 
+ + if ( alreadyRun ) { 
+ + log . info ( " Migration { } already run at { } , skipping " , migrationName , Instant . ofEpochMilli ( ts ) ) 
+ + } else { 
+ + conn . runSync ( 
+ + MigrationTsStorage . upsert ( 
+ + migrationName , 
+ + Int64Value ( ts ) . toByteArray 
+ + ) 
+ + ) 
+ + log . info ( " Wrote migration timestamp for : { } , date : { } " , migrationName , Instant . ofEpochMilli ( ts ) ) 
+ + } 
+ + } 
+ + } 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ index 90385c9 . . 9f0b5ed 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ @ @ - 8 , 24 + 8 , 36 @ @ import akka . stream . ActorMaterializer 
+ import akka . util . Timeout 
+ import com . google . protobuf . wrappers . Int32Value 
+ import im . actor . server . db . DbExtension 
+ + import im . actor . server . migrations . v2 . { MigrationNameList , MigrationTsActions } 
+ import im . actor . server . model . _ 
+ import im . actor . server . sequence . operations . { DeliveryOperations , DifferenceOperations , PushOperations } 
+ import im . actor . storage . SimpleStorage 
+ - import im . actor . storage . api . { GetAction , PutAction } 
+ + import im . actor . storage . api . { GetAction , UpsertAction } 
+ 
+ import scala . concurrent . duration . _ 
+ import scala . concurrent . { ExecutionContext , Future , Promise } 
+ 
+ - case class Difference ( updates : IndexedSeq [ SerializedUpdate ] , seq : Int , commonState : Array [ Byte ] , needMore : Boolean ) 
+ + final case class Difference ( 
+ + updates : IndexedSeq [ SerializedUpdate ] , 
+ + clientSeq : Int , 
+ + commonState : Array [ Byte ] , 
+ + needMore : Boolean 
+ + ) 
+ 
+ - object SeqStorage extends SimpleStorage ( " seqs " ) { 
+ + / * * 
+ + * Stores mapping ` authId ` - > ` seq ` for 
+ + * authId : Long 
+ + * seq : Int 
+ + * / 
+ + object SequenceStorage extends SimpleStorage ( " sequence " ) { 
+ def getSeq ( authId : Long ) : GetAction = { 
+ get ( authId . toString ) 
+ } 
+ - def putSeq ( authId : Long , seq : Int ) : PutAction = { 
+ - put ( authId . toString , Int32Value ( seq ) . toByteArray ) 
+ + def upsertSeq ( authId : Long , seq : Int ) : UpsertAction = { 
+ + upsert ( authId . toString , Int32Value ( seq ) . toByteArray ) 
+ } 
+ } 
+ + 
+ final class SeqUpdatesExtension ( _ system : ActorSystem ) 
+ extends Extension 
+ with DeliveryOperations 
+ @ @ - 38 , 11 + 50 , 19 @ @ final class SeqUpdatesExtension ( _ system : ActorSystem ) 
+ protected implicit val OperationTimeout : Timeout = Timeout ( 20 . seconds ) 
+ private implicit val system : ActorSystem = _ system 
+ protected implicit val ec : ExecutionContext = system . dispatcher 
+ - protected implicit lazy val db = DbExtension ( system ) . db 
+ + protected lazy val ( db , conn ) = { 
+ + val ext = DbExtension ( system ) 
+ + ( ext . db , ext . connector ) 
+ + } 
+ lazy val region : SeqUpdatesManagerRegion = SeqUpdatesManagerRegion . start ( ) ( system ) 
+ private val writer = system . actorOf ( BatchUpdatesWriter . props , " batch - updates - writer " ) 
+ private val mediator = DistributedPubSub ( system ) . mediator 
+ 
+ + val MultiSequenceMigrationTs : Long = { 
+ + val optTs = MigrationTsActions . getTimestamp ( MigrationNameList . MultiSequence ) ( conn ) 
+ + optTs . getOrElse ( throw new RuntimeException ( s " No Migration timestamp found for $ { MigrationNameList . MultiSequence } " ) ) 
+ + } 
+ + 
+ def getSeqState ( userId : Int , authId : Long ) : Future [ SeqState ] = 
+ ( region . ref ? Envelope ( userId ) . withGetSeqState ( GetSeqState ( authId ) ) ) . mapTo [ SeqState ] 
+ 
+ @ @ - 58 , 7 + 78 , 7 @ @ final class SeqUpdatesExtension ( _ system : ActorSystem ) 
+ def subscribe ( authId : Long , ref : ActorRef ) : Future [ Unit ] = 
+ ( mediator ? DistributedPubSubMediator . Subscribe ( UserSequence . topic ( authId ) , ref ) ) map ( _ ⇒ ( ) ) 
+ 
+ - def commonState ( commonSeq : Int ) : CommonState = CommonState ( CommonStateVersion . V1 , commonSeq ) 
+ + def buildCommonState ( commonSeq : Int ) : CommonState = CommonState ( CommonStateVersion . V1 , commonSeq ) 
+ 
+ def persistUpdate ( update : SeqUpdate ) : Future [ Unit ] = { 
+ val promise = Promise [ Unit ] ( ) 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala 
+ index c39d7da . . 014f921 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala 
+ @ @ - 8 , 26 + 8 , 19 @ @ import com . google . protobuf . ByteString 
+ import com . google . protobuf . wrappers . { Int32Value , StringValue } 
+ import im . actor . api . rpc . sequence . UpdateEmptyUpdate 
+ import im . actor . server . db . DbExtension 
+ - import im . actor . server . model . { AuthId , SeqUpdate , UpdateMapping } 
+ - import im . actor . server . persist . AuthIdRepo 
+ + import im . actor . server . model . { SeqUpdate , UpdateMapping } 
+ + import im . actor . server . persist . { AuthIdRepo , AuthSessionRepo } 
+ import im . actor . server . persist . sequence . UserSequenceRepo 
+ import im . actor . server . pubsub . PubSubExtension 
+ 
+ + import scala . collection . immutable 
+ import scala . concurrent . Future 
+ import scala . language . postfixOps 
+ import scala . util . { Failure , Success } 
+ 
+ - object UserSequence { 
+ - def topic ( authId : Long ) : String = s " sequence . $ authId " 
+ - 
+ - private final case class Initialized ( commonSeq : Int , seqs : Map [ Long , Int ] ) 
+ - 
+ - private [ sequence ] def props = 
+ - Props ( new UserSequence ) 
+ - } 
+ - 
+ private trait SeqControl { 
+ - private var _ commonSeq : Int = 0 
+ + import UserSequence . _ 
+ + private var _ commonSeq : Int = Const . UserSeqStart 
+ 
+ protected def commonSeq = this . _ commonSeq 
+ protected def commonSeq _ = ( seq : Int ) = this . _ commonSeq = seq 
+ @ @ - 38 , 20 + 31 , 36 @ @ private trait SeqControl { 
+ nseq 
+ } 
+ 
+ - private var _ seqMap : Map [ Long , Int ] = Map . empty 
+ + private var _ seqMap : immutable . Map [ Long , Int ] = Map . empty 
+ 
+ protected def seqMap = this . _ seqMap 
+ protected def seqMap _ = ( map : Map [ Long , Int ] ) = this . _ seqMap = map 
+ 
+ - protected def getSeq ( authId : Long ) = seqMap getOrElse ( authId , 0 ) 
+ + protected def getSeq ( authId : Long ) = this . _ seqMap getOrElse ( authId , Const . SeqStart ) 
+ 
+ protected def nextSeq ( authId : Long ) = { 
+ - val nextSeq = _ seqMap . getOrElse ( authId , 0 ) + 1 
+ + val nextSeq = _ seqMap . getOrElse ( authId , Const . SeqStart ) + 1 
+ this . _ seqMap + = ( authId → nextSeq ) 
+ nextSeq 
+ } 
+ } 
+ 
+ + object UserSequence { 
+ + object Const { 
+ + val UserSeqStart : Int = 0 
+ + val SeqStart : Int = 1 
+ + val SeqIncrement : Int = 1000 
+ + val FlushInterval : Int = 500 / / TODO : make it 250 
+ + } 
+ + 
+ + def topic ( authId : Long ) : String = s " sequence . $ authId " 
+ + 
+ + private final case class Initialized ( userSeq : Int , seqs : Map [ Long , Int ] ) 
+ + 
+ + private [ sequence ] def props = 
+ + Props ( new UserSequence ) 
+ + } 
+ + 
+ private [ sequence ] final class UserSequence 
+ extends Actor 
+ with ActorLogging 
+ @ @ - 63 , 8 + 72 , 10 @ @ private [ sequence ] final class UserSequence 
+ import akka . cluster . pubsub . DistributedPubSubMediator . _ 
+ import context . dispatcher 
+ 
+ - private val db = DbExtension ( context . system ) . db 
+ - private val connector = DbExtension ( context . system ) . connector 
+ + private val ( db , conn ) = { 
+ + val ext = DbExtension ( context . system ) 
+ + ( ext . db , ext . connector ) 
+ + } 
+ private val seqUpdExt = SeqUpdatesExtension ( context . system ) 
+ private val pubSubExt = PubSubExtension ( context . system ) 
+ 
+ @ @ - 84 , 8 + 95 , 8 @ @ private [ sequence ] final class UserSequence 
+ init ( ) 
+ 
+ def receive = { 
+ - case Initialized ( commonSeq , seqs ) ⇒ 
+ - this . commonSeq = commonSeq 
+ + case Initialized ( userSeq , seqs ) ⇒ 
+ + this . commonSeq = userSeq 
+ this . seqMap = seqs 
+ unstashAll ( ) 
+ context become initialized 
+ @ @ - 102 , 16 + 113 , 22 @ @ private [ sequence ] final class UserSequence 
+ * / 
+ override def preRestart ( reason : Throwable , message : Option [ Any ] ) : Unit = { 
+ log . error ( reason , " Failure while processing { } " , message ) 
+ - authIdsOptFu . keys foreach { authId ⇒ 
+ - val seq = getSeq ( authId ) 
+ - if ( seq ! = 0 ) { 
+ - log . warning ( " Persisting current seq : { } for authId : { } " , seq , authId ) 
+ - connector . run ( SeqStorage . putSeq ( authId , seq ) ) 
+ - } 
+ - } 
+ + persistNonEmptySeqs ( ) 
+ super . preRestart ( reason , message ) 
+ } 
+ 
+ + / / TODO : figure out is it okay to access actor ' s state in postStop . 
+ + / / / * * 
+ + / / * On actor stop we are trying to persist 
+ + / / * all non - empty ` seq ` s for every authId . 
+ + / / * This method may never been called . 
+ + / / * / 
+ + / / override def postStop ( ) : Unit = { 
+ + / / log . warning ( " Stopping user sequence , trying to persist seqs " ) 
+ + / / persistNonEmptySeqs ( ) 
+ + / / super . postStop ( ) 
+ + / / } 
+ + 
+ private def initialized : Receive = { 
+ case cmd : VendorPushCommand ⇒ vendorPush forward cmd 
+ case DeliverUpdate ( authId , mappingOpt , pushRules , reduceKey , deliveryId ) ⇒ 
+ @ @ - 120 , 7 + 137 , 7 @ @ private [ sequence ] final class UserSequence 
+ case None ⇒ log . error ( " Empty mapping " ) 
+ } 
+ case GetSeqState ( authId ) ⇒ 
+ - sender ( ) ! SeqState ( getSeq ( authId ) , commonState ( ) ) 
+ + sender ( ) ! SeqState ( getSeq ( authId ) , buildCommonState ( ) ) 
+ case RegisterAuthId ( authId ) ⇒ 
+ addAuthId ( authId ) 
+ case UnregisterAuthId ( authId ) ⇒ 
+ @ @ - 133 , 23 + 150 , 18 @ @ private [ sequence ] final class UserSequence 
+ } 
+ 
+ / * * 
+ - * Initialize user sequence . 
+ - * ` commonSeq ` is primary key for UserSequenceRepo , or 0 if UserSequence is empty . 
+ - * ` seq ` - s for every authId retrieved and associated with empty optimization function . 
+ - * If ` authId ` sequence is empty - return 0 , otherwise return ` seq ` + 1000 . 
+ + * • Fetch ` userSeq ` , or get ` Const . UserSeqStart ` if sequence isn ' t initialized yet . 
+ + * • Associate every ` authId ` with empty optimization function and put in ` authIdsOptFu ` map 
+ + * • Initialize sequence for every authId 
+ * / 
+ private def init ( ) : Unit = 
+ ( for { 
+ - authIds ← db . run ( AuthIdRepo . findByUserId ( userId ) ) 
+ - _ = this . authIdsOptFu = authIds . map ( _ . id → Optimization . EmptyFunc ) . toMap 
+ - authIdsSeqs ← Future . traverse ( authIds ) { 
+ - case AuthId ( authId , _ , _ ) ⇒ 
+ - connector . run ( SeqStorage . getSeq ( authId ) ) map { seqBytes ⇒ 
+ - authId → ( seqBytes map ( Int32Value . parseFrom ( _ ) . value + 1000 ) getOrElse 0 ) 
+ - } 
+ - } 
+ - commonSeq ← db . run ( UserSequenceRepo . fetchSeq ( userId ) ) map ( _ getOrElse 0 ) 
+ - } yield Initialized ( commonSeq , authIdsSeqs . toMap ) ) pipeTo self 
+ + userSeq ← db . run ( UserSequenceRepo . fetchSeq ( userId ) ) map ( _ getOrElse Const . UserSeqStart ) 
+ + authIdsModels ← db . run ( AuthIdRepo . findByUserId ( userId ) ) 
+ + authIds = authIdsModels map ( _ . id ) 
+ + _ = this . authIdsOptFu = authIds . map ( _ → Optimization . EmptyFunc ) . toMap 
+ + authIdsSeqs ← initializeSeqs ( userSeq , authIds ) 
+ + } yield Initialized ( userSeq , authIdsSeqs . toMap ) ) pipeTo self 
+ 
+ private def deliver ( 
+ authId : Long , 
+ @ @ - 172 , 7 + 184 , 7 @ @ private [ sequence ] final class UserSequence 
+ ) 
+ 
+ writeToDb ( seqUpdate ) map { _ ⇒ 
+ - val state = commonState ( ) 
+ + val state = buildCommonState ( ) 
+ 
+ authIdsOptFu . keys foreach { authId ⇒ 
+ val update = optimizedMapping . custom . getOrElse ( authId , optimizedMapping . getDefault ) 
+ @ @ - 180 , 9 + 192 , 7 @ @ private [ sequence ] final class UserSequence 
+ / / This update won ' t affect sequence , and will not appear in difference . 
+ if ( update . header ! = UpdateEmptyUpdate . header ) { 
+ val seq = nextSeq ( authId ) 
+ - if ( seq % 500 = = 0 ) { 
+ - connector . run ( SeqStorage . putSeq ( authId , seq ) ) 
+ - } 
+ + flushSeq ( authId , seq ) 
+ pubSubExt . publish ( 
+ Publish ( 
+ topic ( authId ) , 
+ @ @ - 197 , 6 + 207 , 71 @ @ private [ sequence ] final class UserSequence 
+ } 
+ } 
+ 
+ + / * * 
+ + * Initialize ` seq ` for every ` authId ` . 
+ + * We keep compatibility with old clients ( pre - multi - sequence ) in following way : 
+ + * 1 . If ` seq ` for given ` authId ` exists in ` SequenceStorage ` - it is initialized already , sequence is : ` seq ` + ` Const . SeqIncrement ` 
+ + * 2 . If no ` seq ` found for given ` authId ` , we find ` AuthSession ` associated with given ` authId ` , and : 
+ + * 2 . 1 If ` AuthSession ` found and ` authTime ` is after migration date - this is new client , sequence is : ` Const . SeqStart ` 
+ + * 2 . 2 If ` AuthSession ` found , but ` authTime ` is before migration date - this is old client , sequence is : ` commonSeq ` + Const . SeqIncrement 
+ + * 2 . 3 If ` AuthSession ` not found ( what could be an error ) , we ASSUME this is old client , sequence is : ` commonSeq ` + Const . SeqIncrement 
+ + * 
+ + * NOTE : After we get ` seq ` from storage , or create new one - we should persist it , 
+ + * to avoid cases , when client ' s seq won ' t be persisted until next interval point . 
+ + * / 
+ + private def initializeSeqs ( userSeq : Int , authIds : Seq [ Long ] ) : Future [ Seq [ ( Long , Int ) ] ] = 
+ + Future . traverse ( authIds ) { authId ⇒ 
+ + val seqFu = conn . run ( SequenceStorage . getSeq ( authId ) ) flatMap { 
+ + case Some ( seqBytes ) ⇒ 
+ + FastFuture . successful ( Int32Value . parseFrom ( seqBytes ) . value + Const . SeqIncrement ) / / 1 . 
+ + case None ⇒ 
+ + for { 
+ + optSession ← db . run ( AuthSessionRepo . findByAuthId ( authId ) ) 
+ + seq = optSession match { 
+ + case Some ( session ) ⇒ 
+ + if ( session . authTime . getMillis > seqUpdExt . MultiSequenceMigrationTs ) 
+ + Const . SeqStart / / 2 . 1 
+ + else 
+ + userSeq + Const . SeqIncrement / / 2 . 2 
+ + case None ⇒ 
+ + log . warning ( " Didn ' t find auth session for authId : { } , assuming it an old client ! " , authId ) 
+ + userSeq + Const . SeqIncrement / / 2 . 3 
+ + } 
+ + } yield seq 
+ + } 
+ + 
+ + for { 
+ + seq ← seqFu 
+ + _ ← conn . run ( SequenceStorage . upsertSeq ( authId , seq ) ) 
+ + } yield authId → seq 
+ + } 
+ + 
+ + / / TODO : move to SequenceStorageActions 
+ + private def persistSeq ( authId : Long , seq : Int ) : Future [ Int ] = 
+ + conn . run ( SequenceStorage . upsertSeq ( authId , seq ) ) 
+ + 
+ + / * * 
+ + * Flush ` seq ` for given ` authId ` with ` Const . FlushInterval ` interval . 
+ + * / 
+ + private def flushSeq ( authId : Long , seq : Int ) : Unit = { 
+ + if ( seq % Const . FlushInterval = = 0 ) { 
+ + persistSeq ( authId , seq ) 
+ + } 
+ + } 
+ + 
+ + / * * 
+ + * Persist non - empty seqs for every user ' s ` authId ` . 
+ + * / 
+ + private def persistNonEmptySeqs ( ) : Unit = { 
+ + authIdsOptFu . keys foreach { authId ⇒ 
+ + val seq = getSeq ( authId ) 
+ + if ( seq > Const . SeqStart ) { 
+ + log . warning ( " Persisting current seq : { } for authId : { } " , seq , authId ) 
+ + persistSeq ( authId , seq ) 
+ + } 
+ + } 
+ + } 
+ + 
+ private def applyOptimizations ( mapping : UpdateMapping ) : UpdateMapping = { 
+ val default = mapping . getDefault 
+ val customOptimized = authIdsOptFu flatMap { 
+ @ @ - 213 , 9 + 288 , 10 @ @ private [ sequence ] final class UserSequence 
+ } 
+ if ( ! this . seqMap . contains ( authId ) ) { 
+ for { 
+ - optSeq ← connector . run ( SeqStorage . getSeq ( authId ) ) 
+ - seq = optSeq map ( v ⇒ Int32Value . parseFrom ( v ) . value ) getOrElse 0 
+ + optSeq ← conn . run ( SequenceStorage . getSeq ( authId ) ) 
+ + seq = optSeq map ( v ⇒ Int32Value . parseFrom ( v ) . value ) getOrElse Const . SeqStart 
+ _ = this . seqMap + = authId → seq 
+ + _ ← persistSeq ( authId , seq ) 
+ } yield ( ) 
+ } 
+ } 
+ @ @ - 225 , 8 + 301 , 8 @ @ private [ sequence ] final class UserSequence 
+ this . seqMap - = authId 
+ } 
+ 
+ - private def commonState ( ) : ByteString = 
+ - ByteString . copyFrom ( seqUpdExt . commonState ( commonSeq ) . toByteArray ) 
+ + private def buildCommonState ( ) : ByteString = 
+ + ByteString . copyFrom ( seqUpdExt . buildCommonState ( commonSeq ) . toByteArray ) 
+ 
+ private def cached ( authId : Long , deliveryId : String ) ( f : ⇒ Future [ SeqState ] ) : Unit = { 
+ val deliveryKey = s " $ { authId } _ $ { deliveryId } " 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / operations / DifferenceOperations . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / operations / DifferenceOperations . scala 
+ index ab5ecc9 . . 1e08e3f 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / operations / DifferenceOperations . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / operations / DifferenceOperations . scala 
+ @ @ - 1 , 5 + 1 , 6 @ @ 
+ package im . actor . server . sequence . operations 
+ 
+ + import akka . http . scaladsl . util . FastFuture 
+ import im . actor . api . rpc . sequence . UpdateEmptyUpdate 
+ import im . actor . server . model . { SeqUpdate , SerializedUpdate , UpdateMapping } 
+ import im . actor . server . persist . sequence . UserSequenceRepo 
+ @ @ - 47 , 7 + 48 , 7 @ @ trait DifferenceOperations { this : SeqUpdatesExtension ⇒ 
+ def getDifference ( 
+ userId : Int , 
+ clientSeq : Int , 
+ - state : Array [ Byte ] , 
+ + commonState : Array [ Byte ] , 
+ authId : Long , 
+ authSid : Int , 
+ maxSizeInBytes : Long 
+ @ @ - 66 , 7 + 67 , 7 @ @ trait DifferenceOperations { this : SeqUpdatesExtension ⇒ 
+ } 
+ } 
+ 
+ - val commonSeq = CommonState . validate ( state ) match { 
+ + val commonSeq = CommonState . validate ( commonState ) match { 
+ case Success ( CommonState ( _ , 0 ) ) ⇒ 
+ log . debug ( " Got old client with seq : { } " , clientSeq ) 
+ clientSeq 
+ @ @ - 78 , 10 + 79 , 15 @ @ trait DifferenceOperations { this : SeqUpdatesExtension ⇒ 
+ 
+ for { 
+ ( acc , needMore ) ← db . run ( run ( commonSeq , DiffAcc . empty ( commonSeq ) , 0L ) ) 
+ + newClientSeq ← if ( ! needMore ) { 
+ + getSeqState ( userId , authId ) map ( _ . seq ) 
+ + } else { 
+ + FastFuture . successful ( clientSeq + acc . seqDelta ) 
+ + } 
+ } yield Difference ( 
+ updates = acc . toVector , 
+ - seq = clientSeq + acc . seqDelta , 
+ - commonState = commonState ( acc . commonSeq ) . toByteArray , 
+ + clientSeq = newClientSeq , 
+ + commonState = buildCommonState ( acc . commonSeq ) . toByteArray , 
+ needMore = needMore 
+ ) 
+ } 
+ diff - - git a / actor - server / actor - models / src / main / scala / im / actor / server / model / AuthSession . scala b / actor - server / actor - models / src / main / scala / im / actor / server / model / AuthSession . scala 
+ index a2fb571 . . 571db78 100644 
+ - - - a / actor - server / actor - models / src / main / scala / im / actor / server / model / AuthSession . scala 
+ + + + b / actor - server / actor - models / src / main / scala / im / actor / server / model / AuthSession . scala 
+ @ @ - 23 , 8 + 23 , 17 @ @ object AppId { 
+ 
+ @ SerialVersionUID ( 1L ) 
+ final case class AuthSession ( 
+ - userId : Int , id : Int , authId : Long , appId : Int , appTitle : String , deviceTitle : String , deviceHash : Array [ Byte ] , 
+ - authTime : DateTime , authLocation : String , latitude : Option [ Double ] , longitude : Option [ Double ] 
+ + userId : Int , 
+ + id : Int , 
+ + authId : Long , 
+ + appId : Int , 
+ + appTitle : String , 
+ + deviceTitle : String , 
+ + deviceHash : Array [ Byte ] , 
+ + authTime : DateTime , 
+ + authLocation : String , 
+ + latitude : Option [ Double ] , 
+ + longitude : Option [ Double ] 
+ ) 
+ 
+ object AuthSession { 
+ diff - - git a / actor - server / actor - persist / src / main / resources / sql / migration / V20160623061400 _ _ AddTimestampIndexToSequence . sql b / actor - server / actor - persist / src / main / resources / sql / migration / V20160623061400 _ _ AddTimestampIndexToSequence . sql 
+ index a305ead . . 179a3c1 100644 
+ - - - a / actor - server / actor - persist / src / main / resources / sql / migration / V20160623061400 _ _ AddTimestampIndexToSequence . sql 
+ + + + b / actor - server / actor - persist / src / main / resources / sql / migration / V20160623061400 _ _ AddTimestampIndexToSequence . sql 
+ @ @ - 1 + 1 , 2 @ @ 
+ CREATE INDEX ON user _ sequence ( user _ id , timestamp ) ; 
+ + create index ON auth _ sessions ( auth _ id ) ; 
+ diff - - git a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / sequence / SequenceServiceImpl . scala b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / sequence / SequenceServiceImpl . scala 
+ index 2d1db00 . . 37817bb 100644 
+ - - - a / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / sequence / SequenceServiceImpl . scala 
+ + + + b / actor - server / actor - rpc - api / src / main / scala / im / actor / server / api / rpc / service / sequence / SequenceServiceImpl . scala 
+ @ @ - 16 , 7 + 16 , 7 @ @ import im . actor . api . rpc . misc . { ResponseSeq , ResponseVoid } 
+ import im . actor . api . rpc . peers . { ApiGroupOutPeer , ApiUserOutPeer } 
+ import im . actor . server . db . DbExtension 
+ import im . actor . server . group . { GroupExtension , GroupUtils } 
+ - import im . actor . server . sequence . { Difference , SeqUpdatesExtension } 
+ + import im . actor . server . sequence . { Difference , SeqState , SeqUpdatesExtension } 
+ import im . actor . server . session . _ 
+ import im . actor . server . user . UserUtils 
+ import im . actor . server . db . ActorPostgresDriver . api . _ 
+ @ @ - 46 , 14 + 46 , 13 @ @ final class SequenceServiceImpl ( config : SequenceServiceConfig ) ( 
+ override def doHandleGetState ( optimizations : IndexedSeq [ ApiUpdateOptimization . ApiUpdateOptimization ] , clientData : ClientData ) : Future [ HandlerResult [ ResponseSeq ] ] = 
+ authorized ( clientData ) { implicit client ⇒ 
+ subscribeToSeq ( optimizations ) 
+ - val action = for { 
+ - seqState ← DBIO . from ( seqUpdExt . getSeqState ( client . userId , clientData . authId ) ) 
+ - } yield Ok ( ResponseSeq ( seqState . seq , seqState . state . toByteArray ) ) 
+ - db . run ( action ) 
+ + for { 
+ + SeqState ( seq , state ) ← seqUpdExt . getSeqState ( client . userId , clientData . authId ) 
+ + } yield Ok ( ResponseSeq ( seq , state . toByteArray ) ) 
+ } 
+ 
+ override def doHandleGetDifference ( 
+ - seq : Int , 
+ + clientSeq : Int , 
+ commonState : Array [ Byte ] , 
+ optimizations : IndexedSeq [ ApiUpdateOptimization . ApiUpdateOptimization ] , 
+ clientData : ClientData 
+ @ @ - 63 , 10 + 62 , 10 @ @ final class SequenceServiceImpl ( config : SequenceServiceConfig ) ( 
+ 
+ for { 
+ / / FIXME : would new updates between getSeqState and getDifference break client state ? 
+ - Difference ( updates , clientSeq , newCommonState , needMore ) ← seqUpdExt . getDifference ( 
+ + Difference ( updates , newClientSeq , newCommonState , needMore ) ← seqUpdExt . getDifference ( 
+ userId = client . userId , 
+ - clientSeq = seq , 
+ - state = commonState , 
+ + clientSeq = clientSeq , 
+ + commonState = commonState , 
+ authId = client . authId , 
+ authSid = client . authSid , 
+ maxSizeInBytes = maxDifferenceSize 
+ @ @ - 77 , 7 + 76 , 7 @ @ final class SequenceServiceImpl ( config : SequenceServiceConfig ) ( 
+ ( userRefs , groupRefs ) ← getRefs ( userIds , groupIds , optimizations , client ) 
+ } yield { 
+ Ok ( ResponseGetDifference ( 
+ - seq = clientSeq , 
+ + seq = newClientSeq , 
+ state = newCommonState , 
+ updates = diffUpdates , 
+ needMore = needMore , 
+ diff - - git a / actor - server / actor - testkit / src / main / scala / im / actor / server / BaseAppSuite . scala b / actor - server / actor - testkit / src / main / scala / im / actor / server / BaseAppSuite . scala 
+ index c520008 . . 8b488f8 100644 
+ - - - a / actor - server / actor - testkit / src / main / scala / im / actor / server / BaseAppSuite . scala 
+ + + + b / actor - server / actor - testkit / src / main / scala / im / actor / server / BaseAppSuite . scala 
+ @ @ - 1 , 15 + 1 , 16 @ @ 
+ package im . actor . server 
+ 
+ + import java . time . Instant 
+ + 
+ import akka . actor . ActorSystem 
+ import akka . stream . ActorMaterializer 
+ import org . scalatest . concurrent . ScalaFutures 
+ import org . scalatest . time . { Seconds , Span } 
+ - import org . scalatest . { Inside , FlatSpecLike , Matchers } 
+ - import slick . driver . PostgresDriver 
+ + import org . scalatest . { FlatSpecLike , Inside , Matchers } 
+ 
+ import scala . concurrent . ExecutionContext 
+ - 
+ import im . actor . server . db . DbExtension 
+ + import im . actor . server . migrations . v2 . { MigrationNameList , MigrationTsActions } 
+ 
+ abstract class BaseAppSuite ( _ system : ActorSystem = { 
+ ActorSpecification . createSystem ( ) 
+ @ @ - 27 , 12 + 28 , 19 @ @ abstract class BaseAppSuite ( _ system : ActorSystem = { 
+ protected implicit val materializer : ActorMaterializer = ActorMaterializer ( ) 
+ implicit lazy val ec : ExecutionContext = _ system . dispatcher 
+ 
+ - protected implicit lazy val db : PostgresDriver . api . Database = { 
+ + protected implicit lazy val ( db , conn ) = { 
+ DbExtension ( _ system ) . clean ( ) 
+ DbExtension ( _ system ) . migrate ( ) 
+ - DbExtension ( _ system ) . db 
+ + val ext = DbExtension ( _ system ) 
+ + ( ext . db , ext . connector ) 
+ } 
+ 
+ + system . log . debug ( " Writing migration timestamps " ) 
+ + MigrationTsActions . insertTimestamp ( 
+ + MigrationNameList . MultiSequence , 
+ + Instant . now . toEpochMilli 
+ + ) ( conn ) 
+ + 
+ override implicit def patienceConfig : PatienceConfig = 
+ new PatienceConfig ( timeout = Span ( 15 , Seconds ) ) 
+ 
+ diff - - git a / actor - server / actor - testkit / src / main / scala / im / actor / server / SeqUpdateMatchers . scala b / actor - server / actor - testkit / src / main / scala / im / actor / server / SeqUpdateMatchers . scala 
+ index 20855ae . . abce5d8 100644 
+ - - - a / actor - server / actor - testkit / src / main / scala / im / actor / server / SeqUpdateMatchers . scala 
+ + + + b / actor - server / actor - testkit / src / main / scala / im / actor / server / SeqUpdateMatchers . scala 
+ @ @ - 182 , 9 + 182 , 10 @ @ trait SeqUpdateMatchers extends Matchers with ScalaFutures with AnyRefLogSource 
+ Long . MaxValue 
+ ) 
+ . map { diff ⇒ 
+ - diff . updates → mkSeqState ( diff . seq , diff . commonState ) 
+ + diff . updates → mkSeqState ( diff . clientSeq , diff . commonState ) 
+ } ( system . dispatcher ) 
+ 
+ + / / TODO : move it to separate . decouple from updates . 
+ @ tailrec 
+ final def repeatAfterSleep [ T ] ( times : Int ) ( f : ⇒ T ) : T = { 
+ Try ( f ) match { 
+ diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ContactsServiceSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ContactsServiceSpec . scala 
+ index 2afeb65 . . 5e2aa3f 100644 
+ - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ContactsServiceSpec . scala 
+ + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / ContactsServiceSpec . scala 
+ @ @ - 110 , 7 + 110 , 7 @ @ final class ContactsServiceSpec 
+ 
+ implicit val clientData = api . ClientData ( authId , sessionId , Some ( AuthData ( user . id , authSid , 42 ) ) ) 
+ 
+ - def add ( firstRun : Boolean = true , expectedUpdSeq : Int = 1 ) = { 
+ + def add ( firstRun : Boolean = true , expectedUpdSeq : Int = 2 ) = { 
+ whenReady ( service . handleAddContact ( user2 . id , user2AccessHash ) ) { resp ⇒ 
+ resp should matchPattern { 
+ case Ok ( ResponseSeq ( seq , state ) ) if seq = = expectedUpdSeq ⇒ 
+ @ @ - 158 , 7 + 158 , 7 @ @ final class ContactsServiceSpec 
+ def remove ( ) = { 
+ whenReady ( service . handleRemoveContact ( user2 . id , user2AccessHash ) ) { resp ⇒ 
+ resp should matchPattern { 
+ - case Ok ( ResponseSeq ( 3 , state ) ) ⇒ 
+ + case Ok ( ResponseSeq ( 4 , state ) ) ⇒ 
+ } 
+ } 
+ 
+ @ @ - 169 , 7 + 169 , 7 @ @ final class ContactsServiceSpec 
+ } 
+ } 
+ 
+ - def addAfterRemove ( ) = add ( firstRun = false , expectedUpdSeq = 4 ) 
+ + def addAfterRemove ( ) = add ( firstRun = false , expectedUpdSeq = 5 ) 
+ } 
+ 
+ object imprt { 
+ diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / GroupsServiceSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / GroupsServiceSpec . scala 
+ index 552d2cf . . bd83d3b 100644 
+ - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / GroupsServiceSpec . scala 
+ + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / GroupsServiceSpec . scala 
+ @ @ - 128 , 7 + 128 , 7 @ @ final class GroupsServiceSpec 
+ 
+ whenReady ( service . handleInviteUser ( groupOutPeer , Random . nextLong ( ) , user2OutPeer , Vector . empty ) ) { resp ⇒ 
+ resp should matchPattern { 
+ - case Ok ( ResponseSeqDate ( 3 , _ , _ ) ) ⇒ 
+ + case Ok ( ResponseSeqDate ( 4 , _ , _ ) ) ⇒ 
+ } 
+ } 
+ expectUpdate ( classOf [ UpdateGroupUserInvitedObsolete ] ) ( identity ) 
+ @ @ - 159 , 7 + 159 , 7 @ @ final class GroupsServiceSpec 
+ 
+ whenReady ( service . handleEditGroupTitle ( groupOutPeer , Random . nextLong ( ) , " Very fun group " , Vector . empty ) ) { resp ⇒ 
+ resp should matchPattern { 
+ - case Ok ( ResponseSeqDate ( 4 , _ , _ ) ) ⇒ 
+ + case Ok ( ResponseSeqDate ( 5 , _ , _ ) ) ⇒ 
+ } 
+ } 
+ expectUpdate ( classOf [ UpdateChatGroupsChanged ] ) ( identity ) 
+ diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / SequenceServiceSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / SequenceServiceSpec . scala 
+ index 54ea27f . . 70166d1 100644 
+ - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / SequenceServiceSpec . scala 
+ + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / api / rpc / service / SequenceServiceSpec . scala 
+ @ @ - 1 , 6 + 1 , 5 @ @ 
+ package im . actor . server . api . rpc . service 
+ 
+ - import com . google . protobuf . CodedInputStream 
+ import com . typesafe . config . ConfigFactory 
+ import im . actor . api . rpc . _ 
+ import im . actor . api . rpc . contacts . UpdateContactsAdded 
+ @ @ - 11 , 7 + 10 , 7 @ @ import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType } 
+ import im . actor . api . rpc . sequence . { ApiUpdateContainer , ApiUpdateOptimization , ResponseGetDifference , UpdateEmptyUpdate } 
+ import im . actor . server . _ 
+ import im . actor . server . api . rpc . service . sequence . SequenceServiceConfig 
+ - import im . actor . server . sequence . { CommonState , CommonStateVersion } 
+ + import im . actor . server . sequence . { CommonState , CommonStateVersion , UserSequence } 
+ 
+ import scala . concurrent . Future 
+ 
+ @ @ - 47 , 7 + 46 , 7 @ @ final class SequenceServiceSpec extends BaseAppSuite ( { 
+ implicit val clientData = ClientData ( authId , sessionId , Some ( AuthData ( user . id , authSid , 42 ) ) ) 
+ 
+ whenReady ( service . handleGetState ( Vector . empty ) ) { res ⇒ 
+ - res should matchPattern { case Ok ( ResponseSeq ( 0 , _ ) ) ⇒ } 
+ + res should matchPattern { case Ok ( ResponseSeq ( 1 , _ ) ) ⇒ } 
+ } 
+ } 
+ 
+ @ @ - 119 , 11 + 118 , 11 @ @ final class SequenceServiceSpec extends BaseAppSuite ( { 
+ ( updates . map ( _ . toByteArray . length ) . sum < = withError ( config . maxDifferenceSize ) ) shouldEqual true 
+ needMore shouldEqual false 
+ totalUpdates + + = updates 
+ - diff . seq shouldEqual seq2 + updates . length 
+ + diff . seq shouldEqual seq2 + updates . length + UserSequence . Const . SeqStart / / this is real user ' s seq 
+ } 
+ val commonState = CommonState . parseFrom ( diff . state ) 
+ commonState . version shouldEqual CommonStateVersion . V1 
+ - commonState . seq shouldEqual diff . seq 
+ + commonState . seq shouldEqual diff . seq - UserSequence . Const . SeqStart / / user ' s seq starts from ` UserSequence . Const . SeqStart ` - take away difference 
+ ( diff . seq , diff . state ) 
+ } 
+ } 
+ @ @ - 137 , 8 + 136 , 9 @ @ final class SequenceServiceSpec extends BaseAppSuite ( { 
+ } 
+ 
+ totalUpdates . length shouldEqual 3841 
+ - finalSeq shouldEqual 3841 
+ - CommonState . parseFrom ( finalState ) . seq shouldEqual 3841 
+ + val current = getCurrentState 
+ + finalSeq shouldEqual current . seq 
+ + CommonState . parseFrom ( finalState ) . seq shouldEqual CommonState . parseFrom ( current . state . toByteArray ) . seq 
+ } 
+ 
+ def bigUpdate ( ) = { 
+ diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / migrations / MigrationTsSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / migrations / MigrationTsSpec . scala 
+ new file mode 100644 
+ index 0000000 . . ef0819f 
+ - - - / dev / null 
+ + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / migrations / MigrationTsSpec . scala 
+ @ @ - 0 , 0 + 1 , 24 @ @ 
+ + package im . actor . server . migrations 
+ + 
+ + import im . actor . server . BaseAppSuite 
+ + import im . actor . server . db . DbExtension 
+ + import im . actor . server . migrations . v2 . MigrationTsActions 
+ + 
+ + class MigrationTsSpec extends BaseAppSuite { 
+ + 
+ + " Migration timestamp " should " be written only once , and never changed " in writeOnce ( ) 
+ + 
+ + def writeOnce ( ) : Unit = { 
+ + val conn = DbExtension ( system ) . connector 
+ + 
+ + val initialTs = System . currentTimeMillis - 1000 
+ + MigrationTsActions . insertTimestamp ( " test - migration - 2016 - 07 - 03 " , initialTs ) ( conn ) 
+ + 
+ + val secondTs = System . currentTimeMillis + 2000 
+ + MigrationTsActions . insertTimestamp ( " test - migration - 2016 - 07 - 03 " , secondTs ) ( conn ) 
+ + 
+ + val optTs = MigrationTsActions . getTimestamp ( " test - migration - 2016 - 07 - 03 " ) ( conn ) 
+ + optTs should not be empty 
+ + optTs . get shouldEqual initialTs 
+ + } 
+ + } 
+ diff - - git a / actor - server / actor - tests / src / test / scala / im / actor / server / sequence / UserSequenceSpec . scala b / actor - server / actor - tests / src / test / scala / im / actor / server / sequence / UserSequenceSpec . scala 
+ index ba36ff5 . . dc213d8 100644 
+ - - - a / actor - server / actor - tests / src / test / scala / im / actor / server / sequence / UserSequenceSpec . scala 
+ + + + b / actor - server / actor - tests / src / test / scala / im / actor / server / sequence / UserSequenceSpec . scala 
+ @ @ - 52 , 13 + 52 , 13 @ @ final class UserSequenceSpec extends BaseAppSuite ( 
+ { 
+ probe . send ( region . ref , deliverEnv ) 
+ val msg = probe . receiveOne ( 5 . seconds ) . asInstanceOf [ SeqState ] 
+ - msg . seq should = = = ( 1 ) 
+ + msg . seq shouldEqual 2 
+ } 
+ 
+ { 
+ probe . send ( region . ref , deliverEnv ) 
+ val msg = probe . receiveOne ( 1 . second ) . asInstanceOf [ SeqState ] 
+ - msg . seq should = = = ( 2 ) 
+ + msg . seq shouldEqual 3 
+ } 
+ 
+ probe . expectNoMsg ( 3 . seconds ) 
+ @ @ - 66 , 19 + 66 , 19 @ @ final class UserSequenceSpec extends BaseAppSuite ( 
+ { 
+ probe . send ( region . ref , deliverEnv ) 
+ val msg = probe . receiveOne ( 1 . second ) . asInstanceOf [ SeqState ] 
+ - msg . seq should = = = ( 3 ) 
+ + msg . seq shouldEqual 4 
+ } 
+ 
+ for ( a ← 1 to 600 ) 
+ probe . send ( region . ref , deliverEnv ) 
+ 
+ - probe . receiveN ( 600 , 5 . seconds ) / / seq = 603 
+ + probe . receiveN ( 600 , 5 . seconds ) / / seq = 604 
+ probe . expectNoMsg ( 4 . seconds ) 
+ 
+ { 
+ probe . send ( region . ref , deliverEnv ) 
+ val msg = probe . receiveOne ( 5 . seconds ) . asInstanceOf [ SeqState ] 
+ - msg . seq should = = = ( 604 ) 
+ + msg . seq shouldEqual 605 
+ } 
+ } 
+ 
+ @ @ - 97 , 7 + 97 , 7 @ @ final class UserSequenceSpec extends BaseAppSuite ( 
+ ) 
+ ) 
+ 
+ - val futures = for ( i ← 1 to 500 ) yield { 
+ + val futures = for ( i ← 2 to 501 ) yield { 
+ val f = ( region . ref ? deliverEnv ) 
+ . mapTo [ SeqState ] 
+ 
+ diff - - git a / actor - server / project / Dependencies . scala b / actor - server / project / Dependencies . scala 
+ index e4e0a56 . . cfeaa24 100644 
+ - - - a / actor - server / project / Dependencies . scala 
+ + + + b / actor - server / project / Dependencies . scala 
+ @ @ - 4 , 7 + 4 , 7 @ @ import sbt . _ 
+ 
+ object Dependencies { 
+ object V { 
+ - val actorCommons = " 0 . 0 . 17 " 
+ + val actorCommons = " 0 . 0 . 18 " 
+ val actorBotkit = " 1 . 0 . 109 " 
+ val akka = " 2 . 4 . 7 " 
+ val akkaHttpJson = " 1 . 5 . 0 "
+
+NEAREST DIFF:
+diff - - git a / actor - server / actor - bot - messages / src / main / scala / im / actor / bot / BotMessages . scala b / actor - server / actor - bot - messages / src / main / scala / im / actor / bot / BotMessages . scala 
+ new file mode 100644 
+ index 0000000 . . 9b8e44a 
+ - - - / dev / null 
+ + + + b / actor - server / actor - bot - messages / src / main / scala / im / actor / bot / BotMessages . scala 
+ @ @ - 0 , 0 + 1 , 33 @ @ 
+ + package im . actor . bot 
+ + 
+ + import derive . key 
+ + 
+ + sealed trait BotMessage 
+ + 
+ + final object BotMessages { 
+ + final object OutPeer { 
+ + def privat ( id : Int , accessHash : Long ) = OutPeer ( 1 , id , accessHash ) 
+ + def group ( id : Int , accessHash : Long ) = OutPeer ( 2 , id , accessHash ) 
+ + } 
+ + final case class OutPeer ( ` type ` : Int , id : Int , accessHash : Long ) 
+ + final case class Peer ( ` type ` : Int , id : Int ) 
+ + 
+ + sealed trait RequestBody 
+ + 
+ + final case class BotRequest ( id : Long , body : RequestBody ) extends BotMessage 
+ + 
+ + @ key ( " SendMessage " ) 
+ + final case class SendTextMessage ( peer : OutPeer , randomId : Long , message : String ) extends RequestBody 
+ + 
+ + sealed trait ResponseBody 
+ + 
+ + final case class BotResponse ( id : Long , body : ResponseBody ) extends BotMessage 
+ + 
+ + @ key ( " MessageSent " ) 
+ + final case class MessageSent ( date : Long ) extends ResponseBody 
+ + 
+ + sealed trait BotUpdate extends BotMessage 
+ + 
+ + @ key ( " TextMessage " ) 
+ + final case class TextMessage ( peer : Peer , senderUserId : Int , date : Long , randomId : Long , message : String ) extends BotUpdate 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - bot / src / main / scala / im / actor / server / bot / BotExtension . scala b / actor - server / actor - bot / src / main / scala / im / actor / server / bot / BotExtension . scala 
+ new file mode 100644 
+ index 0000000 . . f2d446e 
+ - - - / dev / null 
+ + + + b / actor - server / actor - bot / src / main / scala / im / actor / server / bot / BotExtension . scala 
+ @ @ - 0 , 0 + 1 , 98 @ @ 
+ + package im . actor . server . bot 
+ + 
+ + import akka . actor . { ExtendedActorSystem , ExtensionId , ActorSystem , Extension } 
+ + import akka . util . Timeout 
+ + import im . actor . api . rpc . users . ApiSex 
+ + import im . actor . config . ActorConfig 
+ + import im . actor . server . acl . ACLUtils 
+ + import im . actor . server . db . DbExtension 
+ + import im . actor . server . user . UserExtension 
+ + import im . actor . server . persist 
+ + import im . actor . util . misc . IdUtils 
+ + import shardakka . ShardakkaExtension 
+ + 
+ + import scala . concurrent . Future 
+ + 
+ + object BotExtension extends ExtensionId [ BotExtension ] { 
+ + private [ bot ] val tokensKV = " BotsTokens " 
+ + 
+ + override def createExtension ( system : ExtendedActorSystem ) : BotExtension = new BotExtensionImpl ( system ) 
+ + } 
+ + 
+ + trait BotExtension extends Extension { 
+ + type Token = String 
+ + type UserId = Int 
+ + type AuthId = Long 
+ + 
+ + / * * 
+ + * Creates a bot user 
+ + * 
+ + * @ return token future 
+ + * / 
+ + def create ( name : String ) : Future [ Token ] 
+ + 
+ + / * * 
+ + * Gets userId associated with token 
+ + * 
+ + * @ param token 
+ + * @ return user id 
+ + * / 
+ + def getUserId ( token : String ) : Future [ Option [ UserId ] ] 
+ + 
+ + / * * 
+ + * Gets or creates bot auth id 
+ + * @ param token 
+ + * @ return auth id 
+ + * / 
+ + def getAuthId ( token : String ) : Future [ Option [ AuthId ] ] 
+ + } 
+ + 
+ + private [ bot ] final class BotExtensionImpl ( _ system : ActorSystem ) extends BotExtension { 
+ + import _ system . _ 
+ + 
+ + private implicit val system = _ system 
+ + private implicit val timeout = Timeout ( ActorConfig . defaultTimeout ) 
+ + 
+ + private lazy val userExt = UserExtension ( system ) 
+ + private lazy val tokensKV = ShardakkaExtension ( system ) . simpleKeyValue ( BotExtension . tokensKV ) 
+ + private lazy val db = DbExtension ( system ) . db 
+ + 
+ + override def create ( name : String ) : Future [ Token ] = { 
+ + val userId = IdUtils . nextIntId ( ) 
+ + val token = ACLUtils . randomHash ( ) 
+ + 
+ + for { 
+ + user ← userExt . create ( 
+ + userId = userId , 
+ + accessSalt = ACLUtils . nextAccessSalt ( ) , 
+ + name = name , 
+ + countryCode = " US " , 
+ + sex = ApiSex . Unknown , 
+ + isBot = true 
+ + ) 
+ + _ ← tokensKV . upsert ( token , s " $ userId " ) 
+ + } yield token 
+ + } 
+ + 
+ + override def getUserId ( token : String ) : Future [ Option [ UserId ] ] = { 
+ + for { 
+ + tokOpt ← tokensKV . get ( token ) 
+ + } yield tokOpt map ( _ . toInt ) 
+ + } 
+ + 
+ + override def getAuthId ( token : String ) : Future [ Option [ AuthId ] ] = { 
+ + getUserId ( token ) flatMap { 
+ + case Some ( userId ) ⇒ getOrCreateAuthId ( userId ) map ( Some ( _ ) ) 
+ + case None ⇒ Future . successful ( None ) 
+ + } 
+ + } 
+ + 
+ + private def getOrCreateAuthId ( userId : Int ) : Future [ AuthId ] = { 
+ + db . run ( persist . AuthId . findFirstIdByUserId ( userId ) ) flatMap { 
+ + case Some ( authId ) ⇒ Future . successful ( authId ) 
+ + case None ⇒ 
+ + val authId = ACLUtils . randomLong ( ) 
+ + db . run ( persist . AuthId . create ( authId , Some ( userId ) , None ) ) map ( _ ⇒ authId ) 
+ + } 
+ + } 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / acl / ACLUtils . scala b / actor - server / actor - core / src / main / scala / im / actor / server / acl / ACLUtils . scala 
+ index ba37e90 . . 734f1f9 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / acl / ACLUtils . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / acl / ACLUtils . scala 
+ @ @ - 46 , 7 + 46 , 18 @ @ object ACLUtils { 
+ def authTransactionHash ( accessSalt : String ) ( implicit s : ActorSystem ) : String = 
+ DigestUtils . sha1Hex ( s " $ accessSalt : $ { secretKey ( ) } " ) 
+ 
+ - def nextAccessSalt ( rng : ThreadLocalRandom ) : String = rng . nextLong ( ) . toString 
+ + def randomHash ( ) ( implicit s : ActorSystem ) : String = 
+ + DigestUtils . sha1Hex ( s " $ { randomString ( ) } : $ { secretKey ( ) } " ) 
+ + 
+ + def randomLong ( ) : Long = randomLong ( ThreadLocalRandom . current ( ) ) 
+ + 
+ + def randomLong ( rng : ThreadLocalRandom ) : Long = rng . nextLong ( ) 
+ + 
+ + def randomString ( ) : String = randomString ( ThreadLocalRandom . current ( ) ) 
+ + 
+ + def randomString ( rng : ThreadLocalRandom ) : String = rng . nextLong ( ) . toString 
+ + 
+ + def nextAccessSalt ( rng : ThreadLocalRandom ) : String = randomString ( rng ) 
+ 
+ def nextAccessSalt ( ) : String = { 
+ nextAccessSalt ( ThreadLocalRandom . current ( ) ) 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala 
+ index bd3b59c . . 79e425b 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / dialog / DialogExtension . scala 
+ @ @ - 5 , 6 + 5 , 7 @ @ import akka . pattern . ask 
+ import akka . util . Timeout 
+ import im . actor . api . rpc . messaging . ApiMessage 
+ import im . actor . api . rpc . misc . ApiExtension 
+ + import im . actor . api . rpc . peers . ApiPeer 
+ import im . actor . api . rpc . peers . ApiPeerType . _ 
+ import im . actor . api . rpc . peers . ApiPeerType . ApiPeerType 
+ import im . actor . extension . InternalExtensions 
+ @ @ - 28 , 7 + 29 , 17 @ @ final class DialogExtensionImpl ( system : ActorSystem ) extends DialogExtension { 
+ 
+ implicit val s : ActorSystem = system 
+ implicit val ec : ExecutionContext = system . dispatcher 
+ - implicit val timeout : Timeout = Timeout ( 20 . seconds ) / / TODO : configurable 
+ + implicit val timeout : Timeout = Timeout ( 20 . seconds ) / / TODO : configurable 
+ + 
+ + def sendMessage ( 
+ + peer : ApiPeer , 
+ + senderUserId : Int , 
+ + senderAuthId : Long , 
+ + randomId : Long , 
+ + message : ApiMessage , 
+ + isFat : Boolean 
+ + ) : Future [ SeqStateDate ] = 
+ + sendMessage ( peer . ` type ` , peer . id , senderUserId , senderAuthId , randomId , message , isFat ) 
+ 
+ def sendMessage ( peerType : ApiPeerType , peerId : Int , senderUserId : Int , senderAuthId : Long , randomId : Long , message : ApiMessage , isFat : Boolean = false ) : Future [ SeqStateDate ] = { 
+ ( peerType match { 
+ @ @ - 83 , 4 + 94 , 4 @ @ object DialogExtension extends ExtensionId [ DialogExtensionImpl ] with ExtensionId 
+ override def lookup = DialogExtension 
+ 
+ override def createExtension ( system : ExtendedActorSystem ) = new DialogExtensionImpl ( system ) 
+ - } 
+ \ No newline at end of file 
+ + } 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ index 9552f85 . . 56fd62a 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ @ @ - 8 , 7 + 8 , 7 @ @ import slick . driver . PostgresDriver . api . _ 
+ 
+ import scala . concurrent . duration . _ 
+ import scala . concurrent . { Future , Promise } 
+ - import scala . util . { Failure , Success , Try } 
+ + import scala . util . Try 
+ 
+ sealed trait SeqUpdatesExtension extends Extension { 
+ val region : SeqUpdatesManagerRegion 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UpdatesConsumer . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UpdatesConsumer . scala 
+ index cd328be . . 2a6c005 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UpdatesConsumer . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UpdatesConsumer . scala 
+ @ @ - 10 , 11 + 10 , 11 @ @ import im . actor . api . rpc . users . ApiUser 
+ import im . actor . api . rpc . weak . { UpdateGroupOnline , UpdateUserLastSeen , UpdateUserOffline , UpdateUserOnline } 
+ import im . actor . api . rpc . { Update , UpdateBox ⇒ ProtoUpdateBox } 
+ import im . actor . server . db . DbExtension 
+ - import im . actor . server . group . { GroupExtension , GroupOffice , GroupViewRegion } 
+ + import im . actor . server . group . GroupExtension 
+ import im . actor . server . mtproto . protocol . UpdateBox 
+ import im . actor . server . persist 
+ import im . actor . server . presences . _ 
+ - import im . actor . server . user . { UserExtension , UserOffice , UserViewRegion } 
+ + import im . actor . server . user . UserExtension 
+ import org . joda . time . DateTime 
+ 
+ import scala . concurrent . _ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala 
+ index b06a574 . . 533795b 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala 
+ @ @ - 33 , 9 + 33 , 17 @ @ private [ user ] sealed trait Commands extends AuthCommands { 
+ 
+ implicit val timeout : Timeout 
+ 
+ - def create ( userId : Int , accessSalt : String , name : String , countryCode : String , sex : ApiSex . ApiSex , isBot : Boolean , extensions : Seq [ ApiExtension ] , external : Option [ String ] ) : Future [ CreateAck ] = { 
+ + def create ( 
+ + userId : Int , 
+ + accessSalt : String , 
+ + name : String , 
+ + countryCode : String , 
+ + sex : ApiSex . ApiSex , 
+ + isBot : Boolean , 
+ + extensions : Seq [ ApiExtension ] = Seq . empty , 
+ + external : Option [ String ] = None 
+ + ) : Future [ CreateAck ] = 
+ ( processorRegion . ref ? Create ( userId , accessSalt , name , countryCode , sex , isBot , extensions , external ) ) . mapTo [ CreateAck ] 
+ - } 
+ 
+ def addPhone ( userId : Int , phone : Long ) : Future [ Unit ] = { 
+ ( processorRegion . ref ? AddPhone ( userId , phone ) ) . mapTo [ AddPhoneAck ] map ( _ ⇒ ( ) ) 
+ diff - - git a / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotBlueprint . scala b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotBlueprint . scala 
+ new file mode 100644 
+ index 0000000 . . 940b6dd 
+ - - - / dev / null 
+ + + + b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotBlueprint . scala 
+ @ @ - 0 , 0 + 1 , 68 @ @ 
+ + package im . actor . server . api . http . bots 
+ + 
+ + import akka . actor . ActorSystem 
+ + import akka . stream . scaladsl . { Flow , Merge , Source } 
+ + import im . actor . api . rpc . messaging . ApiTextMessage 
+ + import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType } 
+ + import im . actor . bot . BotMessages 
+ + import im . actor . server . dialog . DialogExtension 
+ + import im . actor . server . sequence . SeqStateDate 
+ + import upickle . default . _ 
+ + 
+ + import scala . concurrent . Future 
+ + 
+ + final class BotBlueprint ( botUserId : Int , botAuthId : Long , system : ActorSystem ) { 
+ + 
+ + import BotMessages . _ 
+ + import akka . stream . scaladsl . FlowGraph . Implicits . _ 
+ + import system . _ 
+ + 
+ + private lazy val dialogExt = DialogExtension ( system ) 
+ + 
+ + val flow : Flow [ String , String , Unit ] = { 
+ + val updSource = 
+ + Source . actorPublisher [ BotUpdate ] ( UpdatesSource . props ( botAuthId ) ) 
+ + . map ( write [ BotUpdate ] ) 
+ + 
+ + val rqrspFlow = Flow [ String ] 
+ + . map ( parseMessage ) 
+ + . mapAsync ( 1 ) ( r ⇒ handleRequest ( r . id , r . body ) ) 
+ + . map ( write [ BotResponse ] ) 
+ + 
+ + Flow ( ) { implicit b ⇒ 
+ + val upd = b . add ( updSource ) 
+ + val rqrsp = b . add ( rqrspFlow ) 
+ + val merge = b . add ( Merge [ String ] ( 2 ) ) 
+ + 
+ + upd ~ > merge 
+ + rqrsp ~ > merge 
+ + 
+ + ( rqrsp . inlet , merge . out ) 
+ + } 
+ + } 
+ + 
+ + private def parseMessage ( source : String ) : BotRequest = read [ BotRequest ] ( source ) 
+ + 
+ + private def handleRequest ( id : Long , body : RequestBody ) : Future [ BotResponse ] = 
+ + for { 
+ + response ← handleRequestBody ( body ) 
+ + } yield BotResponse ( id , response ) 
+ + 
+ + private def handleRequestBody ( body : RequestBody ) : Future [ ResponseBody ] = body match { 
+ + case SendTextMessage ( peer , randomId , message ) ⇒ sendTextMessage ( peer , randomId , message ) 
+ + } 
+ + 
+ + private def sendTextMessage ( peer : OutPeer , randomId : Long , message : String ) : Future [ ResponseBody ] = { 
+ + / / FIXME : check access hash 
+ + for { 
+ + SeqStateDate ( _ , _ , date ) ← dialogExt . sendMessage ( 
+ + peer = ApiPeer ( ApiPeerType ( peer . ` type ` ) , peer . id ) , 
+ + senderUserId = botUserId , 
+ + senderAuthId = 0L , 
+ + randomId = randomId , 
+ + message = ApiTextMessage ( message , Vector . empty , None ) , 
+ + isFat = false 
+ + ) 
+ + } yield MessageSent ( date ) 
+ + } 
+ + } 
+ diff - - git a / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotsHandler . scala b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotsHandler . scala 
+ new file mode 100644 
+ index 0000000 . . efa0994 
+ - - - / dev / null 
+ + + + b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / BotsHandler . scala 
+ @ @ - 0 , 0 + 1 , 46 @ @ 
+ + package im . actor . server . api . http . bots 
+ + 
+ + import akka . actor . ActorSystem 
+ + import akka . http . scaladsl . model . ws . { Message , TextMessage } 
+ + import akka . http . scaladsl . server . Directives . _ 
+ + import akka . http . scaladsl . server . Route 
+ + import akka . stream . scaladsl . Flow 
+ + import cats . data . OptionT 
+ + import cats . std . future . _ 
+ + import im . actor . server . api . http . RoutesHandler 
+ + import im . actor . server . bot . BotExtension 
+ + 
+ + import scala . util . control . NoStackTrace 
+ + 
+ + private [ http ] final class BotsHandler ( system : ActorSystem ) extends RoutesHandler { 
+ + 
+ + import system . _ 
+ + 
+ + private val botExt = BotExtension ( system ) 
+ + 
+ + override def routes : Route = path ( " bots " / Segment ) { token ⇒ 
+ + val flowFuture = ( for { 
+ + userId ← OptionT ( botExt . getUserId ( token ) ) 
+ + authId ← OptionT ( botExt . getAuthId ( token ) ) 
+ + } yield flow ( userId , authId ) ) . value map { 
+ + case Some ( r ) ⇒ r 
+ + case None ⇒ throw new RuntimeException ( " Wrong token " ) with NoStackTrace 
+ + } 
+ + 
+ + onSuccess ( flowFuture ) { 
+ + case flow ⇒ handleWebsocketMessages ( flow ) 
+ + } 
+ + } 
+ + 
+ + private def flow ( botUserId : Int , botAuthId : Long ) = { 
+ + val bp = new BotBlueprint ( botUserId , botAuthId , system ) 
+ + 
+ + Flow [ Message ] 
+ + . collect { 
+ + case TextMessage . Strict ( text ) ⇒ text 
+ + case tm : TextMessage ⇒ throw new RuntimeException ( " Streamed text message is not supported " ) with NoStackTrace 
+ + } 
+ + . via ( bp . flow ) 
+ + . map ( TextMessage . Strict ( _ ) . asInstanceOf [ Message ] ) 
+ + } 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / UpdatesSource . scala b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / UpdatesSource . scala 
+ new file mode 100644 
+ index 0000000 . . 40f3804 
+ - - - / dev / null 
+ + + + b / actor - server / actor - http - api / src / main / scala / im / actor / server / api / http / bots / UpdatesSource . scala 
+ @ @ - 0 , 0 + 1 , 95 @ @ 
+ + package im . actor . server . api . http . bots 
+ + 
+ + import akka . actor . { ActorLogging , Props } 
+ + import akka . stream . actor . ActorPublisher 
+ + import im . actor . api . rpc . codecs . _ 
+ + import im . actor . api . rpc . messaging . { ApiTextMessage , UpdateMessage } 
+ + import im . actor . api . rpc . sequence . SeqUpdate 
+ + import im . actor . bot . BotMessages 
+ + import im . actor . server . mtproto . protocol . UpdateBox 
+ + import im . actor . server . presences . { GroupPresenceManager , PresenceManager } 
+ + import im . actor . server . sequence . { UpdatesConsumer , WeakUpdatesManager } 
+ + 
+ + import scala . annotation . tailrec 
+ + 
+ + private [ bots ] object UpdatesSource { 
+ + def props ( authId : Long ) = Props ( classOf [ UpdatesSource ] , authId ) 
+ + } 
+ + 
+ + private class UpdatesSource ( authId : Long ) extends ActorPublisher [ BotMessages . BotUpdate ] with ActorLogging { 
+ + 
+ + import BotMessages . { Peer , TextMessage } 
+ + import akka . stream . actor . ActorPublisherMessage . _ 
+ + import context . _ 
+ + import im . actor . server . sequence . NewUpdate 
+ + 
+ + private implicit val weakUpdatesManagerRegion = WeakUpdatesManager . startRegionProxy ( ) 
+ + private implicit val presenceManagerRegion = PresenceManager . startRegionProxy ( ) 
+ + private implicit val groupPresenceManagerRegion = GroupPresenceManager . startRegionProxy ( ) 
+ + 
+ + context . actorOf ( UpdatesConsumer . props ( authId , self ) , " updatesConsumer " ) 
+ + 
+ + private var buf = Vector . empty [ BotMessages . BotUpdate ] 
+ + 
+ + def receive = { 
+ + case NewUpdate ( UpdateBox ( bodyBytes ) , _ ) ⇒ 
+ + UpdateBoxCodec . decode ( bodyBytes ) . require . value match { 
+ + case SeqUpdate ( _ , _ , header , body ) ⇒ 
+ + 
+ + header match { 
+ + case UpdateMessage . header ⇒ 
+ + UpdateMessage . parseFrom ( body ) match { 
+ + case Right ( upd ) ⇒ 
+ + upd . message match { 
+ + case ApiTextMessage ( message , _ , _ ) ⇒ 
+ + log . debug ( " Received ApiTextMessage " ) 
+ + enqueue ( TextMessage ( 
+ + peer = Peer ( upd . peer . ` type ` . id , upd . peer . id ) , 
+ + senderUserId = upd . senderUserId , 
+ + date = upd . date , 
+ + randomId = upd . randomId , 
+ + message = message 
+ + ) ) 
+ + case _ ⇒ 
+ + log . debug ( " Received non - text message , ignoring " ) 
+ + } 
+ + 
+ + case Left ( e ) ⇒ 
+ + log . error ( e , " Failed to parse UpdateMessage " ) 
+ + } 
+ + case _ ⇒ 
+ + log . debug ( " Received SeqUpdate with header : { } , ignoring " , header ) 
+ + } 
+ + case _ ⇒ 
+ + } 
+ + case Request ( _ ) ⇒ 
+ + deliverBuf ( ) 
+ + case Cancel ⇒ 
+ + context . stop ( self ) 
+ + } 
+ + 
+ + private def enqueue ( upd : BotMessages . BotUpdate ) : Unit = { 
+ + log . debug ( " Enqueuing { } " , upd ) 
+ + 
+ + if ( buf . isEmpty & & totalDemand > 0 ) { 
+ + onNext ( upd ) 
+ + } else { 
+ + buf : + = upd 
+ + deliverBuf ( ) 
+ + } 
+ + } 
+ + 
+ + @ tailrec final def deliverBuf ( ) : Unit = 
+ + if ( totalDemand > 0 ) { 
+ + if ( totalDemand < = Int . MaxValue ) { 
+ + val ( use , keep ) = buf . splitAt ( totalDemand . toInt ) 
+ + buf = keep 
+ + use foreach onNext 
+ + } else { 
+ + val ( use , keep ) = buf . splitAt ( Int . MaxValue ) 
+ + buf = keep 
+ + use foreach onNext 
+ + deliverBuf ( ) 
+ + } 
+ + } 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / AuthId . scala b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / AuthId . scala 
+ index 8e12f6e . . aa01de9 100644 
+ - - - a / actor - server / actor - persist / src / main / scala / im / actor / server / persist / AuthId . scala 
+ + + + b / actor - server / actor - persist / src / main / scala / im / actor / server / persist / AuthId . scala 
+ @ @ - 43 , 6 + 43 , 7 @ @ object AuthId { 
+ 
+ val activeByUserIdCompiled = Compiled ( ( userId : Rep [ Int ] ) ⇒ activeByUserId ( userId ) ) 
+ val activeIdByUserIdCompiled = Compiled ( ( userId : Rep [ Int ] ) ⇒ activeByUserId ( userId ) map ( _ . id ) ) 
+ + val firstActiveIdByUserIdCompiled = Compiled ( ( userId : Rep [ Int ] ) ⇒ activeByUserId ( userId ) map ( _ . id ) take ( 1 ) ) 
+ 
+ def activeIdByUserIds ( userIds : Set [ Int ] ) = activeAuthIds . filter ( _ . userId inSetBind userIds ) . map ( _ . id ) 
+ 
+ @ @ - 61 , 6 + 62 , 9 @ @ object AuthId { 
+ def findIdByUserId ( userId : Int ) = 
+ activeIdByUserIdCompiled ( userId ) . result 
+ 
+ + def findFirstIdByUserId ( userId : Int ) = 
+ + firstActiveIdByUserIdCompiled ( userId ) . result . headOption 
+ + 
+ def findIdByUserIds ( userIds : Set [ Int ] ) = 
+ activeIdByUserIds ( userIds ) . result 
+ 
+ diff - - git a / actor - server / actor - runner / src / main / scala / im / actor / server / Main . scala b / actor - server / actor - runner / src / main / scala / im / actor / server / Main . scala 
+ index c55ec26 . . 5ce2887 100644 
+ - - - a / actor - server / actor - runner / src / main / scala / im / actor / server / Main . scala 
+ + + + b / actor - server / actor - runner / src / main / scala / im / actor / server / Main . scala 
+ @ @ - 113 , 7 + 113 , 7 @ @ object Main extends App { 
+ new EmailSender ( emailConfig ) 
+ ) 
+ case " actor - activation " ⇒ new GateCodeActivation ( gateConfig ) 
+ - case _ ⇒ throw new Exception ( " " " Invalid activation . default - service value provided : valid options : " internal " , actor - activation " " " ) 
+ + case _ ⇒ throw new Exception ( " " " Invalid activation . default - service value provided : valid options : " internal " , actor - activation " " " ) 
+ } 
+ 
+ implicit val sessionRegion = Session . startRegion ( 
+ @ @ - 146 , 10 + 146 , 10 @ @ object Main extends App { 
+ Frontend . start ( serverConfig ) 
+ HttpApiFrontend . start ( serverConfig ) 
+ } catch { 
+ - case e : ConfigException = > 
+ + case e : ConfigException ⇒ 
+ system . log . error ( e , " Failed to load server configuration " ) 
+ throw e 
+ - case e : Throwable = > 
+ + case e : Throwable ⇒ 
+ system . log . error ( e , " Server failed to start up " ) 
+ throw e 
+ } 
+ diff - - git a / actor - server / actor - runtime / src / main / resources / reference . conf b / actor - server / actor - runtime / src / main / resources / reference . conf 
+ index 281b729 . . 1402287 100644 
+ - - - a / actor - server / actor - runtime / src / main / resources / reference . conf 
+ + + + b / actor - server / actor - runtime / src / main / resources / reference . conf 
+ @ @ - 19 , 6 + 19 , 10 @ @ tls { 
+ } 
+ } 
+ 
+ + common { 
+ + default - timeout : 20 seconds 
+ + } 
+ + 
+ akka { 
+ extensions = $ { akka . extensions } [ 
+ " akka . contrib . pattern . DistributedPubSubExtension " , 
+ diff - - git a / actor - server / actor - runtime / src / main / scala / im / actor / config / ActorConfig . scala b / actor - server / actor - runtime / src / main / scala / im / actor / config / ActorConfig . scala 
+ index badb833 . . 0cef7d5 100644 
+ - - - a / actor - server / actor - runtime / src / main / scala / im / actor / config / ActorConfig . scala 
+ + + + b / actor - server / actor - runtime / src / main / scala / im / actor / config / ActorConfig . scala 
+ @ @ - 1 , 5 + 1 , 8 @ @ 
+ package im . actor . config 
+ 
+ + import scala . concurrent . duration . _ 
+ + import java . util . concurrent . TimeUnit 
+ + 
+ import com . typesafe . config . { Config , ConfigFactory } 
+ 
+ object ActorConfig { 
+ @ @ - 31 , 4 + 34 , 6 @ @ object ActorConfig { 
+ ) ) 
+ . resolve ( ) 
+ } 
+ + 
+ + val defaultTimeout : FiniteDuration = ActorConfig . load ( ) . getDuration ( " common . default - timeout " , TimeUnit . MILLISECONDS ) . millis 
+ } 
+ diff - - git a / actor - server / actor - session / src / main / scala / im / actor / server / session / SessionStream . scala b / actor - server / actor - session / src / main / scala / im / actor / server / session / SessionStream . scala 
+ index 2d4d434 . . 980b06d 100644 
+ - - - a / actor - server / actor - session / src / main / scala / im / actor / server / session / SessionStream . scala 
+ + + + b / actor - server / actor - session / src / main / scala / im / actor / server / session / SessionStream . scala 
+ @ @ - 24 , 8 + 24 , 6 @ @ object SessionStreamMessage { 
+ 
+ @ SerialVersionUID ( 1L ) 
+ case class SendProtoMessage ( message : ProtoMessage with OutgoingProtoMessage ) extends SessionStreamMessage 
+ - 
+ - case class EnqueuedProtoMessage ( message : ProtoMessage , reduceKey : Option [ String ] ) extends SessionStreamMessage 
+ } 
+ 
+ private [ session ] object SessionStream { 
+ diff - - git a / actor - server / actor - session / src / main / scala / im / actor / server / session / UpdatesHandler . scala b / actor - server / actor - session / src / main / scala / im / actor / server / session / UpdatesHandler . scala 
+ index 5656c80 . . fa15f5e 100644 
+ - - - a / actor - server / actor - session / src / main / scala / im / actor / server / session / UpdatesHandler . scala 
+ + + + b / actor - server / actor - session / src / main / scala / im / actor / server / session / UpdatesHandler . scala 
+ @ @ - 2 , 10 + 2 , 9 @ @ package im . actor . server . session 
+ 
+ import akka . actor . { ActorLogging , Props } 
+ import akka . stream . actor . _ 
+ - import im . actor . server . mtproto . protocol . ProtoMessage 
+ + import im . actor . server . mtproto . protocol . UpdateBox 
+ import im . actor . server . presences . { GroupPresenceManagerRegion , PresenceManagerRegion } 
+ import im . actor . server . sequence . _ 
+ - import im . actor . server . session . SessionStreamMessage . EnqueuedProtoMessage 
+ 
+ import scala . annotation . tailrec 
+ import scala . collection . immutable 
+ @ @ - 26 , 7 + 25 , 7 @ @ private [ session ] class UpdatesHandler ( authId : Long ) ( 
+ weakUpdManagerRegion : WeakUpdatesManagerRegion , 
+ presenceManagerRegion : PresenceManagerRegion , 
+ groupPresenceManagerRegion : GroupPresenceManagerRegion 
+ - ) extends ActorSubscriber with ActorPublisher [ ( ProtoMessage , Option [ String ] ) ] with ActorLogging { 
+ + ) extends ActorSubscriber with ActorPublisher [ ( UpdateBox , Option [ String ] ) ] with ActorLogging { 
+ 
+ import ActorPublisherMessage . _ 
+ import ActorSubscriberMessage . _ 
+ @ @ - 62 , 7 + 61 , 7 @ @ private [ session ] class UpdatesHandler ( authId : Long ) ( 
+ override val requestStrategy = WatermarkRequestStrategy ( 10 ) / / TODO : configurable 
+ 
+ / / Publisher - related 
+ - private [ this ] var messageQueue = immutable . Queue . empty [ ( ProtoMessage , Option [ String ] ) ] 
+ + private [ this ] var messageQueue = immutable . Queue . empty [ ( UpdateBox , Option [ String ] ) ] 
+ 
+ def publisher : Receive = { 
+ case NewUpdate ( ub , reduceKey ) ⇒ enqueueProtoMessage ( ub , reduceKey ) 
+ @ @ - 70 , 7 + 69 , 7 @ @ private [ session ] class UpdatesHandler ( authId : Long ) ( 
+ case Cancel ⇒ context . stop ( self ) 
+ } 
+ 
+ - private def enqueueProtoMessage ( message : ProtoMessage , reduceKey : Option [ String ] ) : Unit = { 
+ + private def enqueueProtoMessage ( message : UpdateBox , reduceKey : Option [ String ] ) : Unit = { 
+ if ( messageQueue . isEmpty & & totalDemand > 0 ) { 
+ onNext ( message → reduceKey ) 
+ } else { 
+ diff - - git a / actor - server / project / Build . scala b / actor - server / project / Build . scala 
+ index 5fb9a44 . . b96b492 100644 
+ - - - a / actor - server / project / Build . scala 
+ + + + b / actor - server / project / Build . scala 
+ @ @ - 114 , 6 + 114 , 7 @ @ object Build extends sbt . Build with Versioning with Releasing { 
+ settings = defaultSettings 
+ ) . dependsOn ( 
+ actorActivation , 
+ + actorBot , 
+ actorEnrich , 
+ actorEmail , 
+ actorFrontend , 
+ @ @ - 133 , 6 + 134 , 24 @ @ object Build extends sbt . Build with Versioning with Releasing { 
+ ) 
+ ) . dependsOn ( actorEmail , actorSms , actorPersist ) 
+ 
+ + lazy val actorBot = Project ( 
+ + id = " actor - bot " , 
+ + base = file ( " actor - bot " ) , 
+ + settings = defaultSettings + + 
+ + Seq ( 
+ + libraryDependencies + + = Dependencies . bot 
+ + ) 
+ + ) . dependsOn ( actorBotMessages , shardakka , actorCore ) 
+ + 
+ + lazy val actorBotMessages = Project ( 
+ + id = " actor - bot - messages " , 
+ + base = file ( " actor - bot - messages " ) , 
+ + settings = defaultSettings + + 
+ + Seq ( 
+ + libraryDependencies + + = Dependencies . botMessages 
+ + ) 
+ + ) 
+ + 
+ lazy val actorCore = Project ( 
+ id = " actor - core " , 
+ base = file ( " actor - core " ) , 
+ @ @ - 164 , 7 + 183 , 7 @ @ object Build extends sbt . Build with Versioning with Releasing { 
+ settings = defaultSettings + + Seq ( 
+ libraryDependencies + + = Dependencies . httpApi 
+ ) 
+ - ) . dependsOn ( actorCore , actorPersist , actorRuntime ) 
+ + ) . dependsOn ( actorBot , actorCore , actorPersist , actorRuntime ) 
+ 
+ lazy val actorOAuth = Project ( 
+ id = " actor - oauth " , 
+ diff - - git a / actor - server / project / Dependencies . scala b / actor - server / project / Dependencies . scala 
+ index ce84317 . . 428af06 100644 
+ - - - a / actor - server / project / Dependencies . scala 
+ + + + b / actor - server / project / Dependencies . scala 
+ @ @ - 9 , 7 + 9 , 7 @ @ object Dependencies { 
+ val scalaz = " 7 . 1 . 1 " 
+ val slick = " 3 . 0 . 3 " 
+ val scalatest = " 2 . 2 . 4 " 
+ - val catsVersion = " 0 . 1 . 2 " 
+ + val catsVersion = " 0 . 2 . 0 " 
+ 
+ } 
+ 
+ @ @ - 30 , 8 + 30 , 7 @ @ object Dependencies { 
+ val caffeine = " com . github . ben - manes . caffeine " % " caffeine " % " 1 . 2 . 0 " 
+ val eaioUuid = " com . eaio . uuid " % " uuid " % " 3 . 4 " 
+ 
+ - val cats = " org . spire - math " % % " cats - core " % V . catsVersion 
+ - val catsStd = " org . spire - math " % % " cats - std " % V . catsVersion 
+ + val cats = " org . spire - math " % % " cats " % V . catsVersion 
+ 
+ val configs = " com . github . kxbmap " % % " configs " % " 0 . 2 . 4 " 
+ 
+ @ @ - 39 , 6 + 38 , 7 @ @ object Dependencies { 
+ val javaCompat = " org . scala - lang . modules " % % " scala - java8 - compat " % " 0 . 5 . 0 " 
+ 
+ val playJson = " com . typesafe . play " % % " play - json " % " 2 . 4 . 2 " 
+ + val upickle = " com . lihaoyi " % % " upickle " % " 0 . 3 . 6 " 
+ 
+ val postgresJdbc = " org . postgresql " % " postgresql " % " 9 . 4 - 1201 - jdbc41 " exclude ( " org . slf4j " , " slf4j - simple " ) 
+ val slick = " com . typesafe . slick " % % " slick " % V . slick 
+ @ @ - 102 , 6 + 102 , 10 @ @ object Dependencies { 
+ 
+ val activation = shared + + Seq ( akkaActor , akkaHttp , playJson ) 
+ 
+ + val bot = shared + + Seq ( upickle ) 
+ + 
+ + val botMessages = Seq ( upickle ) 
+ + 
+ val core = shared + + Seq ( akkaActor , akkaContrib , amazonaws , awsWrap , caffeine , gcmServer , pushy , jodaTime , postgresJdbc , slick , scrImageCore ) 
+ 
+ val enrich = shared + + Seq ( akkaActor , akkaHttp ) 
+ @ @ - 146 , 7 + 150 , 7 @ @ object Dependencies { 
+ 
+ val notifications = shared + + Seq ( akkaContrib , slick ) 
+ 
+ - val runtime = shared + + Seq ( akkaActor , akkaHttp , akkaStream , akkaPersistenceJdbc , caffeine , cats , catsStd , concmap , jodaConvert , jodaTime , libPhoneNumber , scalazCore , akkaTestkit % " test " , scalatest % " test " ) 
+ + val runtime = shared + + Seq ( akkaActor , akkaHttp , akkaStream , akkaPersistenceJdbc , caffeine , cats , concmap , jodaConvert , jodaTime , libPhoneNumber , scalazCore , akkaTestkit % " test " , scalatest % " test " ) 
+ 
+ val voximplant = shared + + Seq ( akkaActor , dispatch , playJson )

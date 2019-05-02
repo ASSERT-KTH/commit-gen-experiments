@@ -1,0 +1,151 @@
+BLEU SCORE: 0.041961149062965476
+
+TEST MSG: Stripe MV locks by key plus cfid to reduce contention
+GENERATED MSG: Re - apply MV updates on commitlog replay
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index 67cb67b . . 3efd6a4 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 3 . 4 <nl> + * Stripe view locks by key and table ID to reduce contention ( CASSANDRA - 10981 ) <nl> * Add nodetool gettimeout and settimeout commands ( CASSANDRA - 10953 ) <nl> * Add 3 . 0 metadata to sstablemetadata output ( CASSANDRA - 10838 ) <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / Keyspace . java b / src / java / org / apache / cassandra / db / Keyspace . java <nl> index 7b4f79b . . 0ec94ea 100644 <nl> - - - a / src / java / org / apache / cassandra / db / Keyspace . java <nl> + + + b / src / java / org / apache / cassandra / db / Keyspace . java <nl> @ @ - 19 , 6 + 19 , 7 @ @ package org . apache . cassandra . db ; <nl> <nl> import java . io . File ; <nl> import java . io . IOException ; <nl> + import java . nio . ByteBuffer ; <nl> import java . util . * ; <nl> import java . util . concurrent . * ; <nl> import java . util . concurrent . atomic . AtomicLong ; <nl> @ @ - 408 , 46 + 409 , 60 @ @ public class Keyspace <nl> if ( TEST _ FAIL _ WRITES & & metadata . name . equals ( TEST _ FAIL _ WRITES _ KS ) ) <nl> throw new RuntimeException ( " Testing write failures " ) ; <nl> <nl> - Lock lock = null ; <nl> + Lock [ ] locks = null ; <nl> boolean requiresViewUpdate = updateIndexes & & viewManager . updatesAffectView ( Collections . singleton ( mutation ) , false ) ; <nl> <nl> if ( requiresViewUpdate ) <nl> { <nl> mutation . viewLockAcquireStart . compareAndSet ( 0L , System . currentTimeMillis ( ) ) ; <nl> - lock = ViewManager . acquireLockFor ( mutation . key ( ) . getKey ( ) ) ; <nl> <nl> - if ( lock = = null ) <nl> + / / the order of lock acquisition doesn ' t matter ( from a deadlock perspective ) because we only use tryLock ( ) <nl> + Collection < UUID > columnFamilyIds = mutation . getColumnFamilyIds ( ) ; <nl> + Iterator < UUID > idIterator = columnFamilyIds . iterator ( ) ; <nl> + locks = new Lock [ columnFamilyIds . size ( ) ] ; <nl> + <nl> + for ( int i = 0 ; i < columnFamilyIds . size ( ) ; i + + ) <nl> { <nl> - if ( ( System . currentTimeMillis ( ) - mutation . createdAt ) > DatabaseDescriptor . getWriteRpcTimeout ( ) ) <nl> + UUID cfid = idIterator . next ( ) ; <nl> + int lockKey = Objects . hash ( mutation . key ( ) . getKey ( ) , cfid ) ; <nl> + Lock lock = ViewManager . acquireLockFor ( lockKey ) ; <nl> + if ( lock = = null ) <nl> { <nl> - logger . trace ( " Could not acquire lock for { } " , ByteBufferUtil . bytesToHex ( mutation . key ( ) . getKey ( ) ) ) ; <nl> - Tracing . trace ( " Could not acquire MV lock " ) ; <nl> - throw new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ; <nl> + / / we will either time out or retry , so release all acquired locks <nl> + for ( int j = 0 ; j < i ; j + + ) <nl> + locks [ j ] . unlock ( ) ; <nl> + <nl> + if ( ( System . currentTimeMillis ( ) - mutation . createdAt ) > DatabaseDescriptor . getWriteRpcTimeout ( ) ) <nl> + { <nl> + logger . trace ( " Could not acquire lock for { } and table { } " , ByteBufferUtil . bytesToHex ( mutation . key ( ) . getKey ( ) ) , columnFamilyStores . get ( cfid ) . name ) ; <nl> + Tracing . trace ( " Could not acquire MV lock " ) ; <nl> + throw new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ; <nl> + } <nl> + else <nl> + { <nl> + / / This view update can ' t happen right now . so rather than keep this thread busy <nl> + / / we will re - apply ourself to the queue and try again later <nl> + StageManager . getStage ( Stage . MUTATION ) . execute ( ( ) - > { <nl> + if ( writeCommitLog ) <nl> + mutation . apply ( ) ; <nl> + else <nl> + mutation . applyUnsafe ( ) ; <nl> + } ) ; <nl> + <nl> + return ; <nl> + } <nl> } <nl> else <nl> { <nl> - / / This view update can ' t happen right now . so rather than keep this thread busy <nl> - / / we will re - apply ourself to the queue and try again later <nl> - StageManager . getStage ( Stage . MUTATION ) . execute ( ( ) - > { <nl> - if ( writeCommitLog ) <nl> - mutation . apply ( ) ; <nl> - else <nl> - mutation . applyUnsafe ( ) ; <nl> - } ) ; <nl> - <nl> - return ; <nl> + locks [ i ] = lock ; <nl> } <nl> } <nl> - else <nl> + <nl> + long acquireTime = System . currentTimeMillis ( ) - mutation . viewLockAcquireStart . get ( ) ; <nl> + if ( ! isClReplay ) <nl> { <nl> - long acquireTime = System . currentTimeMillis ( ) - mutation . viewLockAcquireStart . get ( ) ; <nl> - if ( ! isClReplay ) <nl> - { <nl> - for ( UUID cfid : mutation . getColumnFamilyIds ( ) ) <nl> - { <nl> - columnFamilyStores . get ( cfid ) . metric . viewLockAcquireTime . update ( acquireTime , TimeUnit . MILLISECONDS ) ; <nl> - } <nl> - } <nl> + for ( UUID cfid : columnFamilyIds ) <nl> + columnFamilyStores . get ( cfid ) . metric . viewLockAcquireTime . update ( acquireTime , TimeUnit . MILLISECONDS ) ; <nl> } <nl> } <nl> int nowInSec = FBUtilities . nowInSeconds ( ) ; <nl> @ @ - 498 , 8 + 513 , 11 @ @ public class Keyspace <nl> } <nl> finally <nl> { <nl> - if ( lock ! = null ) <nl> - lock . unlock ( ) ; <nl> + if ( locks ! = null ) <nl> + { <nl> + for ( Lock lock : locks ) <nl> + lock . unlock ( ) ; <nl> + } <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / view / ViewManager . java b / src / java / org / apache / cassandra / db / view / ViewManager . java <nl> index 9fe0544 . . ac48cfe 100644 <nl> - - - a / src / java / org / apache / cassandra / db / view / ViewManager . java <nl> + + + b / src / java / org / apache / cassandra / db / view / ViewManager . java <nl> @ @ - 256 , 9 + 256 , 9 @ @ public class ViewManager <nl> return forStore ; <nl> } <nl> <nl> - public static Lock acquireLockFor ( ByteBuffer key ) <nl> + public static Lock acquireLockFor ( int keyAndCfidHash ) <nl> { <nl> - Lock lock = LOCKS . get ( key ) ; <nl> + Lock lock = LOCKS . get ( keyAndCfidHash ) ; <nl> <nl> if ( lock . tryLock ( ) ) <nl> return lock ;
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index 67cb67b . . 3efd6a4 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 3 . 4 
+ + * Stripe view locks by key and table ID to reduce contention ( CASSANDRA - 10981 ) 
+ * Add nodetool gettimeout and settimeout commands ( CASSANDRA - 10953 ) 
+ * Add 3 . 0 metadata to sstablemetadata output ( CASSANDRA - 10838 ) 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / Keyspace . java b / src / java / org / apache / cassandra / db / Keyspace . java 
+ index 7b4f79b . . 0ec94ea 100644 
+ - - - a / src / java / org / apache / cassandra / db / Keyspace . java 
+ + + + b / src / java / org / apache / cassandra / db / Keyspace . java 
+ @ @ - 19 , 6 + 19 , 7 @ @ package org . apache . cassandra . db ; 
+ 
+ import java . io . File ; 
+ import java . io . IOException ; 
+ + import java . nio . ByteBuffer ; 
+ import java . util . * ; 
+ import java . util . concurrent . * ; 
+ import java . util . concurrent . atomic . AtomicLong ; 
+ @ @ - 408 , 46 + 409 , 60 @ @ public class Keyspace 
+ if ( TEST _ FAIL _ WRITES & & metadata . name . equals ( TEST _ FAIL _ WRITES _ KS ) ) 
+ throw new RuntimeException ( " Testing write failures " ) ; 
+ 
+ - Lock lock = null ; 
+ + Lock [ ] locks = null ; 
+ boolean requiresViewUpdate = updateIndexes & & viewManager . updatesAffectView ( Collections . singleton ( mutation ) , false ) ; 
+ 
+ if ( requiresViewUpdate ) 
+ { 
+ mutation . viewLockAcquireStart . compareAndSet ( 0L , System . currentTimeMillis ( ) ) ; 
+ - lock = ViewManager . acquireLockFor ( mutation . key ( ) . getKey ( ) ) ; 
+ 
+ - if ( lock = = null ) 
+ + / / the order of lock acquisition doesn ' t matter ( from a deadlock perspective ) because we only use tryLock ( ) 
+ + Collection < UUID > columnFamilyIds = mutation . getColumnFamilyIds ( ) ; 
+ + Iterator < UUID > idIterator = columnFamilyIds . iterator ( ) ; 
+ + locks = new Lock [ columnFamilyIds . size ( ) ] ; 
+ + 
+ + for ( int i = 0 ; i < columnFamilyIds . size ( ) ; i + + ) 
+ { 
+ - if ( ( System . currentTimeMillis ( ) - mutation . createdAt ) > DatabaseDescriptor . getWriteRpcTimeout ( ) ) 
+ + UUID cfid = idIterator . next ( ) ; 
+ + int lockKey = Objects . hash ( mutation . key ( ) . getKey ( ) , cfid ) ; 
+ + Lock lock = ViewManager . acquireLockFor ( lockKey ) ; 
+ + if ( lock = = null ) 
+ { 
+ - logger . trace ( " Could not acquire lock for { } " , ByteBufferUtil . bytesToHex ( mutation . key ( ) . getKey ( ) ) ) ; 
+ - Tracing . trace ( " Could not acquire MV lock " ) ; 
+ - throw new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ; 
+ + / / we will either time out or retry , so release all acquired locks 
+ + for ( int j = 0 ; j < i ; j + + ) 
+ + locks [ j ] . unlock ( ) ; 
+ + 
+ + if ( ( System . currentTimeMillis ( ) - mutation . createdAt ) > DatabaseDescriptor . getWriteRpcTimeout ( ) ) 
+ + { 
+ + logger . trace ( " Could not acquire lock for { } and table { } " , ByteBufferUtil . bytesToHex ( mutation . key ( ) . getKey ( ) ) , columnFamilyStores . get ( cfid ) . name ) ; 
+ + Tracing . trace ( " Could not acquire MV lock " ) ; 
+ + throw new WriteTimeoutException ( WriteType . VIEW , ConsistencyLevel . LOCAL _ ONE , 0 , 1 ) ; 
+ + } 
+ + else 
+ + { 
+ + / / This view update can ' t happen right now . so rather than keep this thread busy 
+ + / / we will re - apply ourself to the queue and try again later 
+ + StageManager . getStage ( Stage . MUTATION ) . execute ( ( ) - > { 
+ + if ( writeCommitLog ) 
+ + mutation . apply ( ) ; 
+ + else 
+ + mutation . applyUnsafe ( ) ; 
+ + } ) ; 
+ + 
+ + return ; 
+ + } 
+ } 
+ else 
+ { 
+ - / / This view update can ' t happen right now . so rather than keep this thread busy 
+ - / / we will re - apply ourself to the queue and try again later 
+ - StageManager . getStage ( Stage . MUTATION ) . execute ( ( ) - > { 
+ - if ( writeCommitLog ) 
+ - mutation . apply ( ) ; 
+ - else 
+ - mutation . applyUnsafe ( ) ; 
+ - } ) ; 
+ - 
+ - return ; 
+ + locks [ i ] = lock ; 
+ } 
+ } 
+ - else 
+ + 
+ + long acquireTime = System . currentTimeMillis ( ) - mutation . viewLockAcquireStart . get ( ) ; 
+ + if ( ! isClReplay ) 
+ { 
+ - long acquireTime = System . currentTimeMillis ( ) - mutation . viewLockAcquireStart . get ( ) ; 
+ - if ( ! isClReplay ) 
+ - { 
+ - for ( UUID cfid : mutation . getColumnFamilyIds ( ) ) 
+ - { 
+ - columnFamilyStores . get ( cfid ) . metric . viewLockAcquireTime . update ( acquireTime , TimeUnit . MILLISECONDS ) ; 
+ - } 
+ - } 
+ + for ( UUID cfid : columnFamilyIds ) 
+ + columnFamilyStores . get ( cfid ) . metric . viewLockAcquireTime . update ( acquireTime , TimeUnit . MILLISECONDS ) ; 
+ } 
+ } 
+ int nowInSec = FBUtilities . nowInSeconds ( ) ; 
+ @ @ - 498 , 8 + 513 , 11 @ @ public class Keyspace 
+ } 
+ finally 
+ { 
+ - if ( lock ! = null ) 
+ - lock . unlock ( ) ; 
+ + if ( locks ! = null ) 
+ + { 
+ + for ( Lock lock : locks ) 
+ + lock . unlock ( ) ; 
+ + } 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / view / ViewManager . java b / src / java / org / apache / cassandra / db / view / ViewManager . java 
+ index 9fe0544 . . ac48cfe 100644 
+ - - - a / src / java / org / apache / cassandra / db / view / ViewManager . java 
+ + + + b / src / java / org / apache / cassandra / db / view / ViewManager . java 
+ @ @ - 256 , 9 + 256 , 9 @ @ public class ViewManager 
+ return forStore ; 
+ } 
+ 
+ - public static Lock acquireLockFor ( ByteBuffer key ) 
+ + public static Lock acquireLockFor ( int keyAndCfidHash ) 
+ { 
+ - Lock lock = LOCKS . get ( key ) ; 
+ + Lock lock = LOCKS . get ( keyAndCfidHash ) ; 
+ 
+ if ( lock . tryLock ( ) ) 
+ return lock ;
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

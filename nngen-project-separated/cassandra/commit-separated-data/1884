@@ -1,0 +1,904 @@
+BLEU SCORE: 0.041961149062965476
+
+TEST MSG: Make sure we compact highly overlapping cold sstables with STCS
+GENERATED MSG: Compact hottest sstables first and optionally omit coldest
+
+TEST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index b247127 . . ff6a26f 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 1 , 4 + 1 , 6 @ @ <nl> 2 . 1 . 3 <nl> + * Make sure we compact highly overlapping cold sstables with <nl> + STCS ( CASSANDRA - 8635 ) <nl> * rpc _ interface and listen _ interface generate NPE on startup when specified interface doesn ' t exist ( CASSANDRA - 8677 ) <nl> * Fix ArrayIndexOutOfBoundsException in nodetool cfhistograms ( CASSANDRA - 8514 ) <nl> * Switch from yammer metrics for nodetool cf / proxy histograms ( CASSANDRA - 8662 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java <nl> index 4b44426 . . fbd715c 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java <nl> @ @ - 24 , 12 + 24 , 14 @ @ import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . collect . Iterables ; <nl> import com . google . common . collect . Lists ; <nl> import com . google . common . collect . Sets ; <nl> + import com . google . common . primitives . Longs ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> import org . apache . cassandra . cql3 . statements . CFPropDefs ; <nl> import org . apache . cassandra . db . ColumnFamilyStore ; <nl> import org . apache . cassandra . exceptions . ConfigurationException ; <nl> + import org . apache . cassandra . io . sstable . ColumnNameHelper ; <nl> import org . apache . cassandra . io . sstable . SSTableReader ; <nl> import org . apache . cassandra . utils . Pair ; <nl> <nl> @ @ - 80 , 7 + 82 , 7 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy <nl> int maxThreshold = cfs . getMaximumCompactionThreshold ( ) ; <nl> <nl> Iterable < SSTableReader > candidates = filterSuspectSSTables ( Sets . intersection ( cfs . getUncompactingSSTables ( ) , sstables ) ) ; <nl> - candidates = filterColdSSTables ( Lists . newArrayList ( candidates ) , options . coldReadsToOmit ) ; <nl> + candidates = filterColdSSTables ( Lists . newArrayList ( candidates ) , options . coldReadsToOmit , cfs . getMinimumCompactionThreshold ( ) ) ; <nl> <nl> List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndLengthPairs ( candidates ) , options . bucketHigh , options . bucketLow , options . minSSTableSize ) ; <nl> logger . debug ( " Compaction buckets are { } " , buckets ) ; <nl> @ @ - 109 , 10 + 111 , 11 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy <nl> * across all sstables <nl> * @ param sstables all sstables to consider <nl> * @ param coldReadsToOmit the proportion of total reads / sec that will be omitted ( 0 = omit nothing , 1 = omit everything ) <nl> + * @ param minThreshold min compaction threshold <nl> * @ return a list of sstables with the coldest sstables excluded until the reads they represent reaches coldReadsToOmit <nl> * / <nl> @ VisibleForTesting <nl> - static List < SSTableReader > filterColdSSTables ( List < SSTableReader > sstables , double coldReadsToOmit ) <nl> + static List < SSTableReader > filterColdSSTables ( List < SSTableReader > sstables , double coldReadsToOmit , int minThreshold ) <nl> { <nl> if ( coldReadsToOmit = = 0 . 0 ) <nl> return sstables ; <nl> @ @ - 167 , 10 + 170 , 78 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy <nl> totalColdReads + = reads ; <nl> cutoffIndex + + ; <nl> } <nl> + List < SSTableReader > hotSSTables = new ArrayList < > ( sstables . subList ( cutoffIndex , sstables . size ( ) ) ) ; <nl> + List < SSTableReader > coldSSTables = sstables . subList ( 0 , cutoffIndex ) ; <nl> + logger . debug ( " hotSSTables = { } , coldSSTables = { } " , hotSSTables . size ( ) , coldSSTables . size ( ) ) ; <nl> + if ( hotSSTables . size ( ) > = minThreshold ) <nl> + return hotSSTables ; <nl> + if ( coldSSTables . size ( ) < minThreshold ) <nl> + return Collections . emptyList ( ) ; <nl> + <nl> + Map < SSTableReader , Set < SSTableReader > > overlapMap = new HashMap < > ( ) ; <nl> + for ( int i = 0 ; i < coldSSTables . size ( ) ; i + + ) <nl> + { <nl> + SSTableReader sstable = coldSSTables . get ( i ) ; <nl> + Set < SSTableReader > overlaps = new HashSet < > ( ) ; <nl> + for ( int j = 0 ; j < coldSSTables . size ( ) ; j + + ) <nl> + { <nl> + SSTableReader innerSSTable = coldSSTables . get ( j ) ; <nl> + if ( ColumnNameHelper . overlaps ( sstable . getSSTableMetadata ( ) . minColumnNames , <nl> + sstable . getSSTableMetadata ( ) . maxColumnNames , <nl> + innerSSTable . getSSTableMetadata ( ) . minColumnNames , <nl> + innerSSTable . getSSTableMetadata ( ) . maxColumnNames , <nl> + sstable . metadata . comparator ) ) <nl> + { <nl> + overlaps . add ( innerSSTable ) ; <nl> + } <nl> + } <nl> + overlapMap . put ( sstable , overlaps ) ; <nl> + } <nl> + List < Set < SSTableReader > > overlapChains = new ArrayList < > ( ) ; <nl> + for ( SSTableReader sstable : overlapMap . keySet ( ) ) <nl> + overlapChains . add ( createOverlapChain ( sstable , overlapMap ) ) ; <nl> + <nl> + Collections . sort ( overlapChains , new Comparator < Set < SSTableReader > > ( ) <nl> + { <nl> + @ Override <nl> + public int compare ( Set < SSTableReader > o1 , Set < SSTableReader > o2 ) <nl> + { <nl> + return Longs . compare ( SSTableReader . getTotalBytes ( o2 ) , SSTableReader . getTotalBytes ( o1 ) ) ; <nl> + } <nl> + } ) ; <nl> + for ( Set < SSTableReader > overlapping : overlapChains ) <nl> + { <nl> + / / if we are expecting to only keep 70 % of the keys after a compaction , run a compaction on these cold sstables : <nl> + if ( SSTableReader . estimateCompactionGain ( overlapping ) < 0 . 7 ) <nl> + return new ArrayList < > ( overlapping ) ; <nl> + } <nl> + return Collections . emptyList ( ) ; <nl> + } <nl> <nl> - return sstables . subList ( cutoffIndex , sstables . size ( ) ) ; <nl> + / * * <nl> + * returns a set with all overlapping sstables starting with s . <nl> + * if we have 3 sstables , a , b , c where a overlaps with b , but not c and b overlaps with c , all sstables would be returned . <nl> + * <nl> + * m contains an sstable - > all overlapping mapping <nl> + * / <nl> + private static Set < SSTableReader > createOverlapChain ( SSTableReader s , Map < SSTableReader , Set < SSTableReader > > m ) <nl> + { <nl> + Deque < SSTableReader > sstables = new ArrayDeque < > ( ) ; <nl> + Set < SSTableReader > overlapChain = new HashSet < > ( ) ; <nl> + sstables . push ( s ) ; <nl> + while ( ! sstables . isEmpty ( ) ) <nl> + { <nl> + SSTableReader sstable = sstables . pop ( ) ; <nl> + if ( overlapChain . add ( sstable ) ) <nl> + { <nl> + if ( m . containsKey ( sstable ) ) <nl> + sstables . addAll ( m . get ( sstable ) ) ; <nl> + } <nl> + } <nl> + return overlapChain ; <nl> } <nl> <nl> + <nl> / * * <nl> * @ param buckets list of buckets from which to return the most interesting , where " interesting " is the total hotness for reads <nl> * @ param minThreshold minimum number of sstables in a bucket to qualify as interesting <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / ColumnNameHelper . java b / src / java / org / apache / cassandra / io / sstable / ColumnNameHelper . java <nl> index f74b86f . . 436975b 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / ColumnNameHelper . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / ColumnNameHelper . java <nl> @ @ - 217 , 4 + 217 , 26 @ @ public class ColumnNameHelper <nl> <nl> return retList ; <nl> } <nl> + <nl> + / * * <nl> + * Checks if the given min / max column names could overlap ( i . e they could share some column names based on the max / min column names in the sstables ) <nl> + * / <nl> + public static boolean overlaps ( List < ByteBuffer > minColumnNames1 , List < ByteBuffer > maxColumnNames1 , List < ByteBuffer > minColumnNames2 , List < ByteBuffer > maxColumnNames2 , CellNameType comparator ) <nl> + { <nl> + if ( minColumnNames1 . isEmpty ( ) | | maxColumnNames1 . isEmpty ( ) | | minColumnNames2 . isEmpty ( ) | | maxColumnNames2 . isEmpty ( ) ) <nl> + return true ; <nl> + <nl> + return ! ( compare ( maxColumnNames1 , minColumnNames2 , comparator ) < 0 | | compare ( minColumnNames1 , maxColumnNames2 , comparator ) > 0 ) ; <nl> + } <nl> + <nl> + private static int compare ( List < ByteBuffer > columnNames1 , List < ByteBuffer > columnNames2 , CellNameType comparator ) <nl> + { <nl> + for ( int i = 0 ; i < Math . min ( columnNames1 . size ( ) , columnNames2 . size ( ) ) ; i + + ) <nl> + { <nl> + int cmp = comparator . subtype ( i ) . compare ( columnNames1 . get ( i ) , columnNames2 . get ( i ) ) ; <nl> + if ( cmp ! = 0 ) <nl> + return cmp ; <nl> + } <nl> + return 0 ; <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> index ee8b7c3 . . 50bf3e3 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> @ @ - 31 , 6 + 31 , 7 @ @ import java . util . Collection ; <nl> import java . util . Collections ; <nl> import java . util . Comparator ; <nl> import java . util . EnumSet ; <nl> + import java . util . HashSet ; <nl> import java . util . Iterator ; <nl> import java . util . List ; <nl> import java . util . Map ; <nl> @ @ - 54 , 6 + 55 , 7 @ @ import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> import com . clearspring . analytics . stream . cardinality . CardinalityMergeException ; <nl> + import com . clearspring . analytics . stream . cardinality . HyperLogLogPlus ; <nl> import com . clearspring . analytics . stream . cardinality . ICardinality ; <nl> import org . apache . cassandra . cache . CachingOptions ; <nl> import org . apache . cassandra . cache . InstrumentingCache ; <nl> @ @ - 272 , 6 + 274 , 54 @ @ public class SSTableReader extends SSTable <nl> return count ; <nl> } <nl> <nl> + / * * <nl> + * Estimates how much of the keys we would keep if the sstables were compacted together <nl> + * / <nl> + public static double estimateCompactionGain ( Set < SSTableReader > overlapping ) <nl> + { <nl> + Set < ICardinality > cardinalities = new HashSet < > ( overlapping . size ( ) ) ; <nl> + for ( SSTableReader sstable : overlapping ) <nl> + { <nl> + try <nl> + { <nl> + ICardinality cardinality = ( ( CompactionMetadata ) sstable . descriptor . getMetadataSerializer ( ) . deserialize ( sstable . descriptor , MetadataType . COMPACTION ) ) . cardinalityEstimator ; <nl> + if ( cardinality ! = null ) <nl> + cardinalities . add ( cardinality ) ; <nl> + else <nl> + logger . debug ( " Got a null cardinality estimator in : " + sstable . getFilename ( ) ) ; <nl> + } <nl> + catch ( IOException e ) <nl> + { <nl> + logger . warn ( " Could not read up compaction metadata for " + sstable , e ) ; <nl> + } <nl> + } <nl> + long totalKeyCountBefore = 0 ; <nl> + for ( ICardinality cardinality : cardinalities ) <nl> + { <nl> + totalKeyCountBefore + = cardinality . cardinality ( ) ; <nl> + } <nl> + if ( totalKeyCountBefore = = 0 ) <nl> + return 1 ; <nl> + <nl> + long totalKeyCountAfter = mergeCardinalities ( cardinalities ) . cardinality ( ) ; <nl> + logger . debug ( " Estimated compaction gain : { } / { } = { } " , totalKeyCountAfter , totalKeyCountBefore , ( ( double ) totalKeyCountAfter ) / totalKeyCountBefore ) ; <nl> + return ( ( double ) totalKeyCountAfter ) / totalKeyCountBefore ; <nl> + } <nl> + <nl> + private static ICardinality mergeCardinalities ( Collection < ICardinality > cardinalities ) <nl> + { <nl> + ICardinality base = new HyperLogLogPlus ( 13 , 25 ) ; / / see MetadataCollector . cardinality <nl> + try <nl> + { <nl> + base = base . merge ( cardinalities . toArray ( new ICardinality [ cardinalities . size ( ) ] ) ) ; <nl> + } <nl> + catch ( CardinalityMergeException e ) <nl> + { <nl> + logger . warn ( " Could not merge cardinalities " , e ) ; <nl> + } <nl> + return base ; <nl> + } <nl> + <nl> public static SSTableReader open ( Descriptor descriptor ) throws IOException <nl> { <nl> CFMetaData metadata ; <nl> diff - - git a / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java <nl> index 6132dad . . d9bf017 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java <nl> @ @ - 216 , 17 + 216 , 17 @ @ public class SizeTieredCompactionStrategyTest extends SchemaLoader <nl> <nl> for ( SSTableReader sstr : sstrs ) <nl> sstr . readMeter = null ; <nl> - filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; <nl> + filtered = filterColdSSTables ( sstrs , 0 . 05 , 0 ) ; <nl> assertEquals ( " when there are no read meters , no sstables should be filtered " , sstrs . size ( ) , filtered . size ( ) ) ; <nl> <nl> for ( SSTableReader sstr : sstrs ) <nl> sstr . readMeter = new RestorableMeter ( 0 . 0 , 0 . 0 ) ; <nl> - filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; <nl> + filtered = filterColdSSTables ( sstrs , 0 . 05 , 0 ) ; <nl> assertEquals ( " when all read meters are zero , no sstables should be filtered " , sstrs . size ( ) , filtered . size ( ) ) ; <nl> <nl> / / leave all read rates at 0 besides one <nl> sstrs . get ( 0 ) . readMeter = new RestorableMeter ( 1000 . 0 , 1000 . 0 ) ; <nl> - filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; <nl> + filtered = filterColdSSTables ( sstrs , 0 . 05 , 0 ) ; <nl> assertEquals ( " there should only be one hot sstable " , 1 , filtered . size ( ) ) ; <nl> assertEquals ( 1000 . 0 , filtered . get ( 0 ) . readMeter . twoHourRate ( ) , 0 . 5 ) ; <nl> <nl> @ @ - 239 , 20 + 239 , 20 @ @ public class SizeTieredCompactionStrategyTest extends SchemaLoader <nl> sstrs . get ( 2 ) . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; <nl> sstrs . get ( 3 ) . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; <nl> <nl> - filtered = filterColdSSTables ( sstrs , 0 . 025 ) ; <nl> + filtered = filterColdSSTables ( sstrs , 0 . 025 , 0 ) ; <nl> assertEquals ( 2 , filtered . size ( ) ) ; <nl> assertEquals ( 98 . 0 , filtered . get ( 0 ) . readMeter . twoHourRate ( ) + filtered . get ( 1 ) . readMeter . twoHourRate ( ) , 0 . 5 ) ; <nl> <nl> / / make sure a threshold of 0 . 0 doesn ' t result in any sstables being filtered <nl> for ( SSTableReader sstr : sstrs ) <nl> sstr . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; <nl> - filtered = filterColdSSTables ( sstrs , 0 . 0 ) ; <nl> + filtered = filterColdSSTables ( sstrs , 0 . 0 , 0 ) ; <nl> assertEquals ( sstrs . size ( ) , filtered . size ( ) ) ; <nl> <nl> / / just for fun , set a threshold where all sstables are considered cold <nl> for ( SSTableReader sstr : sstrs ) <nl> sstr . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; <nl> - filtered = filterColdSSTables ( sstrs , 1 . 0 ) ; <nl> + filtered = filterColdSSTables ( sstrs , 1 . 0 , 0 ) ; <nl> assertTrue ( filtered . isEmpty ( ) ) ; <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / db / filter / ColumnSliceTest . java b / test / unit / org / apache / cassandra / db / filter / ColumnSliceTest . java <nl> index f1be21c . . 8ba2665 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / filter / ColumnSliceTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / filter / ColumnSliceTest . java <nl> @ @ - 27 , 6 + 27 , 7 @ @ import org . junit . Test ; <nl> import org . apache . cassandra . db . composites . * ; <nl> import org . apache . cassandra . db . marshal . AbstractType ; <nl> import org . apache . cassandra . db . marshal . Int32Type ; <nl> + import org . apache . cassandra . io . sstable . ColumnNameHelper ; <nl> import org . apache . cassandra . utils . ByteBufferUtil ; <nl> <nl> import static org . junit . Assert . * ; <nl> @ @ - 344 , 6 + 345 , 19 @ @ public class ColumnSliceTest <nl> slice = new ColumnSlice ( composite ( 0 ) , composite ( 0 , 1 , 2 ) ) ; <nl> assertFalse ( slice . intersects ( columnNames ( 1 ) , columnNames ( 1 , 2 ) , nameType , false ) ) ; <nl> } <nl> + @ Test <nl> + public void testColumnNameHelper ( ) <nl> + { <nl> + List < AbstractType < ? > > types = new ArrayList < > ( ) ; <nl> + types . add ( Int32Type . instance ) ; <nl> + types . add ( Int32Type . instance ) ; <nl> + types . add ( Int32Type . instance ) ; <nl> + CompoundDenseCellNameType nameType = new CompoundDenseCellNameType ( types ) ; <nl> + assertTrue ( ColumnNameHelper . overlaps ( columnNames ( 0 , 0 , 0 ) , columnNames ( 3 , 3 , 3 ) , columnNames ( 1 , 1 , 1 ) , columnNames ( 2 , 2 , 2 ) , nameType ) ) ; <nl> + assertFalse ( ColumnNameHelper . overlaps ( columnNames ( 0 , 0 , 0 ) , columnNames ( 3 , 3 , 3 ) , columnNames ( 4 , 4 , 4 ) , columnNames ( 5 , 5 , 5 ) , nameType ) ) ; <nl> + assertFalse ( ColumnNameHelper . overlaps ( columnNames ( 0 , 0 , 0 ) , columnNames ( 3 , 3 , 3 ) , columnNames ( 3 , 3 , 4 ) , columnNames ( 5 , 5 , 5 ) , nameType ) ) ; <nl> + assertTrue ( ColumnNameHelper . overlaps ( columnNames ( 0 ) , columnNames ( 3 , 3 , 3 ) , columnNames ( 1 , 1 ) , columnNames ( 5 ) , nameType ) ) ; <nl> + } <nl> <nl> @ Test <nl> public void testDeoverlapSlices ( )
+NEAREST DIFF (one line): diff - - git a / CHANGES . txt b / CHANGES . txt <nl> index c1ddf20 . . 8cdbbe1 100644 <nl> - - - a / CHANGES . txt <nl> + + + b / CHANGES . txt <nl> @ @ - 8 , 6 + 8 , 8 @ @ <nl> <nl> <nl> 2 . 0 . 3 <nl> + * Compact hottest sstables first and optionally omit coldest from <nl> + compaction entirely ( CASSANDRA - 6109 ) <nl> * Fix modifying column _ metadata from thrift ( CASSANDRA - 6182 ) <nl> * cqlsh : fix LIST USERS output ( CASSANDRA - 6242 ) <nl> * Add IRequestSink interface ( CASSANDRA - 6248 ) <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java <nl> index 61f5668 . . f883597 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java <nl> @ @ - 20 , 8 + 20 , 9 @ @ package org . apache . cassandra . db . compaction ; <nl> import java . util . * ; <nl> import java . util . Map . Entry ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . collect . Iterables ; <nl> - import com . google . common . primitives . Longs ; <nl> + import com . google . common . collect . Lists ; <nl> import org . slf4j . Logger ; <nl> import org . slf4j . LoggerFactory ; <nl> <nl> @ @ - 34 , 20 + 35 , 18 @ @ import org . apache . cassandra . utils . Pair ; <nl> public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy <nl> { <nl> private static final Logger logger = LoggerFactory . getLogger ( SizeTieredCompactionStrategy . class ) ; <nl> - <nl> - private static Comparator < SSTableReader > generationComparator = new Comparator < SSTableReader > ( ) <nl> - { <nl> - public int compare ( SSTableReader o1 , SSTableReader o2 ) <nl> - { <nl> - return o1 . descriptor . generation - o2 . descriptor . generation ; <nl> - } <nl> - } ; <nl> - <nl> - private static Comparator < List < SSTableReader > > avgBucketSizeComparator = new Comparator < List < SSTableReader > > ( ) <nl> + <nl> + private static final Comparator < Pair < List < SSTableReader > , Double > > bucketsByHotnessComparator = new Comparator < Pair < List < SSTableReader > , Double > > ( ) <nl> { <nl> - public int compare ( List < SSTableReader > o1 , List < SSTableReader > o2 ) <nl> + public int compare ( Pair < List < SSTableReader > , Double > o1 , Pair < List < SSTableReader > , Double > o2 ) <nl> { <nl> - return Longs . compare ( avgSize ( o1 ) , avgSize ( o2 ) ) ; <nl> + int comparison = Double . compare ( o1 . right , o2 . right ) ; <nl> + if ( comparison ! = 0 ) <nl> + return comparison ; <nl> + <nl> + / / break ties by compacting the smallest sstables first ( this will probably only happen for <nl> + / / system tables and new / unread sstables ) <nl> + return Long . compare ( avgSize ( o1 . left ) , avgSize ( o2 . left ) ) ; <nl> } <nl> <nl> private long avgSize ( List < SSTableReader > sstables ) <nl> @ @ - 78 , 8 + 77 , 10 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy <nl> int minThreshold = cfs . getMinimumCompactionThreshold ( ) ; <nl> int maxThreshold = cfs . getMaximumCompactionThreshold ( ) ; <nl> <nl> - Set < SSTableReader > candidates = cfs . getUncompactingSSTables ( ) ; <nl> - List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndLengthPairs ( filterSuspectSSTables ( candidates ) ) , options . bucketHigh , options . bucketLow , options . minSSTableSize ) ; <nl> + Iterable < SSTableReader > candidates = filterSuspectSSTables ( cfs . getUncompactingSSTables ( ) ) ; <nl> + candidates = filterColdSSTables ( Lists . newArrayList ( candidates ) , options . coldReadsToOmit ) ; <nl> + <nl> + List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndLengthPairs ( candidates ) , options . bucketHigh , options . bucketLow , options . minSSTableSize ) ; <nl> logger . debug ( " Compaction buckets are { } " , buckets ) ; <nl> updateEstimatedCompactionsByTasks ( buckets ) ; <nl> List < SSTableReader > mostInteresting = mostInterestingBucket ( buckets , minThreshold , maxThreshold ) ; <nl> @ @ - 101 , 24 + 102 , 114 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy <nl> return Collections . singletonList ( sstablesWithTombstones . get ( 0 ) ) ; <nl> } <nl> <nl> + / * * <nl> + * Removes as many cold sstables as possible while retaining at least 1 - coldReadsToOmit of the total reads / sec <nl> + * across all sstables <nl> + * @ param sstables all sstables to consider <nl> + * @ param coldReadsToOmit the proportion of total reads / sec that will be omitted ( 0 = omit nothing , 1 = omit everything ) <nl> + * @ return a list of sstables with the coldest sstables excluded until the reads they represent reaches coldReadsToOmit <nl> + * / <nl> + @ VisibleForTesting <nl> + static List < SSTableReader > filterColdSSTables ( List < SSTableReader > sstables , double coldReadsToOmit ) <nl> + { <nl> + / / sort the sstables by hotness ( coldest - first ) , breaking ties with size on disk ( mainly for system tables and cold tables ) <nl> + Collections . sort ( sstables , new Comparator < SSTableReader > ( ) <nl> + { <nl> + public int compare ( SSTableReader o1 , SSTableReader o2 ) <nl> + { <nl> + int comparison = Double . compare ( hotness ( o1 ) , hotness ( o2 ) ) ; <nl> + if ( comparison ! = 0 ) <nl> + return comparison ; <nl> + <nl> + return Long . compare ( o1 . bytesOnDisk ( ) , o2 . bytesOnDisk ( ) ) ; <nl> + } <nl> + } ) ; <nl> + <nl> + / / calculate the total reads / sec across all sstables <nl> + double totalReads = 0 . 0 ; <nl> + for ( SSTableReader sstr : sstables ) <nl> + if ( sstr . readMeter ! = null ) <nl> + totalReads + = sstr . readMeter . twoHourRate ( ) ; <nl> + <nl> + / / if this is a system table with no read meters or we don ' t have any read rates yet , just return them all <nl> + if ( totalReads = = 0 . 0 ) <nl> + return sstables ; <nl> + <nl> + / / iteratively ignore the coldest sstables until ignoring one more would put us over the coldReadsToOmit threshold <nl> + double maxColdReads = coldReadsToOmit * totalReads ; <nl> + <nl> + double totalColdReads = 0 . 0 ; <nl> + int cutoffIndex = 0 ; <nl> + while ( cutoffIndex < sstables . size ( ) ) <nl> + { <nl> + double reads = sstables . get ( cutoffIndex ) . readMeter . twoHourRate ( ) ; <nl> + if ( totalColdReads + reads > maxColdReads ) <nl> + break ; <nl> + <nl> + totalColdReads + = reads ; <nl> + cutoffIndex + + ; <nl> + } <nl> + <nl> + return sstables . subList ( cutoffIndex , sstables . size ( ) ) ; <nl> + } <nl> + <nl> + / * * <nl> + * @ param buckets list of buckets from which to return the most interesting , where " interesting " is the total hotness for reads <nl> + * @ param minThreshold minimum number of sstables in a bucket to qualify as interesting <nl> + * @ param maxThreshold maximum number of sstables to compact at once ( the returned bucket will be trimmed down to this ) <nl> + * @ return a bucket ( list ) of sstables to compact <nl> + * / <nl> public static List < SSTableReader > mostInterestingBucket ( List < List < SSTableReader > > buckets , int minThreshold , int maxThreshold ) <nl> { <nl> - / / skip buckets containing less than minThreshold sstables , and limit other buckets to maxThreshold entries <nl> - List < List < SSTableReader > > prunedBuckets = new ArrayList < List < SSTableReader > > ( ) ; <nl> + / / skip buckets containing less than minThreshold sstables , and limit other buckets to maxThreshold sstables <nl> + final List < Pair < List < SSTableReader > , Double > > prunedBucketsAndHotness = new ArrayList < > ( buckets . size ( ) ) ; <nl> for ( List < SSTableReader > bucket : buckets ) <nl> { <nl> - if ( bucket . size ( ) < minThreshold ) <nl> - continue ; <nl> - <nl> - Collections . sort ( bucket , generationComparator ) ; <nl> - List < SSTableReader > prunedBucket = bucket . subList ( 0 , Math . min ( bucket . size ( ) , maxThreshold ) ) ; <nl> - prunedBuckets . add ( prunedBucket ) ; <nl> + Pair < List < SSTableReader > , Double > bucketAndHotness = trimToThresholdWithHotness ( bucket , maxThreshold ) ; <nl> + if ( bucketAndHotness ! = null & & bucketAndHotness . left . size ( ) > = minThreshold ) <nl> + prunedBucketsAndHotness . add ( bucketAndHotness ) ; <nl> } <nl> - if ( prunedBuckets . isEmpty ( ) ) <nl> + if ( prunedBucketsAndHotness . isEmpty ( ) ) <nl> return Collections . emptyList ( ) ; <nl> - <nl> - / / prefer compacting buckets with smallest average size ; that will yield the fastest improvement for read performance <nl> - return Collections . min ( prunedBuckets , avgBucketSizeComparator ) ; <nl> + <nl> + Pair < List < SSTableReader > , Double > hottest = Collections . max ( prunedBucketsAndHotness , bucketsByHotnessComparator ) ; <nl> + return hottest . left ; <nl> + } <nl> + <nl> + / * * <nl> + * Returns a ( bucket , hotness ) pair or null if there were not enough sstables in the bucket to meet minThreshold . <nl> + * If there are more than maxThreshold sstables , the coldest sstables will be trimmed to meet the threshold . <nl> + * * / <nl> + @ VisibleForTesting <nl> + static Pair < List < SSTableReader > , Double > trimToThresholdWithHotness ( List < SSTableReader > bucket , int maxThreshold ) <nl> + { <nl> + / / sort by sstable hotness ( descending ) <nl> + Collections . sort ( bucket , new Comparator < SSTableReader > ( ) <nl> + { <nl> + public int compare ( SSTableReader o1 , SSTableReader o2 ) <nl> + { <nl> + return - 1 * Double . compare ( hotness ( o1 ) , hotness ( o2 ) ) ; <nl> + } <nl> + } ) ; <nl> + <nl> + / / and then trim the coldest sstables off the end to meet the maxThreshold <nl> + List < SSTableReader > prunedBucket = bucket . subList ( 0 , Math . min ( bucket . size ( ) , maxThreshold ) ) ; <nl> + <nl> + / / bucket hotness is the sum of the hotness of all sstable members <nl> + double bucketHotness = 0 . 0 ; <nl> + for ( SSTableReader sstr : prunedBucket ) <nl> + bucketHotness + = hotness ( sstr ) ; <nl> + <nl> + return Pair . create ( prunedBucket , bucketHotness ) ; <nl> + } <nl> + <nl> + / * * <nl> + * Returns the reads per second per key for this sstable , or 0 . 0 if the sstable has no read meter <nl> + * / <nl> + private static double hotness ( SSTableReader sstr ) <nl> + { <nl> + / / system tables don ' t have read meters , just use 0 . 0 for the hotness <nl> + return sstr . readMeter = = null ? 0 . 0 : sstr . readMeter . twoHourRate ( ) / sstr . estimatedKeys ( ) ; <nl> } <nl> <nl> public synchronized AbstractCompactionTask getNextBackgroundTask ( int gcBefore ) <nl> @ @ - 128 , 13 + 219 , 13 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy <nl> <nl> while ( true ) <nl> { <nl> - List < SSTableReader > smallestBucket = getNextBackgroundSSTables ( gcBefore ) ; <nl> + List < SSTableReader > hottestBucket = getNextBackgroundSSTables ( gcBefore ) ; <nl> <nl> - if ( smallestBucket . isEmpty ( ) ) <nl> + if ( hottestBucket . isEmpty ( ) ) <nl> return null ; <nl> <nl> - if ( cfs . getDataTracker ( ) . markCompacting ( smallestBucket ) ) <nl> - return new CompactionTask ( cfs , smallestBucket , gcBefore ) ; <nl> + if ( cfs . getDataTracker ( ) . markCompacting ( hottestBucket ) ) <nl> + return new CompactionTask ( cfs , hottestBucket , gcBefore ) ; <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyOptions . java b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyOptions . java <nl> index d7c9075 . . 711ec6e 100644 <nl> - - - a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyOptions . java <nl> + + + b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyOptions . java <nl> @ @ - 26 , 31 + 26 , 48 @ @ public final class SizeTieredCompactionStrategyOptions <nl> protected static final long DEFAULT _ MIN _ SSTABLE _ SIZE = 50L * 1024L * 1024L ; <nl> protected static final double DEFAULT _ BUCKET _ LOW = 0 . 5 ; <nl> protected static final double DEFAULT _ BUCKET _ HIGH = 1 . 5 ; <nl> + protected static final double DEFAULT _ COLD _ READS _ TO _ OMIT = 0 . 0 ; <nl> protected static final String MIN _ SSTABLE _ SIZE _ KEY = " min _ sstable _ size " ; <nl> protected static final String BUCKET _ LOW _ KEY = " bucket _ low " ; <nl> protected static final String BUCKET _ HIGH _ KEY = " bucket _ high " ; <nl> + protected static final String MAX _ COLD _ READS _ RATIO _ KEY = " max _ cold _ reads _ ratio " ; <nl> <nl> protected long minSSTableSize ; <nl> protected double bucketLow ; <nl> protected double bucketHigh ; <nl> + protected double coldReadsToOmit ; <nl> <nl> public SizeTieredCompactionStrategyOptions ( Map < String , String > options ) <nl> { <nl> - <nl> String optionValue = options . get ( MIN _ SSTABLE _ SIZE _ KEY ) ; <nl> minSSTableSize = optionValue = = null ? DEFAULT _ MIN _ SSTABLE _ SIZE : Long . parseLong ( optionValue ) ; <nl> optionValue = options . get ( BUCKET _ LOW _ KEY ) ; <nl> bucketLow = optionValue = = null ? DEFAULT _ BUCKET _ LOW : Double . parseDouble ( optionValue ) ; <nl> optionValue = options . get ( BUCKET _ HIGH _ KEY ) ; <nl> bucketHigh = optionValue = = null ? DEFAULT _ BUCKET _ HIGH : Double . parseDouble ( optionValue ) ; <nl> + optionValue = options . get ( MAX _ COLD _ READS _ RATIO _ KEY ) ; <nl> + coldReadsToOmit = optionValue = = null ? DEFAULT _ COLD _ READS _ TO _ OMIT : Double . parseDouble ( optionValue ) ; <nl> } <nl> <nl> public SizeTieredCompactionStrategyOptions ( ) <nl> { <nl> - <nl> minSSTableSize = DEFAULT _ MIN _ SSTABLE _ SIZE ; <nl> bucketLow = DEFAULT _ BUCKET _ LOW ; <nl> bucketHigh = DEFAULT _ BUCKET _ HIGH ; <nl> + coldReadsToOmit = DEFAULT _ COLD _ READS _ TO _ OMIT ; <nl> + } <nl> + <nl> + private static double parseDouble ( Map < String , String > options , String key , double defaultValue ) throws ConfigurationException <nl> + { <nl> + String optionValue = options . get ( key ) ; <nl> + try <nl> + { <nl> + return optionValue = = null ? defaultValue : Double . parseDouble ( optionValue ) ; <nl> + } <nl> + catch ( NumberFormatException e ) <nl> + { <nl> + throw new ConfigurationException ( String . format ( " % s is not a parsable float for % s " , optionValue , key ) , e ) ; <nl> + } <nl> } <nl> <nl> public static Map < String , String > validateOptions ( Map < String , String > options , Map < String , String > uncheckedOptions ) throws ConfigurationException <nl> @ @ - 69 , 36 + 86 , 26 @ @ public final class SizeTieredCompactionStrategyOptions <nl> throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , MIN _ SSTABLE _ SIZE _ KEY ) , e ) ; <nl> } <nl> <nl> - double bucketLow , bucketHigh ; <nl> - optionValue = options . get ( BUCKET _ LOW _ KEY ) ; <nl> - try <nl> - { <nl> - bucketLow = optionValue = = null ? DEFAULT _ BUCKET _ LOW : Double . parseDouble ( optionValue ) ; <nl> - } <nl> - catch ( NumberFormatException e ) <nl> - { <nl> - throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , DEFAULT _ BUCKET _ LOW ) , e ) ; <nl> - } <nl> - <nl> - optionValue = options . get ( BUCKET _ HIGH _ KEY ) ; <nl> - try <nl> - { <nl> - bucketHigh = optionValue = = null ? DEFAULT _ BUCKET _ HIGH : Double . parseDouble ( optionValue ) ; <nl> - } <nl> - catch ( NumberFormatException e ) <nl> + double bucketLow = parseDouble ( options , BUCKET _ LOW _ KEY , DEFAULT _ BUCKET _ LOW ) ; <nl> + double bucketHigh = parseDouble ( options , BUCKET _ HIGH _ KEY , DEFAULT _ BUCKET _ HIGH ) ; <nl> + if ( bucketHigh < = bucketLow ) <nl> { <nl> - throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , DEFAULT _ BUCKET _ HIGH ) , e ) ; <nl> + throw new ConfigurationException ( String . format ( " % s value ( % s ) is less than or equal to the % s value ( % s ) " , <nl> + BUCKET _ HIGH _ KEY , bucketHigh , BUCKET _ LOW _ KEY , bucketLow ) ) ; <nl> } <nl> <nl> - if ( bucketHigh < = bucketLow ) <nl> + double maxColdReadsRatio = parseDouble ( options , MAX _ COLD _ READS _ RATIO _ KEY , DEFAULT _ COLD _ READS _ TO _ OMIT ) ; <nl> + if ( maxColdReadsRatio < 0 . 0 | | maxColdReadsRatio > 1 . 0 ) <nl> { <nl> - throw new ConfigurationException ( String . format ( " Bucket high value ( % s ) is less than or equal bucket low value ( % s ) " , bucketHigh , bucketLow ) ) ; <nl> + throw new ConfigurationException ( String . format ( " % s value ( % s ) should be between between 0 . 0 and 1 . 0 " , <nl> + MAX _ COLD _ READS _ RATIO _ KEY , optionValue ) ) ; <nl> } <nl> <nl> uncheckedOptions . remove ( MIN _ SSTABLE _ SIZE _ KEY ) ; <nl> uncheckedOptions . remove ( BUCKET _ LOW _ KEY ) ; <nl> uncheckedOptions . remove ( BUCKET _ HIGH _ KEY ) ; <nl> + uncheckedOptions . remove ( MAX _ COLD _ READS _ RATIO _ KEY ) ; <nl> <nl> return uncheckedOptions ; <nl> } <nl> - } <nl> + } <nl> \ No newline at end of file <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> index df5a046 . . c5b61d9 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java <nl> @ @ - 28 , 6 + 28 , 7 @ @ import java . util . concurrent . atomic . AtomicBoolean ; <nl> import java . util . concurrent . atomic . AtomicInteger ; <nl> import java . util . concurrent . atomic . AtomicLong ; <nl> <nl> + import com . google . common . annotations . VisibleForTesting ; <nl> import com . google . common . primitives . Longs ; <nl> import com . google . common . util . concurrent . RateLimiter ; <nl> import org . slf4j . Logger ; <nl> @ @ - 103 , 7 + 104 , 8 @ @ public class SSTableReader extends SSTable implements Closeable <nl> private final AtomicLong keyCacheHit = new AtomicLong ( 0 ) ; <nl> private final AtomicLong keyCacheRequest = new AtomicLong ( 0 ) ; <nl> <nl> - public final RestorableMeter readMeter ; <nl> + @ VisibleForTesting <nl> + public RestorableMeter readMeter ; <nl> <nl> public static long getApproximateKeyCount ( Iterable < SSTableReader > sstables , CFMetaData metadata ) <nl> { <nl> diff - - git a / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java <nl> index 89604c5 . . 5e79bd8 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java <nl> @ @ - 17 , 17 + 17 , 80 @ @ <nl> * / <nl> package org . apache . cassandra . db . compaction ; <nl> <nl> - import java . util . ArrayList ; <nl> - import java . util . List ; <nl> + import java . nio . ByteBuffer ; <nl> + import java . util . * ; <nl> <nl> import org . junit . Test ; <nl> <nl> + import org . apache . cassandra . SchemaLoader ; <nl> + import org . apache . cassandra . Util ; <nl> + import org . apache . cassandra . db . ColumnFamilyStore ; <nl> + import org . apache . cassandra . db . DecoratedKey ; <nl> + import org . apache . cassandra . db . Keyspace ; <nl> + import org . apache . cassandra . db . RowMutation ; <nl> + import org . apache . cassandra . exceptions . ConfigurationException ; <nl> + import org . apache . cassandra . io . sstable . SSTableReader ; <nl> + import org . apache . cassandra . metrics . RestorableMeter ; <nl> + import org . apache . cassandra . utils . ByteBufferUtil ; <nl> import org . apache . cassandra . utils . Pair ; <nl> <nl> - import static org . junit . Assert . assertEquals ; <nl> + import static org . apache . cassandra . db . compaction . SizeTieredCompactionStrategy . getBuckets ; <nl> + import static org . apache . cassandra . db . compaction . SizeTieredCompactionStrategy . mostInterestingBucket ; <nl> + import static org . apache . cassandra . db . compaction . SizeTieredCompactionStrategy . trimToThresholdWithHotness ; <nl> + import static org . apache . cassandra . db . compaction . SizeTieredCompactionStrategy . filterColdSSTables ; <nl> + import static org . apache . cassandra . db . compaction . SizeTieredCompactionStrategy . validateOptions ; <nl> <nl> - public class SizeTieredCompactionStrategyTest <nl> + import static org . junit . Assert . * ; <nl> + <nl> + public class SizeTieredCompactionStrategyTest extends SchemaLoader <nl> { <nl> + <nl> + @ Test <nl> + public void testOptionsValidation ( ) throws ConfigurationException <nl> + { <nl> + Map < String , String > options = new HashMap < > ( ) ; <nl> + options . put ( SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY , " 0 . 35 " ) ; <nl> + options . put ( SizeTieredCompactionStrategyOptions . BUCKET _ LOW _ KEY , " 0 . 5 " ) ; <nl> + options . put ( SizeTieredCompactionStrategyOptions . BUCKET _ HIGH _ KEY , " 1 . 5 " ) ; <nl> + options . put ( SizeTieredCompactionStrategyOptions . MIN _ SSTABLE _ SIZE _ KEY , " 10000 " ) ; <nl> + Map < String , String > unvalidated = validateOptions ( options ) ; <nl> + assertTrue ( unvalidated . isEmpty ( ) ) ; <nl> + <nl> + try <nl> + { <nl> + options . put ( SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY , " - 0 . 5 " ) ; <nl> + validateOptions ( options ) ; <nl> + fail ( String . format ( " Negative % s should be rejected " , SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY ) ) ; <nl> + } <nl> + catch ( ConfigurationException e ) { } <nl> + <nl> + try <nl> + { <nl> + options . put ( SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY , " 10 . 0 " ) ; <nl> + validateOptions ( options ) ; <nl> + fail ( String . format ( " % s > 1 . 0 should be rejected " , SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY ) ) ; <nl> + } <nl> + catch ( ConfigurationException e ) <nl> + { <nl> + options . put ( SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY , " 0 . 25 " ) ; <nl> + } <nl> + <nl> + try <nl> + { <nl> + options . put ( SizeTieredCompactionStrategyOptions . BUCKET _ LOW _ KEY , " 1000 . 0 " ) ; <nl> + validateOptions ( options ) ; <nl> + fail ( " bucket _ low greater than bucket _ high should be rejected " ) ; <nl> + } <nl> + catch ( ConfigurationException e ) <nl> + { <nl> + options . put ( SizeTieredCompactionStrategyOptions . BUCKET _ LOW _ KEY , " 0 . 5 " ) ; <nl> + } <nl> + <nl> + options . put ( " bad _ option " , " 1 . 0 " ) ; <nl> + unvalidated = validateOptions ( options ) ; <nl> + assertTrue ( unvalidated . containsKey ( " bad _ option " ) ) ; <nl> + } <nl> + <nl> @ Test <nl> public void testGetBuckets ( ) <nl> { <nl> @ @ - 39 , 7 + 102 , 7 @ @ public class SizeTieredCompactionStrategyTest <nl> pairs . add ( pair ) ; <nl> } <nl> <nl> - List < List < String > > buckets = SizeTieredCompactionStrategy . getBuckets ( pairs , 1 . 5 , 0 . 5 , 2 ) ; <nl> + List < List < String > > buckets = getBuckets ( pairs , 1 . 5 , 0 . 5 , 2 ) ; <nl> assertEquals ( 3 , buckets . size ( ) ) ; <nl> <nl> for ( List < String > bucket : buckets ) <nl> @ @ - 59 , 7 + 122 , 7 @ @ public class SizeTieredCompactionStrategyTest <nl> pairs . add ( pair ) ; <nl> } <nl> <nl> - buckets = SizeTieredCompactionStrategy . getBuckets ( pairs , 1 . 5 , 0 . 5 , 2 ) ; <nl> + buckets = getBuckets ( pairs , 1 . 5 , 0 . 5 , 2 ) ; <nl> assertEquals ( 2 , buckets . size ( ) ) ; <nl> <nl> for ( List < String > bucket : buckets ) <nl> @ @ - 80 , 7 + 143 , 120 @ @ public class SizeTieredCompactionStrategyTest <nl> pairs . add ( pair ) ; <nl> } <nl> <nl> - buckets = SizeTieredCompactionStrategy . getBuckets ( pairs , 1 . 5 , 0 . 5 , 10 ) ; <nl> + buckets = getBuckets ( pairs , 1 . 5 , 0 . 5 , 10 ) ; <nl> assertEquals ( 1 , buckets . size ( ) ) ; <nl> } <nl> - } <nl> + <nl> + @ Test <nl> + public void testPrepBucket ( ) throws Exception <nl> + { <nl> + String ksname = " Keyspace1 " ; <nl> + String cfname = " Standard1 " ; <nl> + Keyspace keyspace = Keyspace . open ( ksname ) ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfname ) ; <nl> + cfs . truncateBlocking ( ) ; <nl> + cfs . disableAutoCompaction ( ) ; <nl> + <nl> + ByteBuffer value = ByteBuffer . wrap ( new byte [ 100 ] ) ; <nl> + <nl> + / / create 3 sstables <nl> + int numSSTables = 3 ; <nl> + for ( int r = 0 ; r < numSSTables ; r + + ) <nl> + { <nl> + DecoratedKey key = Util . dk ( String . valueOf ( r ) ) ; <nl> + RowMutation rm = new RowMutation ( ksname , key . key ) ; <nl> + rm . add ( cfname , ByteBufferUtil . bytes ( " column " ) , value , 0 ) ; <nl> + rm . apply ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + } <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + List < SSTableReader > sstrs = new ArrayList < > ( cfs . getSSTables ( ) ) ; <nl> + Pair < List < SSTableReader > , Double > bucket ; <nl> + <nl> + List < SSTableReader > interestingBucket = mostInterestingBucket ( Collections . singletonList ( sstrs . subList ( 0 , 2 ) ) , 4 , 32 ) ; <nl> + assertTrue ( " nothing should be returned when all buckets are below the min threshold " , interestingBucket . isEmpty ( ) ) ; <nl> + <nl> + sstrs . get ( 0 ) . readMeter = new RestorableMeter ( 100 . 0 , 100 . 0 ) ; <nl> + sstrs . get ( 1 ) . readMeter = new RestorableMeter ( 200 . 0 , 200 . 0 ) ; <nl> + sstrs . get ( 2 ) . readMeter = new RestorableMeter ( 300 . 0 , 300 . 0 ) ; <nl> + <nl> + long estimatedKeys = sstrs . get ( 0 ) . estimatedKeys ( ) ; <nl> + <nl> + / / if we have more than the max threshold , the coldest should be dropped <nl> + bucket = trimToThresholdWithHotness ( sstrs , 2 ) ; <nl> + assertEquals ( " one bucket should have been dropped " , 2 , bucket . left . size ( ) ) ; <nl> + double expectedBucketHotness = ( 200 . 0 + 300 . 0 ) / estimatedKeys ; <nl> + assertEquals ( String . format ( " bucket hotness ( % f ) should be close to % f " , bucket . right , expectedBucketHotness ) , <nl> + expectedBucketHotness , bucket . right , 1 . 0 ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testFilterColdSSTables ( ) throws Exception <nl> + { <nl> + String ksname = " Keyspace1 " ; <nl> + String cfname = " Standard1 " ; <nl> + Keyspace keyspace = Keyspace . open ( ksname ) ; <nl> + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfname ) ; <nl> + cfs . truncateBlocking ( ) ; <nl> + cfs . disableAutoCompaction ( ) ; <nl> + <nl> + ByteBuffer value = ByteBuffer . wrap ( new byte [ 100 ] ) ; <nl> + <nl> + / / create 10 sstables <nl> + int numSSTables = 10 ; <nl> + for ( int r = 0 ; r < numSSTables ; r + + ) <nl> + { <nl> + DecoratedKey key = Util . dk ( String . valueOf ( r ) ) ; <nl> + RowMutation rm = new RowMutation ( ksname , key . key ) ; <nl> + rm . add ( cfname , ByteBufferUtil . bytes ( " column " ) , value , 0 ) ; <nl> + rm . apply ( ) ; <nl> + cfs . forceBlockingFlush ( ) ; <nl> + } <nl> + cfs . forceBlockingFlush ( ) ; <nl> + <nl> + List < SSTableReader > filtered ; <nl> + List < SSTableReader > sstrs = new ArrayList < > ( cfs . getSSTables ( ) ) ; <nl> + <nl> + for ( SSTableReader sstr : sstrs ) <nl> + sstr . readMeter = null ; <nl> + filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; <nl> + assertEquals ( " when there are no read meters , no sstables should be filtered " , sstrs . size ( ) , filtered . size ( ) ) ; <nl> + <nl> + for ( SSTableReader sstr : sstrs ) <nl> + sstr . readMeter = new RestorableMeter ( 0 . 0 , 0 . 0 ) ; <nl> + filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; <nl> + assertEquals ( " when all read meters are zero , no sstables should be filtered " , sstrs . size ( ) , filtered . size ( ) ) ; <nl> + <nl> + / / leave all read rates at 0 besides one <nl> + sstrs . get ( 0 ) . readMeter = new RestorableMeter ( 1000 . 0 , 1000 . 0 ) ; <nl> + filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; <nl> + assertEquals ( " there should only be one hot sstable " , 1 , filtered . size ( ) ) ; <nl> + assertEquals ( 1000 . 0 , filtered . get ( 0 ) . readMeter . twoHourRate ( ) , 0 . 5 ) ; <nl> + <nl> + / / the total read rate is 100 , and we ' ll set a threshold of 2 . 5 % , so two of the sstables with read <nl> + / / rate 1 . 0 should be ignored , but not the third <nl> + for ( SSTableReader sstr : sstrs ) <nl> + sstr . readMeter = new RestorableMeter ( 0 . 0 , 0 . 0 ) ; <nl> + sstrs . get ( 0 ) . readMeter = new RestorableMeter ( 97 . 0 , 97 . 0 ) ; <nl> + sstrs . get ( 1 ) . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; <nl> + sstrs . get ( 2 ) . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; <nl> + sstrs . get ( 3 ) . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; <nl> + <nl> + filtered = filterColdSSTables ( sstrs , 0 . 025 ) ; <nl> + assertEquals ( 2 , filtered . size ( ) ) ; <nl> + assertEquals ( 98 . 0 , filtered . get ( 0 ) . readMeter . twoHourRate ( ) + filtered . get ( 1 ) . readMeter . twoHourRate ( ) , 0 . 5 ) ; <nl> + <nl> + / / make sure a threshold of 0 . 0 doesn ' t result in any sstables being filtered <nl> + for ( SSTableReader sstr : sstrs ) <nl> + sstr . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; <nl> + filtered = filterColdSSTables ( sstrs , 0 . 0 ) ; <nl> + assertEquals ( sstrs . size ( ) , filtered . size ( ) ) ; <nl> + <nl> + / / just for fun , set a threshold where all sstables are considered cold <nl> + for ( SSTableReader sstr : sstrs ) <nl> + sstr . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; <nl> + filtered = filterColdSSTables ( sstrs , 1 . 0 ) ; <nl> + assertTrue ( filtered . isEmpty ( ) ) ; <nl> + } <nl> + } <nl> \ No newline at end of file
+
+TEST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index b247127 . . ff6a26f 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 1 , 4 + 1 , 6 @ @ 
+ 2 . 1 . 3 
+ + * Make sure we compact highly overlapping cold sstables with 
+ + STCS ( CASSANDRA - 8635 ) 
+ * rpc _ interface and listen _ interface generate NPE on startup when specified interface doesn ' t exist ( CASSANDRA - 8677 ) 
+ * Fix ArrayIndexOutOfBoundsException in nodetool cfhistograms ( CASSANDRA - 8514 ) 
+ * Switch from yammer metrics for nodetool cf / proxy histograms ( CASSANDRA - 8662 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java 
+ index 4b44426 . . fbd715c 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java 
+ @ @ - 24 , 12 + 24 , 14 @ @ import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . collect . Iterables ; 
+ import com . google . common . collect . Lists ; 
+ import com . google . common . collect . Sets ; 
+ + import com . google . common . primitives . Longs ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ import org . apache . cassandra . cql3 . statements . CFPropDefs ; 
+ import org . apache . cassandra . db . ColumnFamilyStore ; 
+ import org . apache . cassandra . exceptions . ConfigurationException ; 
+ + import org . apache . cassandra . io . sstable . ColumnNameHelper ; 
+ import org . apache . cassandra . io . sstable . SSTableReader ; 
+ import org . apache . cassandra . utils . Pair ; 
+ 
+ @ @ - 80 , 7 + 82 , 7 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy 
+ int maxThreshold = cfs . getMaximumCompactionThreshold ( ) ; 
+ 
+ Iterable < SSTableReader > candidates = filterSuspectSSTables ( Sets . intersection ( cfs . getUncompactingSSTables ( ) , sstables ) ) ; 
+ - candidates = filterColdSSTables ( Lists . newArrayList ( candidates ) , options . coldReadsToOmit ) ; 
+ + candidates = filterColdSSTables ( Lists . newArrayList ( candidates ) , options . coldReadsToOmit , cfs . getMinimumCompactionThreshold ( ) ) ; 
+ 
+ List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndLengthPairs ( candidates ) , options . bucketHigh , options . bucketLow , options . minSSTableSize ) ; 
+ logger . debug ( " Compaction buckets are { } " , buckets ) ; 
+ @ @ - 109 , 10 + 111 , 11 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy 
+ * across all sstables 
+ * @ param sstables all sstables to consider 
+ * @ param coldReadsToOmit the proportion of total reads / sec that will be omitted ( 0 = omit nothing , 1 = omit everything ) 
+ + * @ param minThreshold min compaction threshold 
+ * @ return a list of sstables with the coldest sstables excluded until the reads they represent reaches coldReadsToOmit 
+ * / 
+ @ VisibleForTesting 
+ - static List < SSTableReader > filterColdSSTables ( List < SSTableReader > sstables , double coldReadsToOmit ) 
+ + static List < SSTableReader > filterColdSSTables ( List < SSTableReader > sstables , double coldReadsToOmit , int minThreshold ) 
+ { 
+ if ( coldReadsToOmit = = 0 . 0 ) 
+ return sstables ; 
+ @ @ - 167 , 10 + 170 , 78 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy 
+ totalColdReads + = reads ; 
+ cutoffIndex + + ; 
+ } 
+ + List < SSTableReader > hotSSTables = new ArrayList < > ( sstables . subList ( cutoffIndex , sstables . size ( ) ) ) ; 
+ + List < SSTableReader > coldSSTables = sstables . subList ( 0 , cutoffIndex ) ; 
+ + logger . debug ( " hotSSTables = { } , coldSSTables = { } " , hotSSTables . size ( ) , coldSSTables . size ( ) ) ; 
+ + if ( hotSSTables . size ( ) > = minThreshold ) 
+ + return hotSSTables ; 
+ + if ( coldSSTables . size ( ) < minThreshold ) 
+ + return Collections . emptyList ( ) ; 
+ + 
+ + Map < SSTableReader , Set < SSTableReader > > overlapMap = new HashMap < > ( ) ; 
+ + for ( int i = 0 ; i < coldSSTables . size ( ) ; i + + ) 
+ + { 
+ + SSTableReader sstable = coldSSTables . get ( i ) ; 
+ + Set < SSTableReader > overlaps = new HashSet < > ( ) ; 
+ + for ( int j = 0 ; j < coldSSTables . size ( ) ; j + + ) 
+ + { 
+ + SSTableReader innerSSTable = coldSSTables . get ( j ) ; 
+ + if ( ColumnNameHelper . overlaps ( sstable . getSSTableMetadata ( ) . minColumnNames , 
+ + sstable . getSSTableMetadata ( ) . maxColumnNames , 
+ + innerSSTable . getSSTableMetadata ( ) . minColumnNames , 
+ + innerSSTable . getSSTableMetadata ( ) . maxColumnNames , 
+ + sstable . metadata . comparator ) ) 
+ + { 
+ + overlaps . add ( innerSSTable ) ; 
+ + } 
+ + } 
+ + overlapMap . put ( sstable , overlaps ) ; 
+ + } 
+ + List < Set < SSTableReader > > overlapChains = new ArrayList < > ( ) ; 
+ + for ( SSTableReader sstable : overlapMap . keySet ( ) ) 
+ + overlapChains . add ( createOverlapChain ( sstable , overlapMap ) ) ; 
+ + 
+ + Collections . sort ( overlapChains , new Comparator < Set < SSTableReader > > ( ) 
+ + { 
+ + @ Override 
+ + public int compare ( Set < SSTableReader > o1 , Set < SSTableReader > o2 ) 
+ + { 
+ + return Longs . compare ( SSTableReader . getTotalBytes ( o2 ) , SSTableReader . getTotalBytes ( o1 ) ) ; 
+ + } 
+ + } ) ; 
+ + for ( Set < SSTableReader > overlapping : overlapChains ) 
+ + { 
+ + / / if we are expecting to only keep 70 % of the keys after a compaction , run a compaction on these cold sstables : 
+ + if ( SSTableReader . estimateCompactionGain ( overlapping ) < 0 . 7 ) 
+ + return new ArrayList < > ( overlapping ) ; 
+ + } 
+ + return Collections . emptyList ( ) ; 
+ + } 
+ 
+ - return sstables . subList ( cutoffIndex , sstables . size ( ) ) ; 
+ + / * * 
+ + * returns a set with all overlapping sstables starting with s . 
+ + * if we have 3 sstables , a , b , c where a overlaps with b , but not c and b overlaps with c , all sstables would be returned . 
+ + * 
+ + * m contains an sstable - > all overlapping mapping 
+ + * / 
+ + private static Set < SSTableReader > createOverlapChain ( SSTableReader s , Map < SSTableReader , Set < SSTableReader > > m ) 
+ + { 
+ + Deque < SSTableReader > sstables = new ArrayDeque < > ( ) ; 
+ + Set < SSTableReader > overlapChain = new HashSet < > ( ) ; 
+ + sstables . push ( s ) ; 
+ + while ( ! sstables . isEmpty ( ) ) 
+ + { 
+ + SSTableReader sstable = sstables . pop ( ) ; 
+ + if ( overlapChain . add ( sstable ) ) 
+ + { 
+ + if ( m . containsKey ( sstable ) ) 
+ + sstables . addAll ( m . get ( sstable ) ) ; 
+ + } 
+ + } 
+ + return overlapChain ; 
+ } 
+ 
+ + 
+ / * * 
+ * @ param buckets list of buckets from which to return the most interesting , where " interesting " is the total hotness for reads 
+ * @ param minThreshold minimum number of sstables in a bucket to qualify as interesting 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / ColumnNameHelper . java b / src / java / org / apache / cassandra / io / sstable / ColumnNameHelper . java 
+ index f74b86f . . 436975b 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / ColumnNameHelper . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / ColumnNameHelper . java 
+ @ @ - 217 , 4 + 217 , 26 @ @ public class ColumnNameHelper 
+ 
+ return retList ; 
+ } 
+ + 
+ + / * * 
+ + * Checks if the given min / max column names could overlap ( i . e they could share some column names based on the max / min column names in the sstables ) 
+ + * / 
+ + public static boolean overlaps ( List < ByteBuffer > minColumnNames1 , List < ByteBuffer > maxColumnNames1 , List < ByteBuffer > minColumnNames2 , List < ByteBuffer > maxColumnNames2 , CellNameType comparator ) 
+ + { 
+ + if ( minColumnNames1 . isEmpty ( ) | | maxColumnNames1 . isEmpty ( ) | | minColumnNames2 . isEmpty ( ) | | maxColumnNames2 . isEmpty ( ) ) 
+ + return true ; 
+ + 
+ + return ! ( compare ( maxColumnNames1 , minColumnNames2 , comparator ) < 0 | | compare ( minColumnNames1 , maxColumnNames2 , comparator ) > 0 ) ; 
+ + } 
+ + 
+ + private static int compare ( List < ByteBuffer > columnNames1 , List < ByteBuffer > columnNames2 , CellNameType comparator ) 
+ + { 
+ + for ( int i = 0 ; i < Math . min ( columnNames1 . size ( ) , columnNames2 . size ( ) ) ; i + + ) 
+ + { 
+ + int cmp = comparator . subtype ( i ) . compare ( columnNames1 . get ( i ) , columnNames2 . get ( i ) ) ; 
+ + if ( cmp ! = 0 ) 
+ + return cmp ; 
+ + } 
+ + return 0 ; 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ index ee8b7c3 . . 50bf3e3 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ @ @ - 31 , 6 + 31 , 7 @ @ import java . util . Collection ; 
+ import java . util . Collections ; 
+ import java . util . Comparator ; 
+ import java . util . EnumSet ; 
+ + import java . util . HashSet ; 
+ import java . util . Iterator ; 
+ import java . util . List ; 
+ import java . util . Map ; 
+ @ @ - 54 , 6 + 55 , 7 @ @ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ import com . clearspring . analytics . stream . cardinality . CardinalityMergeException ; 
+ + import com . clearspring . analytics . stream . cardinality . HyperLogLogPlus ; 
+ import com . clearspring . analytics . stream . cardinality . ICardinality ; 
+ import org . apache . cassandra . cache . CachingOptions ; 
+ import org . apache . cassandra . cache . InstrumentingCache ; 
+ @ @ - 272 , 6 + 274 , 54 @ @ public class SSTableReader extends SSTable 
+ return count ; 
+ } 
+ 
+ + / * * 
+ + * Estimates how much of the keys we would keep if the sstables were compacted together 
+ + * / 
+ + public static double estimateCompactionGain ( Set < SSTableReader > overlapping ) 
+ + { 
+ + Set < ICardinality > cardinalities = new HashSet < > ( overlapping . size ( ) ) ; 
+ + for ( SSTableReader sstable : overlapping ) 
+ + { 
+ + try 
+ + { 
+ + ICardinality cardinality = ( ( CompactionMetadata ) sstable . descriptor . getMetadataSerializer ( ) . deserialize ( sstable . descriptor , MetadataType . COMPACTION ) ) . cardinalityEstimator ; 
+ + if ( cardinality ! = null ) 
+ + cardinalities . add ( cardinality ) ; 
+ + else 
+ + logger . debug ( " Got a null cardinality estimator in : " + sstable . getFilename ( ) ) ; 
+ + } 
+ + catch ( IOException e ) 
+ + { 
+ + logger . warn ( " Could not read up compaction metadata for " + sstable , e ) ; 
+ + } 
+ + } 
+ + long totalKeyCountBefore = 0 ; 
+ + for ( ICardinality cardinality : cardinalities ) 
+ + { 
+ + totalKeyCountBefore + = cardinality . cardinality ( ) ; 
+ + } 
+ + if ( totalKeyCountBefore = = 0 ) 
+ + return 1 ; 
+ + 
+ + long totalKeyCountAfter = mergeCardinalities ( cardinalities ) . cardinality ( ) ; 
+ + logger . debug ( " Estimated compaction gain : { } / { } = { } " , totalKeyCountAfter , totalKeyCountBefore , ( ( double ) totalKeyCountAfter ) / totalKeyCountBefore ) ; 
+ + return ( ( double ) totalKeyCountAfter ) / totalKeyCountBefore ; 
+ + } 
+ + 
+ + private static ICardinality mergeCardinalities ( Collection < ICardinality > cardinalities ) 
+ + { 
+ + ICardinality base = new HyperLogLogPlus ( 13 , 25 ) ; / / see MetadataCollector . cardinality 
+ + try 
+ + { 
+ + base = base . merge ( cardinalities . toArray ( new ICardinality [ cardinalities . size ( ) ] ) ) ; 
+ + } 
+ + catch ( CardinalityMergeException e ) 
+ + { 
+ + logger . warn ( " Could not merge cardinalities " , e ) ; 
+ + } 
+ + return base ; 
+ + } 
+ + 
+ public static SSTableReader open ( Descriptor descriptor ) throws IOException 
+ { 
+ CFMetaData metadata ; 
+ diff - - git a / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java 
+ index 6132dad . . d9bf017 100644 
+ - - - a / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java 
+ @ @ - 216 , 17 + 216 , 17 @ @ public class SizeTieredCompactionStrategyTest extends SchemaLoader 
+ 
+ for ( SSTableReader sstr : sstrs ) 
+ sstr . readMeter = null ; 
+ - filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; 
+ + filtered = filterColdSSTables ( sstrs , 0 . 05 , 0 ) ; 
+ assertEquals ( " when there are no read meters , no sstables should be filtered " , sstrs . size ( ) , filtered . size ( ) ) ; 
+ 
+ for ( SSTableReader sstr : sstrs ) 
+ sstr . readMeter = new RestorableMeter ( 0 . 0 , 0 . 0 ) ; 
+ - filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; 
+ + filtered = filterColdSSTables ( sstrs , 0 . 05 , 0 ) ; 
+ assertEquals ( " when all read meters are zero , no sstables should be filtered " , sstrs . size ( ) , filtered . size ( ) ) ; 
+ 
+ / / leave all read rates at 0 besides one 
+ sstrs . get ( 0 ) . readMeter = new RestorableMeter ( 1000 . 0 , 1000 . 0 ) ; 
+ - filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; 
+ + filtered = filterColdSSTables ( sstrs , 0 . 05 , 0 ) ; 
+ assertEquals ( " there should only be one hot sstable " , 1 , filtered . size ( ) ) ; 
+ assertEquals ( 1000 . 0 , filtered . get ( 0 ) . readMeter . twoHourRate ( ) , 0 . 5 ) ; 
+ 
+ @ @ - 239 , 20 + 239 , 20 @ @ public class SizeTieredCompactionStrategyTest extends SchemaLoader 
+ sstrs . get ( 2 ) . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; 
+ sstrs . get ( 3 ) . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; 
+ 
+ - filtered = filterColdSSTables ( sstrs , 0 . 025 ) ; 
+ + filtered = filterColdSSTables ( sstrs , 0 . 025 , 0 ) ; 
+ assertEquals ( 2 , filtered . size ( ) ) ; 
+ assertEquals ( 98 . 0 , filtered . get ( 0 ) . readMeter . twoHourRate ( ) + filtered . get ( 1 ) . readMeter . twoHourRate ( ) , 0 . 5 ) ; 
+ 
+ / / make sure a threshold of 0 . 0 doesn ' t result in any sstables being filtered 
+ for ( SSTableReader sstr : sstrs ) 
+ sstr . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; 
+ - filtered = filterColdSSTables ( sstrs , 0 . 0 ) ; 
+ + filtered = filterColdSSTables ( sstrs , 0 . 0 , 0 ) ; 
+ assertEquals ( sstrs . size ( ) , filtered . size ( ) ) ; 
+ 
+ / / just for fun , set a threshold where all sstables are considered cold 
+ for ( SSTableReader sstr : sstrs ) 
+ sstr . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; 
+ - filtered = filterColdSSTables ( sstrs , 1 . 0 ) ; 
+ + filtered = filterColdSSTables ( sstrs , 1 . 0 , 0 ) ; 
+ assertTrue ( filtered . isEmpty ( ) ) ; 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / db / filter / ColumnSliceTest . java b / test / unit / org / apache / cassandra / db / filter / ColumnSliceTest . java 
+ index f1be21c . . 8ba2665 100644 
+ - - - a / test / unit / org / apache / cassandra / db / filter / ColumnSliceTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / filter / ColumnSliceTest . java 
+ @ @ - 27 , 6 + 27 , 7 @ @ import org . junit . Test ; 
+ import org . apache . cassandra . db . composites . * ; 
+ import org . apache . cassandra . db . marshal . AbstractType ; 
+ import org . apache . cassandra . db . marshal . Int32Type ; 
+ + import org . apache . cassandra . io . sstable . ColumnNameHelper ; 
+ import org . apache . cassandra . utils . ByteBufferUtil ; 
+ 
+ import static org . junit . Assert . * ; 
+ @ @ - 344 , 6 + 345 , 19 @ @ public class ColumnSliceTest 
+ slice = new ColumnSlice ( composite ( 0 ) , composite ( 0 , 1 , 2 ) ) ; 
+ assertFalse ( slice . intersects ( columnNames ( 1 ) , columnNames ( 1 , 2 ) , nameType , false ) ) ; 
+ } 
+ + @ Test 
+ + public void testColumnNameHelper ( ) 
+ + { 
+ + List < AbstractType < ? > > types = new ArrayList < > ( ) ; 
+ + types . add ( Int32Type . instance ) ; 
+ + types . add ( Int32Type . instance ) ; 
+ + types . add ( Int32Type . instance ) ; 
+ + CompoundDenseCellNameType nameType = new CompoundDenseCellNameType ( types ) ; 
+ + assertTrue ( ColumnNameHelper . overlaps ( columnNames ( 0 , 0 , 0 ) , columnNames ( 3 , 3 , 3 ) , columnNames ( 1 , 1 , 1 ) , columnNames ( 2 , 2 , 2 ) , nameType ) ) ; 
+ + assertFalse ( ColumnNameHelper . overlaps ( columnNames ( 0 , 0 , 0 ) , columnNames ( 3 , 3 , 3 ) , columnNames ( 4 , 4 , 4 ) , columnNames ( 5 , 5 , 5 ) , nameType ) ) ; 
+ + assertFalse ( ColumnNameHelper . overlaps ( columnNames ( 0 , 0 , 0 ) , columnNames ( 3 , 3 , 3 ) , columnNames ( 3 , 3 , 4 ) , columnNames ( 5 , 5 , 5 ) , nameType ) ) ; 
+ + assertTrue ( ColumnNameHelper . overlaps ( columnNames ( 0 ) , columnNames ( 3 , 3 , 3 ) , columnNames ( 1 , 1 ) , columnNames ( 5 ) , nameType ) ) ; 
+ + } 
+ 
+ @ Test 
+ public void testDeoverlapSlices ( )
+
+NEAREST DIFF:
+diff - - git a / CHANGES . txt b / CHANGES . txt 
+ index c1ddf20 . . 8cdbbe1 100644 
+ - - - a / CHANGES . txt 
+ + + + b / CHANGES . txt 
+ @ @ - 8 , 6 + 8 , 8 @ @ 
+ 
+ 
+ 2 . 0 . 3 
+ + * Compact hottest sstables first and optionally omit coldest from 
+ + compaction entirely ( CASSANDRA - 6109 ) 
+ * Fix modifying column _ metadata from thrift ( CASSANDRA - 6182 ) 
+ * cqlsh : fix LIST USERS output ( CASSANDRA - 6242 ) 
+ * Add IRequestSink interface ( CASSANDRA - 6248 ) 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java 
+ index 61f5668 . . f883597 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategy . java 
+ @ @ - 20 , 8 + 20 , 9 @ @ package org . apache . cassandra . db . compaction ; 
+ import java . util . * ; 
+ import java . util . Map . Entry ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . collect . Iterables ; 
+ - import com . google . common . primitives . Longs ; 
+ + import com . google . common . collect . Lists ; 
+ import org . slf4j . Logger ; 
+ import org . slf4j . LoggerFactory ; 
+ 
+ @ @ - 34 , 20 + 35 , 18 @ @ import org . apache . cassandra . utils . Pair ; 
+ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy 
+ { 
+ private static final Logger logger = LoggerFactory . getLogger ( SizeTieredCompactionStrategy . class ) ; 
+ - 
+ - private static Comparator < SSTableReader > generationComparator = new Comparator < SSTableReader > ( ) 
+ - { 
+ - public int compare ( SSTableReader o1 , SSTableReader o2 ) 
+ - { 
+ - return o1 . descriptor . generation - o2 . descriptor . generation ; 
+ - } 
+ - } ; 
+ - 
+ - private static Comparator < List < SSTableReader > > avgBucketSizeComparator = new Comparator < List < SSTableReader > > ( ) 
+ + 
+ + private static final Comparator < Pair < List < SSTableReader > , Double > > bucketsByHotnessComparator = new Comparator < Pair < List < SSTableReader > , Double > > ( ) 
+ { 
+ - public int compare ( List < SSTableReader > o1 , List < SSTableReader > o2 ) 
+ + public int compare ( Pair < List < SSTableReader > , Double > o1 , Pair < List < SSTableReader > , Double > o2 ) 
+ { 
+ - return Longs . compare ( avgSize ( o1 ) , avgSize ( o2 ) ) ; 
+ + int comparison = Double . compare ( o1 . right , o2 . right ) ; 
+ + if ( comparison ! = 0 ) 
+ + return comparison ; 
+ + 
+ + / / break ties by compacting the smallest sstables first ( this will probably only happen for 
+ + / / system tables and new / unread sstables ) 
+ + return Long . compare ( avgSize ( o1 . left ) , avgSize ( o2 . left ) ) ; 
+ } 
+ 
+ private long avgSize ( List < SSTableReader > sstables ) 
+ @ @ - 78 , 8 + 77 , 10 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy 
+ int minThreshold = cfs . getMinimumCompactionThreshold ( ) ; 
+ int maxThreshold = cfs . getMaximumCompactionThreshold ( ) ; 
+ 
+ - Set < SSTableReader > candidates = cfs . getUncompactingSSTables ( ) ; 
+ - List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndLengthPairs ( filterSuspectSSTables ( candidates ) ) , options . bucketHigh , options . bucketLow , options . minSSTableSize ) ; 
+ + Iterable < SSTableReader > candidates = filterSuspectSSTables ( cfs . getUncompactingSSTables ( ) ) ; 
+ + candidates = filterColdSSTables ( Lists . newArrayList ( candidates ) , options . coldReadsToOmit ) ; 
+ + 
+ + List < List < SSTableReader > > buckets = getBuckets ( createSSTableAndLengthPairs ( candidates ) , options . bucketHigh , options . bucketLow , options . minSSTableSize ) ; 
+ logger . debug ( " Compaction buckets are { } " , buckets ) ; 
+ updateEstimatedCompactionsByTasks ( buckets ) ; 
+ List < SSTableReader > mostInteresting = mostInterestingBucket ( buckets , minThreshold , maxThreshold ) ; 
+ @ @ - 101 , 24 + 102 , 114 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy 
+ return Collections . singletonList ( sstablesWithTombstones . get ( 0 ) ) ; 
+ } 
+ 
+ + / * * 
+ + * Removes as many cold sstables as possible while retaining at least 1 - coldReadsToOmit of the total reads / sec 
+ + * across all sstables 
+ + * @ param sstables all sstables to consider 
+ + * @ param coldReadsToOmit the proportion of total reads / sec that will be omitted ( 0 = omit nothing , 1 = omit everything ) 
+ + * @ return a list of sstables with the coldest sstables excluded until the reads they represent reaches coldReadsToOmit 
+ + * / 
+ + @ VisibleForTesting 
+ + static List < SSTableReader > filterColdSSTables ( List < SSTableReader > sstables , double coldReadsToOmit ) 
+ + { 
+ + / / sort the sstables by hotness ( coldest - first ) , breaking ties with size on disk ( mainly for system tables and cold tables ) 
+ + Collections . sort ( sstables , new Comparator < SSTableReader > ( ) 
+ + { 
+ + public int compare ( SSTableReader o1 , SSTableReader o2 ) 
+ + { 
+ + int comparison = Double . compare ( hotness ( o1 ) , hotness ( o2 ) ) ; 
+ + if ( comparison ! = 0 ) 
+ + return comparison ; 
+ + 
+ + return Long . compare ( o1 . bytesOnDisk ( ) , o2 . bytesOnDisk ( ) ) ; 
+ + } 
+ + } ) ; 
+ + 
+ + / / calculate the total reads / sec across all sstables 
+ + double totalReads = 0 . 0 ; 
+ + for ( SSTableReader sstr : sstables ) 
+ + if ( sstr . readMeter ! = null ) 
+ + totalReads + = sstr . readMeter . twoHourRate ( ) ; 
+ + 
+ + / / if this is a system table with no read meters or we don ' t have any read rates yet , just return them all 
+ + if ( totalReads = = 0 . 0 ) 
+ + return sstables ; 
+ + 
+ + / / iteratively ignore the coldest sstables until ignoring one more would put us over the coldReadsToOmit threshold 
+ + double maxColdReads = coldReadsToOmit * totalReads ; 
+ + 
+ + double totalColdReads = 0 . 0 ; 
+ + int cutoffIndex = 0 ; 
+ + while ( cutoffIndex < sstables . size ( ) ) 
+ + { 
+ + double reads = sstables . get ( cutoffIndex ) . readMeter . twoHourRate ( ) ; 
+ + if ( totalColdReads + reads > maxColdReads ) 
+ + break ; 
+ + 
+ + totalColdReads + = reads ; 
+ + cutoffIndex + + ; 
+ + } 
+ + 
+ + return sstables . subList ( cutoffIndex , sstables . size ( ) ) ; 
+ + } 
+ + 
+ + / * * 
+ + * @ param buckets list of buckets from which to return the most interesting , where " interesting " is the total hotness for reads 
+ + * @ param minThreshold minimum number of sstables in a bucket to qualify as interesting 
+ + * @ param maxThreshold maximum number of sstables to compact at once ( the returned bucket will be trimmed down to this ) 
+ + * @ return a bucket ( list ) of sstables to compact 
+ + * / 
+ public static List < SSTableReader > mostInterestingBucket ( List < List < SSTableReader > > buckets , int minThreshold , int maxThreshold ) 
+ { 
+ - / / skip buckets containing less than minThreshold sstables , and limit other buckets to maxThreshold entries 
+ - List < List < SSTableReader > > prunedBuckets = new ArrayList < List < SSTableReader > > ( ) ; 
+ + / / skip buckets containing less than minThreshold sstables , and limit other buckets to maxThreshold sstables 
+ + final List < Pair < List < SSTableReader > , Double > > prunedBucketsAndHotness = new ArrayList < > ( buckets . size ( ) ) ; 
+ for ( List < SSTableReader > bucket : buckets ) 
+ { 
+ - if ( bucket . size ( ) < minThreshold ) 
+ - continue ; 
+ - 
+ - Collections . sort ( bucket , generationComparator ) ; 
+ - List < SSTableReader > prunedBucket = bucket . subList ( 0 , Math . min ( bucket . size ( ) , maxThreshold ) ) ; 
+ - prunedBuckets . add ( prunedBucket ) ; 
+ + Pair < List < SSTableReader > , Double > bucketAndHotness = trimToThresholdWithHotness ( bucket , maxThreshold ) ; 
+ + if ( bucketAndHotness ! = null & & bucketAndHotness . left . size ( ) > = minThreshold ) 
+ + prunedBucketsAndHotness . add ( bucketAndHotness ) ; 
+ } 
+ - if ( prunedBuckets . isEmpty ( ) ) 
+ + if ( prunedBucketsAndHotness . isEmpty ( ) ) 
+ return Collections . emptyList ( ) ; 
+ - 
+ - / / prefer compacting buckets with smallest average size ; that will yield the fastest improvement for read performance 
+ - return Collections . min ( prunedBuckets , avgBucketSizeComparator ) ; 
+ + 
+ + Pair < List < SSTableReader > , Double > hottest = Collections . max ( prunedBucketsAndHotness , bucketsByHotnessComparator ) ; 
+ + return hottest . left ; 
+ + } 
+ + 
+ + / * * 
+ + * Returns a ( bucket , hotness ) pair or null if there were not enough sstables in the bucket to meet minThreshold . 
+ + * If there are more than maxThreshold sstables , the coldest sstables will be trimmed to meet the threshold . 
+ + * * / 
+ + @ VisibleForTesting 
+ + static Pair < List < SSTableReader > , Double > trimToThresholdWithHotness ( List < SSTableReader > bucket , int maxThreshold ) 
+ + { 
+ + / / sort by sstable hotness ( descending ) 
+ + Collections . sort ( bucket , new Comparator < SSTableReader > ( ) 
+ + { 
+ + public int compare ( SSTableReader o1 , SSTableReader o2 ) 
+ + { 
+ + return - 1 * Double . compare ( hotness ( o1 ) , hotness ( o2 ) ) ; 
+ + } 
+ + } ) ; 
+ + 
+ + / / and then trim the coldest sstables off the end to meet the maxThreshold 
+ + List < SSTableReader > prunedBucket = bucket . subList ( 0 , Math . min ( bucket . size ( ) , maxThreshold ) ) ; 
+ + 
+ + / / bucket hotness is the sum of the hotness of all sstable members 
+ + double bucketHotness = 0 . 0 ; 
+ + for ( SSTableReader sstr : prunedBucket ) 
+ + bucketHotness + = hotness ( sstr ) ; 
+ + 
+ + return Pair . create ( prunedBucket , bucketHotness ) ; 
+ + } 
+ + 
+ + / * * 
+ + * Returns the reads per second per key for this sstable , or 0 . 0 if the sstable has no read meter 
+ + * / 
+ + private static double hotness ( SSTableReader sstr ) 
+ + { 
+ + / / system tables don ' t have read meters , just use 0 . 0 for the hotness 
+ + return sstr . readMeter = = null ? 0 . 0 : sstr . readMeter . twoHourRate ( ) / sstr . estimatedKeys ( ) ; 
+ } 
+ 
+ public synchronized AbstractCompactionTask getNextBackgroundTask ( int gcBefore ) 
+ @ @ - 128 , 13 + 219 , 13 @ @ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy 
+ 
+ while ( true ) 
+ { 
+ - List < SSTableReader > smallestBucket = getNextBackgroundSSTables ( gcBefore ) ; 
+ + List < SSTableReader > hottestBucket = getNextBackgroundSSTables ( gcBefore ) ; 
+ 
+ - if ( smallestBucket . isEmpty ( ) ) 
+ + if ( hottestBucket . isEmpty ( ) ) 
+ return null ; 
+ 
+ - if ( cfs . getDataTracker ( ) . markCompacting ( smallestBucket ) ) 
+ - return new CompactionTask ( cfs , smallestBucket , gcBefore ) ; 
+ + if ( cfs . getDataTracker ( ) . markCompacting ( hottestBucket ) ) 
+ + return new CompactionTask ( cfs , hottestBucket , gcBefore ) ; 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyOptions . java b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyOptions . java 
+ index d7c9075 . . 711ec6e 100644 
+ - - - a / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyOptions . java 
+ + + + b / src / java / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyOptions . java 
+ @ @ - 26 , 31 + 26 , 48 @ @ public final class SizeTieredCompactionStrategyOptions 
+ protected static final long DEFAULT _ MIN _ SSTABLE _ SIZE = 50L * 1024L * 1024L ; 
+ protected static final double DEFAULT _ BUCKET _ LOW = 0 . 5 ; 
+ protected static final double DEFAULT _ BUCKET _ HIGH = 1 . 5 ; 
+ + protected static final double DEFAULT _ COLD _ READS _ TO _ OMIT = 0 . 0 ; 
+ protected static final String MIN _ SSTABLE _ SIZE _ KEY = " min _ sstable _ size " ; 
+ protected static final String BUCKET _ LOW _ KEY = " bucket _ low " ; 
+ protected static final String BUCKET _ HIGH _ KEY = " bucket _ high " ; 
+ + protected static final String MAX _ COLD _ READS _ RATIO _ KEY = " max _ cold _ reads _ ratio " ; 
+ 
+ protected long minSSTableSize ; 
+ protected double bucketLow ; 
+ protected double bucketHigh ; 
+ + protected double coldReadsToOmit ; 
+ 
+ public SizeTieredCompactionStrategyOptions ( Map < String , String > options ) 
+ { 
+ - 
+ String optionValue = options . get ( MIN _ SSTABLE _ SIZE _ KEY ) ; 
+ minSSTableSize = optionValue = = null ? DEFAULT _ MIN _ SSTABLE _ SIZE : Long . parseLong ( optionValue ) ; 
+ optionValue = options . get ( BUCKET _ LOW _ KEY ) ; 
+ bucketLow = optionValue = = null ? DEFAULT _ BUCKET _ LOW : Double . parseDouble ( optionValue ) ; 
+ optionValue = options . get ( BUCKET _ HIGH _ KEY ) ; 
+ bucketHigh = optionValue = = null ? DEFAULT _ BUCKET _ HIGH : Double . parseDouble ( optionValue ) ; 
+ + optionValue = options . get ( MAX _ COLD _ READS _ RATIO _ KEY ) ; 
+ + coldReadsToOmit = optionValue = = null ? DEFAULT _ COLD _ READS _ TO _ OMIT : Double . parseDouble ( optionValue ) ; 
+ } 
+ 
+ public SizeTieredCompactionStrategyOptions ( ) 
+ { 
+ - 
+ minSSTableSize = DEFAULT _ MIN _ SSTABLE _ SIZE ; 
+ bucketLow = DEFAULT _ BUCKET _ LOW ; 
+ bucketHigh = DEFAULT _ BUCKET _ HIGH ; 
+ + coldReadsToOmit = DEFAULT _ COLD _ READS _ TO _ OMIT ; 
+ + } 
+ + 
+ + private static double parseDouble ( Map < String , String > options , String key , double defaultValue ) throws ConfigurationException 
+ + { 
+ + String optionValue = options . get ( key ) ; 
+ + try 
+ + { 
+ + return optionValue = = null ? defaultValue : Double . parseDouble ( optionValue ) ; 
+ + } 
+ + catch ( NumberFormatException e ) 
+ + { 
+ + throw new ConfigurationException ( String . format ( " % s is not a parsable float for % s " , optionValue , key ) , e ) ; 
+ + } 
+ } 
+ 
+ public static Map < String , String > validateOptions ( Map < String , String > options , Map < String , String > uncheckedOptions ) throws ConfigurationException 
+ @ @ - 69 , 36 + 86 , 26 @ @ public final class SizeTieredCompactionStrategyOptions 
+ throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , MIN _ SSTABLE _ SIZE _ KEY ) , e ) ; 
+ } 
+ 
+ - double bucketLow , bucketHigh ; 
+ - optionValue = options . get ( BUCKET _ LOW _ KEY ) ; 
+ - try 
+ - { 
+ - bucketLow = optionValue = = null ? DEFAULT _ BUCKET _ LOW : Double . parseDouble ( optionValue ) ; 
+ - } 
+ - catch ( NumberFormatException e ) 
+ - { 
+ - throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , DEFAULT _ BUCKET _ LOW ) , e ) ; 
+ - } 
+ - 
+ - optionValue = options . get ( BUCKET _ HIGH _ KEY ) ; 
+ - try 
+ - { 
+ - bucketHigh = optionValue = = null ? DEFAULT _ BUCKET _ HIGH : Double . parseDouble ( optionValue ) ; 
+ - } 
+ - catch ( NumberFormatException e ) 
+ + double bucketLow = parseDouble ( options , BUCKET _ LOW _ KEY , DEFAULT _ BUCKET _ LOW ) ; 
+ + double bucketHigh = parseDouble ( options , BUCKET _ HIGH _ KEY , DEFAULT _ BUCKET _ HIGH ) ; 
+ + if ( bucketHigh < = bucketLow ) 
+ { 
+ - throw new ConfigurationException ( String . format ( " % s is not a parsable int ( base10 ) for % s " , optionValue , DEFAULT _ BUCKET _ HIGH ) , e ) ; 
+ + throw new ConfigurationException ( String . format ( " % s value ( % s ) is less than or equal to the % s value ( % s ) " , 
+ + BUCKET _ HIGH _ KEY , bucketHigh , BUCKET _ LOW _ KEY , bucketLow ) ) ; 
+ } 
+ 
+ - if ( bucketHigh < = bucketLow ) 
+ + double maxColdReadsRatio = parseDouble ( options , MAX _ COLD _ READS _ RATIO _ KEY , DEFAULT _ COLD _ READS _ TO _ OMIT ) ; 
+ + if ( maxColdReadsRatio < 0 . 0 | | maxColdReadsRatio > 1 . 0 ) 
+ { 
+ - throw new ConfigurationException ( String . format ( " Bucket high value ( % s ) is less than or equal bucket low value ( % s ) " , bucketHigh , bucketLow ) ) ; 
+ + throw new ConfigurationException ( String . format ( " % s value ( % s ) should be between between 0 . 0 and 1 . 0 " , 
+ + MAX _ COLD _ READS _ RATIO _ KEY , optionValue ) ) ; 
+ } 
+ 
+ uncheckedOptions . remove ( MIN _ SSTABLE _ SIZE _ KEY ) ; 
+ uncheckedOptions . remove ( BUCKET _ LOW _ KEY ) ; 
+ uncheckedOptions . remove ( BUCKET _ HIGH _ KEY ) ; 
+ + uncheckedOptions . remove ( MAX _ COLD _ READS _ RATIO _ KEY ) ; 
+ 
+ return uncheckedOptions ; 
+ } 
+ - } 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ index df5a046 . . c5b61d9 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / SSTableReader . java 
+ @ @ - 28 , 6 + 28 , 7 @ @ import java . util . concurrent . atomic . AtomicBoolean ; 
+ import java . util . concurrent . atomic . AtomicInteger ; 
+ import java . util . concurrent . atomic . AtomicLong ; 
+ 
+ + import com . google . common . annotations . VisibleForTesting ; 
+ import com . google . common . primitives . Longs ; 
+ import com . google . common . util . concurrent . RateLimiter ; 
+ import org . slf4j . Logger ; 
+ @ @ - 103 , 7 + 104 , 8 @ @ public class SSTableReader extends SSTable implements Closeable 
+ private final AtomicLong keyCacheHit = new AtomicLong ( 0 ) ; 
+ private final AtomicLong keyCacheRequest = new AtomicLong ( 0 ) ; 
+ 
+ - public final RestorableMeter readMeter ; 
+ + @ VisibleForTesting 
+ + public RestorableMeter readMeter ; 
+ 
+ public static long getApproximateKeyCount ( Iterable < SSTableReader > sstables , CFMetaData metadata ) 
+ { 
+ diff - - git a / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java b / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java 
+ index 89604c5 . . 5e79bd8 100644 
+ - - - a / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / compaction / SizeTieredCompactionStrategyTest . java 
+ @ @ - 17 , 17 + 17 , 80 @ @ 
+ * / 
+ package org . apache . cassandra . db . compaction ; 
+ 
+ - import java . util . ArrayList ; 
+ - import java . util . List ; 
+ + import java . nio . ByteBuffer ; 
+ + import java . util . * ; 
+ 
+ import org . junit . Test ; 
+ 
+ + import org . apache . cassandra . SchemaLoader ; 
+ + import org . apache . cassandra . Util ; 
+ + import org . apache . cassandra . db . ColumnFamilyStore ; 
+ + import org . apache . cassandra . db . DecoratedKey ; 
+ + import org . apache . cassandra . db . Keyspace ; 
+ + import org . apache . cassandra . db . RowMutation ; 
+ + import org . apache . cassandra . exceptions . ConfigurationException ; 
+ + import org . apache . cassandra . io . sstable . SSTableReader ; 
+ + import org . apache . cassandra . metrics . RestorableMeter ; 
+ + import org . apache . cassandra . utils . ByteBufferUtil ; 
+ import org . apache . cassandra . utils . Pair ; 
+ 
+ - import static org . junit . Assert . assertEquals ; 
+ + import static org . apache . cassandra . db . compaction . SizeTieredCompactionStrategy . getBuckets ; 
+ + import static org . apache . cassandra . db . compaction . SizeTieredCompactionStrategy . mostInterestingBucket ; 
+ + import static org . apache . cassandra . db . compaction . SizeTieredCompactionStrategy . trimToThresholdWithHotness ; 
+ + import static org . apache . cassandra . db . compaction . SizeTieredCompactionStrategy . filterColdSSTables ; 
+ + import static org . apache . cassandra . db . compaction . SizeTieredCompactionStrategy . validateOptions ; 
+ 
+ - public class SizeTieredCompactionStrategyTest 
+ + import static org . junit . Assert . * ; 
+ + 
+ + public class SizeTieredCompactionStrategyTest extends SchemaLoader 
+ { 
+ + 
+ + @ Test 
+ + public void testOptionsValidation ( ) throws ConfigurationException 
+ + { 
+ + Map < String , String > options = new HashMap < > ( ) ; 
+ + options . put ( SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY , " 0 . 35 " ) ; 
+ + options . put ( SizeTieredCompactionStrategyOptions . BUCKET _ LOW _ KEY , " 0 . 5 " ) ; 
+ + options . put ( SizeTieredCompactionStrategyOptions . BUCKET _ HIGH _ KEY , " 1 . 5 " ) ; 
+ + options . put ( SizeTieredCompactionStrategyOptions . MIN _ SSTABLE _ SIZE _ KEY , " 10000 " ) ; 
+ + Map < String , String > unvalidated = validateOptions ( options ) ; 
+ + assertTrue ( unvalidated . isEmpty ( ) ) ; 
+ + 
+ + try 
+ + { 
+ + options . put ( SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY , " - 0 . 5 " ) ; 
+ + validateOptions ( options ) ; 
+ + fail ( String . format ( " Negative % s should be rejected " , SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY ) ) ; 
+ + } 
+ + catch ( ConfigurationException e ) { } 
+ + 
+ + try 
+ + { 
+ + options . put ( SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY , " 10 . 0 " ) ; 
+ + validateOptions ( options ) ; 
+ + fail ( String . format ( " % s > 1 . 0 should be rejected " , SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY ) ) ; 
+ + } 
+ + catch ( ConfigurationException e ) 
+ + { 
+ + options . put ( SizeTieredCompactionStrategyOptions . MAX _ COLD _ READS _ RATIO _ KEY , " 0 . 25 " ) ; 
+ + } 
+ + 
+ + try 
+ + { 
+ + options . put ( SizeTieredCompactionStrategyOptions . BUCKET _ LOW _ KEY , " 1000 . 0 " ) ; 
+ + validateOptions ( options ) ; 
+ + fail ( " bucket _ low greater than bucket _ high should be rejected " ) ; 
+ + } 
+ + catch ( ConfigurationException e ) 
+ + { 
+ + options . put ( SizeTieredCompactionStrategyOptions . BUCKET _ LOW _ KEY , " 0 . 5 " ) ; 
+ + } 
+ + 
+ + options . put ( " bad _ option " , " 1 . 0 " ) ; 
+ + unvalidated = validateOptions ( options ) ; 
+ + assertTrue ( unvalidated . containsKey ( " bad _ option " ) ) ; 
+ + } 
+ + 
+ @ Test 
+ public void testGetBuckets ( ) 
+ { 
+ @ @ - 39 , 7 + 102 , 7 @ @ public class SizeTieredCompactionStrategyTest 
+ pairs . add ( pair ) ; 
+ } 
+ 
+ - List < List < String > > buckets = SizeTieredCompactionStrategy . getBuckets ( pairs , 1 . 5 , 0 . 5 , 2 ) ; 
+ + List < List < String > > buckets = getBuckets ( pairs , 1 . 5 , 0 . 5 , 2 ) ; 
+ assertEquals ( 3 , buckets . size ( ) ) ; 
+ 
+ for ( List < String > bucket : buckets ) 
+ @ @ - 59 , 7 + 122 , 7 @ @ public class SizeTieredCompactionStrategyTest 
+ pairs . add ( pair ) ; 
+ } 
+ 
+ - buckets = SizeTieredCompactionStrategy . getBuckets ( pairs , 1 . 5 , 0 . 5 , 2 ) ; 
+ + buckets = getBuckets ( pairs , 1 . 5 , 0 . 5 , 2 ) ; 
+ assertEquals ( 2 , buckets . size ( ) ) ; 
+ 
+ for ( List < String > bucket : buckets ) 
+ @ @ - 80 , 7 + 143 , 120 @ @ public class SizeTieredCompactionStrategyTest 
+ pairs . add ( pair ) ; 
+ } 
+ 
+ - buckets = SizeTieredCompactionStrategy . getBuckets ( pairs , 1 . 5 , 0 . 5 , 10 ) ; 
+ + buckets = getBuckets ( pairs , 1 . 5 , 0 . 5 , 10 ) ; 
+ assertEquals ( 1 , buckets . size ( ) ) ; 
+ } 
+ - } 
+ + 
+ + @ Test 
+ + public void testPrepBucket ( ) throws Exception 
+ + { 
+ + String ksname = " Keyspace1 " ; 
+ + String cfname = " Standard1 " ; 
+ + Keyspace keyspace = Keyspace . open ( ksname ) ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfname ) ; 
+ + cfs . truncateBlocking ( ) ; 
+ + cfs . disableAutoCompaction ( ) ; 
+ + 
+ + ByteBuffer value = ByteBuffer . wrap ( new byte [ 100 ] ) ; 
+ + 
+ + / / create 3 sstables 
+ + int numSSTables = 3 ; 
+ + for ( int r = 0 ; r < numSSTables ; r + + ) 
+ + { 
+ + DecoratedKey key = Util . dk ( String . valueOf ( r ) ) ; 
+ + RowMutation rm = new RowMutation ( ksname , key . key ) ; 
+ + rm . add ( cfname , ByteBufferUtil . bytes ( " column " ) , value , 0 ) ; 
+ + rm . apply ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + } 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + List < SSTableReader > sstrs = new ArrayList < > ( cfs . getSSTables ( ) ) ; 
+ + Pair < List < SSTableReader > , Double > bucket ; 
+ + 
+ + List < SSTableReader > interestingBucket = mostInterestingBucket ( Collections . singletonList ( sstrs . subList ( 0 , 2 ) ) , 4 , 32 ) ; 
+ + assertTrue ( " nothing should be returned when all buckets are below the min threshold " , interestingBucket . isEmpty ( ) ) ; 
+ + 
+ + sstrs . get ( 0 ) . readMeter = new RestorableMeter ( 100 . 0 , 100 . 0 ) ; 
+ + sstrs . get ( 1 ) . readMeter = new RestorableMeter ( 200 . 0 , 200 . 0 ) ; 
+ + sstrs . get ( 2 ) . readMeter = new RestorableMeter ( 300 . 0 , 300 . 0 ) ; 
+ + 
+ + long estimatedKeys = sstrs . get ( 0 ) . estimatedKeys ( ) ; 
+ + 
+ + / / if we have more than the max threshold , the coldest should be dropped 
+ + bucket = trimToThresholdWithHotness ( sstrs , 2 ) ; 
+ + assertEquals ( " one bucket should have been dropped " , 2 , bucket . left . size ( ) ) ; 
+ + double expectedBucketHotness = ( 200 . 0 + 300 . 0 ) / estimatedKeys ; 
+ + assertEquals ( String . format ( " bucket hotness ( % f ) should be close to % f " , bucket . right , expectedBucketHotness ) , 
+ + expectedBucketHotness , bucket . right , 1 . 0 ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testFilterColdSSTables ( ) throws Exception 
+ + { 
+ + String ksname = " Keyspace1 " ; 
+ + String cfname = " Standard1 " ; 
+ + Keyspace keyspace = Keyspace . open ( ksname ) ; 
+ + ColumnFamilyStore cfs = keyspace . getColumnFamilyStore ( cfname ) ; 
+ + cfs . truncateBlocking ( ) ; 
+ + cfs . disableAutoCompaction ( ) ; 
+ + 
+ + ByteBuffer value = ByteBuffer . wrap ( new byte [ 100 ] ) ; 
+ + 
+ + / / create 10 sstables 
+ + int numSSTables = 10 ; 
+ + for ( int r = 0 ; r < numSSTables ; r + + ) 
+ + { 
+ + DecoratedKey key = Util . dk ( String . valueOf ( r ) ) ; 
+ + RowMutation rm = new RowMutation ( ksname , key . key ) ; 
+ + rm . add ( cfname , ByteBufferUtil . bytes ( " column " ) , value , 0 ) ; 
+ + rm . apply ( ) ; 
+ + cfs . forceBlockingFlush ( ) ; 
+ + } 
+ + cfs . forceBlockingFlush ( ) ; 
+ + 
+ + List < SSTableReader > filtered ; 
+ + List < SSTableReader > sstrs = new ArrayList < > ( cfs . getSSTables ( ) ) ; 
+ + 
+ + for ( SSTableReader sstr : sstrs ) 
+ + sstr . readMeter = null ; 
+ + filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; 
+ + assertEquals ( " when there are no read meters , no sstables should be filtered " , sstrs . size ( ) , filtered . size ( ) ) ; 
+ + 
+ + for ( SSTableReader sstr : sstrs ) 
+ + sstr . readMeter = new RestorableMeter ( 0 . 0 , 0 . 0 ) ; 
+ + filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; 
+ + assertEquals ( " when all read meters are zero , no sstables should be filtered " , sstrs . size ( ) , filtered . size ( ) ) ; 
+ + 
+ + / / leave all read rates at 0 besides one 
+ + sstrs . get ( 0 ) . readMeter = new RestorableMeter ( 1000 . 0 , 1000 . 0 ) ; 
+ + filtered = filterColdSSTables ( sstrs , 0 . 05 ) ; 
+ + assertEquals ( " there should only be one hot sstable " , 1 , filtered . size ( ) ) ; 
+ + assertEquals ( 1000 . 0 , filtered . get ( 0 ) . readMeter . twoHourRate ( ) , 0 . 5 ) ; 
+ + 
+ + / / the total read rate is 100 , and we ' ll set a threshold of 2 . 5 % , so two of the sstables with read 
+ + / / rate 1 . 0 should be ignored , but not the third 
+ + for ( SSTableReader sstr : sstrs ) 
+ + sstr . readMeter = new RestorableMeter ( 0 . 0 , 0 . 0 ) ; 
+ + sstrs . get ( 0 ) . readMeter = new RestorableMeter ( 97 . 0 , 97 . 0 ) ; 
+ + sstrs . get ( 1 ) . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; 
+ + sstrs . get ( 2 ) . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; 
+ + sstrs . get ( 3 ) . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; 
+ + 
+ + filtered = filterColdSSTables ( sstrs , 0 . 025 ) ; 
+ + assertEquals ( 2 , filtered . size ( ) ) ; 
+ + assertEquals ( 98 . 0 , filtered . get ( 0 ) . readMeter . twoHourRate ( ) + filtered . get ( 1 ) . readMeter . twoHourRate ( ) , 0 . 5 ) ; 
+ + 
+ + / / make sure a threshold of 0 . 0 doesn ' t result in any sstables being filtered 
+ + for ( SSTableReader sstr : sstrs ) 
+ + sstr . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; 
+ + filtered = filterColdSSTables ( sstrs , 0 . 0 ) ; 
+ + assertEquals ( sstrs . size ( ) , filtered . size ( ) ) ; 
+ + 
+ + / / just for fun , set a threshold where all sstables are considered cold 
+ + for ( SSTableReader sstr : sstrs ) 
+ + sstr . readMeter = new RestorableMeter ( 1 . 0 , 1 . 0 ) ; 
+ + filtered = filterColdSSTables ( sstrs , 1 . 0 ) ; 
+ + assertTrue ( filtered . isEmpty ( ) ) ; 
+ + } 
+ + } 
+ \ No newline at end of file

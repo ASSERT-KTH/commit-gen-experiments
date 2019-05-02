@@ -1,0 +1,830 @@
+BLEU SCORE: 0.014929831413909562
+
+TEST MSG: Reduce IOP cost for small reads
+GENERATED MSG: Fix regression in SSTableRewriter causing some rows to become unreadable during compaction
+
+TEST DIFF (one line): diff - - git a / conf / cassandra . yaml b / conf / cassandra . yaml <nl> index 5fe3d87 . . 7ce36af 100644 <nl> - - - a / conf / cassandra . yaml <nl> + + + b / conf / cassandra . yaml <nl> @ @ - 354 , 7 + 354 , 13 @ @ concurrent _ counter _ writes : 32 <nl> <nl> # buffer _ pool _ use _ heap _ if _ exhausted : true <nl> <nl> - # Total permitted memory to use for memtables . Cassandra will stop <nl> + # The strategy for optimizing disk read <nl> + # Possible values are : <nl> + # ssd ( for solid state disks , the default ) <nl> + # spinning ( for spinning disks ) <nl> + # disk _ optimization _ strategy : ssd <nl> + <nl> + # Total permitted memory to use for memtables . Cassandra will stop <nl> # accepting writes when the limit is exceeded until a flush completes , <nl> # and will trigger a flush based on memtable _ cleanup _ threshold <nl> # If omitted , Cassandra will set both to 1 / 4 the size of the heap . <nl> diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java <nl> index fe6752f . . 64b23dd 100644 <nl> - - - a / src / java / org / apache / cassandra / config / Config . java <nl> + + + b / src / java / org / apache / cassandra / config / Config . java <nl> @ @ - 222 , 6 + 222 , 12 @ @ public class Config <nl> <nl> public boolean buffer _ pool _ use _ heap _ if _ exhausted = true ; <nl> <nl> + public DiskOptimizationStrategy disk _ optimization _ strategy = DiskOptimizationStrategy . ssd ; <nl> + <nl> + public double disk _ optimization _ estimate _ percentile = 0 . 95 ; <nl> + <nl> + public double disk _ optimization _ page _ cross _ chance = 0 . 1 ; <nl> + <nl> public boolean inter _ dc _ tcp _ nodelay = true ; <nl> <nl> public MemtableAllocationType memtable _ allocation _ type = MemtableAllocationType . heap _ buffers ; <nl> @ @ - 308 , 17 + 314 , 17 @ @ public class Config <nl> isClientMode = clientMode ; <nl> } <nl> <nl> - public static enum CommitLogSync <nl> + public enum CommitLogSync <nl> { <nl> periodic , <nl> batch <nl> } <nl> - public static enum InternodeCompression <nl> + public enum InternodeCompression <nl> { <nl> all , none , dc <nl> } <nl> <nl> - public static enum DiskAccessMode <nl> + public enum DiskAccessMode <nl> { <nl> auto , <nl> mmap , <nl> @ @ - 326 , 7 + 332 , 7 @ @ public class Config <nl> standard , <nl> } <nl> <nl> - public static enum MemtableAllocationType <nl> + public enum MemtableAllocationType <nl> { <nl> unslabbed _ heap _ buffers , <nl> heap _ buffers , <nl> @ @ - 334 , 7 + 340 , 7 @ @ public class Config <nl> offheap _ objects <nl> } <nl> <nl> - public static enum DiskFailurePolicy <nl> + public enum DiskFailurePolicy <nl> { <nl> best _ effort , <nl> stop , <nl> @ @ - 343 , 7 + 349 , 7 @ @ public class Config <nl> die <nl> } <nl> <nl> - public static enum CommitFailurePolicy <nl> + public enum CommitFailurePolicy <nl> { <nl> stop , <nl> stop _ commit , <nl> @ @ - 351 , 15 + 357 , 21 @ @ public class Config <nl> die , <nl> } <nl> <nl> - public static enum UserFunctionTimeoutPolicy <nl> + public enum UserFunctionTimeoutPolicy <nl> { <nl> ignore , <nl> die , <nl> die _ immediate <nl> } <nl> <nl> - public static enum RequestSchedulerId <nl> + public enum RequestSchedulerId <nl> { <nl> keyspace <nl> } <nl> + <nl> + public enum DiskOptimizationStrategy <nl> + { <nl> + ssd , <nl> + spinning <nl> + } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> index a25af65 . . f1369d1 100644 <nl> - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java <nl> @ @ - 1493 , 6 + 1493 , 33 @ @ public class DatabaseDescriptor <nl> return conf . buffer _ pool _ use _ heap _ if _ exhausted ; <nl> } <nl> <nl> + public static Config . DiskOptimizationStrategy getDiskOptimizationStrategy ( ) <nl> + { <nl> + return conf . disk _ optimization _ strategy ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + public static void setDiskOptimizationStrategy ( Config . DiskOptimizationStrategy strategy ) <nl> + { <nl> + conf . disk _ optimization _ strategy = strategy ; <nl> + } <nl> + <nl> + public static double getDiskOptimizationEstimatePercentile ( ) <nl> + { <nl> + return conf . disk _ optimization _ estimate _ percentile ; <nl> + } <nl> + <nl> + public static double getDiskOptimizationPageCrossChance ( ) <nl> + { <nl> + return conf . disk _ optimization _ page _ cross _ chance ; <nl> + } <nl> + <nl> + @ VisibleForTesting <nl> + public static void setDiskOptimizationPageCrossChance ( double chance ) <nl> + { <nl> + conf . disk _ optimization _ page _ cross _ chance = chance ; <nl> + } <nl> + <nl> public static long getTotalCommitlogSpaceInMB ( ) <nl> { <nl> return conf . commitlog _ total _ space _ in _ mb ; <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / format / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / format / SSTableReader . java <nl> index a8aedc7 . . bae0858 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / format / SSTableReader . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / format / SSTableReader . java <nl> @ @ - 51 , 6 + 51 , 7 @ @ import org . apache . cassandra . dht . * ; <nl> import org . apache . cassandra . io . FSError ; <nl> import org . apache . cassandra . io . compress . CompressionMetadata ; <nl> import org . apache . cassandra . io . sstable . * ; <nl> + import org . apache . cassandra . io . sstable . format . big . BigTableWriter ; <nl> import org . apache . cassandra . io . sstable . metadata . * ; <nl> import org . apache . cassandra . io . util . * ; <nl> import org . apache . cassandra . metrics . RestorableMeter ; <nl> @ @ - 414 , 8 + 415 , 8 @ @ public abstract class SSTableReader extends SSTable implements SelfRefCounted < SS <nl> { <nl> if ( ! sstable . loadSummary ( ibuilder , dbuilder ) ) <nl> sstable . buildSummary ( false , ibuilder , dbuilder , false , Downsampling . BASE _ SAMPLING _ LEVEL ) ; <nl> - sstable . ifile = ibuilder . complete ( sstable . descriptor . filenameFor ( Component . PRIMARY _ INDEX ) ) ; <nl> - sstable . dfile = dbuilder . complete ( sstable . descriptor . filenameFor ( Component . DATA ) ) ; <nl> + sstable . ifile = ibuilder . buildIndex ( sstable . descriptor , sstable . indexSummary ) ; <nl> + sstable . dfile = dbuilder . buildData ( sstable . descriptor , statsMetadata ) ; <nl> sstable . bf = FilterFactory . AlwaysPresent ; <nl> sstable . setup ( true ) ; <nl> return sstable ; <nl> @ @ - 719 , 9 + 720 , 9 @ @ public abstract class SSTableReader extends SSTable implements SelfRefCounted < SS <nl> } <nl> <nl> if ( components . contains ( Component . PRIMARY _ INDEX ) ) <nl> - ifile = ibuilder . complete ( descriptor . filenameFor ( Component . PRIMARY _ INDEX ) ) ; <nl> + ifile = ibuilder . buildIndex ( descriptor , indexSummary ) ; <nl> <nl> - dfile = dbuilder . complete ( descriptor . filenameFor ( Component . DATA ) ) ; <nl> + dfile = dbuilder . buildData ( descriptor , sstableMetadata ) ; <nl> <nl> / / Check for an index summary that was downsampled even though the serialization format doesn ' t support <nl> / / that . If it was downsampled , rebuild it . See CASSANDRA - 8993 for details . <nl> @ @ - 738 , 8 + 739 , 8 @ @ public abstract class SSTableReader extends SSTable implements SelfRefCounted < SS <nl> SegmentedFile . Builder dbuilderRebuild = SegmentedFile . getBuilder ( DatabaseDescriptor . getDiskAccessMode ( ) , compression ) ) <nl> { <nl> buildSummary ( false , ibuilderRebuild , dbuilderRebuild , false , Downsampling . BASE _ SAMPLING _ LEVEL ) ; <nl> - ifile = ibuilderRebuild . complete ( descriptor . filenameFor ( Component . PRIMARY _ INDEX ) ) ; <nl> - dfile = dbuilderRebuild . complete ( descriptor . filenameFor ( Component . DATA ) ) ; <nl> + ifile = ibuilderRebuild . buildIndex ( descriptor , indexSummary ) ; <nl> + dfile = dbuilderRebuild . buildData ( descriptor , sstableMetadata ) ; <nl> saveSummary ( ibuilderRebuild , dbuilderRebuild ) ; <nl> } <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / sstable / format / big / BigTableWriter . java b / src / java / org / apache / cassandra / io / sstable / format / big / BigTableWriter . java <nl> index 13c9954 . . ff279a8 100644 <nl> - - - a / src / java / org / apache / cassandra / io / sstable / format / big / BigTableWriter . java <nl> + + + b / src / java / org / apache / cassandra / io / sstable / format / big / BigTableWriter . java <nl> @ @ - 243 , 12 + 243 , 13 @ @ public class BigTableWriter extends SSTableWriter <nl> StatsMetadata stats = statsMetadata ( ) ; <nl> assert boundary . indexLength > 0 & & boundary . dataLength > 0 ; <nl> / / open the reader early <nl> - SegmentedFile ifile = iwriter . builder . complete ( descriptor . filenameFor ( Component . PRIMARY _ INDEX ) , boundary . indexLength ) ; <nl> - SegmentedFile dfile = dbuilder . complete ( descriptor . filenameFor ( Component . DATA ) , boundary . dataLength ) ; <nl> + IndexSummary indexSummary = iwriter . summary . build ( partitioner , boundary ) ; <nl> + SegmentedFile ifile = iwriter . builder . buildIndex ( descriptor , indexSummary , boundary ) ; <nl> + SegmentedFile dfile = dbuilder . buildData ( descriptor , stats , boundary ) ; <nl> SSTableReader sstable = SSTableReader . internalOpen ( descriptor , <nl> components , metadata , <nl> partitioner , ifile , <nl> - dfile , iwriter . summary . build ( partitioner , boundary ) , <nl> + dfile , indexSummary , <nl> iwriter . bf . sharedCopy ( ) , maxDataAge , stats , SSTableReader . OpenReason . EARLY , header ) ; <nl> <nl> / / now it ' s open , find the ACTUAL last readable key ( i . e . for which the data file has also been flushed ) <nl> @ @ - 274 , 15 + 275 , 16 @ @ public class BigTableWriter extends SSTableWriter <nl> <nl> StatsMetadata stats = statsMetadata ( ) ; <nl> / / finalize in - memory state for the reader <nl> - SegmentedFile ifile = iwriter . builder . complete ( desc . filenameFor ( Component . PRIMARY _ INDEX ) ) ; <nl> - SegmentedFile dfile = dbuilder . complete ( desc . filenameFor ( Component . DATA ) ) ; <nl> + IndexSummary indexSummary = iwriter . summary . build ( partitioner ) ; <nl> + SegmentedFile ifile = iwriter . builder . buildIndex ( desc , indexSummary ) ; <nl> + SegmentedFile dfile = dbuilder . buildData ( desc , stats ) ; <nl> SSTableReader sstable = SSTableReader . internalOpen ( desc , <nl> components , <nl> this . metadata , <nl> partitioner , <nl> ifile , <nl> dfile , <nl> - iwriter . summary . build ( partitioner ) , <nl> + indexSummary , <nl> iwriter . bf . sharedCopy ( ) , <nl> maxDataAge , <nl> stats , <nl> diff - - git a / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java <nl> index 2c59def . . 744e828 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java <nl> @ @ - 19 , 9 + 19 , 9 @ @ package org . apache . cassandra . io . util ; <nl> <nl> public class BufferedSegmentedFile extends SegmentedFile <nl> { <nl> - public BufferedSegmentedFile ( ChannelProxy channel , long length ) <nl> + public BufferedSegmentedFile ( ChannelProxy channel , int bufferSize , long length ) <nl> { <nl> - super ( new Cleanup ( channel ) , channel , length ) ; <nl> + super ( new Cleanup ( channel ) , channel , bufferSize , length ) ; <nl> } <nl> <nl> private BufferedSegmentedFile ( BufferedSegmentedFile copy ) <nl> @ @ - 48 , 16 + 48 , 16 @ @ public class BufferedSegmentedFile extends SegmentedFile <nl> / / only one segment in a standard - io file <nl> } <nl> <nl> - public SegmentedFile complete ( ChannelProxy channel , long overrideLength ) <nl> + public SegmentedFile complete ( ChannelProxy channel , int bufferSize , long overrideLength ) <nl> { <nl> long length = overrideLength > 0 ? overrideLength : channel . size ( ) ; <nl> - return new BufferedSegmentedFile ( channel , length ) ; <nl> + return new BufferedSegmentedFile ( channel , bufferSize , length ) ; <nl> } <nl> } <nl> <nl> public FileDataInput getSegment ( long position ) <nl> { <nl> - RandomAccessReader reader = RandomAccessReader . open ( channel ) ; <nl> + RandomAccessReader reader = RandomAccessReader . open ( channel , bufferSize , - 1L ) ; <nl> reader . seek ( position ) ; <nl> return reader ; <nl> } <nl> diff - - git a / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java <nl> index ceff7ba . . 2ae4781 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java <nl> @ @ - 37 , 14 + 37 , 14 @ @ public class CompressedSegmentedFile extends SegmentedFile implements ICompresse <nl> private static int MAX _ SEGMENT _ SIZE = Integer . MAX _ VALUE ; <nl> private final TreeMap < Long , MappedByteBuffer > chunkSegments ; <nl> <nl> - public CompressedSegmentedFile ( ChannelProxy channel , CompressionMetadata metadata ) <nl> + public CompressedSegmentedFile ( ChannelProxy channel , int bufferSize , CompressionMetadata metadata ) <nl> { <nl> - this ( channel , metadata , createMappedSegments ( channel , metadata ) ) ; <nl> + this ( channel , bufferSize , metadata , createMappedSegments ( channel , metadata ) ) ; <nl> } <nl> <nl> - public CompressedSegmentedFile ( ChannelProxy channel , CompressionMetadata metadata , TreeMap < Long , MappedByteBuffer > chunkSegments ) <nl> + public CompressedSegmentedFile ( ChannelProxy channel , int bufferSize , CompressionMetadata metadata , TreeMap < Long , MappedByteBuffer > chunkSegments ) <nl> { <nl> - super ( new Cleanup ( channel , metadata , chunkSegments ) , channel , metadata . dataLength , metadata . compressedFileLength ) ; <nl> + super ( new Cleanup ( channel , metadata , chunkSegments ) , channel , bufferSize , metadata . dataLength , metadata . compressedFileLength ) ; <nl> this . metadata = metadata ; <nl> this . chunkSegments = chunkSegments ; <nl> } <nl> @ @ - 144 , 9 + 144 , 9 @ @ public class CompressedSegmentedFile extends SegmentedFile implements ICompresse <nl> return writer . open ( overrideLength ) ; <nl> } <nl> <nl> - public SegmentedFile complete ( ChannelProxy channel , long overrideLength ) <nl> + public SegmentedFile complete ( ChannelProxy channel , int bufferSize , long overrideLength ) <nl> { <nl> - return new CompressedSegmentedFile ( channel , metadata ( channel . filePath ( ) , overrideLength ) ) ; <nl> + return new CompressedSegmentedFile ( channel , bufferSize , metadata ( channel . filePath ( ) , overrideLength ) ) ; <nl> } <nl> } <nl> <nl> diff - - git a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> index 91908c9 . . 879ca6f 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java <nl> @ @ - 43 , 9 + 43 , 9 @ @ public class MmappedSegmentedFile extends SegmentedFile <nl> * / <nl> private final Segment [ ] segments ; <nl> <nl> - public MmappedSegmentedFile ( ChannelProxy channel , long length , Segment [ ] segments ) <nl> + public MmappedSegmentedFile ( ChannelProxy channel , int bufferSize , long length , Segment [ ] segments ) <nl> { <nl> - super ( new Cleanup ( channel , segments ) , channel , length ) ; <nl> + super ( new Cleanup ( channel , segments ) , channel , bufferSize , length ) ; <nl> this . segments = segments ; <nl> } <nl> <nl> @ @ - 90 , 7 + 90 , 7 @ @ public class MmappedSegmentedFile extends SegmentedFile <nl> / / we can have single cells or partitions larger than 2Gb , which is our maximum addressable range in a single segment ; <nl> / / in this case we open as a normal random access reader <nl> / / FIXME : brafs are unbounded , so this segment will cover the rest of the file , rather than just the row <nl> - RandomAccessReader file = RandomAccessReader . open ( channel ) ; <nl> + RandomAccessReader file = RandomAccessReader . open ( channel , bufferSize , - 1L ) ; <nl> file . seek ( position ) ; <nl> return file ; <nl> } <nl> @ @ - 183 , 11 + 183 , 11 @ @ public class MmappedSegmentedFile extends SegmentedFile <nl> } <nl> } <nl> <nl> - public SegmentedFile complete ( ChannelProxy channel , long overrideLength ) <nl> + public SegmentedFile complete ( ChannelProxy channel , int bufferSize , long overrideLength ) <nl> { <nl> long length = overrideLength > 0 ? overrideLength : channel . size ( ) ; <nl> / / create the segments <nl> - return new MmappedSegmentedFile ( channel , length , createSegments ( channel , length ) ) ; <nl> + return new MmappedSegmentedFile ( channel , bufferSize , length , createSegments ( channel , length ) ) ; <nl> } <nl> <nl> private Segment [ ] createSegments ( ChannelProxy channel , long length ) <nl> diff - - git a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java <nl> index c4be8e9 . . b13d154 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java <nl> + + + b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java <nl> @ @ - 27 , 7 + 27 , 7 @ @ import org . apache . cassandra . utils . memory . BufferPool ; <nl> <nl> public class RandomAccessReader extends AbstractDataInput implements FileDataInput <nl> { <nl> - public static final int DEFAULT _ BUFFER _ SIZE = 64 * 1024 ; <nl> + public static final int DEFAULT _ BUFFER _ SIZE = 4096 ; <nl> <nl> / / the IO channel to the file , we do not own a reference to this due to <nl> / / performance reasons ( CASSANDRA - 9379 ) so it ' s up to the owner of the RAR to <nl> @ @ - 59 , 9 + 59 , 16 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp <nl> buffer . limit ( 0 ) ; <nl> } <nl> <nl> + / * * The buffer size is typically already page aligned but if that is not the case <nl> + * make sure that it is a multiple of the page size , 4096 . <nl> + * * / <nl> protected int getBufferSize ( int size ) <nl> { <nl> - return ( int ) Math . min ( fileLength , size ) ; <nl> + if ( ( size & ~ 4095 ) ! = size ) <nl> + { / / should already be a page size multiple but if that ' s not case round it up <nl> + size = ( size + 4095 ) & ~ 4095 ; <nl> + } <nl> + return size ; <nl> } <nl> <nl> protected ByteBuffer allocateBuffer ( int size , BufferType bufferType ) <nl> @ @ - 103 , 12 + 110 , 7 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp <nl> <nl> public static RandomAccessReader open ( ChannelProxy channel ) <nl> { <nl> - return open ( channel , - 1L ) ; <nl> - } <nl> - <nl> - public static RandomAccessReader open ( ChannelProxy channel , long overrideSize ) <nl> - { <nl> - return open ( channel , DEFAULT _ BUFFER _ SIZE , overrideSize ) ; <nl> + return open ( channel , DEFAULT _ BUFFER _ SIZE , - 1L ) ; <nl> } <nl> <nl> public static RandomAccessReader open ( ChannelProxy channel , int bufferSize , long overrideSize ) <nl> @ @ - 132 , 7 + 134 , 14 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp <nl> <nl> long position = bufferOffset ; <nl> long limit = bufferOffset ; <nl> - while ( buffer . hasRemaining ( ) & & limit < fileLength ) <nl> + <nl> + long pageAligedPos = position & ~ 4095 ; <nl> + / / Because the buffer capacity is a multiple of the page size , we read less <nl> + / / the first time and then we should read at page boundaries only , <nl> + / / unless the user seeks elsewhere <nl> + long upperLimit = Math . min ( fileLength , pageAligedPos + buffer . capacity ( ) ) ; <nl> + buffer . limit ( ( int ) ( upperLimit - position ) ) ; <nl> + while ( buffer . hasRemaining ( ) & & limit < upperLimit ) <nl> { <nl> int n = channel . read ( buffer , position ) ; <nl> if ( n < 0 ) <nl> diff - - git a / src / java / org / apache / cassandra / io / util / SegmentedFile . java b / src / java / org / apache / cassandra / io / util / SegmentedFile . java <nl> index 13a0ec7 . . e586682 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / SegmentedFile . java <nl> + + + b / src / java / org / apache / cassandra / io / util / SegmentedFile . java <nl> @ @ - 25 , 13 + 25 , 17 @ @ import java . nio . MappedByteBuffer ; <nl> import java . util . Iterator ; <nl> import java . util . NoSuchElementException ; <nl> <nl> - import com . google . common . base . Throwables ; <nl> import com . google . common . util . concurrent . RateLimiter ; <nl> <nl> import org . apache . cassandra . config . Config ; <nl> import org . apache . cassandra . config . DatabaseDescriptor ; <nl> import org . apache . cassandra . io . FSReadError ; <nl> import org . apache . cassandra . io . compress . CompressedSequentialWriter ; <nl> + import org . apache . cassandra . io . sstable . Component ; <nl> + import org . apache . cassandra . io . sstable . Descriptor ; <nl> + import org . apache . cassandra . io . sstable . IndexSummary ; <nl> + import org . apache . cassandra . io . sstable . IndexSummaryBuilder ; <nl> + import org . apache . cassandra . io . sstable . metadata . StatsMetadata ; <nl> import org . apache . cassandra . utils . CLibrary ; <nl> import org . apache . cassandra . utils . Pair ; <nl> import org . apache . cassandra . utils . concurrent . RefCounted ; <nl> @ @ - 51 , 6 + 55 , 7 @ @ import static org . apache . cassandra . utils . Throwables . maybeFail ; <nl> public abstract class SegmentedFile extends SharedCloseableImpl <nl> { <nl> public final ChannelProxy channel ; <nl> + public final int bufferSize ; <nl> public final long length ; <nl> <nl> / / This differs from length for compressed files ( but we still need length for <nl> @ @ - 60 , 15 + 65 , 16 @ @ public abstract class SegmentedFile extends SharedCloseableImpl <nl> / * * <nl> * Use getBuilder to get a Builder to construct a SegmentedFile . <nl> * / <nl> - SegmentedFile ( Cleanup cleanup , ChannelProxy channel , long length ) <nl> + SegmentedFile ( Cleanup cleanup , ChannelProxy channel , int bufferSize , long length ) <nl> { <nl> - this ( cleanup , channel , length , length ) ; <nl> + this ( cleanup , channel , bufferSize , length , length ) ; <nl> } <nl> <nl> - protected SegmentedFile ( Cleanup cleanup , ChannelProxy channel , long length , long onDiskLength ) <nl> + protected SegmentedFile ( Cleanup cleanup , ChannelProxy channel , int bufferSize , long length , long onDiskLength ) <nl> { <nl> super ( cleanup ) ; <nl> this . channel = channel ; <nl> + this . bufferSize = bufferSize ; <nl> this . length = length ; <nl> this . onDiskLength = onDiskLength ; <nl> } <nl> @ @ - 77 , 6 + 83 , 7 @ @ public abstract class SegmentedFile extends SharedCloseableImpl <nl> { <nl> super ( copy ) ; <nl> channel = copy . channel ; <nl> + bufferSize = copy . bufferSize ; <nl> length = copy . length ; <nl> onDiskLength = copy . onDiskLength ; <nl> } <nl> @ @ - 109 , 13 + 116 , 13 @ @ public abstract class SegmentedFile extends SharedCloseableImpl <nl> <nl> public RandomAccessReader createReader ( ) <nl> { <nl> - return RandomAccessReader . open ( channel , length ) ; <nl> + return RandomAccessReader . open ( channel , bufferSize , length ) ; <nl> } <nl> <nl> public RandomAccessReader createThrottledReader ( RateLimiter limiter ) <nl> { <nl> assert limiter ! = null ; <nl> - return ThrottledReader . open ( channel , length , limiter ) ; <nl> + return ThrottledReader . open ( channel , bufferSize , length , limiter ) ; <nl> } <nl> <nl> public FileDataInput getSegment ( long position ) <nl> @ @ - 171 , 19 + 178 , 14 @ @ public abstract class SegmentedFile extends SharedCloseableImpl <nl> * Called after all potential boundaries have been added to apply this Builder to a concrete file on disk . <nl> * @ param channel The channel to the file on disk . <nl> * / <nl> - protected abstract SegmentedFile complete ( ChannelProxy channel , long overrideLength ) ; <nl> + protected abstract SegmentedFile complete ( ChannelProxy channel , int bufferSize , long overrideLength ) ; <nl> <nl> - public SegmentedFile complete ( String path ) <nl> - { <nl> - return complete ( path , - 1L ) ; <nl> - } <nl> - <nl> - public SegmentedFile complete ( String path , long overrideLength ) <nl> + private SegmentedFile complete ( String path , int bufferSize , long overrideLength ) <nl> { <nl> ChannelProxy channelCopy = getChannel ( path ) ; <nl> try <nl> { <nl> - return complete ( channelCopy , overrideLength ) ; <nl> + return complete ( channelCopy , bufferSize , overrideLength ) ; <nl> } <nl> catch ( Throwable t ) <nl> { <nl> @ @ - 192 , 6 + 194 , 79 @ @ public abstract class SegmentedFile extends SharedCloseableImpl <nl> } <nl> } <nl> <nl> + public SegmentedFile buildData ( Descriptor desc , StatsMetadata stats , IndexSummaryBuilder . ReadableBoundary boundary ) <nl> + { <nl> + return complete ( desc . filenameFor ( Component . DATA ) , bufferSize ( stats ) , boundary . dataLength ) ; <nl> + } <nl> + <nl> + public SegmentedFile buildData ( Descriptor desc , StatsMetadata stats ) <nl> + { <nl> + return complete ( desc . filenameFor ( Component . DATA ) , bufferSize ( stats ) , - 1L ) ; <nl> + } <nl> + <nl> + public SegmentedFile buildIndex ( Descriptor desc , IndexSummary indexSummary , IndexSummaryBuilder . ReadableBoundary boundary ) <nl> + { <nl> + return complete ( desc . filenameFor ( Component . PRIMARY _ INDEX ) , bufferSize ( desc , indexSummary ) , boundary . indexLength ) ; <nl> + } <nl> + <nl> + public SegmentedFile buildIndex ( Descriptor desc , IndexSummary indexSummary ) <nl> + { <nl> + return complete ( desc . filenameFor ( Component . PRIMARY _ INDEX ) , bufferSize ( desc , indexSummary ) , - 1L ) ; <nl> + } <nl> + <nl> + private int bufferSize ( StatsMetadata stats ) <nl> + { <nl> + return bufferSize ( stats . estimatedPartitionSize . percentile ( DatabaseDescriptor . getDiskOptimizationEstimatePercentile ( ) ) ) ; <nl> + } <nl> + <nl> + private int bufferSize ( Descriptor desc , IndexSummary indexSummary ) <nl> + { <nl> + File file = new File ( desc . filenameFor ( Component . PRIMARY _ INDEX ) ) ; <nl> + return bufferSize ( file . length ( ) / indexSummary . size ( ) ) ; <nl> + } <nl> + <nl> + / * * <nl> + Return the buffer size for a given record size . For spinning disks always add one page . <nl> + For solid state disks only add one page if the chance of crossing to the next page is more <nl> + than a predifined value , @ see Config . disk _ optimization _ page _ cross _ chance . <nl> + * / <nl> + static int bufferSize ( long recordSize ) <nl> + { <nl> + Config . DiskOptimizationStrategy strategy = DatabaseDescriptor . getDiskOptimizationStrategy ( ) ; <nl> + if ( strategy = = Config . DiskOptimizationStrategy . ssd ) <nl> + { <nl> + / / The crossing probability is calculated assuming a uniform distribution of record <nl> + / / start position in a page , so it ' s the record size modulo the page size divided by <nl> + / / the total page size . <nl> + double pageCrossProbability = ( recordSize % 4096 ) / 4096 . ; <nl> + / / if the page cross probability is equal or bigger than disk _ optimization _ page _ cross _ chance we add one page <nl> + if ( ( pageCrossProbability - DatabaseDescriptor . getDiskOptimizationPageCrossChance ( ) ) > - 1e - 16 ) <nl> + recordSize + = 4096 ; <nl> + <nl> + return roundBufferSize ( recordSize ) ; <nl> + } <nl> + else if ( strategy = = Config . DiskOptimizationStrategy . spinning ) <nl> + { <nl> + return roundBufferSize ( recordSize + 4096 ) ; <nl> + } <nl> + else <nl> + { <nl> + throw new IllegalStateException ( " Unsupported disk optimization strategy : " + strategy ) ; <nl> + } <nl> + } <nl> + <nl> + / * * <nl> + Round up to the next multiple of 4k but no more than 64k <nl> + * / <nl> + static int roundBufferSize ( long size ) <nl> + { <nl> + if ( size < = 0 ) <nl> + return 4096 ; <nl> + <nl> + size = ( size + 4095 ) & ~ 4095 ; <nl> + return ( int ) Math . min ( size , 1 < < 16 ) ; <nl> + } <nl> + <nl> public void serializeBounds ( DataOutput out ) throws IOException <nl> { <nl> out . writeUTF ( DatabaseDescriptor . getDiskAccessMode ( ) . name ( ) ) ; <nl> diff - - git a / src / java / org / apache / cassandra / io / util / ThrottledReader . java b / src / java / org / apache / cassandra / io / util / ThrottledReader . java <nl> index ea21355 . . 024d38f 100644 <nl> - - - a / src / java / org / apache / cassandra / io / util / ThrottledReader . java <nl> + + + b / src / java / org / apache / cassandra / io / util / ThrottledReader . java <nl> @ @ - 29 , 9 + 29 , 9 @ @ public class ThrottledReader extends RandomAccessReader <nl> { <nl> private final RateLimiter limiter ; <nl> <nl> - protected ThrottledReader ( ChannelProxy channel , long overrideLength , RateLimiter limiter ) <nl> + protected ThrottledReader ( ChannelProxy channel , int bufferSize , long overrideLength , RateLimiter limiter ) <nl> { <nl> - super ( channel , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , overrideLength , BufferType . OFF _ HEAP ) ; <nl> + super ( channel , bufferSize , overrideLength , BufferType . OFF _ HEAP ) ; <nl> this . limiter = limiter ; <nl> } <nl> <nl> @ @ - 41 , 8 + 41 , 8 @ @ public class ThrottledReader extends RandomAccessReader <nl> super . reBuffer ( ) ; <nl> } <nl> <nl> - public static ThrottledReader open ( ChannelProxy channel , long overrideLength , RateLimiter limiter ) <nl> + public static ThrottledReader open ( ChannelProxy channel , int bufferSize , long overrideLength , RateLimiter limiter ) <nl> { <nl> - return new ThrottledReader ( channel , overrideLength , limiter ) ; <nl> + return new ThrottledReader ( channel , bufferSize , overrideLength , limiter ) ; <nl> } <nl> } <nl> diff - - git a / test / unit / org / apache / cassandra / MockSchema . java b / test / unit / org / apache / cassandra / MockSchema . java <nl> index d9c7e8b . . e052c0a 100644 <nl> - - - a / test / unit / org / apache / cassandra / MockSchema . java <nl> + + + b / test / unit / org / apache / cassandra / MockSchema . java <nl> @ @ - 43 , 6 + 43 , 7 @ @ import org . apache . cassandra . io . util . BufferedSegmentedFile ; <nl> import org . apache . cassandra . io . util . ChannelProxy ; <nl> import org . apache . cassandra . io . util . FileUtils ; <nl> import org . apache . cassandra . io . util . Memory ; <nl> + import org . apache . cassandra . io . util . RandomAccessReader ; <nl> import org . apache . cassandra . io . util . SegmentedFile ; <nl> import org . apache . cassandra . schema . KeyspaceMetadata ; <nl> import org . apache . cassandra . schema . KeyspaceParams ; <nl> @ @ - 61 , 7 + 62 , 7 @ @ public class MockSchema <nl> public static final Keyspace ks = Keyspace . mockKS ( KeyspaceMetadata . create ( " mockks " , KeyspaceParams . simpleTransient ( 1 ) ) ) ; <nl> <nl> public static final IndexSummary indexSummary ; <nl> - private static final SegmentedFile segmentedFile = new BufferedSegmentedFile ( new ChannelProxy ( temp ( " mocksegmentedfile " ) ) , 0 ) ; <nl> + private static final SegmentedFile segmentedFile = new BufferedSegmentedFile ( new ChannelProxy ( temp ( " mocksegmentedfile " ) ) , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , 0 ) ; <nl> <nl> public static Memtable memtable ( ColumnFamilyStore cfs ) <nl> { <nl> diff - - git a / test / unit / org / apache / cassandra / db / lifecycle / TransactionLogsTest . java b / test / unit / org / apache / cassandra / db / lifecycle / TransactionLogsTest . java <nl> index 3150087 . . 4105800 100644 <nl> - - - a / test / unit / org / apache / cassandra / db / lifecycle / TransactionLogsTest . java <nl> + + + b / test / unit / org / apache / cassandra / db / lifecycle / TransactionLogsTest . java <nl> @ @ - 48 , 6 + 48 , 7 @ @ import org . apache . cassandra . io . sstable . metadata . MetadataType ; <nl> import org . apache . cassandra . io . sstable . metadata . StatsMetadata ; <nl> import org . apache . cassandra . io . util . BufferedSegmentedFile ; <nl> import org . apache . cassandra . io . util . ChannelProxy ; <nl> + import org . apache . cassandra . io . util . RandomAccessReader ; <nl> import org . apache . cassandra . io . util . SegmentedFile ; <nl> import org . apache . cassandra . utils . AlwaysPresentFilter ; <nl> import org . apache . cassandra . utils . concurrent . AbstractTransactionalTest ; <nl> @ @ - 517 , 8 + 518 , 8 @ @ public class TransactionLogsTest extends AbstractTransactionalTest <nl> } <nl> } <nl> <nl> - SegmentedFile dFile = new BufferedSegmentedFile ( new ChannelProxy ( new File ( descriptor . filenameFor ( Component . DATA ) ) ) , 0 ) ; <nl> - SegmentedFile iFile = new BufferedSegmentedFile ( new ChannelProxy ( new File ( descriptor . filenameFor ( Component . PRIMARY _ INDEX ) ) ) , 0 ) ; <nl> + SegmentedFile dFile = new BufferedSegmentedFile ( new ChannelProxy ( new File ( descriptor . filenameFor ( Component . DATA ) ) ) , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , 0 ) ; <nl> + SegmentedFile iFile = new BufferedSegmentedFile ( new ChannelProxy ( new File ( descriptor . filenameFor ( Component . PRIMARY _ INDEX ) ) ) , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , 0 ) ; <nl> <nl> SerializationHeader header = SerializationHeader . make ( cfs . metadata , Collections . EMPTY _ LIST ) ; <nl> StatsMetadata metadata = ( StatsMetadata ) new MetadataCollector ( cfs . metadata . comparator ) <nl> diff - - git a / test / unit / org / apache / cassandra / io / RandomAccessReaderTest . java b / test / unit / org / apache / cassandra / io / RandomAccessReaderTest . java <nl> index 71fab61 . . edbd603 100644 <nl> - - - a / test / unit / org / apache / cassandra / io / RandomAccessReaderTest . java <nl> + + + b / test / unit / org / apache / cassandra / io / RandomAccessReaderTest . java <nl> @ @ - 22 , 23 + 22 , 61 @ @ public class RandomAccessReaderTest <nl> @ Test <nl> public void testReadFully ( ) throws IOException <nl> { <nl> + testReadImpl ( 1 , 0 ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testReadLarge ( ) throws IOException <nl> + { <nl> + testReadImpl ( 1000 , 0 ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testReadLargeWithSkip ( ) throws IOException <nl> + { <nl> + testReadImpl ( 1000 , 322 ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testReadBufferSizeNotAligned ( ) throws IOException <nl> + { <nl> + testReadImpl ( 1000 , 0 , 5122 ) ; <nl> + } <nl> + <nl> + private void testReadImpl ( int numIterations , int skipIterations ) throws IOException <nl> + { <nl> + testReadImpl ( numIterations , skipIterations , RandomAccessReader . DEFAULT _ BUFFER _ SIZE ) ; <nl> + } <nl> + <nl> + private void testReadImpl ( int numIterations , int skipIterations , int bufferSize ) throws IOException <nl> + { <nl> final File f = File . createTempFile ( " testReadFully " , " 1 " ) ; <nl> final String expected = " The quick brown fox jumps over the lazy dog " ; <nl> <nl> SequentialWriter writer = SequentialWriter . open ( f ) ; <nl> - writer . write ( expected . getBytes ( ) ) ; <nl> + for ( int i = 0 ; i < numIterations ; i + + ) <nl> + writer . write ( expected . getBytes ( ) ) ; <nl> writer . finish ( ) ; <nl> <nl> assert f . exists ( ) ; <nl> <nl> ChannelProxy channel = new ChannelProxy ( f ) ; <nl> - RandomAccessReader reader = RandomAccessReader . open ( channel ) ; <nl> + RandomAccessReader reader = RandomAccessReader . open ( channel , bufferSize , - 1L ) ; <nl> assertEquals ( f . getAbsolutePath ( ) , reader . getPath ( ) ) ; <nl> - assertEquals ( expected . length ( ) , reader . length ( ) ) ; <nl> + assertEquals ( expected . length ( ) * numIterations , reader . length ( ) ) ; <nl> + <nl> + if ( skipIterations > 0 ) <nl> + { <nl> + reader . seek ( skipIterations * expected . length ( ) ) ; <nl> + } <nl> <nl> byte [ ] b = new byte [ expected . length ( ) ] ; <nl> - reader . readFully ( b ) ; <nl> - assertEquals ( expected , new String ( b ) ) ; <nl> + int n = numIterations - skipIterations ; <nl> + for ( int i = 0 ; i < n ; i + + ) <nl> + { <nl> + reader . readFully ( b ) ; <nl> + assertEquals ( expected , new String ( b ) ) ; <nl> + } <nl> <nl> assertTrue ( reader . isEOF ( ) ) ; <nl> assertEquals ( 0 , reader . bytesRemaining ( ) ) ; <nl> diff - - git a / test / unit / org / apache / cassandra / io / util / SegmentedFileTest . java b / test / unit / org / apache / cassandra / io / util / SegmentedFileTest . java <nl> new file mode 100644 <nl> index 0000000 . . 03c10de <nl> - - - / dev / null <nl> + + + b / test / unit / org / apache / cassandra / io / util / SegmentedFileTest . java <nl> @ @ - 0 , 0 + 1 , 88 @ @ <nl> + / * <nl> + * Licensed to the Apache Software Foundation ( ASF ) under one <nl> + * or more contributor license agreements . See the NOTICE file <nl> + * distributed with this work for additional information <nl> + * regarding copyright ownership . The ASF licenses this file <nl> + * to you under the Apache License , Version 2 . 0 ( the <nl> + * " License " ) ; you may not use this file except in compliance <nl> + * with the License . You may obtain a copy of the License at <nl> + * <nl> + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 <nl> + * <nl> + * Unless required by applicable law or agreed to in writing , software <nl> + * distributed under the License is distributed on an " AS IS " BASIS , <nl> + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . <nl> + * See the License for the specific language governing permissions and <nl> + * limitations under the License . <nl> + * / <nl> + <nl> + package org . apache . cassandra . io . util ; <nl> + <nl> + import org . junit . Test ; <nl> + <nl> + import org . apache . cassandra . config . Config ; <nl> + import org . apache . cassandra . config . DatabaseDescriptor ; <nl> + <nl> + import static org . junit . Assert . assertEquals ; <nl> + <nl> + public class SegmentedFileTest <nl> + { <nl> + @ Test <nl> + public void testRoundingBufferSize ( ) <nl> + { <nl> + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( - 1L ) ) ; <nl> + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( 0 ) ) ; <nl> + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( 1 ) ) ; <nl> + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( 2013 ) ) ; <nl> + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( 4095 ) ) ; <nl> + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( 4096 ) ) ; <nl> + assertEquals ( 8192 , SegmentedFile . Builder . roundBufferSize ( 4097 ) ) ; <nl> + assertEquals ( 8192 , SegmentedFile . Builder . roundBufferSize ( 8191 ) ) ; <nl> + assertEquals ( 8192 , SegmentedFile . Builder . roundBufferSize ( 8192 ) ) ; <nl> + assertEquals ( 12288 , SegmentedFile . Builder . roundBufferSize ( 8193 ) ) ; <nl> + assertEquals ( 65536 , SegmentedFile . Builder . roundBufferSize ( 65535 ) ) ; <nl> + assertEquals ( 65536 , SegmentedFile . Builder . roundBufferSize ( 65536 ) ) ; <nl> + assertEquals ( 65536 , SegmentedFile . Builder . roundBufferSize ( 65537 ) ) ; <nl> + assertEquals ( 65536 , SegmentedFile . Builder . roundBufferSize ( 10000000000000000L ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testBufferSize _ ssd ( ) <nl> + { <nl> + DatabaseDescriptor . setDiskOptimizationStrategy ( Config . DiskOptimizationStrategy . ssd ) ; <nl> + DatabaseDescriptor . setDiskOptimizationPageCrossChance ( 0 . 1 ) ; <nl> + <nl> + assertEquals ( 4096 , SegmentedFile . Builder . bufferSize ( 0 ) ) ; <nl> + assertEquals ( 4096 , SegmentedFile . Builder . bufferSize ( 10 ) ) ; <nl> + assertEquals ( 4096 , SegmentedFile . Builder . bufferSize ( 100 ) ) ; <nl> + assertEquals ( 4096 , SegmentedFile . Builder . bufferSize ( 4096 ) ) ; <nl> + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 4505 ) ) ; / / just < ( 4096 + 4096 * 0 . 1 ) <nl> + assertEquals ( 12288 , SegmentedFile . Builder . bufferSize ( 4506 ) ) ; / / just > ( 4096 + 4096 * 0 . 1 ) <nl> + <nl> + DatabaseDescriptor . setDiskOptimizationPageCrossChance ( 0 . 5 ) ; <nl> + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 4506 ) ) ; / / just > ( 4096 + 4096 * 0 . 1 ) <nl> + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 6143 ) ) ; / / < ( 4096 + 4096 * 0 . 5 ) <nl> + assertEquals ( 12288 , SegmentedFile . Builder . bufferSize ( 6144 ) ) ; / / = ( 4096 + 4096 * 0 . 5 ) <nl> + assertEquals ( 12288 , SegmentedFile . Builder . bufferSize ( 6145 ) ) ; / / > ( 4096 + 4096 * 0 . 5 ) <nl> + <nl> + DatabaseDescriptor . setDiskOptimizationPageCrossChance ( 1 . 0 ) ; / / never add a page <nl> + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 8191 ) ) ; <nl> + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 8192 ) ) ; <nl> + <nl> + DatabaseDescriptor . setDiskOptimizationPageCrossChance ( 0 . 0 ) ; / / always add a page <nl> + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 10 ) ) ; <nl> + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 4096 ) ) ; <nl> + } <nl> + <nl> + @ Test <nl> + public void testBufferSize _ spinning ( ) <nl> + { <nl> + DatabaseDescriptor . setDiskOptimizationStrategy ( Config . DiskOptimizationStrategy . spinning ) ; <nl> + <nl> + assertEquals ( 4096 , SegmentedFile . Builder . bufferSize ( 0 ) ) ; <nl> + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 10 ) ) ; <nl> + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 100 ) ) ; <nl> + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 4096 ) ) ; <nl> + assertEquals ( 12288 , SegmentedFile . Builder . bufferSize ( 4097 ) ) ; <nl> + } <nl> + }
+NEAREST DIFF (one line): ELIMINATEDSENTENCE
+
+TEST DIFF:
+diff - - git a / conf / cassandra . yaml b / conf / cassandra . yaml 
+ index 5fe3d87 . . 7ce36af 100644 
+ - - - a / conf / cassandra . yaml 
+ + + + b / conf / cassandra . yaml 
+ @ @ - 354 , 7 + 354 , 13 @ @ concurrent _ counter _ writes : 32 
+ 
+ # buffer _ pool _ use _ heap _ if _ exhausted : true 
+ 
+ - # Total permitted memory to use for memtables . Cassandra will stop 
+ + # The strategy for optimizing disk read 
+ + # Possible values are : 
+ + # ssd ( for solid state disks , the default ) 
+ + # spinning ( for spinning disks ) 
+ + # disk _ optimization _ strategy : ssd 
+ + 
+ + # Total permitted memory to use for memtables . Cassandra will stop 
+ # accepting writes when the limit is exceeded until a flush completes , 
+ # and will trigger a flush based on memtable _ cleanup _ threshold 
+ # If omitted , Cassandra will set both to 1 / 4 the size of the heap . 
+ diff - - git a / src / java / org / apache / cassandra / config / Config . java b / src / java / org / apache / cassandra / config / Config . java 
+ index fe6752f . . 64b23dd 100644 
+ - - - a / src / java / org / apache / cassandra / config / Config . java 
+ + + + b / src / java / org / apache / cassandra / config / Config . java 
+ @ @ - 222 , 6 + 222 , 12 @ @ public class Config 
+ 
+ public boolean buffer _ pool _ use _ heap _ if _ exhausted = true ; 
+ 
+ + public DiskOptimizationStrategy disk _ optimization _ strategy = DiskOptimizationStrategy . ssd ; 
+ + 
+ + public double disk _ optimization _ estimate _ percentile = 0 . 95 ; 
+ + 
+ + public double disk _ optimization _ page _ cross _ chance = 0 . 1 ; 
+ + 
+ public boolean inter _ dc _ tcp _ nodelay = true ; 
+ 
+ public MemtableAllocationType memtable _ allocation _ type = MemtableAllocationType . heap _ buffers ; 
+ @ @ - 308 , 17 + 314 , 17 @ @ public class Config 
+ isClientMode = clientMode ; 
+ } 
+ 
+ - public static enum CommitLogSync 
+ + public enum CommitLogSync 
+ { 
+ periodic , 
+ batch 
+ } 
+ - public static enum InternodeCompression 
+ + public enum InternodeCompression 
+ { 
+ all , none , dc 
+ } 
+ 
+ - public static enum DiskAccessMode 
+ + public enum DiskAccessMode 
+ { 
+ auto , 
+ mmap , 
+ @ @ - 326 , 7 + 332 , 7 @ @ public class Config 
+ standard , 
+ } 
+ 
+ - public static enum MemtableAllocationType 
+ + public enum MemtableAllocationType 
+ { 
+ unslabbed _ heap _ buffers , 
+ heap _ buffers , 
+ @ @ - 334 , 7 + 340 , 7 @ @ public class Config 
+ offheap _ objects 
+ } 
+ 
+ - public static enum DiskFailurePolicy 
+ + public enum DiskFailurePolicy 
+ { 
+ best _ effort , 
+ stop , 
+ @ @ - 343 , 7 + 349 , 7 @ @ public class Config 
+ die 
+ } 
+ 
+ - public static enum CommitFailurePolicy 
+ + public enum CommitFailurePolicy 
+ { 
+ stop , 
+ stop _ commit , 
+ @ @ - 351 , 15 + 357 , 21 @ @ public class Config 
+ die , 
+ } 
+ 
+ - public static enum UserFunctionTimeoutPolicy 
+ + public enum UserFunctionTimeoutPolicy 
+ { 
+ ignore , 
+ die , 
+ die _ immediate 
+ } 
+ 
+ - public static enum RequestSchedulerId 
+ + public enum RequestSchedulerId 
+ { 
+ keyspace 
+ } 
+ + 
+ + public enum DiskOptimizationStrategy 
+ + { 
+ + ssd , 
+ + spinning 
+ + } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ index a25af65 . . f1369d1 100644 
+ - - - a / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ + + + b / src / java / org / apache / cassandra / config / DatabaseDescriptor . java 
+ @ @ - 1493 , 6 + 1493 , 33 @ @ public class DatabaseDescriptor 
+ return conf . buffer _ pool _ use _ heap _ if _ exhausted ; 
+ } 
+ 
+ + public static Config . DiskOptimizationStrategy getDiskOptimizationStrategy ( ) 
+ + { 
+ + return conf . disk _ optimization _ strategy ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + public static void setDiskOptimizationStrategy ( Config . DiskOptimizationStrategy strategy ) 
+ + { 
+ + conf . disk _ optimization _ strategy = strategy ; 
+ + } 
+ + 
+ + public static double getDiskOptimizationEstimatePercentile ( ) 
+ + { 
+ + return conf . disk _ optimization _ estimate _ percentile ; 
+ + } 
+ + 
+ + public static double getDiskOptimizationPageCrossChance ( ) 
+ + { 
+ + return conf . disk _ optimization _ page _ cross _ chance ; 
+ + } 
+ + 
+ + @ VisibleForTesting 
+ + public static void setDiskOptimizationPageCrossChance ( double chance ) 
+ + { 
+ + conf . disk _ optimization _ page _ cross _ chance = chance ; 
+ + } 
+ + 
+ public static long getTotalCommitlogSpaceInMB ( ) 
+ { 
+ return conf . commitlog _ total _ space _ in _ mb ; 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / format / SSTableReader . java b / src / java / org / apache / cassandra / io / sstable / format / SSTableReader . java 
+ index a8aedc7 . . bae0858 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / format / SSTableReader . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / format / SSTableReader . java 
+ @ @ - 51 , 6 + 51 , 7 @ @ import org . apache . cassandra . dht . * ; 
+ import org . apache . cassandra . io . FSError ; 
+ import org . apache . cassandra . io . compress . CompressionMetadata ; 
+ import org . apache . cassandra . io . sstable . * ; 
+ + import org . apache . cassandra . io . sstable . format . big . BigTableWriter ; 
+ import org . apache . cassandra . io . sstable . metadata . * ; 
+ import org . apache . cassandra . io . util . * ; 
+ import org . apache . cassandra . metrics . RestorableMeter ; 
+ @ @ - 414 , 8 + 415 , 8 @ @ public abstract class SSTableReader extends SSTable implements SelfRefCounted < SS 
+ { 
+ if ( ! sstable . loadSummary ( ibuilder , dbuilder ) ) 
+ sstable . buildSummary ( false , ibuilder , dbuilder , false , Downsampling . BASE _ SAMPLING _ LEVEL ) ; 
+ - sstable . ifile = ibuilder . complete ( sstable . descriptor . filenameFor ( Component . PRIMARY _ INDEX ) ) ; 
+ - sstable . dfile = dbuilder . complete ( sstable . descriptor . filenameFor ( Component . DATA ) ) ; 
+ + sstable . ifile = ibuilder . buildIndex ( sstable . descriptor , sstable . indexSummary ) ; 
+ + sstable . dfile = dbuilder . buildData ( sstable . descriptor , statsMetadata ) ; 
+ sstable . bf = FilterFactory . AlwaysPresent ; 
+ sstable . setup ( true ) ; 
+ return sstable ; 
+ @ @ - 719 , 9 + 720 , 9 @ @ public abstract class SSTableReader extends SSTable implements SelfRefCounted < SS 
+ } 
+ 
+ if ( components . contains ( Component . PRIMARY _ INDEX ) ) 
+ - ifile = ibuilder . complete ( descriptor . filenameFor ( Component . PRIMARY _ INDEX ) ) ; 
+ + ifile = ibuilder . buildIndex ( descriptor , indexSummary ) ; 
+ 
+ - dfile = dbuilder . complete ( descriptor . filenameFor ( Component . DATA ) ) ; 
+ + dfile = dbuilder . buildData ( descriptor , sstableMetadata ) ; 
+ 
+ / / Check for an index summary that was downsampled even though the serialization format doesn ' t support 
+ / / that . If it was downsampled , rebuild it . See CASSANDRA - 8993 for details . 
+ @ @ - 738 , 8 + 739 , 8 @ @ public abstract class SSTableReader extends SSTable implements SelfRefCounted < SS 
+ SegmentedFile . Builder dbuilderRebuild = SegmentedFile . getBuilder ( DatabaseDescriptor . getDiskAccessMode ( ) , compression ) ) 
+ { 
+ buildSummary ( false , ibuilderRebuild , dbuilderRebuild , false , Downsampling . BASE _ SAMPLING _ LEVEL ) ; 
+ - ifile = ibuilderRebuild . complete ( descriptor . filenameFor ( Component . PRIMARY _ INDEX ) ) ; 
+ - dfile = dbuilderRebuild . complete ( descriptor . filenameFor ( Component . DATA ) ) ; 
+ + ifile = ibuilderRebuild . buildIndex ( descriptor , indexSummary ) ; 
+ + dfile = dbuilderRebuild . buildData ( descriptor , sstableMetadata ) ; 
+ saveSummary ( ibuilderRebuild , dbuilderRebuild ) ; 
+ } 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / sstable / format / big / BigTableWriter . java b / src / java / org / apache / cassandra / io / sstable / format / big / BigTableWriter . java 
+ index 13c9954 . . ff279a8 100644 
+ - - - a / src / java / org / apache / cassandra / io / sstable / format / big / BigTableWriter . java 
+ + + + b / src / java / org / apache / cassandra / io / sstable / format / big / BigTableWriter . java 
+ @ @ - 243 , 12 + 243 , 13 @ @ public class BigTableWriter extends SSTableWriter 
+ StatsMetadata stats = statsMetadata ( ) ; 
+ assert boundary . indexLength > 0 & & boundary . dataLength > 0 ; 
+ / / open the reader early 
+ - SegmentedFile ifile = iwriter . builder . complete ( descriptor . filenameFor ( Component . PRIMARY _ INDEX ) , boundary . indexLength ) ; 
+ - SegmentedFile dfile = dbuilder . complete ( descriptor . filenameFor ( Component . DATA ) , boundary . dataLength ) ; 
+ + IndexSummary indexSummary = iwriter . summary . build ( partitioner , boundary ) ; 
+ + SegmentedFile ifile = iwriter . builder . buildIndex ( descriptor , indexSummary , boundary ) ; 
+ + SegmentedFile dfile = dbuilder . buildData ( descriptor , stats , boundary ) ; 
+ SSTableReader sstable = SSTableReader . internalOpen ( descriptor , 
+ components , metadata , 
+ partitioner , ifile , 
+ - dfile , iwriter . summary . build ( partitioner , boundary ) , 
+ + dfile , indexSummary , 
+ iwriter . bf . sharedCopy ( ) , maxDataAge , stats , SSTableReader . OpenReason . EARLY , header ) ; 
+ 
+ / / now it ' s open , find the ACTUAL last readable key ( i . e . for which the data file has also been flushed ) 
+ @ @ - 274 , 15 + 275 , 16 @ @ public class BigTableWriter extends SSTableWriter 
+ 
+ StatsMetadata stats = statsMetadata ( ) ; 
+ / / finalize in - memory state for the reader 
+ - SegmentedFile ifile = iwriter . builder . complete ( desc . filenameFor ( Component . PRIMARY _ INDEX ) ) ; 
+ - SegmentedFile dfile = dbuilder . complete ( desc . filenameFor ( Component . DATA ) ) ; 
+ + IndexSummary indexSummary = iwriter . summary . build ( partitioner ) ; 
+ + SegmentedFile ifile = iwriter . builder . buildIndex ( desc , indexSummary ) ; 
+ + SegmentedFile dfile = dbuilder . buildData ( desc , stats ) ; 
+ SSTableReader sstable = SSTableReader . internalOpen ( desc , 
+ components , 
+ this . metadata , 
+ partitioner , 
+ ifile , 
+ dfile , 
+ - iwriter . summary . build ( partitioner ) , 
+ + indexSummary , 
+ iwriter . bf . sharedCopy ( ) , 
+ maxDataAge , 
+ stats , 
+ diff - - git a / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java 
+ index 2c59def . . 744e828 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / BufferedSegmentedFile . java 
+ @ @ - 19 , 9 + 19 , 9 @ @ package org . apache . cassandra . io . util ; 
+ 
+ public class BufferedSegmentedFile extends SegmentedFile 
+ { 
+ - public BufferedSegmentedFile ( ChannelProxy channel , long length ) 
+ + public BufferedSegmentedFile ( ChannelProxy channel , int bufferSize , long length ) 
+ { 
+ - super ( new Cleanup ( channel ) , channel , length ) ; 
+ + super ( new Cleanup ( channel ) , channel , bufferSize , length ) ; 
+ } 
+ 
+ private BufferedSegmentedFile ( BufferedSegmentedFile copy ) 
+ @ @ - 48 , 16 + 48 , 16 @ @ public class BufferedSegmentedFile extends SegmentedFile 
+ / / only one segment in a standard - io file 
+ } 
+ 
+ - public SegmentedFile complete ( ChannelProxy channel , long overrideLength ) 
+ + public SegmentedFile complete ( ChannelProxy channel , int bufferSize , long overrideLength ) 
+ { 
+ long length = overrideLength > 0 ? overrideLength : channel . size ( ) ; 
+ - return new BufferedSegmentedFile ( channel , length ) ; 
+ + return new BufferedSegmentedFile ( channel , bufferSize , length ) ; 
+ } 
+ } 
+ 
+ public FileDataInput getSegment ( long position ) 
+ { 
+ - RandomAccessReader reader = RandomAccessReader . open ( channel ) ; 
+ + RandomAccessReader reader = RandomAccessReader . open ( channel , bufferSize , - 1L ) ; 
+ reader . seek ( position ) ; 
+ return reader ; 
+ } 
+ diff - - git a / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java 
+ index ceff7ba . . 2ae4781 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / CompressedSegmentedFile . java 
+ @ @ - 37 , 14 + 37 , 14 @ @ public class CompressedSegmentedFile extends SegmentedFile implements ICompresse 
+ private static int MAX _ SEGMENT _ SIZE = Integer . MAX _ VALUE ; 
+ private final TreeMap < Long , MappedByteBuffer > chunkSegments ; 
+ 
+ - public CompressedSegmentedFile ( ChannelProxy channel , CompressionMetadata metadata ) 
+ + public CompressedSegmentedFile ( ChannelProxy channel , int bufferSize , CompressionMetadata metadata ) 
+ { 
+ - this ( channel , metadata , createMappedSegments ( channel , metadata ) ) ; 
+ + this ( channel , bufferSize , metadata , createMappedSegments ( channel , metadata ) ) ; 
+ } 
+ 
+ - public CompressedSegmentedFile ( ChannelProxy channel , CompressionMetadata metadata , TreeMap < Long , MappedByteBuffer > chunkSegments ) 
+ + public CompressedSegmentedFile ( ChannelProxy channel , int bufferSize , CompressionMetadata metadata , TreeMap < Long , MappedByteBuffer > chunkSegments ) 
+ { 
+ - super ( new Cleanup ( channel , metadata , chunkSegments ) , channel , metadata . dataLength , metadata . compressedFileLength ) ; 
+ + super ( new Cleanup ( channel , metadata , chunkSegments ) , channel , bufferSize , metadata . dataLength , metadata . compressedFileLength ) ; 
+ this . metadata = metadata ; 
+ this . chunkSegments = chunkSegments ; 
+ } 
+ @ @ - 144 , 9 + 144 , 9 @ @ public class CompressedSegmentedFile extends SegmentedFile implements ICompresse 
+ return writer . open ( overrideLength ) ; 
+ } 
+ 
+ - public SegmentedFile complete ( ChannelProxy channel , long overrideLength ) 
+ + public SegmentedFile complete ( ChannelProxy channel , int bufferSize , long overrideLength ) 
+ { 
+ - return new CompressedSegmentedFile ( channel , metadata ( channel . filePath ( ) , overrideLength ) ) ; 
+ + return new CompressedSegmentedFile ( channel , bufferSize , metadata ( channel . filePath ( ) , overrideLength ) ) ; 
+ } 
+ } 
+ 
+ diff - - git a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ index 91908c9 . . 879ca6f 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / MmappedSegmentedFile . java 
+ @ @ - 43 , 9 + 43 , 9 @ @ public class MmappedSegmentedFile extends SegmentedFile 
+ * / 
+ private final Segment [ ] segments ; 
+ 
+ - public MmappedSegmentedFile ( ChannelProxy channel , long length , Segment [ ] segments ) 
+ + public MmappedSegmentedFile ( ChannelProxy channel , int bufferSize , long length , Segment [ ] segments ) 
+ { 
+ - super ( new Cleanup ( channel , segments ) , channel , length ) ; 
+ + super ( new Cleanup ( channel , segments ) , channel , bufferSize , length ) ; 
+ this . segments = segments ; 
+ } 
+ 
+ @ @ - 90 , 7 + 90 , 7 @ @ public class MmappedSegmentedFile extends SegmentedFile 
+ / / we can have single cells or partitions larger than 2Gb , which is our maximum addressable range in a single segment ; 
+ / / in this case we open as a normal random access reader 
+ / / FIXME : brafs are unbounded , so this segment will cover the rest of the file , rather than just the row 
+ - RandomAccessReader file = RandomAccessReader . open ( channel ) ; 
+ + RandomAccessReader file = RandomAccessReader . open ( channel , bufferSize , - 1L ) ; 
+ file . seek ( position ) ; 
+ return file ; 
+ } 
+ @ @ - 183 , 11 + 183 , 11 @ @ public class MmappedSegmentedFile extends SegmentedFile 
+ } 
+ } 
+ 
+ - public SegmentedFile complete ( ChannelProxy channel , long overrideLength ) 
+ + public SegmentedFile complete ( ChannelProxy channel , int bufferSize , long overrideLength ) 
+ { 
+ long length = overrideLength > 0 ? overrideLength : channel . size ( ) ; 
+ / / create the segments 
+ - return new MmappedSegmentedFile ( channel , length , createSegments ( channel , length ) ) ; 
+ + return new MmappedSegmentedFile ( channel , bufferSize , length , createSegments ( channel , length ) ) ; 
+ } 
+ 
+ private Segment [ ] createSegments ( ChannelProxy channel , long length ) 
+ diff - - git a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java 
+ index c4be8e9 . . b13d154 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / RandomAccessReader . java 
+ + + + b / src / java / org / apache / cassandra / io / util / RandomAccessReader . java 
+ @ @ - 27 , 7 + 27 , 7 @ @ import org . apache . cassandra . utils . memory . BufferPool ; 
+ 
+ public class RandomAccessReader extends AbstractDataInput implements FileDataInput 
+ { 
+ - public static final int DEFAULT _ BUFFER _ SIZE = 64 * 1024 ; 
+ + public static final int DEFAULT _ BUFFER _ SIZE = 4096 ; 
+ 
+ / / the IO channel to the file , we do not own a reference to this due to 
+ / / performance reasons ( CASSANDRA - 9379 ) so it ' s up to the owner of the RAR to 
+ @ @ - 59 , 9 + 59 , 16 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp 
+ buffer . limit ( 0 ) ; 
+ } 
+ 
+ + / * * The buffer size is typically already page aligned but if that is not the case 
+ + * make sure that it is a multiple of the page size , 4096 . 
+ + * * / 
+ protected int getBufferSize ( int size ) 
+ { 
+ - return ( int ) Math . min ( fileLength , size ) ; 
+ + if ( ( size & ~ 4095 ) ! = size ) 
+ + { / / should already be a page size multiple but if that ' s not case round it up 
+ + size = ( size + 4095 ) & ~ 4095 ; 
+ + } 
+ + return size ; 
+ } 
+ 
+ protected ByteBuffer allocateBuffer ( int size , BufferType bufferType ) 
+ @ @ - 103 , 12 + 110 , 7 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp 
+ 
+ public static RandomAccessReader open ( ChannelProxy channel ) 
+ { 
+ - return open ( channel , - 1L ) ; 
+ - } 
+ - 
+ - public static RandomAccessReader open ( ChannelProxy channel , long overrideSize ) 
+ - { 
+ - return open ( channel , DEFAULT _ BUFFER _ SIZE , overrideSize ) ; 
+ + return open ( channel , DEFAULT _ BUFFER _ SIZE , - 1L ) ; 
+ } 
+ 
+ public static RandomAccessReader open ( ChannelProxy channel , int bufferSize , long overrideSize ) 
+ @ @ - 132 , 7 + 134 , 14 @ @ public class RandomAccessReader extends AbstractDataInput implements FileDataInp 
+ 
+ long position = bufferOffset ; 
+ long limit = bufferOffset ; 
+ - while ( buffer . hasRemaining ( ) & & limit < fileLength ) 
+ + 
+ + long pageAligedPos = position & ~ 4095 ; 
+ + / / Because the buffer capacity is a multiple of the page size , we read less 
+ + / / the first time and then we should read at page boundaries only , 
+ + / / unless the user seeks elsewhere 
+ + long upperLimit = Math . min ( fileLength , pageAligedPos + buffer . capacity ( ) ) ; 
+ + buffer . limit ( ( int ) ( upperLimit - position ) ) ; 
+ + while ( buffer . hasRemaining ( ) & & limit < upperLimit ) 
+ { 
+ int n = channel . read ( buffer , position ) ; 
+ if ( n < 0 ) 
+ diff - - git a / src / java / org / apache / cassandra / io / util / SegmentedFile . java b / src / java / org / apache / cassandra / io / util / SegmentedFile . java 
+ index 13a0ec7 . . e586682 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / SegmentedFile . java 
+ + + + b / src / java / org / apache / cassandra / io / util / SegmentedFile . java 
+ @ @ - 25 , 13 + 25 , 17 @ @ import java . nio . MappedByteBuffer ; 
+ import java . util . Iterator ; 
+ import java . util . NoSuchElementException ; 
+ 
+ - import com . google . common . base . Throwables ; 
+ import com . google . common . util . concurrent . RateLimiter ; 
+ 
+ import org . apache . cassandra . config . Config ; 
+ import org . apache . cassandra . config . DatabaseDescriptor ; 
+ import org . apache . cassandra . io . FSReadError ; 
+ import org . apache . cassandra . io . compress . CompressedSequentialWriter ; 
+ + import org . apache . cassandra . io . sstable . Component ; 
+ + import org . apache . cassandra . io . sstable . Descriptor ; 
+ + import org . apache . cassandra . io . sstable . IndexSummary ; 
+ + import org . apache . cassandra . io . sstable . IndexSummaryBuilder ; 
+ + import org . apache . cassandra . io . sstable . metadata . StatsMetadata ; 
+ import org . apache . cassandra . utils . CLibrary ; 
+ import org . apache . cassandra . utils . Pair ; 
+ import org . apache . cassandra . utils . concurrent . RefCounted ; 
+ @ @ - 51 , 6 + 55 , 7 @ @ import static org . apache . cassandra . utils . Throwables . maybeFail ; 
+ public abstract class SegmentedFile extends SharedCloseableImpl 
+ { 
+ public final ChannelProxy channel ; 
+ + public final int bufferSize ; 
+ public final long length ; 
+ 
+ / / This differs from length for compressed files ( but we still need length for 
+ @ @ - 60 , 15 + 65 , 16 @ @ public abstract class SegmentedFile extends SharedCloseableImpl 
+ / * * 
+ * Use getBuilder to get a Builder to construct a SegmentedFile . 
+ * / 
+ - SegmentedFile ( Cleanup cleanup , ChannelProxy channel , long length ) 
+ + SegmentedFile ( Cleanup cleanup , ChannelProxy channel , int bufferSize , long length ) 
+ { 
+ - this ( cleanup , channel , length , length ) ; 
+ + this ( cleanup , channel , bufferSize , length , length ) ; 
+ } 
+ 
+ - protected SegmentedFile ( Cleanup cleanup , ChannelProxy channel , long length , long onDiskLength ) 
+ + protected SegmentedFile ( Cleanup cleanup , ChannelProxy channel , int bufferSize , long length , long onDiskLength ) 
+ { 
+ super ( cleanup ) ; 
+ this . channel = channel ; 
+ + this . bufferSize = bufferSize ; 
+ this . length = length ; 
+ this . onDiskLength = onDiskLength ; 
+ } 
+ @ @ - 77 , 6 + 83 , 7 @ @ public abstract class SegmentedFile extends SharedCloseableImpl 
+ { 
+ super ( copy ) ; 
+ channel = copy . channel ; 
+ + bufferSize = copy . bufferSize ; 
+ length = copy . length ; 
+ onDiskLength = copy . onDiskLength ; 
+ } 
+ @ @ - 109 , 13 + 116 , 13 @ @ public abstract class SegmentedFile extends SharedCloseableImpl 
+ 
+ public RandomAccessReader createReader ( ) 
+ { 
+ - return RandomAccessReader . open ( channel , length ) ; 
+ + return RandomAccessReader . open ( channel , bufferSize , length ) ; 
+ } 
+ 
+ public RandomAccessReader createThrottledReader ( RateLimiter limiter ) 
+ { 
+ assert limiter ! = null ; 
+ - return ThrottledReader . open ( channel , length , limiter ) ; 
+ + return ThrottledReader . open ( channel , bufferSize , length , limiter ) ; 
+ } 
+ 
+ public FileDataInput getSegment ( long position ) 
+ @ @ - 171 , 19 + 178 , 14 @ @ public abstract class SegmentedFile extends SharedCloseableImpl 
+ * Called after all potential boundaries have been added to apply this Builder to a concrete file on disk . 
+ * @ param channel The channel to the file on disk . 
+ * / 
+ - protected abstract SegmentedFile complete ( ChannelProxy channel , long overrideLength ) ; 
+ + protected abstract SegmentedFile complete ( ChannelProxy channel , int bufferSize , long overrideLength ) ; 
+ 
+ - public SegmentedFile complete ( String path ) 
+ - { 
+ - return complete ( path , - 1L ) ; 
+ - } 
+ - 
+ - public SegmentedFile complete ( String path , long overrideLength ) 
+ + private SegmentedFile complete ( String path , int bufferSize , long overrideLength ) 
+ { 
+ ChannelProxy channelCopy = getChannel ( path ) ; 
+ try 
+ { 
+ - return complete ( channelCopy , overrideLength ) ; 
+ + return complete ( channelCopy , bufferSize , overrideLength ) ; 
+ } 
+ catch ( Throwable t ) 
+ { 
+ @ @ - 192 , 6 + 194 , 79 @ @ public abstract class SegmentedFile extends SharedCloseableImpl 
+ } 
+ } 
+ 
+ + public SegmentedFile buildData ( Descriptor desc , StatsMetadata stats , IndexSummaryBuilder . ReadableBoundary boundary ) 
+ + { 
+ + return complete ( desc . filenameFor ( Component . DATA ) , bufferSize ( stats ) , boundary . dataLength ) ; 
+ + } 
+ + 
+ + public SegmentedFile buildData ( Descriptor desc , StatsMetadata stats ) 
+ + { 
+ + return complete ( desc . filenameFor ( Component . DATA ) , bufferSize ( stats ) , - 1L ) ; 
+ + } 
+ + 
+ + public SegmentedFile buildIndex ( Descriptor desc , IndexSummary indexSummary , IndexSummaryBuilder . ReadableBoundary boundary ) 
+ + { 
+ + return complete ( desc . filenameFor ( Component . PRIMARY _ INDEX ) , bufferSize ( desc , indexSummary ) , boundary . indexLength ) ; 
+ + } 
+ + 
+ + public SegmentedFile buildIndex ( Descriptor desc , IndexSummary indexSummary ) 
+ + { 
+ + return complete ( desc . filenameFor ( Component . PRIMARY _ INDEX ) , bufferSize ( desc , indexSummary ) , - 1L ) ; 
+ + } 
+ + 
+ + private int bufferSize ( StatsMetadata stats ) 
+ + { 
+ + return bufferSize ( stats . estimatedPartitionSize . percentile ( DatabaseDescriptor . getDiskOptimizationEstimatePercentile ( ) ) ) ; 
+ + } 
+ + 
+ + private int bufferSize ( Descriptor desc , IndexSummary indexSummary ) 
+ + { 
+ + File file = new File ( desc . filenameFor ( Component . PRIMARY _ INDEX ) ) ; 
+ + return bufferSize ( file . length ( ) / indexSummary . size ( ) ) ; 
+ + } 
+ + 
+ + / * * 
+ + Return the buffer size for a given record size . For spinning disks always add one page . 
+ + For solid state disks only add one page if the chance of crossing to the next page is more 
+ + than a predifined value , @ see Config . disk _ optimization _ page _ cross _ chance . 
+ + * / 
+ + static int bufferSize ( long recordSize ) 
+ + { 
+ + Config . DiskOptimizationStrategy strategy = DatabaseDescriptor . getDiskOptimizationStrategy ( ) ; 
+ + if ( strategy = = Config . DiskOptimizationStrategy . ssd ) 
+ + { 
+ + / / The crossing probability is calculated assuming a uniform distribution of record 
+ + / / start position in a page , so it ' s the record size modulo the page size divided by 
+ + / / the total page size . 
+ + double pageCrossProbability = ( recordSize % 4096 ) / 4096 . ; 
+ + / / if the page cross probability is equal or bigger than disk _ optimization _ page _ cross _ chance we add one page 
+ + if ( ( pageCrossProbability - DatabaseDescriptor . getDiskOptimizationPageCrossChance ( ) ) > - 1e - 16 ) 
+ + recordSize + = 4096 ; 
+ + 
+ + return roundBufferSize ( recordSize ) ; 
+ + } 
+ + else if ( strategy = = Config . DiskOptimizationStrategy . spinning ) 
+ + { 
+ + return roundBufferSize ( recordSize + 4096 ) ; 
+ + } 
+ + else 
+ + { 
+ + throw new IllegalStateException ( " Unsupported disk optimization strategy : " + strategy ) ; 
+ + } 
+ + } 
+ + 
+ + / * * 
+ + Round up to the next multiple of 4k but no more than 64k 
+ + * / 
+ + static int roundBufferSize ( long size ) 
+ + { 
+ + if ( size < = 0 ) 
+ + return 4096 ; 
+ + 
+ + size = ( size + 4095 ) & ~ 4095 ; 
+ + return ( int ) Math . min ( size , 1 < < 16 ) ; 
+ + } 
+ + 
+ public void serializeBounds ( DataOutput out ) throws IOException 
+ { 
+ out . writeUTF ( DatabaseDescriptor . getDiskAccessMode ( ) . name ( ) ) ; 
+ diff - - git a / src / java / org / apache / cassandra / io / util / ThrottledReader . java b / src / java / org / apache / cassandra / io / util / ThrottledReader . java 
+ index ea21355 . . 024d38f 100644 
+ - - - a / src / java / org / apache / cassandra / io / util / ThrottledReader . java 
+ + + + b / src / java / org / apache / cassandra / io / util / ThrottledReader . java 
+ @ @ - 29 , 9 + 29 , 9 @ @ public class ThrottledReader extends RandomAccessReader 
+ { 
+ private final RateLimiter limiter ; 
+ 
+ - protected ThrottledReader ( ChannelProxy channel , long overrideLength , RateLimiter limiter ) 
+ + protected ThrottledReader ( ChannelProxy channel , int bufferSize , long overrideLength , RateLimiter limiter ) 
+ { 
+ - super ( channel , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , overrideLength , BufferType . OFF _ HEAP ) ; 
+ + super ( channel , bufferSize , overrideLength , BufferType . OFF _ HEAP ) ; 
+ this . limiter = limiter ; 
+ } 
+ 
+ @ @ - 41 , 8 + 41 , 8 @ @ public class ThrottledReader extends RandomAccessReader 
+ super . reBuffer ( ) ; 
+ } 
+ 
+ - public static ThrottledReader open ( ChannelProxy channel , long overrideLength , RateLimiter limiter ) 
+ + public static ThrottledReader open ( ChannelProxy channel , int bufferSize , long overrideLength , RateLimiter limiter ) 
+ { 
+ - return new ThrottledReader ( channel , overrideLength , limiter ) ; 
+ + return new ThrottledReader ( channel , bufferSize , overrideLength , limiter ) ; 
+ } 
+ } 
+ diff - - git a / test / unit / org / apache / cassandra / MockSchema . java b / test / unit / org / apache / cassandra / MockSchema . java 
+ index d9c7e8b . . e052c0a 100644 
+ - - - a / test / unit / org / apache / cassandra / MockSchema . java 
+ + + + b / test / unit / org / apache / cassandra / MockSchema . java 
+ @ @ - 43 , 6 + 43 , 7 @ @ import org . apache . cassandra . io . util . BufferedSegmentedFile ; 
+ import org . apache . cassandra . io . util . ChannelProxy ; 
+ import org . apache . cassandra . io . util . FileUtils ; 
+ import org . apache . cassandra . io . util . Memory ; 
+ + import org . apache . cassandra . io . util . RandomAccessReader ; 
+ import org . apache . cassandra . io . util . SegmentedFile ; 
+ import org . apache . cassandra . schema . KeyspaceMetadata ; 
+ import org . apache . cassandra . schema . KeyspaceParams ; 
+ @ @ - 61 , 7 + 62 , 7 @ @ public class MockSchema 
+ public static final Keyspace ks = Keyspace . mockKS ( KeyspaceMetadata . create ( " mockks " , KeyspaceParams . simpleTransient ( 1 ) ) ) ; 
+ 
+ public static final IndexSummary indexSummary ; 
+ - private static final SegmentedFile segmentedFile = new BufferedSegmentedFile ( new ChannelProxy ( temp ( " mocksegmentedfile " ) ) , 0 ) ; 
+ + private static final SegmentedFile segmentedFile = new BufferedSegmentedFile ( new ChannelProxy ( temp ( " mocksegmentedfile " ) ) , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , 0 ) ; 
+ 
+ public static Memtable memtable ( ColumnFamilyStore cfs ) 
+ { 
+ diff - - git a / test / unit / org / apache / cassandra / db / lifecycle / TransactionLogsTest . java b / test / unit / org / apache / cassandra / db / lifecycle / TransactionLogsTest . java 
+ index 3150087 . . 4105800 100644 
+ - - - a / test / unit / org / apache / cassandra / db / lifecycle / TransactionLogsTest . java 
+ + + + b / test / unit / org / apache / cassandra / db / lifecycle / TransactionLogsTest . java 
+ @ @ - 48 , 6 + 48 , 7 @ @ import org . apache . cassandra . io . sstable . metadata . MetadataType ; 
+ import org . apache . cassandra . io . sstable . metadata . StatsMetadata ; 
+ import org . apache . cassandra . io . util . BufferedSegmentedFile ; 
+ import org . apache . cassandra . io . util . ChannelProxy ; 
+ + import org . apache . cassandra . io . util . RandomAccessReader ; 
+ import org . apache . cassandra . io . util . SegmentedFile ; 
+ import org . apache . cassandra . utils . AlwaysPresentFilter ; 
+ import org . apache . cassandra . utils . concurrent . AbstractTransactionalTest ; 
+ @ @ - 517 , 8 + 518 , 8 @ @ public class TransactionLogsTest extends AbstractTransactionalTest 
+ } 
+ } 
+ 
+ - SegmentedFile dFile = new BufferedSegmentedFile ( new ChannelProxy ( new File ( descriptor . filenameFor ( Component . DATA ) ) ) , 0 ) ; 
+ - SegmentedFile iFile = new BufferedSegmentedFile ( new ChannelProxy ( new File ( descriptor . filenameFor ( Component . PRIMARY _ INDEX ) ) ) , 0 ) ; 
+ + SegmentedFile dFile = new BufferedSegmentedFile ( new ChannelProxy ( new File ( descriptor . filenameFor ( Component . DATA ) ) ) , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , 0 ) ; 
+ + SegmentedFile iFile = new BufferedSegmentedFile ( new ChannelProxy ( new File ( descriptor . filenameFor ( Component . PRIMARY _ INDEX ) ) ) , RandomAccessReader . DEFAULT _ BUFFER _ SIZE , 0 ) ; 
+ 
+ SerializationHeader header = SerializationHeader . make ( cfs . metadata , Collections . EMPTY _ LIST ) ; 
+ StatsMetadata metadata = ( StatsMetadata ) new MetadataCollector ( cfs . metadata . comparator ) 
+ diff - - git a / test / unit / org / apache / cassandra / io / RandomAccessReaderTest . java b / test / unit / org / apache / cassandra / io / RandomAccessReaderTest . java 
+ index 71fab61 . . edbd603 100644 
+ - - - a / test / unit / org / apache / cassandra / io / RandomAccessReaderTest . java 
+ + + + b / test / unit / org / apache / cassandra / io / RandomAccessReaderTest . java 
+ @ @ - 22 , 23 + 22 , 61 @ @ public class RandomAccessReaderTest 
+ @ Test 
+ public void testReadFully ( ) throws IOException 
+ { 
+ + testReadImpl ( 1 , 0 ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testReadLarge ( ) throws IOException 
+ + { 
+ + testReadImpl ( 1000 , 0 ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testReadLargeWithSkip ( ) throws IOException 
+ + { 
+ + testReadImpl ( 1000 , 322 ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testReadBufferSizeNotAligned ( ) throws IOException 
+ + { 
+ + testReadImpl ( 1000 , 0 , 5122 ) ; 
+ + } 
+ + 
+ + private void testReadImpl ( int numIterations , int skipIterations ) throws IOException 
+ + { 
+ + testReadImpl ( numIterations , skipIterations , RandomAccessReader . DEFAULT _ BUFFER _ SIZE ) ; 
+ + } 
+ + 
+ + private void testReadImpl ( int numIterations , int skipIterations , int bufferSize ) throws IOException 
+ + { 
+ final File f = File . createTempFile ( " testReadFully " , " 1 " ) ; 
+ final String expected = " The quick brown fox jumps over the lazy dog " ; 
+ 
+ SequentialWriter writer = SequentialWriter . open ( f ) ; 
+ - writer . write ( expected . getBytes ( ) ) ; 
+ + for ( int i = 0 ; i < numIterations ; i + + ) 
+ + writer . write ( expected . getBytes ( ) ) ; 
+ writer . finish ( ) ; 
+ 
+ assert f . exists ( ) ; 
+ 
+ ChannelProxy channel = new ChannelProxy ( f ) ; 
+ - RandomAccessReader reader = RandomAccessReader . open ( channel ) ; 
+ + RandomAccessReader reader = RandomAccessReader . open ( channel , bufferSize , - 1L ) ; 
+ assertEquals ( f . getAbsolutePath ( ) , reader . getPath ( ) ) ; 
+ - assertEquals ( expected . length ( ) , reader . length ( ) ) ; 
+ + assertEquals ( expected . length ( ) * numIterations , reader . length ( ) ) ; 
+ + 
+ + if ( skipIterations > 0 ) 
+ + { 
+ + reader . seek ( skipIterations * expected . length ( ) ) ; 
+ + } 
+ 
+ byte [ ] b = new byte [ expected . length ( ) ] ; 
+ - reader . readFully ( b ) ; 
+ - assertEquals ( expected , new String ( b ) ) ; 
+ + int n = numIterations - skipIterations ; 
+ + for ( int i = 0 ; i < n ; i + + ) 
+ + { 
+ + reader . readFully ( b ) ; 
+ + assertEquals ( expected , new String ( b ) ) ; 
+ + } 
+ 
+ assertTrue ( reader . isEOF ( ) ) ; 
+ assertEquals ( 0 , reader . bytesRemaining ( ) ) ; 
+ diff - - git a / test / unit / org / apache / cassandra / io / util / SegmentedFileTest . java b / test / unit / org / apache / cassandra / io / util / SegmentedFileTest . java 
+ new file mode 100644 
+ index 0000000 . . 03c10de 
+ - - - / dev / null 
+ + + + b / test / unit / org / apache / cassandra / io / util / SegmentedFileTest . java 
+ @ @ - 0 , 0 + 1 , 88 @ @ 
+ + / * 
+ + * Licensed to the Apache Software Foundation ( ASF ) under one 
+ + * or more contributor license agreements . See the NOTICE file 
+ + * distributed with this work for additional information 
+ + * regarding copyright ownership . The ASF licenses this file 
+ + * to you under the Apache License , Version 2 . 0 ( the 
+ + * " License " ) ; you may not use this file except in compliance 
+ + * with the License . You may obtain a copy of the License at 
+ + * 
+ + * http : / / www . apache . org / licenses / LICENSE - 2 . 0 
+ + * 
+ + * Unless required by applicable law or agreed to in writing , software 
+ + * distributed under the License is distributed on an " AS IS " BASIS , 
+ + * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND , either express or implied . 
+ + * See the License for the specific language governing permissions and 
+ + * limitations under the License . 
+ + * / 
+ + 
+ + package org . apache . cassandra . io . util ; 
+ + 
+ + import org . junit . Test ; 
+ + 
+ + import org . apache . cassandra . config . Config ; 
+ + import org . apache . cassandra . config . DatabaseDescriptor ; 
+ + 
+ + import static org . junit . Assert . assertEquals ; 
+ + 
+ + public class SegmentedFileTest 
+ + { 
+ + @ Test 
+ + public void testRoundingBufferSize ( ) 
+ + { 
+ + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( - 1L ) ) ; 
+ + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( 0 ) ) ; 
+ + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( 1 ) ) ; 
+ + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( 2013 ) ) ; 
+ + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( 4095 ) ) ; 
+ + assertEquals ( 4096 , SegmentedFile . Builder . roundBufferSize ( 4096 ) ) ; 
+ + assertEquals ( 8192 , SegmentedFile . Builder . roundBufferSize ( 4097 ) ) ; 
+ + assertEquals ( 8192 , SegmentedFile . Builder . roundBufferSize ( 8191 ) ) ; 
+ + assertEquals ( 8192 , SegmentedFile . Builder . roundBufferSize ( 8192 ) ) ; 
+ + assertEquals ( 12288 , SegmentedFile . Builder . roundBufferSize ( 8193 ) ) ; 
+ + assertEquals ( 65536 , SegmentedFile . Builder . roundBufferSize ( 65535 ) ) ; 
+ + assertEquals ( 65536 , SegmentedFile . Builder . roundBufferSize ( 65536 ) ) ; 
+ + assertEquals ( 65536 , SegmentedFile . Builder . roundBufferSize ( 65537 ) ) ; 
+ + assertEquals ( 65536 , SegmentedFile . Builder . roundBufferSize ( 10000000000000000L ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testBufferSize _ ssd ( ) 
+ + { 
+ + DatabaseDescriptor . setDiskOptimizationStrategy ( Config . DiskOptimizationStrategy . ssd ) ; 
+ + DatabaseDescriptor . setDiskOptimizationPageCrossChance ( 0 . 1 ) ; 
+ + 
+ + assertEquals ( 4096 , SegmentedFile . Builder . bufferSize ( 0 ) ) ; 
+ + assertEquals ( 4096 , SegmentedFile . Builder . bufferSize ( 10 ) ) ; 
+ + assertEquals ( 4096 , SegmentedFile . Builder . bufferSize ( 100 ) ) ; 
+ + assertEquals ( 4096 , SegmentedFile . Builder . bufferSize ( 4096 ) ) ; 
+ + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 4505 ) ) ; / / just < ( 4096 + 4096 * 0 . 1 ) 
+ + assertEquals ( 12288 , SegmentedFile . Builder . bufferSize ( 4506 ) ) ; / / just > ( 4096 + 4096 * 0 . 1 ) 
+ + 
+ + DatabaseDescriptor . setDiskOptimizationPageCrossChance ( 0 . 5 ) ; 
+ + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 4506 ) ) ; / / just > ( 4096 + 4096 * 0 . 1 ) 
+ + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 6143 ) ) ; / / < ( 4096 + 4096 * 0 . 5 ) 
+ + assertEquals ( 12288 , SegmentedFile . Builder . bufferSize ( 6144 ) ) ; / / = ( 4096 + 4096 * 0 . 5 ) 
+ + assertEquals ( 12288 , SegmentedFile . Builder . bufferSize ( 6145 ) ) ; / / > ( 4096 + 4096 * 0 . 5 ) 
+ + 
+ + DatabaseDescriptor . setDiskOptimizationPageCrossChance ( 1 . 0 ) ; / / never add a page 
+ + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 8191 ) ) ; 
+ + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 8192 ) ) ; 
+ + 
+ + DatabaseDescriptor . setDiskOptimizationPageCrossChance ( 0 . 0 ) ; / / always add a page 
+ + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 10 ) ) ; 
+ + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 4096 ) ) ; 
+ + } 
+ + 
+ + @ Test 
+ + public void testBufferSize _ spinning ( ) 
+ + { 
+ + DatabaseDescriptor . setDiskOptimizationStrategy ( Config . DiskOptimizationStrategy . spinning ) ; 
+ + 
+ + assertEquals ( 4096 , SegmentedFile . Builder . bufferSize ( 0 ) ) ; 
+ + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 10 ) ) ; 
+ + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 100 ) ) ; 
+ + assertEquals ( 8192 , SegmentedFile . Builder . bufferSize ( 4096 ) ) ; 
+ + assertEquals ( 12288 , SegmentedFile . Builder . bufferSize ( 4097 ) ) ; 
+ + } 
+ + }
+
+NEAREST DIFF:
+ELIMINATEDSENTENCE

@@ -1,0 +1,229 @@
+BLEU SCORE: 0.015284801196484512
+
+TEST MSG: Fix potential race condition when a Handler is removed
+GENERATED MSG: Fixed bug causing refresh on closed Realms on background threads with loopers .
+
+TEST DIFF (one line): diff - - git a / changelog . txt b / changelog . txt <nl> index 8958c87 . . 679ab19 100644 <nl> - - - a / changelog . txt <nl> + + + b / changelog . txt <nl> @ @ - 1 , 4 + 1 , 5 @ @ <nl> 0 . 84 . 0 <nl> + * Fixed a bug where closed Realms were trying to refresh themselves resulting in a NullPointerException . <nl> * Added Realm . isClosed ( ) method . <nl> * Added Realm . distinct ( ) method . <nl> * Added RealmQuery . isValid ( ) , RealmResults . isValid ( ) and RealmList . isValid ( ) . Each method checks whether the instance is still valid to use or not ( for example , the Realm has been closed or any parent object has been removed ) . <nl> diff - - git a / realm / src / main / java / io / realm / BaseRealm . java b / realm / src / main / java / io / realm / BaseRealm . java <nl> index cd851bc . . 6ba15ab 100644 <nl> - - - a / realm / src / main / java / io / realm / BaseRealm . java <nl> + + + b / realm / src / main / java / io / realm / BaseRealm . java <nl> @ @ - 99 , 6 + 99 , 7 @ @ abstract class BaseRealm implements Closeable { <nl> * @ throws java . lang . IllegalStateException if trying to enable auto - refresh in a thread without Looper . <nl> * / <nl> public void setAutoRefresh ( boolean autoRefresh ) { <nl> + checkIfValid ( ) ; <nl> if ( autoRefresh & & Looper . myLooper ( ) = = null ) { <nl> throw new IllegalStateException ( " Cannot set auto - refresh in a Thread without a Looper " ) ; <nl> } <nl> @ @ - 107 , 7 + 108 , 7 @ @ abstract class BaseRealm implements Closeable { <nl> handler = new Handler ( new RealmCallback ( ) ) ; <nl> handlers . put ( handler , configuration . getPath ( ) ) ; <nl> } else if ( ! autoRefresh & & this . autoRefresh & & handler ! = null ) { / / Switch it off <nl> - removeHandler ( handler ) ; <nl> + removeHandler ( ) ; <nl> } <nl> this . autoRefresh = autoRefresh ; <nl> } <nl> @ @ - 176 , 9 + 177 , 13 @ @ abstract class BaseRealm implements Closeable { <nl> changeListeners . clear ( ) ; <nl> } <nl> <nl> - protected void removeHandler ( Handler handler ) { <nl> - handler . removeCallbacksAndMessages ( null ) ; <nl> + / * * <nl> + * Remove and stop the current thread handler as gracefully as possible . <nl> + * / <nl> + protected void removeHandler ( ) { <nl> handlers . remove ( handler ) ; <nl> + / / Warning : This only clears the Looper queue . Handler . Callback is not removed . <nl> + handler . removeCallbacksAndMessages ( null ) ; <nl> this . handler = null ; <nl> } <nl> <nl> @ @ - 300 , 8 + 305 , 11 @ @ abstract class BaseRealm implements Closeable { <nl> } <nl> <nl> / / For all other threads , use the Handler <nl> + / / Note there is a race condition with handler . hasMessages ( ) and handler . sendEmptyMessage ( ) <nl> + / / as the target thread consumes messages at the same time . In this case it is not a problem as worst <nl> + / / case we end up with two REALM _ CHANGED messages in the queue . <nl> if ( <nl> - realmPath . equals ( configuration . getPath ( ) ) / / It ' s the right realm <nl> + realmPath . equals ( configuration . getPath ( ) ) / / It ' s the right realm <nl> & & ! handler . hasMessages ( REALM _ CHANGED ) / / The right message <nl> & & handler . getLooper ( ) . getThread ( ) . isAlive ( ) / / The receiving thread is alive <nl> ) { <nl> @ @ - 410 , 7 + 418 , 7 @ @ abstract class BaseRealm implements Closeable { <nl> localRefCount . put ( configuration , Math . max ( 0 , refCount ) ) ; <nl> <nl> if ( handler ! = null & & refCount < = 0 ) { <nl> - removeHandler ( handler ) ; <nl> + removeHandler ( ) ; <nl> } <nl> } <nl> <nl> @ @ - 600 , 7 + 608 , 12 @ @ abstract class BaseRealm implements Closeable { <nl> private class RealmCallback implements Handler . Callback { <nl> @ Override <nl> public boolean handleMessage ( Message message ) { <nl> - if ( message . what = = REALM _ CHANGED ) { <nl> + / / Due to how a ConcurrentHashMap iterator is created we cannot be sure that other threads are <nl> + / / aware when this threads handler is removed before they send messages to it . We don ' t wish to synchronize <nl> + / / access to the handlers as they are the prime mean of notifying about updates . Instead we make sure <nl> + / / that if a message does slip though ( however unlikely ) , it will not try to update a SharedGroup that no <nl> + / / longer exists . ` sharedGroupManager ` will only be null if a Realm is really closed . <nl> + if ( message . what = = REALM _ CHANGED & & sharedGroupManager ! = null ) { <nl> sharedGroupManager . advanceRead ( ) ; <nl> sendNotifications ( ) ; <nl> }
+NEAREST DIFF (one line): diff - - git a / realm / src / androidTest / java / io / realm / NotificationsTest . java b / realm / src / androidTest / java / io / realm / NotificationsTest . java <nl> index b26175b . . 2c66e55 100644 <nl> - - - a / realm / src / androidTest / java / io / realm / NotificationsTest . java <nl> + + + b / realm / src / androidTest / java / io / realm / NotificationsTest . java <nl> @ @ - 15 , 12 + 15 , 14 @ @ <nl> * / <nl> package io . realm ; <nl> <nl> + import android . os . Handler ; <nl> import android . os . Looper ; <nl> import android . test . AndroidTestCase ; <nl> <nl> import java . util . Map ; <nl> import java . util . concurrent . Callable ; <nl> import java . util . concurrent . ConcurrentHashMap ; <nl> + import java . util . concurrent . CountDownLatch ; <nl> import java . util . concurrent . ExecutionException ; <nl> import java . util . concurrent . ExecutorService ; <nl> import java . util . concurrent . Executors ; <nl> @ @ - 193 , 4 + 195 , 76 @ @ public class NotificationsTest extends AndroidTestCase { <nl> assertEquals ( 1 , counter . get ( ) ) ; <nl> assertTrue ( Realm . realmsCache . get ( ) . isEmpty ( ) ) ; <nl> } <nl> + <nl> + public void testCloseClearingHandlerMessages ( ) throws InterruptedException , TimeoutException , ExecutionException { <nl> + final int TEST _ SIZE = 10 ; <nl> + final CountDownLatch backgroundLooperStarted = new CountDownLatch ( 1 ) ; <nl> + final CountDownLatch addHandlerMessages = new CountDownLatch ( 1 ) ; <nl> + <nl> + ExecutorService executorService = Executors . newSingleThreadExecutor ( ) ; <nl> + Future < Boolean > future = executorService . submit ( new Callable < Boolean > ( ) { <nl> + @ Override <nl> + public Boolean call ( ) throws Exception { <nl> + Looper . prepare ( ) ; / / Fake background thread with a looper , eg . a IntentService <nl> + Realm realm = Realm . getInstance ( getContext ( ) ) ; <nl> + backgroundLooperStarted . countDown ( ) ; <nl> + <nl> + / / Random operation in the client code <nl> + final RealmResults < Dog > dogs = realm . allObjects ( Dog . class ) ; <nl> + if ( dogs . size ( ) ! = 0 ) { <nl> + return false ; <nl> + } <nl> + addHandlerMessages . await ( 1 , TimeUnit . SECONDS ) ; / / Wait for main thread to add update messages <nl> + <nl> + / / Find the current Handler for the thread now . All message and references will be <nl> + / / cleared once we call close ( ) . <nl> + Handler threadHandler = null ; <nl> + for ( final Handler handler : Realm . handlers . keySet ( ) ) { <nl> + if ( Realm . handlers . get ( handler ) . equals ( realm . getPath ( ) . hashCode ( ) ) ) { <nl> + threadHandler = handler ; <nl> + break ; <nl> + } <nl> + } <nl> + realm . close ( ) ; / / Close native resources + associated handlers . <nl> + <nl> + / / Looper now reads the update message from the main thread if the Handler was not <nl> + / / cleared . This will cause an IllegalStateException and should not happen . <nl> + / / If it works correctly . The looper will just block on an empty message queue . <nl> + / / This is normal behavior but is bad for testing , so we add a custom quit message <nl> + / / at the end so we can evaluate results faster . <nl> + threadHandler . post ( new Runnable ( ) { <nl> + @ Override <nl> + public void run ( ) { <nl> + Looper . myLooper ( ) . quit ( ) ; <nl> + } <nl> + } ) ; <nl> + <nl> + try { <nl> + Looper . loop ( ) ; <nl> + } catch ( IllegalStateException e ) { <nl> + return false ; <nl> + } <nl> + return true ; <nl> + } <nl> + } ) ; <nl> + <nl> + / / Wait until the looper is started on a background thread <nl> + backgroundLooperStarted . await ( 1 , TimeUnit . SECONDS ) ; <nl> + <nl> + / / Execute a transaction that will trigger a Realm update <nl> + Realm realm = Realm . getInstance ( getContext ( ) ) ; <nl> + realm . beginTransaction ( ) ; <nl> + for ( int i = 0 ; i < TEST _ SIZE ; i + + ) { <nl> + Dog dog = realm . createObject ( Dog . class ) ; <nl> + dog . setName ( " Rex " + i ) ; <nl> + } <nl> + realm . commitTransaction ( ) ; <nl> + assertEquals ( TEST _ SIZE , realm . allObjects ( Dog . class ) . size ( ) ) ; <nl> + realm . close ( ) ; <nl> + addHandlerMessages . countDown ( ) ; <nl> + <nl> + / / Check that messages was properly cleared <nl> + Boolean result = future . get ( 2 , TimeUnit . SECONDS ) ; <nl> + assertTrue ( result ) ; <nl> + } <nl> } <nl> diff - - git a / realm / src / main / java / io / realm / Realm . java b / realm / src / main / java / io / realm / Realm . java <nl> index f373f80 . . 536a9d3 100644 <nl> - - - a / realm / src / main / java / io / realm / Realm . java <nl> + + + b / realm / src / main / java / io / realm / Realm . java <nl> @ @ - 183 , 10 + 183 , 15 @ @ public final class Realm implements Closeable { <nl> referenceCount . set ( localRefCount ) ; <nl> <nl> if ( handler ! = null ) { <nl> - handlers . remove ( handler ) ; <nl> + removeHandler ( handler ) ; <nl> } <nl> } <nl> <nl> + private void removeHandler ( Handler handler ) { <nl> + handler . removeCallbacksAndMessages ( null ) ; <nl> + handlers . remove ( handler ) ; <nl> + } <nl> + <nl> private class RealmCallback implements Handler . Callback { <nl> @ Override <nl> public boolean handleMessage ( Message message ) { <nl> @ @ - 225 , 16 + 230 , 11 @ @ public final class Realm implements Closeable { <nl> handler = new Handler ( new RealmCallback ( ) ) ; <nl> handlers . put ( handler , id ) ; <nl> } else if ( ! autoRefresh & & this . autoRefresh & & handler ! = null ) { / / Switch it off <nl> - handler . removeCallbacksAndMessages ( null ) ; <nl> - handlers . remove ( handler ) ; <nl> + removeHandler ( handler ) ; <nl> } <nl> this . autoRefresh = autoRefresh ; <nl> } <nl> <nl> - / / public static void setDefaultDurability ( SharedGroup . Durability durability ) { <nl> - / / defaultDurability = durability ; <nl> - / / } <nl> - <nl> / / Public because of migrations <nl> public Table getTable ( Class < ? > clazz ) { <nl> String simpleClassName = simpleClassNames . get ( clazz ) ;
+
+TEST DIFF:
+diff - - git a / changelog . txt b / changelog . txt 
+ index 8958c87 . . 679ab19 100644 
+ - - - a / changelog . txt 
+ + + + b / changelog . txt 
+ @ @ - 1 , 4 + 1 , 5 @ @ 
+ 0 . 84 . 0 
+ + * Fixed a bug where closed Realms were trying to refresh themselves resulting in a NullPointerException . 
+ * Added Realm . isClosed ( ) method . 
+ * Added Realm . distinct ( ) method . 
+ * Added RealmQuery . isValid ( ) , RealmResults . isValid ( ) and RealmList . isValid ( ) . Each method checks whether the instance is still valid to use or not ( for example , the Realm has been closed or any parent object has been removed ) . 
+ diff - - git a / realm / src / main / java / io / realm / BaseRealm . java b / realm / src / main / java / io / realm / BaseRealm . java 
+ index cd851bc . . 6ba15ab 100644 
+ - - - a / realm / src / main / java / io / realm / BaseRealm . java 
+ + + + b / realm / src / main / java / io / realm / BaseRealm . java 
+ @ @ - 99 , 6 + 99 , 7 @ @ abstract class BaseRealm implements Closeable { 
+ * @ throws java . lang . IllegalStateException if trying to enable auto - refresh in a thread without Looper . 
+ * / 
+ public void setAutoRefresh ( boolean autoRefresh ) { 
+ + checkIfValid ( ) ; 
+ if ( autoRefresh & & Looper . myLooper ( ) = = null ) { 
+ throw new IllegalStateException ( " Cannot set auto - refresh in a Thread without a Looper " ) ; 
+ } 
+ @ @ - 107 , 7 + 108 , 7 @ @ abstract class BaseRealm implements Closeable { 
+ handler = new Handler ( new RealmCallback ( ) ) ; 
+ handlers . put ( handler , configuration . getPath ( ) ) ; 
+ } else if ( ! autoRefresh & & this . autoRefresh & & handler ! = null ) { / / Switch it off 
+ - removeHandler ( handler ) ; 
+ + removeHandler ( ) ; 
+ } 
+ this . autoRefresh = autoRefresh ; 
+ } 
+ @ @ - 176 , 9 + 177 , 13 @ @ abstract class BaseRealm implements Closeable { 
+ changeListeners . clear ( ) ; 
+ } 
+ 
+ - protected void removeHandler ( Handler handler ) { 
+ - handler . removeCallbacksAndMessages ( null ) ; 
+ + / * * 
+ + * Remove and stop the current thread handler as gracefully as possible . 
+ + * / 
+ + protected void removeHandler ( ) { 
+ handlers . remove ( handler ) ; 
+ + / / Warning : This only clears the Looper queue . Handler . Callback is not removed . 
+ + handler . removeCallbacksAndMessages ( null ) ; 
+ this . handler = null ; 
+ } 
+ 
+ @ @ - 300 , 8 + 305 , 11 @ @ abstract class BaseRealm implements Closeable { 
+ } 
+ 
+ / / For all other threads , use the Handler 
+ + / / Note there is a race condition with handler . hasMessages ( ) and handler . sendEmptyMessage ( ) 
+ + / / as the target thread consumes messages at the same time . In this case it is not a problem as worst 
+ + / / case we end up with two REALM _ CHANGED messages in the queue . 
+ if ( 
+ - realmPath . equals ( configuration . getPath ( ) ) / / It ' s the right realm 
+ + realmPath . equals ( configuration . getPath ( ) ) / / It ' s the right realm 
+ & & ! handler . hasMessages ( REALM _ CHANGED ) / / The right message 
+ & & handler . getLooper ( ) . getThread ( ) . isAlive ( ) / / The receiving thread is alive 
+ ) { 
+ @ @ - 410 , 7 + 418 , 7 @ @ abstract class BaseRealm implements Closeable { 
+ localRefCount . put ( configuration , Math . max ( 0 , refCount ) ) ; 
+ 
+ if ( handler ! = null & & refCount < = 0 ) { 
+ - removeHandler ( handler ) ; 
+ + removeHandler ( ) ; 
+ } 
+ } 
+ 
+ @ @ - 600 , 7 + 608 , 12 @ @ abstract class BaseRealm implements Closeable { 
+ private class RealmCallback implements Handler . Callback { 
+ @ Override 
+ public boolean handleMessage ( Message message ) { 
+ - if ( message . what = = REALM _ CHANGED ) { 
+ + / / Due to how a ConcurrentHashMap iterator is created we cannot be sure that other threads are 
+ + / / aware when this threads handler is removed before they send messages to it . We don ' t wish to synchronize 
+ + / / access to the handlers as they are the prime mean of notifying about updates . Instead we make sure 
+ + / / that if a message does slip though ( however unlikely ) , it will not try to update a SharedGroup that no 
+ + / / longer exists . ` sharedGroupManager ` will only be null if a Realm is really closed . 
+ + if ( message . what = = REALM _ CHANGED & & sharedGroupManager ! = null ) { 
+ sharedGroupManager . advanceRead ( ) ; 
+ sendNotifications ( ) ; 
+ }
+
+NEAREST DIFF:
+diff - - git a / realm / src / androidTest / java / io / realm / NotificationsTest . java b / realm / src / androidTest / java / io / realm / NotificationsTest . java 
+ index b26175b . . 2c66e55 100644 
+ - - - a / realm / src / androidTest / java / io / realm / NotificationsTest . java 
+ + + + b / realm / src / androidTest / java / io / realm / NotificationsTest . java 
+ @ @ - 15 , 12 + 15 , 14 @ @ 
+ * / 
+ package io . realm ; 
+ 
+ + import android . os . Handler ; 
+ import android . os . Looper ; 
+ import android . test . AndroidTestCase ; 
+ 
+ import java . util . Map ; 
+ import java . util . concurrent . Callable ; 
+ import java . util . concurrent . ConcurrentHashMap ; 
+ + import java . util . concurrent . CountDownLatch ; 
+ import java . util . concurrent . ExecutionException ; 
+ import java . util . concurrent . ExecutorService ; 
+ import java . util . concurrent . Executors ; 
+ @ @ - 193 , 4 + 195 , 76 @ @ public class NotificationsTest extends AndroidTestCase { 
+ assertEquals ( 1 , counter . get ( ) ) ; 
+ assertTrue ( Realm . realmsCache . get ( ) . isEmpty ( ) ) ; 
+ } 
+ + 
+ + public void testCloseClearingHandlerMessages ( ) throws InterruptedException , TimeoutException , ExecutionException { 
+ + final int TEST _ SIZE = 10 ; 
+ + final CountDownLatch backgroundLooperStarted = new CountDownLatch ( 1 ) ; 
+ + final CountDownLatch addHandlerMessages = new CountDownLatch ( 1 ) ; 
+ + 
+ + ExecutorService executorService = Executors . newSingleThreadExecutor ( ) ; 
+ + Future < Boolean > future = executorService . submit ( new Callable < Boolean > ( ) { 
+ + @ Override 
+ + public Boolean call ( ) throws Exception { 
+ + Looper . prepare ( ) ; / / Fake background thread with a looper , eg . a IntentService 
+ + Realm realm = Realm . getInstance ( getContext ( ) ) ; 
+ + backgroundLooperStarted . countDown ( ) ; 
+ + 
+ + / / Random operation in the client code 
+ + final RealmResults < Dog > dogs = realm . allObjects ( Dog . class ) ; 
+ + if ( dogs . size ( ) ! = 0 ) { 
+ + return false ; 
+ + } 
+ + addHandlerMessages . await ( 1 , TimeUnit . SECONDS ) ; / / Wait for main thread to add update messages 
+ + 
+ + / / Find the current Handler for the thread now . All message and references will be 
+ + / / cleared once we call close ( ) . 
+ + Handler threadHandler = null ; 
+ + for ( final Handler handler : Realm . handlers . keySet ( ) ) { 
+ + if ( Realm . handlers . get ( handler ) . equals ( realm . getPath ( ) . hashCode ( ) ) ) { 
+ + threadHandler = handler ; 
+ + break ; 
+ + } 
+ + } 
+ + realm . close ( ) ; / / Close native resources + associated handlers . 
+ + 
+ + / / Looper now reads the update message from the main thread if the Handler was not 
+ + / / cleared . This will cause an IllegalStateException and should not happen . 
+ + / / If it works correctly . The looper will just block on an empty message queue . 
+ + / / This is normal behavior but is bad for testing , so we add a custom quit message 
+ + / / at the end so we can evaluate results faster . 
+ + threadHandler . post ( new Runnable ( ) { 
+ + @ Override 
+ + public void run ( ) { 
+ + Looper . myLooper ( ) . quit ( ) ; 
+ + } 
+ + } ) ; 
+ + 
+ + try { 
+ + Looper . loop ( ) ; 
+ + } catch ( IllegalStateException e ) { 
+ + return false ; 
+ + } 
+ + return true ; 
+ + } 
+ + } ) ; 
+ + 
+ + / / Wait until the looper is started on a background thread 
+ + backgroundLooperStarted . await ( 1 , TimeUnit . SECONDS ) ; 
+ + 
+ + / / Execute a transaction that will trigger a Realm update 
+ + Realm realm = Realm . getInstance ( getContext ( ) ) ; 
+ + realm . beginTransaction ( ) ; 
+ + for ( int i = 0 ; i < TEST _ SIZE ; i + + ) { 
+ + Dog dog = realm . createObject ( Dog . class ) ; 
+ + dog . setName ( " Rex " + i ) ; 
+ + } 
+ + realm . commitTransaction ( ) ; 
+ + assertEquals ( TEST _ SIZE , realm . allObjects ( Dog . class ) . size ( ) ) ; 
+ + realm . close ( ) ; 
+ + addHandlerMessages . countDown ( ) ; 
+ + 
+ + / / Check that messages was properly cleared 
+ + Boolean result = future . get ( 2 , TimeUnit . SECONDS ) ; 
+ + assertTrue ( result ) ; 
+ + } 
+ } 
+ diff - - git a / realm / src / main / java / io / realm / Realm . java b / realm / src / main / java / io / realm / Realm . java 
+ index f373f80 . . 536a9d3 100644 
+ - - - a / realm / src / main / java / io / realm / Realm . java 
+ + + + b / realm / src / main / java / io / realm / Realm . java 
+ @ @ - 183 , 10 + 183 , 15 @ @ public final class Realm implements Closeable { 
+ referenceCount . set ( localRefCount ) ; 
+ 
+ if ( handler ! = null ) { 
+ - handlers . remove ( handler ) ; 
+ + removeHandler ( handler ) ; 
+ } 
+ } 
+ 
+ + private void removeHandler ( Handler handler ) { 
+ + handler . removeCallbacksAndMessages ( null ) ; 
+ + handlers . remove ( handler ) ; 
+ + } 
+ + 
+ private class RealmCallback implements Handler . Callback { 
+ @ Override 
+ public boolean handleMessage ( Message message ) { 
+ @ @ - 225 , 16 + 230 , 11 @ @ public final class Realm implements Closeable { 
+ handler = new Handler ( new RealmCallback ( ) ) ; 
+ handlers . put ( handler , id ) ; 
+ } else if ( ! autoRefresh & & this . autoRefresh & & handler ! = null ) { / / Switch it off 
+ - handler . removeCallbacksAndMessages ( null ) ; 
+ - handlers . remove ( handler ) ; 
+ + removeHandler ( handler ) ; 
+ } 
+ this . autoRefresh = autoRefresh ; 
+ } 
+ 
+ - / / public static void setDefaultDurability ( SharedGroup . Durability durability ) { 
+ - / / defaultDurability = durability ; 
+ - / / } 
+ - 
+ / / Public because of migrations 
+ public Table getTable ( Class < ? > clazz ) { 
+ String simpleClassName = simpleClassNames . get ( clazz ) ;

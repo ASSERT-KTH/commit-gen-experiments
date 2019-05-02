@@ -1,0 +1,581 @@
+BLEU SCORE: 0.13912311644176567
+
+TEST MSG: feat ( server : webrtc ) : send apple pushkit notification on incoming calls
+GENERATED MSG: refactor ( server : push ) : make apple push accessible via extension
+
+TEST DIFF (one line): diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala < nl > index ca5eb10 . . bb69ead 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala < nl > @ @ - 9 , 13 + 9 , 15 @ @ import com . relayrides . pushy . apns . util . { SSLContextUtil , SimpleApnsPushNotificati < nl > import com . typesafe . config . Config < nl > import im . actor . server . db . ActorPostgresDriver . api . _ < nl > import im . actor . server . db . DbExtension < nl > + import im . actor . server . model . push . ApplePushCredentials < nl > + import im . actor . server . persist . push . ApplePushCredentialsRepo < nl > < nl > import scala . collection . JavaConversions . _ < nl > - import scala . concurrent . ExecutionContext < nl > + import scala . concurrent . { ExecutionContext , Future } < nl > import scala . concurrent . duration . _ < nl > import scala . util . Try < nl > < nl > - case class ApplePushManagerConfig ( certs : List [ ApnsCert ] ) < nl > + final case class ApplePushManagerConfig ( certs : List [ ApnsCert ] ) < nl > < nl > object ApplePushManagerConfig { < nl > def load ( config : Config ) : ApplePushManagerConfig = { < nl > @ @ - 26 , 7 + 28 , 7 @ @ object ApplePushManagerConfig { < nl > } < nl > } < nl > < nl > - case class ApnsCert ( key : Int , path : String , password : String , isSandbox : Boolean , isVoip : Boolean ) < nl > + final case class ApnsCert ( key : Int , path : String , password : String , isSandbox : Boolean , isVoip : Boolean ) < nl > < nl > object ApnsCert { < nl > def fromConfig ( config : Config ) : ApnsCert = { < nl > @ @ - 49 , 6 + 51 , 8 @ @ object ApplePushExtension extends ExtensionId [ ApplePushExtension ] with Extension < nl > final class ApplePushExtension ( system : ActorSystem ) extends Extension { < nl > import system . dispatcher < nl > < nl > + private lazy val db = DbExtension ( system ) . db < nl > + < nl > private val config = ApplePushManagerConfig . load ( < nl > Try ( system . settings . config . getConfig ( " services . apple . push " ) ) < nl > . getOrElse ( system . settings . config . getConfig ( " push . apple " ) ) < nl > @ @ - 64 , 6 + 68 , 12 @ @ final class ApplePushExtension ( system : ActorSystem ) extends Extension { < nl > < nl > def getVoipInstance ( key : Int ) : Option [ PushManager [ SimpleApnsPushNotification ] ] = voipManagers . get ( key ) < nl > < nl > + def findCreds ( authId : Long ) : Future [ Option [ ApplePushCredentials ] ] = db . run ( ApplePushCredentialsRepo . find ( authId ) ) < nl > + < nl > + def findCreds ( authIds : Set [ Long ] ) : Future [ Seq [ ApplePushCredentials ] ] = db . run ( ApplePushCredentialsRepo . find ( authIds ) ) < nl > + < nl > + def findVoipCreds ( authIds : Set [ Long ] ) : Future [ Seq [ ApplePushCredentials ] ] = findCreds ( authIds ) map ( _ filter ( _ . isVoip ) ) < nl > + < nl > private def createManager ( cert : ApnsCert ) = { < nl > val env = cert . isSandbox match { < nl > case false ⇒ ApnsEnvironment . getProductionEnvironment < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala < nl > index fe09f4b . . 318b47f 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala < nl > @ @ - 17 , 6 + 17 , 7 @ @ import im . actor . server . persist . UserRepo < nl > import im . actor . server . pubsub . PubSubExtension < nl > import im . actor . server . sequence . { PushData , PushRules , SeqUpdatesExtension , SeqState } < nl > import im . actor . server . { model , persist ⇒ p } < nl > + import im . actor . types . _ < nl > import im . actor . util . misc . IdUtils < nl > import slick . driver . PostgresDriver . api . Database < nl > < nl > @ @ - 247 , 6 + 248 , 9 @ @ private [ user ] sealed trait Queries { < nl > def getAuthIds ( userIds : Set [ Int ] ) : Future [ Seq [ Long ] ] = < nl > Future . sequence ( userIds map getAuthIds ) map ( _ . toSeq . flatten ) < nl > < nl > + def getAuthIdsMap ( userIds : Set [ Int ] ) : Future [ Map [ UserId , Seq [ AuthId ] ] ] = < nl > + Future . sequence ( userIds map ( uid ⇒ getAuthIds ( uid ) map ( uid → _ ) ) ) map ( _ . toMap ) < nl > + < nl > def getApiStruct ( userId : Int , clientUserId : Int , clientAuthId : Long ) : Future [ ApiUser ] = < nl > ( viewRegion . ref ? GetApiStruct ( userId , clientUserId , clientAuthId ) ) . mapTo [ GetApiStructResponse ] map ( _ . struct ) < nl > < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala < nl > index 8ae31bd . . cfbd0f7 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala < nl > @ @ - 3 , 19 + 3 , 23 @ @ package im . actor . server . webrtc < nl > import akka . actor . _ < nl > import akka . http . scaladsl . util . FastFuture < nl > import akka . pattern . pipe < nl > + import com . relayrides . pushy . apns . util . { ApnsPayloadBuilder , SimpleApnsPushNotification } < nl > import im . actor . api . rpc . _ < nl > import im . actor . api . rpc . messaging . { ApiServiceExPhoneCall , ApiServiceMessage } < nl > import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType } < nl > import im . actor . api . rpc . webrtc . _ < nl > import im . actor . concurrent . { ActorStashing , FutureExt } < nl > + import im . actor . server . db . DbExtension < nl > import im . actor . server . dialog . DialogExtension < nl > import im . actor . server . eventbus . { EventBus , EventBusExtension } < nl > import im . actor . server . group . GroupExtension < nl > import im . actor . server . model . { Peer , PeerType } < nl > - import im . actor . server . sequence . WeakUpdatesExtension < nl > + import im . actor . server . sequence . { ApplePushExtension , WeakUpdatesExtension } < nl > + import im . actor . server . user . UserExtension < nl > import im . actor . server . values . ValuesExtension < nl > import im . actor . types . _ < nl > < nl > + import scala . concurrent . Future < nl > import scala . concurrent . duration . _ < nl > import scala . concurrent . forkjoin . ThreadLocalRandom < nl > import scala . util . Random < nl > @ @ - 61 , 11 + 65 , 14 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { < nl > < nl > private val id = self . path . name . toLong < nl > < nl > - private lazy val weakUpdExt = WeakUpdatesExtension ( context . system ) < nl > - private lazy val dialogExt = DialogExtension ( context . system ) < nl > - private lazy val eventBusExt = EventBusExtension ( context . system ) < nl > - private lazy val groupExt = GroupExtension ( context . system ) < nl > - private lazy val valuesExt = ValuesExtension ( context . system ) < nl > + private val weakUpdExt = WeakUpdatesExtension ( context . system ) < nl > + private val dialogExt = DialogExtension ( context . system ) < nl > + private val eventBusExt = EventBusExtension ( context . system ) < nl > + private val userExt = UserExtension ( context . system ) < nl > + private val groupExt = GroupExtension ( context . system ) < nl > + private val valuesExt = ValuesExtension ( context . system ) < nl > + private val apnsExt = ApplePushExtension ( context . system ) < nl > + private val db = DbExtension ( context . system ) . db < nl > < nl > case class Device ( < nl > deviceId : EventBus . DeviceId , < nl > @ @ - 109 , 11 + 116 , 11 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { < nl > callees ← fetchParticipants ( callerUserId , peer ) map ( _ filterNot ( _ = = callerUserId ) ) < nl > callerDeviceId ← eventBusExt . fetchOwner ( s . eventBusId ) < nl > _ ← eventBusExt . join ( EventBus . InternalClient ( self ) , s . eventBusId , None ) < nl > + _ ← scheduleIncomingCallUpdates ( callees ) < nl > } yield Res ( callees , callerDeviceId ) ) pipeTo self < nl > < nl > becomeStashing ( replyTo ⇒ { < nl > case Res ( callees , callerDeviceId ) ⇒ < nl > - scheduleIncomingCallUpdates ( callees ) < nl > replyTo ! StartCallAck < nl > < nl > eventBusExt . post ( EventBus . InternalClient ( self ) , s . eventBusId , Seq ( callerDeviceId ) , ApiAdvertiseMaster . toByteArray ) < nl > @ @ - 303 , 18 + 310 , 36 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { < nl > case _ ⇒ FastFuture . failed ( new RuntimeException ( s " Unknown peer type : $ { peer . ` type ` } " ) ) < nl > } < nl > < nl > - private def scheduleIncomingCallUpdates ( callees : Seq [ UserId ] ) : Unit = < nl > - scheduledUpds = < nl > - callees < nl > - . map { callee ⇒ < nl > - ( < nl > - callee , < nl > - context . system . scheduler . schedule ( 0 . seconds , 5 . seconds ) { < nl > - weakUpdExt . broadcastUserWeakUpdate ( callee , UpdateIncomingCall ( id ) , reduceKey = Some ( s " call _ $ id " ) ) < nl > - } < nl > - ) < nl > - } < nl > - . toMap < nl > + private def scheduleIncomingCallUpdates ( callees : Seq [ UserId ] ) : Future [ Unit ] = { < nl > + for { < nl > + authIdsMap ← userExt . getAuthIdsMap ( callees . toSet ) < nl > + credsMap ← FutureExt . ftraverse ( authIdsMap . toSeq ) { < nl > + case ( userId , authIds ) ⇒ < nl > + apnsExt . findVoipCreds ( authIds . toSet ) map ( userId → _ ) < nl > + } < nl > + } yield { < nl > + scheduledUpds = < nl > + credsMap < nl > + . map { < nl > + case ( userId , creds ) ⇒ < nl > + ( < nl > + userId , < nl > + context . system . scheduler . schedule ( 0 . seconds , 5 . seconds ) { < nl > + weakUpdExt . broadcastUserWeakUpdate ( userId , UpdateIncomingCall ( id ) , reduceKey = Some ( s " call _ $ id " ) ) < nl > + < nl > + val payload = ( new ApnsPayloadBuilder ) . addCustomProperty ( " callId " , id ) . buildWithDefaultMaximumLength ( ) < nl > + < nl > + val instanceCreds = creds flatMap ( c ⇒ apnsExt . getVoipInstance ( c . apnsKey ) map ( _ → c ) ) < nl > + for ( ( instance , cred ) ← instanceCreds ) { < nl > + val notif = new SimpleApnsPushNotification ( cred . token . toByteArray , payload ) < nl > + instance . getQueue . add ( notif ) < nl > + } < nl > + } < nl > + ) < nl > + } < nl > + . toMap < nl > + } < nl > + } < nl > < nl > private def cancelIncomingCallUpdates ( callee : UserId ) = < nl > scheduledUpds get callee foreach { c ⇒
+NEAREST DIFF (one line): diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala < nl > new file mode 100644 < nl > index 0000000 . . ca5eb10 < nl > - - - / dev / null < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala < nl > @ @ - 0 , 0 + 1 , 133 @ @ < nl > + package im . actor . server . sequence < nl > + < nl > + import java . util < nl > + < nl > + import akka . actor . { ActorSystem , ExtendedActorSystem , Extension , ExtensionId , ExtensionIdProvider } < nl > + import akka . event . Logging < nl > + import com . relayrides . pushy . apns . _ < nl > + import com . relayrides . pushy . apns . util . { SSLContextUtil , SimpleApnsPushNotification } < nl > + import com . typesafe . config . Config < nl > + import im . actor . server . db . ActorPostgresDriver . api . _ < nl > + import im . actor . server . db . DbExtension < nl > + < nl > + import scala . collection . JavaConversions . _ < nl > + import scala . concurrent . ExecutionContext < nl > + import scala . concurrent . duration . _ < nl > + import scala . util . Try < nl > + < nl > + case class ApplePushManagerConfig ( certs : List [ ApnsCert ] ) < nl > + < nl > + object ApplePushManagerConfig { < nl > + def load ( config : Config ) : ApplePushManagerConfig = { < nl > + ApplePushManagerConfig ( < nl > + certs = config . getConfigList ( " certs " ) . toList map ApnsCert . fromConfig < nl > + ) < nl > + < nl > + } < nl > + } < nl > + < nl > + case class ApnsCert ( key : Int , path : String , password : String , isSandbox : Boolean , isVoip : Boolean ) < nl > + < nl > + object ApnsCert { < nl > + def fromConfig ( config : Config ) : ApnsCert = { < nl > + ApnsCert ( < nl > + config . getInt ( " key " ) , < nl > + config . getString ( " path " ) , < nl > + config . getString ( " password " ) , < nl > + Try ( config . getBoolean ( " voip " ) ) . getOrElse ( false ) , < nl > + Try ( config . getBoolean ( " sandbox " ) ) . getOrElse ( false ) < nl > + ) < nl > + } < nl > + } < nl > + < nl > + object ApplePushExtension extends ExtensionId [ ApplePushExtension ] with ExtensionIdProvider { < nl > + override def createExtension ( system : ExtendedActorSystem ) : ApplePushExtension = new ApplePushExtension ( system ) < nl > + < nl > + override def lookup ( ) : ExtensionId [ _ < : Extension ] = ApplePushExtension < nl > + } < nl > + < nl > + final class ApplePushExtension ( system : ActorSystem ) extends Extension { < nl > + import system . dispatcher < nl > + < nl > + private val config = ApplePushManagerConfig . load ( < nl > + Try ( system . settings . config . getConfig ( " services . apple . push " ) ) < nl > + . getOrElse ( system . settings . config . getConfig ( " push . apple " ) ) < nl > + ) < nl > + < nl > + private val ( managers , voipManagers ) : ( Map [ Int , PushManager [ SimpleApnsPushNotification ] ] , Map [ Int , PushManager [ SimpleApnsPushNotification ] ] ) = { < nl > + val ( certs , voipCerts ) = config . certs . partition ( ! _ . isVoip ) < nl > + < nl > + ( ( certs map createManager ) . toMap , ( voipCerts map createManager ) . toMap ) < nl > + } < nl > + < nl > + def getInstance ( key : Int ) : Option [ PushManager [ SimpleApnsPushNotification ] ] = managers . get ( key ) < nl > + < nl > + def getVoipInstance ( key : Int ) : Option [ PushManager [ SimpleApnsPushNotification ] ] = voipManagers . get ( key ) < nl > + < nl > + private def createManager ( cert : ApnsCert ) = { < nl > + val env = cert . isSandbox match { < nl > + case false ⇒ ApnsEnvironment . getProductionEnvironment < nl > + case true ⇒ ApnsEnvironment . getSandboxEnvironment < nl > + } < nl > + < nl > + cert . isSandbox match { < nl > + case false ⇒ ApnsEnvironment . getProductionEnvironment < nl > + case true ⇒ ApnsEnvironment . getSandboxEnvironment < nl > + } < nl > + < nl > + val mgr = new PushManager [ SimpleApnsPushNotification ] ( < nl > + env , < nl > + SSLContextUtil . createDefaultSSLContext ( cert . path , cert . password ) , < nl > + null , < nl > + null , < nl > + null , < nl > + new PushManagerConfiguration ( ) , < nl > + s " ActorPushManager - $ { cert . key } " < nl > + ) < nl > + < nl > + mgr . registerRejectedNotificationListener ( new LoggingRejectedNotificationListener ( system ) ) < nl > + < nl > + mgr . registerExpiredTokenListener ( new CleanExpiredTokenListener ( system ) ) < nl > + < nl > + mgr . start ( ) < nl > + < nl > + system . scheduler . schedule ( 10 . seconds , 1 . hour ) { < nl > + mgr . requestExpiredTokens ( ) < nl > + } < nl > + < nl > + ( cert . key , mgr ) < nl > + } < nl > + } < nl > + < nl > + private class LoggingRejectedNotificationListener ( _ system : ActorSystem ) extends RejectedNotificationListener [ SimpleApnsPushNotification ] { < nl > + private implicit val system : ActorSystem = _ system < nl > + private implicit val ec : ExecutionContext = _ system . dispatcher < nl > + private lazy val seqUpdExt = SeqUpdatesExtension ( system ) < nl > + private val log = Logging ( system , getClass ) < nl > + < nl > + override def handleRejectedNotification ( pushManager : PushManager [ _ < : SimpleApnsPushNotification ] , notification : SimpleApnsPushNotification , rejectionReason : RejectedNotificationReason ) : Unit = { < nl > + log . warning ( " APNS rejected notification with reason : { } " , rejectionReason ) < nl > + < nl > + if ( rejectionReason . getErrorCode = = RejectedNotificationReason . INVALID _ TOKEN . getErrorCode ) { < nl > + log . warning ( " Deleting token " ) < nl > + log . error ( " Implement push token deletion " ) < nl > + seqUpdExt . deleteApplePushCredentials ( notification . getToken ) < nl > + } < nl > + } < nl > + } < nl > + < nl > + private class CleanExpiredTokenListener ( _ system : ActorSystem ) extends ExpiredTokenListener [ SimpleApnsPushNotification ] { < nl > + private implicit val system : ActorSystem = _ system < nl > + private val log = Logging ( system , getClass ) < nl > + implicit val db : Database = DbExtension ( system ) . db < nl > + < nl > + override def handleExpiredTokens ( < nl > + pushManager : PushManager [ _ < : SimpleApnsPushNotification ] , < nl > + expiredTokens : util . Collection [ ExpiredToken ] < nl > + ) : Unit = { < nl > + expiredTokens foreach { t ⇒ < nl > + log . warning ( " APNS reported expired token " ) < nl > + / / UserExtension ( system ) . logoutByAppleToken ( t . getToken ) < nl > + } < nl > + } < nl > + } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala < nl > deleted file mode 100644 < nl > index 423e15b . . 0000000 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala < nl > + + + / dev / null < nl > @ @ - 1 , 122 + 0 , 0 @ @ < nl > - package im . actor . server . sequence < nl > - < nl > - import java . util < nl > - < nl > - import akka . actor . ActorSystem < nl > - import akka . event . Logging < nl > - import com . relayrides . pushy . apns . _ < nl > - import com . relayrides . pushy . apns . util . { SSLContextUtil , SimpleApnsPushNotification } < nl > - import com . typesafe . config . Config < nl > - import im . actor . server . db . ActorPostgresDriver . api . _ < nl > - import im . actor . server . db . DbExtension < nl > - < nl > - import scala . collection . JavaConversions . _ < nl > - import scala . concurrent . ExecutionContext < nl > - import scala . concurrent . duration . _ < nl > - import scala . util . Try < nl > - < nl > - case class ApplePushManagerConfig ( certs : List [ ApnsCert ] ) < nl > - < nl > - object ApplePushManagerConfig { < nl > - def load ( config : Config ) : ApplePushManagerConfig = { < nl > - ApplePushManagerConfig ( < nl > - certs = config . getConfigList ( " certs " ) . toList map ApnsCert . fromConfig < nl > - ) < nl > - < nl > - } < nl > - } < nl > - < nl > - case class ApnsCert ( key : Int , path : String , password : String , isSandbox : Boolean , isVoip : Boolean ) < nl > - < nl > - object ApnsCert { < nl > - def fromConfig ( config : Config ) : ApnsCert = { < nl > - ApnsCert ( < nl > - config . getInt ( " key " ) , < nl > - config . getString ( " path " ) , < nl > - config . getString ( " password " ) , < nl > - Try ( config . getBoolean ( " voip " ) ) . getOrElse ( false ) , < nl > - Try ( config . getBoolean ( " sandbox " ) ) . getOrElse ( false ) < nl > - ) < nl > - } < nl > - } < nl > - < nl > - final class ApplePushManager ( config : ApplePushManagerConfig , system : ActorSystem ) { < nl > - import system . dispatcher < nl > - < nl > - private val ( managers , voipManagers ) : ( Map [ Int , PushManager [ SimpleApnsPushNotification ] ] , Map [ Int , PushManager [ SimpleApnsPushNotification ] ] ) = { < nl > - val ( certs , voipCerts ) = config . certs . partition ( ! _ . isVoip ) < nl > - < nl > - ( ( certs map createManager ) . toMap , ( voipCerts map createManager ) . toMap ) < nl > - } < nl > - < nl > - def getInstance ( key : Int ) : Option [ PushManager [ SimpleApnsPushNotification ] ] = managers . get ( key ) < nl > - < nl > - def getVoipInstance ( key : Int ) : Option [ PushManager [ SimpleApnsPushNotification ] ] = voipManagers . get ( key ) < nl > - < nl > - private def createManager ( cert : ApnsCert ) = { < nl > - val env = cert . isSandbox match { < nl > - case false ⇒ ApnsEnvironment . getProductionEnvironment < nl > - case true ⇒ ApnsEnvironment . getSandboxEnvironment < nl > - } < nl > - < nl > - cert . isSandbox match { < nl > - case false ⇒ ApnsEnvironment . getProductionEnvironment < nl > - case true ⇒ ApnsEnvironment . getSandboxEnvironment < nl > - } < nl > - < nl > - val mgr = new PushManager [ SimpleApnsPushNotification ] ( < nl > - env , < nl > - SSLContextUtil . createDefaultSSLContext ( cert . path , cert . password ) , < nl > - null , < nl > - null , < nl > - null , < nl > - new PushManagerConfiguration ( ) , < nl > - s " ActorPushManager - $ { cert . key } " < nl > - ) < nl > - < nl > - mgr . registerRejectedNotificationListener ( new LoggingRejectedNotificationListener ( system ) ) < nl > - < nl > - mgr . registerExpiredTokenListener ( new CleanExpiredTokenListener ( system ) ) < nl > - < nl > - mgr . start ( ) < nl > - < nl > - system . scheduler . schedule ( 10 . seconds , 1 . hour ) { < nl > - mgr . requestExpiredTokens ( ) < nl > - } < nl > - < nl > - ( cert . key , mgr ) < nl > - } < nl > - } < nl > - < nl > - private class LoggingRejectedNotificationListener ( _ system : ActorSystem ) extends RejectedNotificationListener [ SimpleApnsPushNotification ] { < nl > - private implicit val system : ActorSystem = _ system < nl > - private implicit val ec : ExecutionContext = _ system . dispatcher < nl > - private lazy val seqUpdExt = SeqUpdatesExtension ( system ) < nl > - private val log = Logging ( system , getClass ) < nl > - < nl > - override def handleRejectedNotification ( pushManager : PushManager [ _ < : SimpleApnsPushNotification ] , notification : SimpleApnsPushNotification , rejectionReason : RejectedNotificationReason ) : Unit = { < nl > - log . warning ( " APNS rejected notification with reason : { } " , rejectionReason ) < nl > - < nl > - if ( rejectionReason . getErrorCode = = RejectedNotificationReason . INVALID _ TOKEN . getErrorCode ) { < nl > - log . warning ( " Deleting token " ) < nl > - log . error ( " Implement push token deletion " ) < nl > - seqUpdExt . deleteApplePushCredentials ( notification . getToken ) < nl > - } < nl > - } < nl > - } < nl > - < nl > - private class CleanExpiredTokenListener ( _ system : ActorSystem ) extends ExpiredTokenListener [ SimpleApnsPushNotification ] { < nl > - private implicit val system : ActorSystem = _ system < nl > - private val log = Logging ( system , getClass ) < nl > - implicit val db : Database = DbExtension ( system ) . db < nl > - < nl > - override def handleExpiredTokens ( < nl > - pushManager : PushManager [ _ < : SimpleApnsPushNotification ] , < nl > - expiredTokens : util . Collection [ ExpiredToken ] < nl > - ) : Unit = { < nl > - expiredTokens foreach { t ⇒ < nl > - log . warning ( " APNS reported expired token " ) < nl > - / / UserExtension ( system ) . logoutByAppleToken ( t . getToken ) < nl > - } < nl > - } < nl > - } < nl > \ No newline at end of file < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushProvider . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushProvider . scala < nl > index f71b70b . . f2654bd 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushProvider . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushProvider . scala < nl > @ @ - 8 , 7 + 8 , 7 @ @ import im . actor . server . db . DbExtension < nl > import im . actor . server . model . push . ApplePushCredentials < nl > import im . actor . server . persist . HistoryMessageRepo < nl > < nl > - private [ sequence ] final class ApplePushProvider ( userId : Int , applePushManager : ApplePushManager , system : ActorSystem ) extends PushProvider { < nl > + private [ sequence ] final class ApplePushProvider ( userId : Int , applePushManager : ApplePushExtension , system : ActorSystem ) extends PushProvider { < nl > import system . dispatcher < nl > < nl > private val log = Logging ( system , getClass ) < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > index 91c6787 . . 92a4f92 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala < nl > @ @ - 25 , 8 + 25 , 7 @ @ import scala . util . Try < nl > < nl > final class SeqUpdatesExtension ( < nl > _ system : ActorSystem , < nl > - gpm : GooglePushManager , < nl > - apm : ApplePushManager < nl > + gpm : GooglePushManager < nl > ) extends Extension { < nl > < nl > import UserSequenceCommands . _ < nl > @ @ - 35 , 6 + 34 , 7 @ @ final class SeqUpdatesExtension ( < nl > private val log = Logging ( _ system , getClass ) < nl > private implicit val OperationTimeout = Timeout ( 20 . seconds ) < nl > private implicit val system : ActorSystem = _ system < nl > + private lazy val apm = ApplePushExtension ( system ) < nl > < nl > log . debug ( " Getting DbExtension " ) < nl > private implicit lazy val db = DbExtension ( system ) . db < nl > @ @ - 274 , 20 + 274 , 15 @ @ object SeqUpdatesExtension extends ExtensionId [ SeqUpdatesExtension ] with Extensi < nl > < nl > try { < nl > log . debug ( " Initiating SeqUpdatesExtension " ) < nl > - val applePushConfig = ApplePushManagerConfig . load ( < nl > - Try ( system . settings . config . getConfig ( " services . apple . push " ) ) < nl > - . getOrElse ( system . settings . config . getConfig ( " push . apple " ) ) < nl > - ) < nl > - log . debug ( " Apple Push Config : { } " , applePushConfig ) < nl > + < nl > val googlePushConfig = GooglePushManagerConfig . load ( system . settings . config . getConfig ( " services . google . push " ) ) . get < nl > log . debug ( " Google Push Config : { } " , googlePushConfig ) < nl > < nl > val gpm = new GooglePushManager ( googlePushConfig ) < nl > - val apm = new ApplePushManager ( applePushConfig , system ) < nl > < nl > log . debug ( " Starting up " ) < nl > < nl > - new SeqUpdatesExtension ( system , gpm , apm ) < nl > + new SeqUpdatesExtension ( system , gpm ) < nl > } catch { < nl > case e : Throwable ⇒ < nl > log . error ( e , " Failed to start up SeqUpdatesExtension " ) < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesManagerRegion . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesManagerRegion . scala < nl > index 13ba687 . . 786b762 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesManagerRegion . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesManagerRegion . scala < nl > @ @ - 45 , 7 + 45 , 7 @ @ object SeqUpdatesManagerRegion { < nl > implicit < nl > system : ActorSystem , < nl > googlePushManager : GooglePushManager , < nl > - applePushManager : ApplePushManager < nl > + applePushManager : ApplePushExtension < nl > ) : SeqUpdatesManagerRegion = < nl > start ( UserSequence . props ( googlePushManager , applePushManager ) ) < nl > < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala < nl > index 99307c3 . . c1fb7f9 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala < nl > @ @ - 21 , 7 + 21 , 7 @ @ object UserSequence { < nl > < nl > private [ sequence ] def props ( < nl > googlePushManager : GooglePushManager , < nl > - applePushManager : ApplePushManager < nl > + applePushManager : ApplePushExtension < nl > ) = < nl > Props ( new UserSequence ( googlePushManager , applePushManager ) ) < nl > } < nl > @ @ - 42 , 7 + 42 , 7 @ @ private trait SeqControl { < nl > < nl > private [ sequence ] final class UserSequence ( < nl > googlePushManager : GooglePushManager , < nl > - applePushManager : ApplePushManager < nl > + applePushManager : ApplePushExtension < nl > ) extends Actor with ActorLogging with Stash with SeqControl { < nl > < nl > import UserSequence . _ < nl > diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala < nl > index b5430c3 . . 5e33981 100644 < nl > - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala < nl > + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala < nl > @ @ - 59 , 7 + 59 , 7 @ @ private [ sequence ] object VendorPush { < nl > < nl > private final case class Initialized ( creds : Seq [ ( PushCredentials , PushCredentialsInfo ) ] ) < nl > < nl > - def props ( userId : Int , googlePushManager : GooglePushManager , applePushManager : ApplePushManager ) = < nl > + def props ( userId : Int , googlePushManager : GooglePushManager , applePushManager : ApplePushExtension ) = < nl > Props ( new VendorPush ( userId , googlePushManager , applePushManager ) ) < nl > } < nl > < nl > @ @ - 125 , 7 + 125 , 7 @ @ private final class SettingsControl ( userId : Int ) extends Actor with ActorLogging < nl > private [ sequence ] final class VendorPush ( < nl > userId : Int , < nl > googlePushManager : GooglePushManager , < nl > - applePushManager : ApplePushManager < nl > + applePushManager : ApplePushExtension < nl > ) extends Actor with ActorLogging with Stash { < nl > < nl > import VendorPush . _
+
+TEST DIFF:
+diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala 
+ index ca5eb10 . . bb69ead 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala 
+ @ @ - 9 , 13 + 9 , 15 @ @ import com . relayrides . pushy . apns . util . { SSLContextUtil , SimpleApnsPushNotificati 
+ import com . typesafe . config . Config 
+ import im . actor . server . db . ActorPostgresDriver . api . _ 
+ import im . actor . server . db . DbExtension 
+ + import im . actor . server . model . push . ApplePushCredentials 
+ + import im . actor . server . persist . push . ApplePushCredentialsRepo 
+ 
+ import scala . collection . JavaConversions . _ 
+ - import scala . concurrent . ExecutionContext 
+ + import scala . concurrent . { ExecutionContext , Future } 
+ import scala . concurrent . duration . _ 
+ import scala . util . Try 
+ 
+ - case class ApplePushManagerConfig ( certs : List [ ApnsCert ] ) 
+ + final case class ApplePushManagerConfig ( certs : List [ ApnsCert ] ) 
+ 
+ object ApplePushManagerConfig { 
+ def load ( config : Config ) : ApplePushManagerConfig = { 
+ @ @ - 26 , 7 + 28 , 7 @ @ object ApplePushManagerConfig { 
+ } 
+ } 
+ 
+ - case class ApnsCert ( key : Int , path : String , password : String , isSandbox : Boolean , isVoip : Boolean ) 
+ + final case class ApnsCert ( key : Int , path : String , password : String , isSandbox : Boolean , isVoip : Boolean ) 
+ 
+ object ApnsCert { 
+ def fromConfig ( config : Config ) : ApnsCert = { 
+ @ @ - 49 , 6 + 51 , 8 @ @ object ApplePushExtension extends ExtensionId [ ApplePushExtension ] with Extension 
+ final class ApplePushExtension ( system : ActorSystem ) extends Extension { 
+ import system . dispatcher 
+ 
+ + private lazy val db = DbExtension ( system ) . db 
+ + 
+ private val config = ApplePushManagerConfig . load ( 
+ Try ( system . settings . config . getConfig ( " services . apple . push " ) ) 
+ . getOrElse ( system . settings . config . getConfig ( " push . apple " ) ) 
+ @ @ - 64 , 6 + 68 , 12 @ @ final class ApplePushExtension ( system : ActorSystem ) extends Extension { 
+ 
+ def getVoipInstance ( key : Int ) : Option [ PushManager [ SimpleApnsPushNotification ] ] = voipManagers . get ( key ) 
+ 
+ + def findCreds ( authId : Long ) : Future [ Option [ ApplePushCredentials ] ] = db . run ( ApplePushCredentialsRepo . find ( authId ) ) 
+ + 
+ + def findCreds ( authIds : Set [ Long ] ) : Future [ Seq [ ApplePushCredentials ] ] = db . run ( ApplePushCredentialsRepo . find ( authIds ) ) 
+ + 
+ + def findVoipCreds ( authIds : Set [ Long ] ) : Future [ Seq [ ApplePushCredentials ] ] = findCreds ( authIds ) map ( _ filter ( _ . isVoip ) ) 
+ + 
+ private def createManager ( cert : ApnsCert ) = { 
+ val env = cert . isSandbox match { 
+ case false ⇒ ApnsEnvironment . getProductionEnvironment 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala 
+ index fe09f4b . . 318b47f 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / user / UserOperations . scala 
+ @ @ - 17 , 6 + 17 , 7 @ @ import im . actor . server . persist . UserRepo 
+ import im . actor . server . pubsub . PubSubExtension 
+ import im . actor . server . sequence . { PushData , PushRules , SeqUpdatesExtension , SeqState } 
+ import im . actor . server . { model , persist ⇒ p } 
+ + import im . actor . types . _ 
+ import im . actor . util . misc . IdUtils 
+ import slick . driver . PostgresDriver . api . Database 
+ 
+ @ @ - 247 , 6 + 248 , 9 @ @ private [ user ] sealed trait Queries { 
+ def getAuthIds ( userIds : Set [ Int ] ) : Future [ Seq [ Long ] ] = 
+ Future . sequence ( userIds map getAuthIds ) map ( _ . toSeq . flatten ) 
+ 
+ + def getAuthIdsMap ( userIds : Set [ Int ] ) : Future [ Map [ UserId , Seq [ AuthId ] ] ] = 
+ + Future . sequence ( userIds map ( uid ⇒ getAuthIds ( uid ) map ( uid → _ ) ) ) map ( _ . toMap ) 
+ + 
+ def getApiStruct ( userId : Int , clientUserId : Int , clientAuthId : Long ) : Future [ ApiUser ] = 
+ ( viewRegion . ref ? GetApiStruct ( userId , clientUserId , clientAuthId ) ) . mapTo [ GetApiStructResponse ] map ( _ . struct ) 
+ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala 
+ index 8ae31bd . . cfbd0f7 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / webrtc / WebrtcCallActor . scala 
+ @ @ - 3 , 19 + 3 , 23 @ @ package im . actor . server . webrtc 
+ import akka . actor . _ 
+ import akka . http . scaladsl . util . FastFuture 
+ import akka . pattern . pipe 
+ + import com . relayrides . pushy . apns . util . { ApnsPayloadBuilder , SimpleApnsPushNotification } 
+ import im . actor . api . rpc . _ 
+ import im . actor . api . rpc . messaging . { ApiServiceExPhoneCall , ApiServiceMessage } 
+ import im . actor . api . rpc . peers . { ApiPeer , ApiPeerType } 
+ import im . actor . api . rpc . webrtc . _ 
+ import im . actor . concurrent . { ActorStashing , FutureExt } 
+ + import im . actor . server . db . DbExtension 
+ import im . actor . server . dialog . DialogExtension 
+ import im . actor . server . eventbus . { EventBus , EventBusExtension } 
+ import im . actor . server . group . GroupExtension 
+ import im . actor . server . model . { Peer , PeerType } 
+ - import im . actor . server . sequence . WeakUpdatesExtension 
+ + import im . actor . server . sequence . { ApplePushExtension , WeakUpdatesExtension } 
+ + import im . actor . server . user . UserExtension 
+ import im . actor . server . values . ValuesExtension 
+ import im . actor . types . _ 
+ 
+ + import scala . concurrent . Future 
+ import scala . concurrent . duration . _ 
+ import scala . concurrent . forkjoin . ThreadLocalRandom 
+ import scala . util . Random 
+ @ @ - 61 , 11 + 65 , 14 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { 
+ 
+ private val id = self . path . name . toLong 
+ 
+ - private lazy val weakUpdExt = WeakUpdatesExtension ( context . system ) 
+ - private lazy val dialogExt = DialogExtension ( context . system ) 
+ - private lazy val eventBusExt = EventBusExtension ( context . system ) 
+ - private lazy val groupExt = GroupExtension ( context . system ) 
+ - private lazy val valuesExt = ValuesExtension ( context . system ) 
+ + private val weakUpdExt = WeakUpdatesExtension ( context . system ) 
+ + private val dialogExt = DialogExtension ( context . system ) 
+ + private val eventBusExt = EventBusExtension ( context . system ) 
+ + private val userExt = UserExtension ( context . system ) 
+ + private val groupExt = GroupExtension ( context . system ) 
+ + private val valuesExt = ValuesExtension ( context . system ) 
+ + private val apnsExt = ApplePushExtension ( context . system ) 
+ + private val db = DbExtension ( context . system ) . db 
+ 
+ case class Device ( 
+ deviceId : EventBus . DeviceId , 
+ @ @ - 109 , 11 + 116 , 11 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { 
+ callees ← fetchParticipants ( callerUserId , peer ) map ( _ filterNot ( _ = = callerUserId ) ) 
+ callerDeviceId ← eventBusExt . fetchOwner ( s . eventBusId ) 
+ _ ← eventBusExt . join ( EventBus . InternalClient ( self ) , s . eventBusId , None ) 
+ + _ ← scheduleIncomingCallUpdates ( callees ) 
+ } yield Res ( callees , callerDeviceId ) ) pipeTo self 
+ 
+ becomeStashing ( replyTo ⇒ { 
+ case Res ( callees , callerDeviceId ) ⇒ 
+ - scheduleIncomingCallUpdates ( callees ) 
+ replyTo ! StartCallAck 
+ 
+ eventBusExt . post ( EventBus . InternalClient ( self ) , s . eventBusId , Seq ( callerDeviceId ) , ApiAdvertiseMaster . toByteArray ) 
+ @ @ - 303 , 18 + 310 , 36 @ @ private final class WebrtcCallActor extends ActorStashing with ActorLogging { 
+ case _ ⇒ FastFuture . failed ( new RuntimeException ( s " Unknown peer type : $ { peer . ` type ` } " ) ) 
+ } 
+ 
+ - private def scheduleIncomingCallUpdates ( callees : Seq [ UserId ] ) : Unit = 
+ - scheduledUpds = 
+ - callees 
+ - . map { callee ⇒ 
+ - ( 
+ - callee , 
+ - context . system . scheduler . schedule ( 0 . seconds , 5 . seconds ) { 
+ - weakUpdExt . broadcastUserWeakUpdate ( callee , UpdateIncomingCall ( id ) , reduceKey = Some ( s " call _ $ id " ) ) 
+ - } 
+ - ) 
+ - } 
+ - . toMap 
+ + private def scheduleIncomingCallUpdates ( callees : Seq [ UserId ] ) : Future [ Unit ] = { 
+ + for { 
+ + authIdsMap ← userExt . getAuthIdsMap ( callees . toSet ) 
+ + credsMap ← FutureExt . ftraverse ( authIdsMap . toSeq ) { 
+ + case ( userId , authIds ) ⇒ 
+ + apnsExt . findVoipCreds ( authIds . toSet ) map ( userId → _ ) 
+ + } 
+ + } yield { 
+ + scheduledUpds = 
+ + credsMap 
+ + . map { 
+ + case ( userId , creds ) ⇒ 
+ + ( 
+ + userId , 
+ + context . system . scheduler . schedule ( 0 . seconds , 5 . seconds ) { 
+ + weakUpdExt . broadcastUserWeakUpdate ( userId , UpdateIncomingCall ( id ) , reduceKey = Some ( s " call _ $ id " ) ) 
+ + 
+ + val payload = ( new ApnsPayloadBuilder ) . addCustomProperty ( " callId " , id ) . buildWithDefaultMaximumLength ( ) 
+ + 
+ + val instanceCreds = creds flatMap ( c ⇒ apnsExt . getVoipInstance ( c . apnsKey ) map ( _ → c ) ) 
+ + for ( ( instance , cred ) ← instanceCreds ) { 
+ + val notif = new SimpleApnsPushNotification ( cred . token . toByteArray , payload ) 
+ + instance . getQueue . add ( notif ) 
+ + } 
+ + } 
+ + ) 
+ + } 
+ + . toMap 
+ + } 
+ + } 
+ 
+ private def cancelIncomingCallUpdates ( callee : UserId ) = 
+ scheduledUpds get callee foreach { c ⇒
+
+NEAREST DIFF:
+diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala 
+ new file mode 100644 
+ index 0000000 . . ca5eb10 
+ - - - / dev / null 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushExtension . scala 
+ @ @ - 0 , 0 + 1 , 133 @ @ 
+ + package im . actor . server . sequence 
+ + 
+ + import java . util 
+ + 
+ + import akka . actor . { ActorSystem , ExtendedActorSystem , Extension , ExtensionId , ExtensionIdProvider } 
+ + import akka . event . Logging 
+ + import com . relayrides . pushy . apns . _ 
+ + import com . relayrides . pushy . apns . util . { SSLContextUtil , SimpleApnsPushNotification } 
+ + import com . typesafe . config . Config 
+ + import im . actor . server . db . ActorPostgresDriver . api . _ 
+ + import im . actor . server . db . DbExtension 
+ + 
+ + import scala . collection . JavaConversions . _ 
+ + import scala . concurrent . ExecutionContext 
+ + import scala . concurrent . duration . _ 
+ + import scala . util . Try 
+ + 
+ + case class ApplePushManagerConfig ( certs : List [ ApnsCert ] ) 
+ + 
+ + object ApplePushManagerConfig { 
+ + def load ( config : Config ) : ApplePushManagerConfig = { 
+ + ApplePushManagerConfig ( 
+ + certs = config . getConfigList ( " certs " ) . toList map ApnsCert . fromConfig 
+ + ) 
+ + 
+ + } 
+ + } 
+ + 
+ + case class ApnsCert ( key : Int , path : String , password : String , isSandbox : Boolean , isVoip : Boolean ) 
+ + 
+ + object ApnsCert { 
+ + def fromConfig ( config : Config ) : ApnsCert = { 
+ + ApnsCert ( 
+ + config . getInt ( " key " ) , 
+ + config . getString ( " path " ) , 
+ + config . getString ( " password " ) , 
+ + Try ( config . getBoolean ( " voip " ) ) . getOrElse ( false ) , 
+ + Try ( config . getBoolean ( " sandbox " ) ) . getOrElse ( false ) 
+ + ) 
+ + } 
+ + } 
+ + 
+ + object ApplePushExtension extends ExtensionId [ ApplePushExtension ] with ExtensionIdProvider { 
+ + override def createExtension ( system : ExtendedActorSystem ) : ApplePushExtension = new ApplePushExtension ( system ) 
+ + 
+ + override def lookup ( ) : ExtensionId [ _ < : Extension ] = ApplePushExtension 
+ + } 
+ + 
+ + final class ApplePushExtension ( system : ActorSystem ) extends Extension { 
+ + import system . dispatcher 
+ + 
+ + private val config = ApplePushManagerConfig . load ( 
+ + Try ( system . settings . config . getConfig ( " services . apple . push " ) ) 
+ + . getOrElse ( system . settings . config . getConfig ( " push . apple " ) ) 
+ + ) 
+ + 
+ + private val ( managers , voipManagers ) : ( Map [ Int , PushManager [ SimpleApnsPushNotification ] ] , Map [ Int , PushManager [ SimpleApnsPushNotification ] ] ) = { 
+ + val ( certs , voipCerts ) = config . certs . partition ( ! _ . isVoip ) 
+ + 
+ + ( ( certs map createManager ) . toMap , ( voipCerts map createManager ) . toMap ) 
+ + } 
+ + 
+ + def getInstance ( key : Int ) : Option [ PushManager [ SimpleApnsPushNotification ] ] = managers . get ( key ) 
+ + 
+ + def getVoipInstance ( key : Int ) : Option [ PushManager [ SimpleApnsPushNotification ] ] = voipManagers . get ( key ) 
+ + 
+ + private def createManager ( cert : ApnsCert ) = { 
+ + val env = cert . isSandbox match { 
+ + case false ⇒ ApnsEnvironment . getProductionEnvironment 
+ + case true ⇒ ApnsEnvironment . getSandboxEnvironment 
+ + } 
+ + 
+ + cert . isSandbox match { 
+ + case false ⇒ ApnsEnvironment . getProductionEnvironment 
+ + case true ⇒ ApnsEnvironment . getSandboxEnvironment 
+ + } 
+ + 
+ + val mgr = new PushManager [ SimpleApnsPushNotification ] ( 
+ + env , 
+ + SSLContextUtil . createDefaultSSLContext ( cert . path , cert . password ) , 
+ + null , 
+ + null , 
+ + null , 
+ + new PushManagerConfiguration ( ) , 
+ + s " ActorPushManager - $ { cert . key } " 
+ + ) 
+ + 
+ + mgr . registerRejectedNotificationListener ( new LoggingRejectedNotificationListener ( system ) ) 
+ + 
+ + mgr . registerExpiredTokenListener ( new CleanExpiredTokenListener ( system ) ) 
+ + 
+ + mgr . start ( ) 
+ + 
+ + system . scheduler . schedule ( 10 . seconds , 1 . hour ) { 
+ + mgr . requestExpiredTokens ( ) 
+ + } 
+ + 
+ + ( cert . key , mgr ) 
+ + } 
+ + } 
+ + 
+ + private class LoggingRejectedNotificationListener ( _ system : ActorSystem ) extends RejectedNotificationListener [ SimpleApnsPushNotification ] { 
+ + private implicit val system : ActorSystem = _ system 
+ + private implicit val ec : ExecutionContext = _ system . dispatcher 
+ + private lazy val seqUpdExt = SeqUpdatesExtension ( system ) 
+ + private val log = Logging ( system , getClass ) 
+ + 
+ + override def handleRejectedNotification ( pushManager : PushManager [ _ < : SimpleApnsPushNotification ] , notification : SimpleApnsPushNotification , rejectionReason : RejectedNotificationReason ) : Unit = { 
+ + log . warning ( " APNS rejected notification with reason : { } " , rejectionReason ) 
+ + 
+ + if ( rejectionReason . getErrorCode = = RejectedNotificationReason . INVALID _ TOKEN . getErrorCode ) { 
+ + log . warning ( " Deleting token " ) 
+ + log . error ( " Implement push token deletion " ) 
+ + seqUpdExt . deleteApplePushCredentials ( notification . getToken ) 
+ + } 
+ + } 
+ + } 
+ + 
+ + private class CleanExpiredTokenListener ( _ system : ActorSystem ) extends ExpiredTokenListener [ SimpleApnsPushNotification ] { 
+ + private implicit val system : ActorSystem = _ system 
+ + private val log = Logging ( system , getClass ) 
+ + implicit val db : Database = DbExtension ( system ) . db 
+ + 
+ + override def handleExpiredTokens ( 
+ + pushManager : PushManager [ _ < : SimpleApnsPushNotification ] , 
+ + expiredTokens : util . Collection [ ExpiredToken ] 
+ + ) : Unit = { 
+ + expiredTokens foreach { t ⇒ 
+ + log . warning ( " APNS reported expired token " ) 
+ + / / UserExtension ( system ) . logoutByAppleToken ( t . getToken ) 
+ + } 
+ + } 
+ + } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala 
+ deleted file mode 100644 
+ index 423e15b . . 0000000 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushManager . scala 
+ + + + / dev / null 
+ @ @ - 1 , 122 + 0 , 0 @ @ 
+ - package im . actor . server . sequence 
+ - 
+ - import java . util 
+ - 
+ - import akka . actor . ActorSystem 
+ - import akka . event . Logging 
+ - import com . relayrides . pushy . apns . _ 
+ - import com . relayrides . pushy . apns . util . { SSLContextUtil , SimpleApnsPushNotification } 
+ - import com . typesafe . config . Config 
+ - import im . actor . server . db . ActorPostgresDriver . api . _ 
+ - import im . actor . server . db . DbExtension 
+ - 
+ - import scala . collection . JavaConversions . _ 
+ - import scala . concurrent . ExecutionContext 
+ - import scala . concurrent . duration . _ 
+ - import scala . util . Try 
+ - 
+ - case class ApplePushManagerConfig ( certs : List [ ApnsCert ] ) 
+ - 
+ - object ApplePushManagerConfig { 
+ - def load ( config : Config ) : ApplePushManagerConfig = { 
+ - ApplePushManagerConfig ( 
+ - certs = config . getConfigList ( " certs " ) . toList map ApnsCert . fromConfig 
+ - ) 
+ - 
+ - } 
+ - } 
+ - 
+ - case class ApnsCert ( key : Int , path : String , password : String , isSandbox : Boolean , isVoip : Boolean ) 
+ - 
+ - object ApnsCert { 
+ - def fromConfig ( config : Config ) : ApnsCert = { 
+ - ApnsCert ( 
+ - config . getInt ( " key " ) , 
+ - config . getString ( " path " ) , 
+ - config . getString ( " password " ) , 
+ - Try ( config . getBoolean ( " voip " ) ) . getOrElse ( false ) , 
+ - Try ( config . getBoolean ( " sandbox " ) ) . getOrElse ( false ) 
+ - ) 
+ - } 
+ - } 
+ - 
+ - final class ApplePushManager ( config : ApplePushManagerConfig , system : ActorSystem ) { 
+ - import system . dispatcher 
+ - 
+ - private val ( managers , voipManagers ) : ( Map [ Int , PushManager [ SimpleApnsPushNotification ] ] , Map [ Int , PushManager [ SimpleApnsPushNotification ] ] ) = { 
+ - val ( certs , voipCerts ) = config . certs . partition ( ! _ . isVoip ) 
+ - 
+ - ( ( certs map createManager ) . toMap , ( voipCerts map createManager ) . toMap ) 
+ - } 
+ - 
+ - def getInstance ( key : Int ) : Option [ PushManager [ SimpleApnsPushNotification ] ] = managers . get ( key ) 
+ - 
+ - def getVoipInstance ( key : Int ) : Option [ PushManager [ SimpleApnsPushNotification ] ] = voipManagers . get ( key ) 
+ - 
+ - private def createManager ( cert : ApnsCert ) = { 
+ - val env = cert . isSandbox match { 
+ - case false ⇒ ApnsEnvironment . getProductionEnvironment 
+ - case true ⇒ ApnsEnvironment . getSandboxEnvironment 
+ - } 
+ - 
+ - cert . isSandbox match { 
+ - case false ⇒ ApnsEnvironment . getProductionEnvironment 
+ - case true ⇒ ApnsEnvironment . getSandboxEnvironment 
+ - } 
+ - 
+ - val mgr = new PushManager [ SimpleApnsPushNotification ] ( 
+ - env , 
+ - SSLContextUtil . createDefaultSSLContext ( cert . path , cert . password ) , 
+ - null , 
+ - null , 
+ - null , 
+ - new PushManagerConfiguration ( ) , 
+ - s " ActorPushManager - $ { cert . key } " 
+ - ) 
+ - 
+ - mgr . registerRejectedNotificationListener ( new LoggingRejectedNotificationListener ( system ) ) 
+ - 
+ - mgr . registerExpiredTokenListener ( new CleanExpiredTokenListener ( system ) ) 
+ - 
+ - mgr . start ( ) 
+ - 
+ - system . scheduler . schedule ( 10 . seconds , 1 . hour ) { 
+ - mgr . requestExpiredTokens ( ) 
+ - } 
+ - 
+ - ( cert . key , mgr ) 
+ - } 
+ - } 
+ - 
+ - private class LoggingRejectedNotificationListener ( _ system : ActorSystem ) extends RejectedNotificationListener [ SimpleApnsPushNotification ] { 
+ - private implicit val system : ActorSystem = _ system 
+ - private implicit val ec : ExecutionContext = _ system . dispatcher 
+ - private lazy val seqUpdExt = SeqUpdatesExtension ( system ) 
+ - private val log = Logging ( system , getClass ) 
+ - 
+ - override def handleRejectedNotification ( pushManager : PushManager [ _ < : SimpleApnsPushNotification ] , notification : SimpleApnsPushNotification , rejectionReason : RejectedNotificationReason ) : Unit = { 
+ - log . warning ( " APNS rejected notification with reason : { } " , rejectionReason ) 
+ - 
+ - if ( rejectionReason . getErrorCode = = RejectedNotificationReason . INVALID _ TOKEN . getErrorCode ) { 
+ - log . warning ( " Deleting token " ) 
+ - log . error ( " Implement push token deletion " ) 
+ - seqUpdExt . deleteApplePushCredentials ( notification . getToken ) 
+ - } 
+ - } 
+ - } 
+ - 
+ - private class CleanExpiredTokenListener ( _ system : ActorSystem ) extends ExpiredTokenListener [ SimpleApnsPushNotification ] { 
+ - private implicit val system : ActorSystem = _ system 
+ - private val log = Logging ( system , getClass ) 
+ - implicit val db : Database = DbExtension ( system ) . db 
+ - 
+ - override def handleExpiredTokens ( 
+ - pushManager : PushManager [ _ < : SimpleApnsPushNotification ] , 
+ - expiredTokens : util . Collection [ ExpiredToken ] 
+ - ) : Unit = { 
+ - expiredTokens foreach { t ⇒ 
+ - log . warning ( " APNS reported expired token " ) 
+ - / / UserExtension ( system ) . logoutByAppleToken ( t . getToken ) 
+ - } 
+ - } 
+ - } 
+ \ No newline at end of file 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushProvider . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushProvider . scala 
+ index f71b70b . . f2654bd 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushProvider . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / ApplePushProvider . scala 
+ @ @ - 8 , 7 + 8 , 7 @ @ import im . actor . server . db . DbExtension 
+ import im . actor . server . model . push . ApplePushCredentials 
+ import im . actor . server . persist . HistoryMessageRepo 
+ 
+ - private [ sequence ] final class ApplePushProvider ( userId : Int , applePushManager : ApplePushManager , system : ActorSystem ) extends PushProvider { 
+ + private [ sequence ] final class ApplePushProvider ( userId : Int , applePushManager : ApplePushExtension , system : ActorSystem ) extends PushProvider { 
+ import system . dispatcher 
+ 
+ private val log = Logging ( system , getClass ) 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ index 91c6787 . . 92a4f92 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesExtension . scala 
+ @ @ - 25 , 8 + 25 , 7 @ @ import scala . util . Try 
+ 
+ final class SeqUpdatesExtension ( 
+ _ system : ActorSystem , 
+ - gpm : GooglePushManager , 
+ - apm : ApplePushManager 
+ + gpm : GooglePushManager 
+ ) extends Extension { 
+ 
+ import UserSequenceCommands . _ 
+ @ @ - 35 , 6 + 34 , 7 @ @ final class SeqUpdatesExtension ( 
+ private val log = Logging ( _ system , getClass ) 
+ private implicit val OperationTimeout = Timeout ( 20 . seconds ) 
+ private implicit val system : ActorSystem = _ system 
+ + private lazy val apm = ApplePushExtension ( system ) 
+ 
+ log . debug ( " Getting DbExtension " ) 
+ private implicit lazy val db = DbExtension ( system ) . db 
+ @ @ - 274 , 20 + 274 , 15 @ @ object SeqUpdatesExtension extends ExtensionId [ SeqUpdatesExtension ] with Extensi 
+ 
+ try { 
+ log . debug ( " Initiating SeqUpdatesExtension " ) 
+ - val applePushConfig = ApplePushManagerConfig . load ( 
+ - Try ( system . settings . config . getConfig ( " services . apple . push " ) ) 
+ - . getOrElse ( system . settings . config . getConfig ( " push . apple " ) ) 
+ - ) 
+ - log . debug ( " Apple Push Config : { } " , applePushConfig ) 
+ + 
+ val googlePushConfig = GooglePushManagerConfig . load ( system . settings . config . getConfig ( " services . google . push " ) ) . get 
+ log . debug ( " Google Push Config : { } " , googlePushConfig ) 
+ 
+ val gpm = new GooglePushManager ( googlePushConfig ) 
+ - val apm = new ApplePushManager ( applePushConfig , system ) 
+ 
+ log . debug ( " Starting up " ) 
+ 
+ - new SeqUpdatesExtension ( system , gpm , apm ) 
+ + new SeqUpdatesExtension ( system , gpm ) 
+ } catch { 
+ case e : Throwable ⇒ 
+ log . error ( e , " Failed to start up SeqUpdatesExtension " ) 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesManagerRegion . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesManagerRegion . scala 
+ index 13ba687 . . 786b762 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesManagerRegion . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / SeqUpdatesManagerRegion . scala 
+ @ @ - 45 , 7 + 45 , 7 @ @ object SeqUpdatesManagerRegion { 
+ implicit 
+ system : ActorSystem , 
+ googlePushManager : GooglePushManager , 
+ - applePushManager : ApplePushManager 
+ + applePushManager : ApplePushExtension 
+ ) : SeqUpdatesManagerRegion = 
+ start ( UserSequence . props ( googlePushManager , applePushManager ) ) 
+ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala 
+ index 99307c3 . . c1fb7f9 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / UserSequence . scala 
+ @ @ - 21 , 7 + 21 , 7 @ @ object UserSequence { 
+ 
+ private [ sequence ] def props ( 
+ googlePushManager : GooglePushManager , 
+ - applePushManager : ApplePushManager 
+ + applePushManager : ApplePushExtension 
+ ) = 
+ Props ( new UserSequence ( googlePushManager , applePushManager ) ) 
+ } 
+ @ @ - 42 , 7 + 42 , 7 @ @ private trait SeqControl { 
+ 
+ private [ sequence ] final class UserSequence ( 
+ googlePushManager : GooglePushManager , 
+ - applePushManager : ApplePushManager 
+ + applePushManager : ApplePushExtension 
+ ) extends Actor with ActorLogging with Stash with SeqControl { 
+ 
+ import UserSequence . _ 
+ diff - - git a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala 
+ index b5430c3 . . 5e33981 100644 
+ - - - a / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala 
+ + + + b / actor - server / actor - core / src / main / scala / im / actor / server / sequence / VendorPush . scala 
+ @ @ - 59 , 7 + 59 , 7 @ @ private [ sequence ] object VendorPush { 
+ 
+ private final case class Initialized ( creds : Seq [ ( PushCredentials , PushCredentialsInfo ) ] ) 
+ 
+ - def props ( userId : Int , googlePushManager : GooglePushManager , applePushManager : ApplePushManager ) = 
+ + def props ( userId : Int , googlePushManager : GooglePushManager , applePushManager : ApplePushExtension ) = 
+ Props ( new VendorPush ( userId , googlePushManager , applePushManager ) ) 
+ } 
+ 
+ @ @ - 125 , 7 + 125 , 7 @ @ private final class SettingsControl ( userId : Int ) extends Actor with ActorLogging 
+ private [ sequence ] final class VendorPush ( 
+ userId : Int , 
+ googlePushManager : GooglePushManager , 
+ - applePushManager : ApplePushManager 
+ + applePushManager : ApplePushExtension 
+ ) extends Actor with ActorLogging with Stash { 
+ 
+ import VendorPush . _
